@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import time
+import types
 from datetime import datetime, timezone
 
 from streamlink.exceptions import NoStreamsError
@@ -94,6 +95,92 @@ def test_start_youtube_without_streamer_returns_false(tmp_path, monkeypatch):
 
     assert asyncio.run(rec.start("ch")) is False
     assert "ch" not in rec._recordings
+
+
+class RaisingReadStream:
+    def open(self):
+        class _Fd:
+            def read(self, n):
+                raise RuntimeError("read boom")
+
+        return _Fd()
+
+
+class FakeFailingStream:
+    def open(self):
+        raise RuntimeError("disk boom")
+
+
+class FakeYouTubeStreamer:
+    def __init__(self, create_error=None):
+        self.create_error = create_error
+
+    async def create_stream(self, author, title, channel, game):
+        if self.create_error:
+            raise self.create_error
+        return {"youtube_url": "https://youtu.be/x", "rtmp_url": "rtmp://x", "broadcast_id": "b1"}
+
+
+def test_pipe_stream_clean_eof_returns_true(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    process = types.SimpleNamespace(stdin=None)
+    result = asyncio.run(rec._pipe_stream("ch", FakeStream(), process, None))
+    assert result is True
+
+
+def test_pipe_stream_read_error_returns_false(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    process = types.SimpleNamespace(stdin=None)
+    result = asyncio.run(rec._pipe_stream("ch", RaisingReadStream(), process, None))
+    assert result is False
+
+
+def test_recording_task_failure_removes_entry(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert not rec.is_recording("ch")
+        assert "ch" not in rec._recordings
+
+    asyncio.run(scenario())
+
+
+def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["output_mode"] = "youtube"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("boom")))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert not rec.is_recording("ch")
+
+    asyncio.run(scenario())
+
+
+def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["output_mode"] = "youtube"
+    rec = Recorder(
+        config,
+        youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("The user has exceeded their quota")),
+    )
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert rec.is_recording("ch")
+        assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
+
+    asyncio.run(scenario())
 
 
 def test_stop_returns_file_info(tmp_path):

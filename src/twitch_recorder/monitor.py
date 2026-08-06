@@ -32,7 +32,10 @@ class Monitor:
         user_to_channel = {v: k for k, v in user_ids.items()}
 
         for user_id, stream in streams.items():
-            channel = user_to_channel[user_id]
+            channel = user_to_channel.get(user_id)
+            if channel is None:
+                logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
+                continue
             if channel not in self._live_channels:
                 ok = await self.recorder.start(
                     channel,
@@ -43,6 +46,18 @@ class Monitor:
                     self._live_channels.add(channel)
                     self._last_failure_notify.pop(channel, None)
                     logger.info("[monitor] %s is LIVE", channel)
+                else:
+                    await self._handle_start_failure(channel)
+            elif not self.recorder.is_recording(channel):
+                logger.warning("[monitor] %s recording stopped unexpectedly, restarting", channel)
+                ok = await self.recorder.start(
+                    channel,
+                    title=stream.get("title"),
+                    game=stream.get("game_name"),
+                )
+                if ok:
+                    self._last_failure_notify.pop(channel, None)
+                    logger.info("[monitor] %s recording restarted", channel)
                 else:
                     await self._handle_start_failure(channel)
 

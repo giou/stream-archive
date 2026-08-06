@@ -98,22 +98,22 @@ class Recorder:
             entry["filepath"] = filepath
 
         if self._mode == "disk":
-            disk_task = asyncio.create_task(
-                self._record_disk(channel, entry["filepath"], best)
+            disk_task = self._track(
+                channel, self._record_disk(channel, entry["filepath"], best)
             )
             tasks.append(disk_task)
             if self._notifier:
                 await self._notifier.notify_live(channel, stream_title, stream_game, twitch_url)
         elif self._mode == "youtube":
             if self._youtube is not None:
-                yt_task = asyncio.create_task(
-                    self._stream_youtube(channel, author, stream_title, stream_game, best, None)
+                yt_task = self._track(
+                    channel, self._stream_youtube(channel, author, stream_title, stream_game, best, None)
                 )
                 tasks.append(yt_task)
         elif self._mode == "both":
             if self._youtube is not None:
-                yt_task = asyncio.create_task(
-                    self._stream_youtube(channel, author, stream_title, stream_game, best, entry["filepath"])
+                yt_task = self._track(
+                    channel, self._stream_youtube(channel, author, stream_title, stream_game, best, entry["filepath"])
                 )
                 tasks.append(yt_task)
 
@@ -124,6 +124,25 @@ class Recorder:
         entry["tasks"] = tasks
         logger.info("[recorder] Started recording %s (mode=%s)", channel, self._mode)
         return True
+
+    def _track(self, channel, coro):
+        task = asyncio.create_task(coro)
+        task.add_done_callback(lambda t: self._on_task_finished(channel, t))
+        return task
+
+    def _on_task_finished(self, channel, task):
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
+        entry = self._recordings.get(channel)
+        if entry is not None and task in entry.get("tasks", []):
+            del self._recordings[channel]
+
+    def is_recording(self, channel):
+        return channel in self._recordings
 
     async def _record_disk(self, channel, filepath, stream):
         logger.info("[recorder] [disk] %s -> %s", channel, filepath)
@@ -156,7 +175,7 @@ class Recorder:
             )
         except Exception as e:
             logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
-            if "rate limit" in str(e).lower() or "403" in str(e):
+            if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():
                 msg = (
                     f"\u26a0\ufe0f YouTube rate limit reached!\n"
                     f"Channel: {channel}\n"
@@ -174,14 +193,15 @@ class Recorder:
                     filepath = os.path.join(recording_dir, f"{safe_title}-{now}.ts")
                     entry["filepath"] = filepath
                     logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)
-                    disk_task = asyncio.create_task(
-                        self._record_disk(channel, filepath, stream)
+                    disk_task = self._track(
+                        channel, self._record_disk(channel, filepath, stream)
                     )
                     entry["tasks"].append(disk_task)
                     if self._notifier:
                         twitch_url = f"https://twitch.tv/{channel}"
                         await self._notifier.notify_live(channel, title, game, twitch_url)
-            return
+                return
+            raise
 
         entry = self._recordings.get(channel)
         if entry is None:
@@ -227,7 +247,7 @@ class Recorder:
         )
 
         try:
-            await asyncio.gather(pipe_task, stderr_task)
+            results = await asyncio.gather(pipe_task, stderr_task)
         except asyncio.CancelledError:
             pipe_task.cancel()
             try:
@@ -235,6 +255,7 @@ class Recorder:
             except (asyncio.CancelledError, Exception):
                 pass
             logger.info("[recorder] [youtube] %s cancelled", channel)
+            return
         finally:
             if process.returncode is None:
                 try:
@@ -248,13 +269,17 @@ class Recorder:
                         pass
             logger.info("[recorder] [youtube] %s ffmpeg stopped (rc=%s)", channel, process.returncode)
 
+        if not results[0]:
+            raise RuntimeError(f"[youtube] {channel} stream interrupted")
+
     async def _pipe_stream(self, channel, stream, process, filepath):
         loop = asyncio.get_running_loop()
+        clean = False
         try:
             fd = await loop.run_in_executor(None, stream.open)
         except Exception as e:
             logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
-            return
+            return False
 
         file_handle = None
         try:
@@ -269,6 +294,7 @@ class Recorder:
                     logger.error("[recorder] [youtube] %s read error: %s", channel, e)
                     break
                 if not data:
+                    clean = True
                     break
 
                 if file_handle:
@@ -296,6 +322,7 @@ class Recorder:
                 process.stdin.close()
             except Exception:
                 pass
+        return clean
 
     async def _read_ffmpeg_stderr(self, channel, process):
         if process.stderr is None:

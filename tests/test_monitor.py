@@ -24,6 +24,7 @@ class FakeRecorder:
         self.ok = ok
         self.started = []
         self.stopped = []
+        self._recording = True
 
     async def start(self, channel, title=None, game=None):
         self.started.append(channel)
@@ -32,6 +33,9 @@ class FakeRecorder:
     async def stop(self, channel):
         self.stopped.append(channel)
         return {}
+
+    def is_recording(self, channel):
+        return self._recording
 
 
 class FakeNotifier:
@@ -107,6 +111,33 @@ def test_failure_alert_not_rate_limited_when_interval_zero(monkeypatch):
 
     assert rec.started == ["ch", "ch"]
     assert len(notifier.messages) == 2
+
+
+def test_recording_death_triggers_restart():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.check_channels(api, config))
+    assert rec.started == ["ch"]
+
+    rec._recording = False
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == ["ch", "ch"]
+    assert rec.stopped == []
+
+
+def test_unknown_user_stream_is_skipped():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u999": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == []
 
 
 def test_transient_api_error_does_not_raise_or_act():
