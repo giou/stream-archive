@@ -45,28 +45,26 @@ recording processes that die mid-stream.
 
 ## Architecture
 
-```
-┌───────────────┐
-│  scheduler    │  poll loop, signal handling, retention cleanup
-└───────┬───────┘
-        │ every monitoring_interval
-┌───────▼───────┐   ┌──────────────────┐
-│  monitor      │──▶│ Twitch Helix API │  resolve user ids + live streams
-└───────┬───────┘   └──────────────────┘
-        │ start / stop / restart
-┌───────▼───────┐   ┌──────────────────┐
-│  recorder     │──▶│ streamlink       │  proxied playlist → stream
-└───┬───────┬───┘   └──────────────────┘
-    │ disk  │ youtube
-    │       │
-┌───▼───┐ ┌▼─────────────────┐   ┌──────────────────┐
-│ .ts   │ │ ffmpeg          │──▶│ YouTube Live API │
-│ files │ │ (pipe → RTMP)   │   └──────────────────┘
-└───────┘ └─────────────────┘
-        │
-┌───────▼───────┐
-│  notifier     │  Telegram alerts (live / offline / failures)
-└───────────────┘
+```mermaid
+flowchart TD
+    Scheduler["scheduler<br/>poll loop · signal handling · retention cleanup"]
+    Monitor["monitor"]
+    Recorder["recorder"]
+    Notifier["notifier"]
+    Telegram["telegram_control<br/>admin-only bot commands"]
+
+    Scheduler -->|"every monitoring_interval"| Monitor
+    Monitor -->|"resolve user ids + live streams"| Twitch["Twitch Helix API"]
+    Monitor -->|"start / stop / restart"| Recorder
+    Recorder -->|"proxied playlist → stream"| Streamlink["streamlink"]
+    Recorder -->|disk| Disk[".ts files"]
+    Recorder -->|youtube| Ffmpeg["ffmpeg<br/>pipe → RTMP"]
+    Ffmpeg -->|"re-stream"| YouTube["YouTube Live API"]
+    Recorder -->|"live / offline / failures"| Notifier
+    Scheduler -->|starts| Telegram
+    Telegram -->|"persists atomically"| Config["config.json"]
+    Telegram -->|"/add /remove /mode /reload /restart"| Recorder
+    Telegram -->|"/remove"| Monitor
 ```
 
 Recording tasks are tracked; a task that fails raises, its channel entry is
