@@ -5,7 +5,10 @@ stream via [streamlink](https://streamlink.github.io/), using ad-block playlist
 proxies (vendored `streamlink-ttvlol` plugin) so streams playable only via
 ad-block workaround still record. Optionally re-streams recordings to
 [YouTube Live](https://www.youtube.com/live) and sends Telegram alerts on
-live/offline events and start failures.
+live/offline events and start failures. The admin can also manage the
+recorder over Telegram — add/remove monitored channels, set retention and
+output mode, view status, reload, or restart — with no other user able to
+issue commands.
 
 The system is designed to be set-and-forget: failures are logged, alerted
 (rate-limited), and retried automatically on the next poll cycle — including
@@ -24,6 +27,11 @@ recording processes that die mid-stream.
 - **Telegram alerts** — live (with title/game/URL), offline (with file size and
   YouTube link), and start-failure (rate-limited to once per 30 minutes per
   channel).
+- **Telegram control** — the admin (`telegram_user_id`) can manage the recorder
+  over the bot: add/remove monitored channels, set retention and output mode,
+  view status, reload `config.json`, or restart the service. Every change is
+  validated and persisted atomically, then applied live on the next poll cycle;
+  non-admin senders get no reply.
 - **Self-healing**:
   - Recording tasks that die mid-stream (ffmpeg crash, disk error, proxy death)
     are detected and restarted on the next poll cycle.
@@ -63,6 +71,12 @@ recording processes that die mid-stream.
 
 Recording tasks are tracked; a task that fails raises, its channel entry is
 removed, and the monitor restarts the recording on the next poll cycle.
+
+Control plane: `telegram_control` runs alongside the scheduler as a polling
+bot. Commands are gated to `telegram_user_id`, validated on a copy, written
+atomically to `config.json`, and applied to the running scheduler /
+recorder / monitor on the next poll cycle — see
+[Telegram control](#telegram-control).
 
 ## Requirements
 
@@ -116,7 +130,7 @@ All keys from `config.json.example`:
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `telegram_user_id` | yes | — | Numeric Telegram user/chat id for alerts |
+| `telegram_user_id` | yes | — | Numeric Telegram user/chat id for alerts; sole authorized user of the bot's control commands |
 | `bot_telegram_api` | yes | — | Telegram bot token from BotFather |
 | `twitch_client_id` | yes | — | Twitch app client id |
 | `twitch_client_secret` | yes | — | Twitch app client secret |
@@ -133,6 +147,37 @@ All keys from `config.json.example`:
 
 `output_mode: youtube` additionally requires `youtube_token.json` (see
 [YouTube setup](#youtube-setup)).
+
+## Telegram control
+
+The admin user (`telegram_user_id`) can manage the recorder by messaging the
+bot; anyone else gets no reply at all. Every change is validated before being
+written atomically to `config.json` and takes effect on the next poll cycle —
+a failed command leaves both memory and disk untouched.
+
+| Command | Action |
+| --- | --- |
+| `/help` | List the available commands |
+| `/status` | Monitored channels, output mode, retention, monitoring interval, and channels currently recording |
+| `/channels` | Numbered list of monitored channels |
+| `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |
+| `/remove <channel>` | Stop monitoring a channel; if it is live, stops the recording (sending the offline notification) |
+| `/retention <days>` | Set `retention_days`; `0` disables cleanup |
+| `/mode <disk\|youtube\|both>` | Set `output_mode`; applies to new recordings |
+| `/reload` | Re-read `config.json` from disk |
+| `/restart` | Gracefully restart the service |
+
+Notes:
+
+- `/mode` applies to new recordings; an in-flight recording finishes in the
+  mode it started with.
+- `/retention` and `/reload` apply immediately — the cleanup loop and the
+  monitor read the live config every cycle.
+- `/restart` replies first, then triggers the scheduler shutdown; the systemd
+  unit's `Restart=always` relaunches the service after `RestartSec`. In a
+  foreground run it simply exits.
+- Secrets (bot token, Twitch credentials, proxy credentials) are never printed
+  by `/status` and cannot be changed over Telegram.
 
 ## Running
 
@@ -193,9 +238,10 @@ src/twitch_recorder/
   youtube_streamer.py    # YouTube Live API (broadcast/stream/bind/end)
   twitch_api.py          # Twitch Helix client (token, users, streams)
   notifier.py            # Telegram messages
+  telegram_control.py    # admin-only Telegram bot commands (/add /remove /mode …)
   config.py              # config loading + validation
 plugins/twitch.py        # vendored streamlink-ttvlol plugin
-tests/                   # pytest suite (recorder, monitor, notifier, config)
+tests/                   # pytest suite (recorder, monitor, notifier, config, telegram_control)
 ```
 
 ## Plugin maintenance
