@@ -72,6 +72,9 @@ class Monitor:
                 await self.notifier.notify_offline(channel, file_info, youtube_url)
                 logger.info("[monitor] %s is OFFLINE", channel)
 
+    def remove_channel(self, channel):
+        self._live_channels.discard(channel)
+
     async def _handle_start_failure(self, channel):
         now = time.monotonic()
         if now - self._last_failure_notify.get(channel, 0.0) < FAILURE_NOTIFY_INTERVAL:

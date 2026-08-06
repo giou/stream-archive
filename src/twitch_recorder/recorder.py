@@ -22,7 +22,6 @@ class Recorder:
         self._config = config
         self._youtube = youtube_streamer
         self._notifier = notifier
-        self._mode = config["output_mode"]
         self._recordings = {}
         self._session = streamlink.Streamlink()
         self._session.set_option("http-timeout", 30)
@@ -63,6 +62,7 @@ class Recorder:
         if channel in self._recordings:
             return True
 
+        mode = self._config["output_mode"]
         self._load_plugin()
         loop = asyncio.get_running_loop()
 
@@ -88,7 +88,7 @@ class Recorder:
         tasks = []
         twitch_url = f"https://twitch.tv/{channel}"
 
-        if self._mode in ("disk", "both"):
+        if mode in ("disk", "both"):
             recording_dir = f"{self._config['recording_dir']}/{channel}"
             os.makedirs(recording_dir, exist_ok=True)
             now = datetime.now(ZoneInfo(self._config["timezone"])).strftime("%d_%m_%Y-%H%M%S")
@@ -97,20 +97,20 @@ class Recorder:
             filepath = os.path.join(recording_dir, filename)
             entry["filepath"] = filepath
 
-        if self._mode == "disk":
+        if mode == "disk":
             disk_task = self._track(
                 channel, self._record_disk(channel, entry["filepath"], best)
             )
             tasks.append(disk_task)
             if self._notifier:
                 await self._notifier.notify_live(channel, stream_title, stream_game, twitch_url)
-        elif self._mode == "youtube":
+        elif mode == "youtube":
             if self._youtube is not None:
                 yt_task = self._track(
                     channel, self._stream_youtube(channel, author, stream_title, stream_game, best, None)
                 )
                 tasks.append(yt_task)
-        elif self._mode == "both":
+        elif mode == "both":
             if self._youtube is not None:
                 yt_task = self._track(
                     channel, self._stream_youtube(channel, author, stream_title, stream_game, best, entry["filepath"])
@@ -122,7 +122,7 @@ class Recorder:
             return False
 
         entry["tasks"] = tasks
-        logger.info("[recorder] Started recording %s (mode=%s)", channel, self._mode)
+        logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
         return True
 
     def _track(self, channel, coro):
@@ -143,6 +143,10 @@ class Recorder:
 
     def is_recording(self, channel):
         return channel in self._recordings
+
+    def active_channels(self):
+        """Names of channels currently being recorded, sorted."""
+        return sorted(self._recordings)
 
     async def _record_disk(self, channel, filepath, stream):
         logger.info("[recorder] [disk] %s -> %s", channel, filepath)

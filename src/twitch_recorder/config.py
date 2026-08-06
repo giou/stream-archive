@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -24,7 +25,36 @@ def get_config():
 
     _validate(config)
     config["_workdir"] = config_path.parent
+    config["_config_path"] = config_path
     return config
+
+
+def save_config(config):
+    """Validate and atomically write config to the file it was loaded from."""
+    _validate(config)
+    path = config["_config_path"]
+    data = {k: v for k, v in config.items() if not k.startswith("_")}
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=4)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def reload_config(config):
+    """Re-read config.json from disk into the live dict; raises ValueError on any failure."""
+    try:
+        with open(config["_config_path"]) as f:
+            new_config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse config.json: {e}")
+    except FileNotFoundError:
+        raise ValueError("config.json not found")
+    _validate(new_config)
+    new_config["_workdir"] = config["_workdir"]
+    new_config["_config_path"] = config["_config_path"]
+    config.clear()
+    config.update(new_config)
 
 
 def _find_config():

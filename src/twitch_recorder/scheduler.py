@@ -8,6 +8,7 @@ from src.twitch_recorder.monitor import Monitor
 from src.twitch_recorder.recorder import Recorder
 from src.twitch_recorder.notifier import Notifier
 from src.twitch_recorder.youtube_streamer import YouTubeStreamer
+from src.twitch_recorder.telegram_control import TelegramController
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,20 @@ async def run_scheduler():
 
     twitch_api = TwitchAPI()
     notifier = Notifier(config["bot_telegram_api"], config["telegram_user_id"])
-    youtube_streamer = None
 
-    if output_mode in ("youtube", "both"):
-        youtube_streamer = YouTubeStreamer(config)
-        logger.info("YouTube streaming enabled (privacy: %s)", config["youtube"]["privacy_status"])
+    # Constructed unconditionally so a live /mode youtube|both always has a
+    # streamer available; it only stores paths and creates an httpx client.
+    # Missing youtube_token.json is handled per-task in _stream_youtube.
+    youtube_streamer = YouTubeStreamer(config)
+    logger.info("YouTube streaming enabled (privacy: %s)", config["youtube"]["privacy_status"])
 
     recorder = Recorder(config, youtube_streamer, notifier)
     monitor = Monitor(recorder, notifier)
+
+    telegram = TelegramController(
+        config, recorder, monitor, on_restart=lambda: _shutdown_event.set()
+    )
+    await telegram.start()
 
     try:
         while not _shutdown_event.is_set():
@@ -63,6 +70,7 @@ async def run_scheduler():
                 await asyncio.sleep(5)
                 continue
 
+            retention_days = config.get("retention_days", 0)
             if retention_days > 0 and (last_cleanup is None or time.monotonic() - last_cleanup >= 86400):
                 removed = await recorder.cleanup_old_recordings(retention_days)
                 logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
@@ -77,10 +85,10 @@ async def run_scheduler():
     finally:
         logger.info("[scheduler] Shutting down, stopping all recordings...")
         await recorder.stop_all()
+        await telegram.stop()
         await notifier.close()
         await twitch_api.close()
-        if youtube_streamer:
-            await youtube_streamer.close()
+        await youtube_streamer.close()
         logger.info("[scheduler] Shutdown complete")
 
 

@@ -1,0 +1,183 @@
+import asyncio
+import copy
+import logging
+
+from telegram.ext import Application, CommandHandler, filters
+
+from src.twitch_recorder.config import _CHANNEL_RE, reload_config, save_config
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramController:
+    """Telegram control surface for the admin user (config['telegram_user_id']).
+
+    All state changes go through ``_apply``: validate on a deep copy, persist
+    atomically to config.json, then swap into the live dict. A failed command
+    leaves both memory and disk untouched.
+    """
+
+    def __init__(self, config, recorder, monitor, on_restart=None):
+        self._config = config
+        self._recorder = recorder
+        self._monitor = monitor
+        self._on_restart = on_restart
+        self._admin_id = config["telegram_user_id"]
+        self._app = Application.builder().token(config["bot_telegram_api"]).build()
+
+    async def start(self):
+        admin = filters.User(user_id=self._admin_id)
+        self._app.add_handlers([
+            CommandHandler("help", self._cmd_help, filters=admin),
+            CommandHandler("status", self._cmd_status, filters=admin),
+            CommandHandler("channels", self._cmd_channels, filters=admin),
+            CommandHandler("add", self._cmd_add, filters=admin),
+            CommandHandler("remove", self._cmd_remove, filters=admin),
+            CommandHandler("retention", self._cmd_retention, filters=admin),
+            CommandHandler("mode", self._cmd_mode, filters=admin),
+            CommandHandler("reload", self._cmd_reload, filters=admin),
+            CommandHandler("restart", self._cmd_restart, filters=admin),
+        ])
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(allowed_updates=["message"])
+        logger.info("[telegram] Bot polling started (admin id=%s)", self._admin_id)
+
+    async def stop(self):
+        await self._app.updater.stop()
+        await self._app.stop()
+        await self._app.shutdown()
+
+    def _apply(self, mutate, ok_text):
+        candidate = copy.deepcopy(self._config)
+        try:
+            mutate(candidate)
+            save_config(candidate)
+        except ValueError as e:
+            return f"\u274c {e}"
+        self._config.clear()
+        self._config.update(candidate)
+        return ok_text(candidate)
+
+    def handle_help(self):
+        return (
+            "Available commands:\n"
+            "/help - this list\n"
+            "/status - current settings\n"
+            "/channels - monitored channels\n"
+            "/add <channel> - start monitoring a channel\n"
+            "/remove <channel> - stop monitoring a channel\n"
+            "/retention <days> - recording retention\n"
+            "/mode <disk|youtube|both> - output mode\n"
+            "/reload - re-read config.json\n"
+            "/restart - restart the service"
+        )
+
+    def handle_status(self):
+        c = self._config
+        active = self._recorder.active_channels()
+        days = c["retention_days"]
+        retention = f"Retention: {days} day" + ("s" if days != 1 else "") if days else "Retention: disabled"
+        return (
+            f"Channels ({len(c['channels'])}): {', '.join(c['channels'])}\n"
+            f"Output mode: {c['output_mode']}\n"
+            f"{retention}\n"
+            f"Monitoring interval: {c['monitoring_interval']}s\n"
+            f"Recording now: {', '.join(active) if active else 'none'}"
+        )
+
+    def handle_channels(self):
+        return "\n".join(f"{i}. {ch}" for i, ch in enumerate(self._config["channels"], 1))
+
+    def handle_add(self, args):
+        if len(args) != 1:
+            return "Usage: /add <channel>"
+        ch = args[0]
+        if not _CHANNEL_RE.match(ch):
+            return f"\u274c Invalid channel name: {ch!r}"
+
+        def mutate(candidate):
+            if ch in candidate["channels"]:
+                raise ValueError(f"{ch} is already monitored")
+            candidate["channels"].append(ch)
+
+        return self._apply(mutate, lambda c: f"Added {ch} \u2014 {len(c['channels'])} channel(s) monitored")
+
+    async def handle_remove(self, args):
+        if len(args) != 1:
+            return "Usage: /remove <channel>"
+        ch = args[0]
+
+        def mutate(candidate):
+            if ch not in candidate["channels"]:
+                raise ValueError(f"{ch} is not in the monitored list")
+            candidate["channels"].remove(ch)
+
+        result = self._apply(mutate, lambda c: f"Removed {ch} \u2014 {len(c['channels'])} channel(s) monitored")
+        if not result.startswith("\u274c") and self._recorder.is_recording(ch):
+            await self._recorder.stop(ch)
+            self._monitor.remove_channel(ch)
+        return result
+
+    def handle_retention(self, args):
+        if len(args) != 1:
+            return "Usage: /retention <days>"
+        try:
+            n = int(args[0])
+        except ValueError:
+            return "\u274c retention must be an integer"
+
+        def mutate(candidate):
+            candidate["retention_days"] = n
+
+        return self._apply(mutate, lambda c: f"Retention set to {n} day(s)")
+
+    def handle_mode(self, args):
+        if len(args) != 1:
+            return "Usage: /mode <disk|youtube|both>"
+        m = args[0].lower()
+
+        def mutate(candidate):
+            candidate["output_mode"] = m
+
+        return self._apply(mutate, lambda c: f"Output mode set to {m}")
+
+    def handle_reload(self):
+        try:
+            reload_config(self._config)
+        except ValueError as e:
+            return f"\u274c Reload failed: {e}"
+        return "\u2705 Config reloaded from config.json"
+
+    def handle_restart(self):
+        if self._on_restart is None:
+            return "Restart is not available (no shutdown callback configured)"
+        asyncio.get_running_loop().call_later(0.5, self._on_restart)
+        return "\U0001f504 Restarting... the service will come back in a few seconds"
+
+    async def _cmd_help(self, update, context):
+        await update.effective_message.reply_text(self.handle_help())
+
+    async def _cmd_status(self, update, context):
+        await update.effective_message.reply_text(self.handle_status())
+
+    async def _cmd_channels(self, update, context):
+        await update.effective_message.reply_text(self.handle_channels())
+
+    async def _cmd_add(self, update, context):
+        await update.effective_message.reply_text(self.handle_add(context.args or []))
+
+    async def _cmd_remove(self, update, context):
+        await update.effective_message.reply_text(await self.handle_remove(context.args or []))
+
+    async def _cmd_retention(self, update, context):
+        await update.effective_message.reply_text(self.handle_retention(context.args or []))
+
+    async def _cmd_mode(self, update, context):
+        await update.effective_message.reply_text(self.handle_mode(context.args or []))
+
+    async def _cmd_reload(self, update, context):
+        await update.effective_message.reply_text(self.handle_reload())
+
+    async def _cmd_restart(self, update, context):
+        await update.effective_message.reply_text(self.handle_restart())
