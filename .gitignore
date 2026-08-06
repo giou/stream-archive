@@ -1,0 +1,11 @@
+config.json
+youtube_token.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.tz
+recordings/
+*:Zone.Identifier
+client_secret.json
+.venv/

@@ -1,0 +1,18 @@
+[Unit]
+Description=Twitch Monitor & Recorder
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/twitch-recorder
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/uv run python main.py
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
