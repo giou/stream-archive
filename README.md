@@ -50,18 +50,18 @@ recording processes that die mid-stream.
 │  scheduler    │  poll loop, signal handling, retention cleanup
 └───────┬───────┘
         │ every monitoring_interval
-┌───────▼───────┐   ┌─────────────────┐
+┌───────▼───────┐   ┌──────────────────┐
 │  monitor      │──▶│ Twitch Helix API │  resolve user ids + live streams
-└───────┬───────┘   └─────────────────┘
+└───────┬───────┘   └──────────────────┘
         │ start / stop / restart
-┌───────▼───────┐   ┌─────────────────┐
-│  recorder     │──▶│ streamlink      │  proxied playlist → stream
-└───┬───────┬───┘   └─────────────────┘
+┌───────▼───────┐   ┌──────────────────┐
+│  recorder     │──▶│ streamlink       │  proxied playlist → stream
+└───┬───────┬───┘   └──────────────────┘
     │ disk  │ youtube
     │       │
-┌───▼───┐ ┌▼────────────────┐   ┌─────────────────┐
+┌───▼───┐ ┌▼─────────────────┐   ┌──────────────────┐
 │ .ts   │ │ ffmpeg          │──▶│ YouTube Live API │
-│ files │ │ (pipe → RTMP)   │   └─────────────────┘
+│ files │ │ (pipe → RTMP)   │   └──────────────────┘
 └───────┘ └─────────────────┘
         │
 ┌───────▼───────┐
