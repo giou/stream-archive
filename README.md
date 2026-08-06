@@ -1,52 +1,148 @@
 # Twitch Monitor & Recorder
 
-## Overview
+Polls the Twitch Helix API for your followed channels and records every live
+stream via [streamlink](https://streamlink.github.io/), using ad-block playlist
+proxies (vendored `streamlink-ttvlol` plugin) so streams playable only via
+ad-block workaround still record. Optionally re-streams recordings to
+[YouTube Live](https://www.youtube.com/live) and sends Telegram alerts on
+live/offline events and start failures.
 
-Polls the Twitch Helix API for live channels and records them via streamlink using ad-block playlist proxies (vendored `streamlink-ttvlol` plugin). Can optionally re-stream recordings to YouTube Live and sends Telegram alerts on live/offline events and start failures.
+The system is designed to be set-and-forget: failures are logged, alerted
+(rate-limited), and retried automatically on the next poll cycle — including
+recording processes that die mid-stream.
+
+## Features
+
+- **Multi-channel monitoring** — polls Helix every `monitoring_interval`
+  seconds and starts/stops recordings as channels go live/offline.
+- **Ad-block proxy support** — playlist URLs from the vendored `streamlink-ttvlol`
+  plugin, with `httpproxy://user:pass@host:port` entries for upstream proxies.
+- **Three output modes**:
+  - `disk` — record `.ts` files into `recording_dir/<channel>/`
+  - `youtube` — pipe the stream through `ffmpeg` to a YouTube Live broadcast
+  - `both` — disk recording and YouTube re-stream simultaneously
+- **Telegram alerts** — live (with title/game/URL), offline (with file size and
+  YouTube link), and start-failure (rate-limited to once per 30 minutes per
+  channel).
+- **Self-healing**:
+  - Recording tasks that die mid-stream (ffmpeg crash, disk error, proxy death)
+    are detected and restarted on the next poll cycle.
+  - YouTube rate-limit / `403` / quota errors fall back to disk recording.
+  - Transient Twitch API errors are logged and retried next cycle; unknown user
+    ids in a stream response are skipped instead of crashing the poll.
+- **Retention cleanup** — optional automatic deletion of recordings older than
+  `retention_days`, run at startup and then daily.
+- **YouTube Live integration** — private/unlisted/public broadcasts, DVR
+  enabled, automatic start/stop, and clean broadcast ending on shutdown.
+
+## Architecture
+
+```
+┌───────────────┐
+│  scheduler    │  poll loop, signal handling, retention cleanup
+└───────┬───────┘
+        │ every monitoring_interval
+┌───────▼───────┐   ┌─────────────────┐
+│  monitor      │──▶│ Twitch Helix API │  resolve user ids + live streams
+└───────┬───────┘   └─────────────────┘
+        │ start / stop / restart
+┌───────▼───────┐   ┌─────────────────┐
+│  recorder     │──▶│ streamlink      │  proxied playlist → stream
+└───┬───────┬───┘   └─────────────────┘
+    │ disk  │ youtube
+    │       │
+┌───▼───┐ ┌▼────────────────┐   ┌─────────────────┐
+│ .ts   │ │ ffmpeg          │──▶│ YouTube Live API │
+│ files │ │ (pipe → RTMP)   │   └─────────────────┘
+└───────┘ └─────────────────┘
+        │
+┌───────▼───────┐
+│  notifier     │  Telegram alerts (live / offline / failures)
+└───────────────┘
+```
+
+Recording tasks are tracked; a task that fails raises, its channel entry is
+removed, and the monitor restarts the recording on the next poll cycle.
 
 ## Requirements
 
 - Python 3.10+
-- [`uv`](https://docs.astral.sh/uv/)
-- `ffmpeg` (stream recording and YouTube re-stream)
-- `chromium` (needed by the plugin's client-integrity token acquisition)
-- Twitch app credentials — register at https://dev.twitch.tv/console
-- Telegram bot token — create one with [BotFather](https://t.me/BotFather)
+- [`uv`](https://docs.astral.sh/uv/) — dependency management and the systemd
+  unit uses `uv run`
+- `ffmpeg` — required for YouTube re-streaming (and used for the pipe)
+- `chromium` — required by the vendored plugin for client-integrity token
+  acquisition
+- **Twitch** app credentials — register at
+  <https://dev.twitch.tv/console> (client id + client secret)
+- **Telegram** bot token — create one with
+  [BotFather](https://t.me/BotFather) and note your user/chat id
+- **Google Cloud OAuth client** (`client_secret.json`) — only for
+  `output_mode: youtube` or `both`; see
+  [YouTube setup](#youtube-setup)
 
-## Setup
+## Quick start
 
 ```sh
 uv sync
 cp config.json.example config.json
-# fill in every key in config.json (see table below)
+# fill in every key — see the configuration reference below
+uv run python main.py
 ```
 
-Run `python setup_youtube.py` **only** if `output_mode` is `youtube` or `both`. It requires `client_secret.json` (Google Cloud OAuth client) and an OAuth consent screen; it saves the resulting token to `youtube_token.json`.
+The config file is looked up in the current directory and then in the
+repository root, so run from anywhere inside the checkout.
+
+### YouTube setup
+
+Only needed when `output_mode` is `youtube` or `both`:
+
+1. Create a Google Cloud project, enable the **YouTube Data API v3**, and
+   download an OAuth desktop client as `client_secret.json` (see
+   [Google's guide](https://developers.google.com/youtube/registering_an_application)).
+2. Run the one-time authorization flow:
+
+   ```sh
+   uv run python setup_youtube.py
+   ```
+
+   It prints a URL, asks for the authorization code, and saves the token to
+   `youtube_token.json` (chmod 600). The token is refreshed automatically
+   while it is still refreshable; if it expires irrecoverably, run
+   `setup_youtube.py` again.
 
 ## Configuration reference
 
-| Key | Description |
-| --- | --- |
-| `channels` | List of channel names to monitor |
-| `monitoring_interval` | Poll interval in seconds; must be greater than 0 (default 60) |
-| `timezone` | IANA timezone used for recording filenames and timestamps |
-| `proxy_list` | Ad-block playlist proxies; `httpproxy://user:pass@host:port` entries or https URLs with `[channel]` placeholder support |
-| `output_mode` | `disk` (default), `youtube`, or `both` |
-| `retention_days` | Delete recordings older than this many days; `0` disables cleanup (default 0) |
-| `recording_dir` | Directory where `.ts` recordings are stored |
-| `plugin_dir` | Directory containing the vendored streamlink plugin |
-| `youtube.privacy_status` | `public`, `unlisted` (default), or `private` |
-| `youtube.client_secrets_file` | Path to the Google Cloud OAuth client secrets JSON |
+All keys from `config.json.example`:
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `telegram_user_id` | yes | — | Numeric Telegram user/chat id for alerts |
+| `bot_telegram_api` | yes | — | Telegram bot token from BotFather |
+| `twitch_client_id` | yes | — | Twitch app client id |
+| `twitch_client_secret` | yes | — | Twitch app client secret |
+| `channels` | yes | — | Non-empty list of channel names to monitor (1–25 chars; first char `[a-zA-Z0-9]`, then `[a-zA-Z0-9_]`) |
+| `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies: `httpproxy://user:pass@host:port` or `https://…` URLs |
+| `monitoring_interval` | yes | — | Poll interval in seconds; must be > 0 |
+| `timezone` | yes | — | IANA timezone (e.g. `Europe/Madrid`) used for filenames and timestamps |
+| `plugin_dir` | yes | — | Directory containing the vendored streamlink plugin (`plugins`) |
+| `recording_dir` | yes | — | Directory where `.ts` recordings are stored |
+| `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
+| `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
+| `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
+| `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
+
+`output_mode: youtube` additionally requires `youtube_token.json` (see
+[YouTube setup](#youtube-setup)).
 
 ## Running
 
-Foreground:
+### Foreground
 
 ```sh
 uv run python main.py
 ```
 
-As a systemd user unit:
+### As a systemd user unit
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -55,24 +151,70 @@ systemctl --user daemon-reload
 systemctl --user enable --now twitch-monitor
 ```
 
-Logs:
+The unit hard-codes the checkout at `~/twitch-recorder` — adjust
+`WorkingDirectory` and `ExecStart` if you clone elsewhere.
+
+### Logs
 
 ```sh
 journalctl --user -u twitch-monitor -f
 ```
 
-## Behavior notes
+`SIGTERM`/`SIGINT` trigger a graceful shutdown: all recordings stop, active
+YouTube broadcasts are transitioned to `complete`, and the scheduler exits
+with `[scheduler] Shutdown complete`.
 
-- **Proxy failure**: if all ad-block proxies fail for a live channel, the channel is skipped, one Telegram alert is sent (rate-limited to once per 30 minutes per channel), and recording is retried automatically on the next poll cycle.
-- **YouTube rate limit**: if YouTube Live refuses a broadcast, the recorder automatically falls back to disk recording (existing behavior).
-- **Retention cleanup**: expired recordings are deleted at startup and then once per day when `retention_days > 0`.
+## Failure handling & recovery
+
+| Failure | Behavior |
+| --- | --- |
+| All ad-block proxies fail for a live channel | Channel skipped, one Telegram alert (rate-limited to 30 min/channel), retried next cycle |
+| YouTube rate limit / `403` / quota error at broadcast creation | Automatic fallback to disk recording; live alert still sent |
+| Other YouTube broadcast-creation error | Task fails loudly; channel restarted next cycle |
+| Recording dies mid-stream (ffmpeg killed, disk write error, proxy death) | Entry removed, `Recording task failed` logged, monitor restarts within one poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
+| Transient Twitch API error (token/request) | Logged, nothing acted on, retried next cycle |
+| Stream reported for an unknown user id | Skipped with a warning; the poll cycle never crashes |
+
+Alerts are sent at most once per 30 minutes per channel (`FAILURE_NOTIFY_INTERVAL`
+in `src/twitch_recorder/monitor.py`).
+
+## Project layout
+
+```
+config.json.example      # template for runtime config (config.json is gitignored)
+main.py                  # entrypoint: logging setup + asyncio.run(scheduler)
+setup_youtube.py         # one-time YouTube OAuth flow
+twitch-monitor.service   # systemd user unit
+pyproject.toml
+src/twitch_recorder/
+  scheduler.py           # poll loop, signal handling, daily retention cleanup
+  monitor.py             # start/stop/restart decisions, failure alerts
+  recorder.py            # streamlink capture, ffmpeg pipe, task tracking
+  youtube_streamer.py    # YouTube Live API (broadcast/stream/bind/end)
+  twitch_api.py          # Twitch Helix client (token, users, streams)
+  notifier.py            # Telegram messages
+  config.py              # config loading + validation
+plugins/twitch.py        # vendored streamlink-ttvlol plugin
+tests/                   # pytest suite (recorder, monitor, notifier, config)
+```
 
 ## Plugin maintenance
 
-`plugins/twitch.py` is vendored from [streamlink-ttvlol](https://github.com/2bc4/streamlink-ttvlol); the banner logs `STREAMLINK_TTVLOL_VERSION`. To refresh, replace the file from upstream and bump the version constant. Upstream issues go to https://github.com/2bc4/streamlink-ttvlol/issues.
+`plugins/twitch.py` is vendored from
+[streamlink-ttvlol](https://github.com/2bc4/streamlink-ttvlol)
+(currently version `8.3.0-20260701`, constant `STREAMLINK_TTVLOL_VERSION`).
+To refresh, replace the file from upstream and bump the constant; the plugin
+logs its version at load. Upstream bugs go to
+<https://github.com/2bc4/streamlink-ttvlol/issues>.
 
 ## Development
 
 ```sh
+uv sync        # installs dev group (pytest)
 uv run pytest
 ```
+
+## License
+
+[MIT](LICENSE). The vendored `plugins/twitch.py` retains its own upstream
+license.
