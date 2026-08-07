@@ -25,6 +25,16 @@ class FakeRecorder:
         self.started = []
         self.stopped = []
         self._recording = True
+        self.snapshot = {
+            "free_gb": 100.0,
+            "total_fs_gb": 500.0,
+            "used_fs_gb": 400.0,
+            "dir_gb": 0.0,
+            "file_count": 0,
+            "dir": "recordings",
+        }
+        self.evict_calls = []
+        self.mode = "disk"
 
     async def start(self, channel, title=None, game=None):
         self.started.append(channel)
@@ -36,6 +46,20 @@ class FakeRecorder:
 
     def is_recording(self, channel):
         return self._recording
+
+    def active_channels(self):
+        return list(self.started)
+
+    async def disk_snapshot(self):
+        return self.snapshot
+
+    async def evict_to_cap(self):
+        self.evict_calls.append(1)
+        self.snapshot["dir_gb"] = 0.0
+        return (0, 0.0)
+
+    def youtube_active_count(self):
+        return len(self.started) if self.mode in ("youtube", "both") else 0
 
 
 class FakeNotifier:
@@ -150,3 +174,84 @@ def test_transient_api_error_does_not_raise_or_act():
 
     assert rec.started == []
     assert rec.stopped == []
+
+
+def test_skip_start_when_free_below_threshold():
+    rec = FakeRecorder()
+    rec.snapshot["free_gb"] = 1.0
+    notifier = FakeNotifier()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch"], "disk": {"min_free_gb": 5}}
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == []
+    assert any("Not recording ch" in m for m in notifier.messages)
+    assert any("free disk space below 5" in m for m in notifier.messages)
+
+
+def test_evicts_and_starts_when_over_cap():
+    rec = FakeRecorder()
+    rec.snapshot["dir_gb"] = 25.0
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "evict_when_over": True}}
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.evict_calls == [1]
+    assert rec.started == ["ch"]
+
+
+def test_block_when_cap_reached_and_nothing_evictable():
+    rec = FakeRecorder()
+    rec.snapshot["dir_gb"] = 25.0
+    notifier = FakeNotifier()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "evict_when_over": True}}
+
+    async def keep_full():
+        rec.evict_calls.append(1)
+        return (0, 0.0)
+
+    rec.evict_to_cap = keep_full
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == []
+    assert any("cap" in m for m in notifier.messages)
+
+
+def test_concurrency_limit_records_first_n():
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    api = FakeTwitchAPI(
+        streams={"u1": {"title": "T", "game_name": "G"}, "u2": {"title": "T", "game_name": "G"}},
+        user_ids={"ch_a": "u1", "ch_b": "u2"},
+    )
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch_a", "ch_b"], "max_concurrent_recordings": 1}
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == ["ch_a"]
+    assert any("concurrent recording limit reached" in m for m in notifier.messages)
+
+
+def test_youtube_limit_blocks_restreams():
+    rec = FakeRecorder()
+    rec.mode = "youtube"
+    notifier = FakeNotifier()
+    api = FakeTwitchAPI(
+        streams={"u1": {"title": "T", "game_name": "G"}, "u2": {"title": "T", "game_name": "G"}},
+        user_ids={"ch_a": "u1", "ch_b": "u2"},
+    )
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch_a", "ch_b"], "output_mode": "youtube", "max_concurrent_youtube_streams": 1}
+
+    asyncio.run(mon.check_channels(api, config))
+
+    assert rec.started == ["ch_a"]
+    assert any("YouTube re-stream limit reached" in m for m in notifier.messages)

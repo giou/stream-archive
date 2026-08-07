@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 import streamlink
 from streamlink.exceptions import NoPluginError, NoStreamsError, PluginError
 
+from src.stream_archive import disk
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,9 +66,12 @@ class Recorder:
                     channel, proxies[0], err,
                 )
                 proxies = proxies[1:]
-        if not streams or "best" not in streams:
-            raise PluginError("No best stream available")
-        best = streams["best"]
+        if not streams:
+            raise PluginError("No streams available")
+        quality = self._config.get("preferred_quality", "best")
+        best = streams.get(quality) or streams.get("best")
+        if best is None:
+            raise PluginError(f"No '{quality}' or 'best' stream available")
         author = getattr(plugin, "author", None) or channel
         if title is None:
             title = getattr(plugin, "title", None) or "Untitled"
@@ -100,6 +105,8 @@ class Recorder:
             return False
 
         entry = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
+        entry["started_at"] = time.monotonic()
+        entry["mode"] = mode
         self._recordings[channel] = entry
         tasks = []
         twitch_url = f"https://twitch.tv/{channel}"
@@ -138,6 +145,11 @@ class Recorder:
             return False
 
         entry["tasks"] = tasks
+
+        disk = self._config.get("disk", {})
+        if disk.get("min_free_gb", 0) > 0 or disk.get("max_total_gb", 0) > 0 or disk.get("min_time_to_full_min", 0) > 0:
+            entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
+
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
         return True
 
@@ -157,12 +169,99 @@ class Recorder:
         if entry is not None and task in entry.get("tasks", []):
             del self._recordings[channel]
 
+    async def _watch_growth(self, channel):
+        try:
+            cfg = self._config["disk"]
+            interval = cfg["check_interval_s"]
+            prev_size, prev_t = 0.0, time.monotonic()
+            while True:
+                await asyncio.sleep(interval)
+                entry = self._recordings.get(channel)
+                if entry is None:
+                    return
+                snap = await disk.disk_snapshot(self._config)
+                min_free = cfg.get("min_free_gb", 0)
+                cap = cfg.get("max_total_gb", 0)
+                fill = cfg.get("min_time_to_full_min", 0)
+                if min_free > 0 and snap["free_gb"] < min_free:
+                    await self._abort(channel, f"free space dropped below {min_free:g} GB ({snap['free_gb']:.1f} GB free)")
+                    return
+                if cap > 0 and snap["dir_gb"] >= cap:
+                    if cfg.get("evict_when_over", True):
+                        await self.evict_to_cap()
+                        snap = await disk.disk_snapshot(self._config)
+                    if snap["dir_gb"] >= cap:
+                        await self._abort(channel, f"recording archive at {cap:g} GB cap")
+                        return
+                if fill > 0 and entry.get("filepath"):
+                    try:
+                        size = os.path.getsize(entry["filepath"])
+                    except OSError:
+                        size = 0
+                    now = time.monotonic()
+                    dt = now - prev_t
+                    rate = (size - prev_size) / dt if dt > 0 else 0.0
+                    prev_size, prev_t = size, now
+                    if rate > 0:
+                        minutes = (snap["free_gb"] * 1024**3) / rate / 60
+                        if minutes < fill:
+                            await self._abort(channel, f"disk filling too fast (estimated full in ~{minutes:.0f} min)")
+                            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("[recorder] [%s] watchdog error: %s", channel, e)
+
+    async def _abort(self, channel, reason):
+        logger.warning("[recorder] [%s] Stopping recording: %s", channel, reason)
+        if self._notifier:
+            await self._notifier.notify(f"\u26d4 Stopped recording {channel}: {reason}")
+        entry = self._recordings.pop(channel, None)
+        if entry is None:
+            return
+        for task in entry.get("tasks", []):
+            task.cancel()
+        await asyncio.gather(*entry.get("tasks", []), return_exceptions=True)
+        if entry.get("youtube_info"):
+            try:
+                await self._youtube.end_stream(entry["youtube_info"]["broadcast_id"])
+            except Exception as e:
+                logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
+
     def is_recording(self, channel):
         return channel in self._recordings
 
     def active_channels(self):
         """Names of channels currently being recorded, sorted."""
         return sorted(self._recordings)
+
+    async def disk_snapshot(self):
+        return await disk.disk_snapshot(self._config)
+
+    def recording_info(self):
+        """Per active channel: duration + current file size (approx). Sorted by channel."""
+        out = []
+        now = time.monotonic()
+        for channel in sorted(self._recordings):
+            e = self._recordings[channel]
+            size_mb = None
+            fp = e.get("filepath")
+            if fp:
+                try:
+                    size_mb = os.path.getsize(fp) / (1024 * 1024)
+                except OSError:
+                    pass
+            out.append({
+                "channel": channel,
+                "mode": e.get("mode"),
+                "duration_s": round(now - e.get("started_at", now)),
+                "size_mb": size_mb,
+            })
+        return out
+
+    def youtube_active_count(self):
+        """Active recordings whose mode uses a YouTube re-stream (for the uplink cap)."""
+        return sum(1 for e in self._recordings.values() if e.get("mode") in ("youtube", "both"))
 
     async def _record_disk(self, channel, filepath, stream):
         logger.info("[recorder] [disk] %s -> %s", channel, filepath)
@@ -360,12 +459,15 @@ class Recorder:
             return None
 
         entry = self._recordings.pop(channel)
-        youtube_info = entry.get("youtube_info")
-
+        wd = entry.pop("watchdog", None)
+        if wd:
+            wd.cancel()
         for task in entry.get("tasks", []):
             task.cancel()
-        if entry.get("tasks"):
-            await asyncio.gather(*entry["tasks"], return_exceptions=True)
+        if entry.get("tasks") or wd:
+            await asyncio.gather(*(entry.get("tasks", []) + ([wd] if wd else [])), return_exceptions=True)
+
+        youtube_info = entry.get("youtube_info")
 
         if youtube_info:
             try:
@@ -387,13 +489,39 @@ class Recorder:
 
         return {"file_info": file_info, "youtube_info": youtube_info}
 
+    async def evict_to_cap(self):
+        """Delete oldest .ts files until under disk.max_total_gb; returns (files_removed, freed_gb)."""
+        cap = self._config["disk"]["max_total_gb"]
+        if cap <= 0:
+            return (0, 0.0)
+        loop = asyncio.get_running_loop()
+
+        def _evict():
+            base = disk.recording_dir_path(self._config)
+            if not base.exists():
+                return (0, 0.0)
+            files = sorted((p for p in base.rglob("*.ts")), key=lambda p: p.stat().st_mtime)
+            total = sum(p.stat().st_size for p in files)
+            cap_bytes = int(cap * 1024**3)
+            removed = freed = 0
+            for p in files:
+                if total < cap_bytes:
+                    break
+                size = p.stat().st_size
+                p.unlink(missing_ok=True)
+                total -= size
+                removed += 1
+                freed += size
+                logger.info("[recorder] Evicted to stay under %s GB cap: %s", cap, p)
+            return removed, freed
+
+        return await loop.run_in_executor(None, _evict)
+
     async def cleanup_old_recordings(self, retention_days):
         """Delete .ts files under recording_dir older than retention_days days; returns count removed."""
         if retention_days <= 0:
             return 0
-        base = Path(self._config["recording_dir"])
-        if not base.is_absolute():
-            base = self._config["_workdir"] / base
+        base = disk.recording_dir_path(self._config)
         if not base.exists():
             return 0
         cutoff = time.time() - retention_days * 86400

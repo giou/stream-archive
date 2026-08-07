@@ -18,6 +18,16 @@
     "output_mode": "disk",
     "channel_output_modes": {},
     "retention_days": 0,
+    "preferred_quality": "best",
+    "max_concurrent_recordings": 0,
+    "max_concurrent_youtube_streams": 0,
+    "disk": {
+        "min_free_gb": 0,
+        "max_total_gb": 0,
+        "check_interval_s": 60,
+        "min_time_to_full_min": 0,
+        "evict_when_over": true
+    },
     "update_check": {
         "enabled": true,
         "interval_hours": 24,

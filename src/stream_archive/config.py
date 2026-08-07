@@ -127,6 +127,9 @@ def _validate(config):
     _validate_channel_output_modes(config)
     _validate_youtube(config)
     _validate_update_check(config)
+    _validate_quality(config)
+    _validate_concurrency(config)
+    _validate_disk(config)
 
 
 def _validate_output_mode(config):
@@ -181,3 +184,39 @@ def _validate_update_check(config):
     for key in ("check_app", "check_streamlink", "check_plugin"):
         if not isinstance(uc[key], bool):
             raise ValueError(f"update_check.{key} must be a boolean")
+
+
+def _validate_quality(config):
+    config.setdefault("preferred_quality", "best")
+    if not isinstance(config["preferred_quality"], str) or not config["preferred_quality"]:
+        raise ValueError("preferred_quality must be a non-empty string")
+
+
+def _validate_concurrency(config):
+    config.setdefault("max_concurrent_recordings", 0)
+    config.setdefault("max_concurrent_youtube_streams", 0)
+    for key in ("max_concurrent_recordings", "max_concurrent_youtube_streams"):
+        if not isinstance(config[key], (int, float)) or config[key] < 0:
+            raise ValueError(f"{key} must be a number >= 0 (0 = unlimited)")
+
+
+def _validate_disk(config):
+    config.setdefault("disk", {})
+    d = config["disk"]
+    if not isinstance(d, dict):
+        raise ValueError("disk must be an object")
+    d.setdefault("min_free_gb", 0)
+    d.setdefault("max_total_gb", 0)
+    d.setdefault("check_interval_s", 60)
+    d.setdefault("min_time_to_full_min", 0)
+    d.setdefault("evict_when_over", True)
+    if not isinstance(d["min_free_gb"], (int, float)) or d["min_free_gb"] < 0:
+        raise ValueError("disk.min_free_gb must be a number >= 0 (0 = disabled)")
+    if not isinstance(d["max_total_gb"], (int, float)) or d["max_total_gb"] < 0:
+        raise ValueError("disk.max_total_gb must be a number >= 0 (0 = disabled)")
+    if not isinstance(d["check_interval_s"], (int, float)) or d["check_interval_s"] <= 0:
+        raise ValueError("disk.check_interval_s must be a number > 0")
+    if not isinstance(d["min_time_to_full_min"], (int, float)) or d["min_time_to_full_min"] < 0:
+        raise ValueError("disk.min_time_to_full_min must be a number >= 0 (0 = disabled)")
+    if not isinstance(d["evict_when_over"], bool):
+        raise ValueError("disk.evict_when_over must be a boolean")

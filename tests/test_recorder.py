@@ -28,6 +28,20 @@ class FakeStream:
         return io.BytesIO()
 
 
+class FakeNotifier:
+    def __init__(self):
+        self.messages = []
+
+    async def notify(self, m):
+        self.messages.append(m)
+
+    async def notify_live(self, *a, **k):
+        pass
+
+    async def notify_offline(self, *a, **k):
+        pass
+
+
 def test_sanitize_filename_replaces_illegal_chars():
     name = 'a<b>c:d"e/f\\g|h?i*j'
     assert _sanitize_filename(name) == "a_b_c_d_e_f_g_h_i_j"
@@ -364,3 +378,129 @@ def test_cleanup_resolves_relative_recording_dir(tmp_path):
 
     assert removed == 1
     assert not old.exists()
+
+
+def test_resolve_stream_preferred_quality(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    s1, s2 = FakeStream(), FakeStream()
+
+    monkeypatch.setattr(
+        rec._session, "resolve_url",
+        lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s1, "720p": s2})
+
+    rec._config["preferred_quality"] = "720p"
+    best, _, _, _ = rec._resolve_stream("ch", None, None)
+    assert best is s2
+
+    rec._config["preferred_quality"] = "1080p"
+    best, _, _, _ = rec._resolve_stream("ch", None, None)
+    assert best is s1
+
+
+def test_start_records_mode_and_started_at(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert rec._recordings["ch"]["mode"] == "disk"
+        assert isinstance(rec._recordings["ch"]["started_at"], float)
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_recording_info_reports_duration_and_size(tmp_path):
+    rec = Recorder(make_config(tmp_path))
+    filepath = tmp_path / "recordings" / "ch" / "rec.ts"
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    filepath.write_bytes(b"\0" * (3 * 1024 * 1024))
+    rec._recordings["ch"] = {
+        "tasks": [],
+        "process": None,
+        "youtube_info": None,
+        "filepath": str(filepath),
+        "started_at": time.monotonic() - 125,
+        "mode": "disk",
+    }
+
+    info = rec.recording_info()
+
+    assert len(info) == 1
+    assert info[0]["channel"] == "ch"
+    assert abs(info[0]["duration_s"] - 125) <= 1
+    assert info[0]["size_mb"] == pytest.approx(3.0, abs=0.1)
+
+
+def test_watchdog_aborts_on_low_free_space(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["disk"] = {"min_free_gb": 2, "check_interval_s": 0.01}
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    async def fake_snapshot(config):
+        return {"free_gb": 0.5, "dir_gb": 0.0, "file_count": 0}
+
+    monkeypatch.setattr("src.stream_archive.disk.disk_snapshot", fake_snapshot)
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert "ch" not in rec._recordings
+
+    asyncio.run(scenario())
+    assert any("Stopped recording ch" in m for m in notifier.messages)
+    assert any("free space dropped below 2" in m for m in notifier.messages)
+
+
+def test_watchdog_aborts_on_fill_rate(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["disk"] = {"min_time_to_full_min": 10, "check_interval_s": 0.01}
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    async def fake_snapshot(config):
+        return {"free_gb": 0.01, "dir_gb": 0.0, "file_count": 0}
+
+    monkeypatch.setattr("src.stream_archive.disk.disk_snapshot", fake_snapshot)
+    sizes = {"n": 0}
+
+    def growing_getsize(path):
+        sizes["n"] += 1
+        return sizes["n"] * 50 * 1024 * 1024
+
+    monkeypatch.setattr(os.path, "getsize", growing_getsize)
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert "ch" not in rec._recordings
+
+    asyncio.run(scenario())
+    assert any("Stopped recording ch" in m for m in notifier.messages)
+    assert any("disk filling too fast" in m for m in notifier.messages)
+
+
+def test_evict_to_cap_deletes_oldest(tmp_path):
+    config = make_config(tmp_path)
+    config["disk"] = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
+    rec = Recorder(config)
+    base = tmp_path / "recordings" / "ch"
+    base.mkdir(parents=True, exist_ok=True)
+    t0 = time.time() - 100
+    for i, name in enumerate(["old.ts", "mid.ts", "new.ts"]):
+        p = base / name
+        p.write_bytes(b"x" * 1024)
+        os.utime(p, (t0 + i, t0 + i))
+
+    removed, freed = asyncio.run(rec.evict_to_cap())
+
+    assert removed == 1
+    assert freed == 1024
+    assert not (base / "old.ts").exists()
+    assert (base / "mid.ts").exists()
+    assert (base / "new.ts").exists()

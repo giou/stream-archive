@@ -34,6 +34,49 @@ def test_valid_config_passes_and_sets_defaults():
         "check_streamlink": True,
         "check_plugin": True,
     }
+    assert config["preferred_quality"] == "best"
+    assert config["max_concurrent_recordings"] == 0
+    assert config["max_concurrent_youtube_streams"] == 0
+    assert config["disk"] == {
+        "min_free_gb": 0,
+        "max_total_gb": 0,
+        "check_interval_s": 60,
+        "min_time_to_full_min": 0,
+        "evict_when_over": True,
+    }
+
+
+def test_valid_disk_values_pass():
+    config = valid_config()
+    config["disk"] = {
+        "min_free_gb": 5.5,
+        "max_total_gb": 100,
+        "check_interval_s": 30,
+        "min_time_to_full_min": 15,
+        "evict_when_over": False,
+    }
+    _validate(config)
+    assert config["disk"]["min_free_gb"] == 5.5
+    assert config["disk"]["evict_when_over"] is False
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: c.__setitem__("preferred_quality", ""),
+    lambda c: c.__setitem__("max_concurrent_recordings", -1),
+    lambda c: c.__setitem__("max_concurrent_youtube_streams", -1),
+    lambda c: c.__setitem__("disk", []),
+    lambda c: c.__setitem__("disk", {"min_free_gb": -1}),
+    lambda c: c.__setitem__("disk", {"max_total_gb": -1}),
+    lambda c: c.__setitem__("disk", {"check_interval_s": 0}),
+    lambda c: c.__setitem__("disk", {"check_interval_s": -5}),
+    lambda c: c.__setitem__("disk", {"min_time_to_full_min": -1}),
+    lambda c: c.__setitem__("disk", {"evict_when_over": "yes"}),
+])
+def test_invalid_new_settings_raise(mutate):
+    config = valid_config()
+    mutate(config)
+    with pytest.raises(ValueError):
+        _validate(config)
 
 
 @pytest.mark.parametrize("key", [

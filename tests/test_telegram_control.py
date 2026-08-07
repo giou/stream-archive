@@ -11,6 +11,14 @@ class FakeRecorder:
         self._active = list(active)
         self._recording = set(recording)
         self.stop_calls = []
+        self.snapshot = {
+            "free_gb": 100.0,
+            "total_fs_gb": 500.0,
+            "used_fs_gb": 400.0,
+            "dir_gb": 0.0,
+            "file_count": 0,
+            "dir": "recordings",
+        }
 
     def is_recording(self, channel):
         return channel in self._recording
@@ -19,8 +27,14 @@ class FakeRecorder:
         self.stop_calls.append(channel)
         self._recording.discard(channel)
 
-    def active_channels(self):
-        return sorted(self._active)
+    async def disk_snapshot(self):
+        return self.snapshot
+
+    def recording_info(self):
+        return [
+            {"channel": ch, "mode": "disk", "duration_s": 0, "size_mb": None}
+            for ch in self._active
+        ]
 
 
 class FakeMonitor:
@@ -83,7 +97,7 @@ def read_file(tmp_path):
 
 def test_status_contains_settings_and_omits_secrets(tmp_path):
     config, ctrl, _, _ = make_controller(tmp_path, active=["channel1"])
-    text = ctrl.handle_status()
+    text = asyncio.run(ctrl.handle_status())
     assert "channel1" in text
     assert "Output mode: disk" in text
     assert "Retention: disabled" in text
@@ -98,9 +112,9 @@ def test_status_contains_settings_and_omits_secrets(tmp_path):
 def test_status_retention_days_and_singular(tmp_path):
     config, ctrl, _, _ = make_controller(tmp_path)
     ctrl.handle_retention(["7"])
-    assert "Retention: 7 days" in ctrl.handle_status()
+    assert "Retention: 7 days" in asyncio.run(ctrl.handle_status())
     ctrl.handle_retention(["1"])
-    assert "Retention: 1 day" in ctrl.handle_status()
+    assert "Retention: 1 day" in asyncio.run(ctrl.handle_status())
 
 
 def test_add_persists_and_updates_live(tmp_path):
@@ -255,7 +269,7 @@ def test_remove_clears_override(tmp_path):
 def test_status_shows_per_channel_modes(tmp_path):
     config, ctrl, _, _ = make_controller(tmp_path)
     ctrl.handle_mode(["channel1", "youtube"])
-    assert "Per-channel modes: channel1=youtube" in ctrl.handle_status()
+    assert "Per-channel modes: channel1=youtube" in asyncio.run(ctrl.handle_status())
 
 
 def test_reload_picks_up_disk_edits(tmp_path):
@@ -385,4 +399,116 @@ def test_update_not_configured(tmp_path):
 
 def test_status_contains_update_check_line(tmp_path):
     config, ctrl, _, _ = make_controller(tmp_path)
-    assert "Update check: enabled (every 24h)" in ctrl.handle_status()
+    assert "Update check: enabled (every 24h)" in asyncio.run(ctrl.handle_status())
+
+
+def test_status_contains_quality_and_disk_lines(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    text = asyncio.run(ctrl.handle_status())
+    assert "Quality: best" in text
+    assert "Concurrent limit: 0 recording(s), 0 YouTube re-stream(s)" in text
+    assert "free of" in text
+    assert "Disk limits: min free 0 GB" in text
+
+
+def test_quality_show_set_invalid(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert "Quality: best" in ctrl.handle_quality([])
+    text = ctrl.handle_quality(["720p"])
+    assert text == "Quality set to 720p"
+    assert read_file(tmp_path)["preferred_quality"] == "720p"
+    assert config["preferred_quality"] == "720p"
+    assert ctrl.handle_quality(["a", "b"]) == "Usage: /quality <best|1080p|720p|...>"
+
+
+def test_quality_empty_rejected(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text = ctrl.handle_quality([""])
+    assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_maxrecordings_show_set_invalid(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert "Max recordings: 0 (0 = unlimited)" in ctrl.handle_maxrecordings([])
+    text = ctrl.handle_maxrecordings(["3"])
+    assert text == "Max recordings set to 3"
+    assert read_file(tmp_path)["max_concurrent_recordings"] == 3
+    assert config["max_concurrent_recordings"] == 3
+    before = read_file(tmp_path)
+    text = ctrl.handle_maxrecordings(["x"])
+    assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+    text = ctrl.handle_maxrecordings(["-1"])
+    assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_maxrecordings_usage(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert ctrl.handle_maxrecordings(["1", "2"]) == "Usage: /maxrecordings <n> (0 = unlimited)"
+
+
+def test_maxyoutube_set(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert "Max YouTube re-streams: 0 (0 = unlimited)" in ctrl.handle_maxyoutube([])
+    text = ctrl.handle_maxyoutube(["2"])
+    assert text == "Max YouTube re-streams set to 2"
+    assert read_file(tmp_path)["max_concurrent_youtube_streams"] == 2
+    assert config["max_concurrent_youtube_streams"] == 2
+    before = read_file(tmp_path)
+    assert ctrl.handle_maxyoutube(["x"]).startswith("\u274c")
+    assert read_file(tmp_path) == before
+    assert ctrl.handle_maxyoutube(["1", "2"]) == "Usage: /maxyoutube <n> (0 = unlimited)"
+
+
+def test_disk_subcommands(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    text = ctrl.handle_disk(["minfree", "5"])
+    assert text == "Disk min free set to 5 GB"
+    assert read_file(tmp_path)["disk"]["min_free_gb"] == 5
+    assert config["disk"]["min_free_gb"] == 5
+
+    text = ctrl.handle_disk(["maxsize", "20"])
+    assert text == "Disk max total set to 20 GB"
+    assert read_file(tmp_path)["disk"]["max_total_gb"] == 20
+
+    text = ctrl.handle_disk(["fill", "10"])
+    assert text == "Disk fill guard set to 10 min"
+    assert read_file(tmp_path)["disk"]["min_time_to_full_min"] == 10
+
+    text = ctrl.handle_disk(["interval", "30"])
+    assert text == "Disk check interval set to 30s"
+    assert read_file(tmp_path)["disk"]["check_interval_s"] == 30
+
+    text = ctrl.handle_disk(["evict", "off"])
+    assert text == "Disk eviction disabled"
+    assert read_file(tmp_path)["disk"]["evict_when_over"] is False
+    text = ctrl.handle_disk(["evict", "on"])
+    assert text == "Disk eviction enabled"
+    assert read_file(tmp_path)["disk"]["evict_when_over"] is True
+
+    assert ctrl.handle_disk(["bogus", "1"]) == "Usage: /disk <minfree|maxsize|fill|interval|evict> <value>"
+    before = read_file(tmp_path)
+    assert ctrl.handle_disk(["minfree", "x"]).startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_disk_show_block(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    text = ctrl.handle_disk([])
+    assert "Disk limits:" in text
+    assert "min free: 0 GB (0 = disabled)" in text
+    assert "max total: 0 GB (0 = disabled, evict: on)" in text
+    assert "stop if full in < 0 min (0 = disabled)" in text
+    assert "check every 60s" in text
+
+
+def test_help_lists_new_commands(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    text = ctrl.handle_help()
+    assert "/quality [value]" in text
+    assert "/maxrecordings <n>" in text
+    assert "/maxyoutube <n>" in text
+    assert "/disk <minfree|maxsize|fill|interval|evict> <value>" in text
