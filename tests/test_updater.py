@@ -10,6 +10,7 @@ from src.stream_archive.updater import (
     _PLUGIN_DOWNLOAD_URL,
     _PLUGIN_RELEASES_URL,
     _PYPI_STREAMLINK_URL,
+    _STREAMLINK_RELEASE_NOTES_URL,
     UpdateChecker,
 )
 
@@ -92,21 +93,26 @@ def make_config(tmp_path):
     return config
 
 
-def app_up_to_date_script(local=LOCAL_SHA, remote=REMOTE_SHA, count="0", subject="Latest commit"):
+def app_up_to_date_script(local=LOCAL_SHA, remote=REMOTE_SHA, count="0", subject="Latest commit", commits=""):
     return {
         ("git", "rev-parse", "HEAD"): (0, local + "\n", ""),
         ("git", "fetch", "origin"): (0, "", ""),
         ("git", "rev-parse", "FETCH_HEAD"): (0, remote + "\n", ""),
         ("git", "rev-list", "--count", "HEAD..FETCH_HEAD"): (0, count + "\n", ""),
         ("git", "log", "-1", "--format=%s", "FETCH_HEAD"): (0, subject + "\n", ""),
+        ("git", "log", "--format=%s", "HEAD..FETCH_HEAD"): (0, (commits + "\n") if commits else "", ""),
     }
 
 
-def plugin_http(plugin_tag=PLUGIN_CURRENT, streamlink_version=STREAMLINK_CURRENT):
-    return FakeHttp({
-        _PLUGIN_RELEASES_URL: FakeResponse(200, {"tag_name": plugin_tag, "assets": []}),
+def plugin_http(plugin_tag=PLUGIN_CURRENT, streamlink_version=STREAMLINK_CURRENT,
+                plugin_body=None, streamlink_body=None):
+    routes = {
+        _PLUGIN_RELEASES_URL: FakeResponse(200, {"tag_name": plugin_tag, "assets": [], "body": plugin_body}),
         _PYPI_STREAMLINK_URL: FakeResponse(200, {"info": {"version": streamlink_version}}),
-    })
+    }
+    if streamlink_body is not None:
+        routes[_STREAMLINK_RELEASE_NOTES_URL.format(tag=streamlink_version)] = FakeResponse(200, {"body": streamlink_body})
+    return FakeHttp(routes)
 
 
 @pytest.fixture
@@ -147,12 +153,19 @@ def test_plugin_update_notifies_once_then_dedups(tmp_path, set_streamlink_versio
         config,
         notifier,
         run_cmd=FakeRunCmd(app_up_to_date_script()),
-        http=plugin_http(plugin_tag=PLUGIN_LATEST),
+        http=plugin_http(
+            plugin_tag=PLUGIN_LATEST,
+            plugin_body="Fixed: crash on live edge\nImproved: proxy rotation",
+        ),
     )
     report = asyncio.run(u.check(notify=True))
     assert report["plugin"]["status"] == "update"
     assert len(notifier.calls) == 1
-    assert f"streamlink-ttvlol: {PLUGIN_CURRENT} → {PLUGIN_LATEST}" in notifier.calls[0]
+    text = notifier.calls[0]
+    assert f"streamlink-ttvlol: {PLUGIN_CURRENT} → {PLUGIN_LATEST}" in text
+    assert "  Changelog:" in text
+    assert "  • Fixed: crash on live edge" in text
+    assert "  • Improved: proxy rotation" in text
     state = json.loads((tmp_path / "update_state.json").read_text())
     assert state["plugin"] == PLUGIN_LATEST
     asyncio.run(u.check(notify=True))
@@ -183,27 +196,43 @@ def test_streamlink_update_notifies(tmp_path, set_streamlink_version):
         config,
         notifier,
         run_cmd=FakeRunCmd(app_up_to_date_script()),
-        http=plugin_http(plugin_tag=PLUGIN_CURRENT, streamlink_version=STREAMLINK_LATEST),
+        http=plugin_http(
+            plugin_tag=PLUGIN_CURRENT,
+            streamlink_version=STREAMLINK_LATEST,
+            streamlink_body="Fixed: named-pipe cleanup\nFixed: stream start offsets",
+        ),
     )
     report = asyncio.run(u.check(notify=True))
     assert report["streamlink"]["status"] == "update"
     assert len(notifier.calls) == 1
-    assert f"streamlink: {STREAMLINK_CURRENT} → {STREAMLINK_LATEST}" in notifier.calls[0]
+    text = notifier.calls[0]
+    assert f"streamlink: {STREAMLINK_CURRENT} → {STREAMLINK_LATEST}" in text
+    assert "  • Fixed: named-pipe cleanup" in text
+    assert "  • Fixed: stream start offsets" in text
 
 
 def test_app_update_detects_behind(tmp_path, set_streamlink_version):
     set_streamlink_version(STREAMLINK_CURRENT)
     config = make_config(tmp_path)
-    script = app_up_to_date_script(local=LOCAL_SHA, remote="def5678", count="3", subject="Add retention cleanup")
-    u = UpdateChecker(
-        config, FakeNotifier(), run_cmd=FakeRunCmd(script), http=plugin_http()
+    notifier = FakeNotifier()
+    script = app_up_to_date_script(
+        local=LOCAL_SHA, remote="def5678", count="3",
+        subject="Add retention cleanup",
+        commits="Add retention cleanup\nFix proxy retry loop",
     )
+    u = UpdateChecker(config, notifier, run_cmd=FakeRunCmd(script), http=plugin_http())
     report = asyncio.run(u.check(notify=True))
     assert report["app"]["status"] == "update"
     assert report["app"]["behind"] == 3
     assert report["app"]["subject"] == "Add retention cleanup"
     assert report["app"]["local"] == LOCAL_SHA
     assert report["app"]["remote"] == "def5678"
+    assert report["app"]["changelog"] == ["Add retention cleanup", "Fix proxy retry loop"]
+    text = notifier.calls[0]
+    assert '• stream-archive: 3 new commit(s) — "Add retention cleanup"' in text
+    assert "  Changelog:" in text
+    assert "  • Add retention cleanup" in text
+    assert "  • Fix proxy retry loop" in text
 
 
 def test_app_fetch_failure_reports_unknown(tmp_path, set_streamlink_version):
@@ -320,6 +349,27 @@ def test_apply_app_failure_continues_with_others(tmp_path):
     )
     assert results["plugin"][0] == "applied"
     assert results["streamlink"][0] == "applied"
+
+
+def test_changelog_lines_truncates_long_body():
+    from src.stream_archive.updater import _changelog_lines
+
+    body = "line1\n" + "word " * 300
+    lines = _changelog_lines(body)
+    assert lines[-1] == "…"
+    assert len(" ".join(lines)) <= 620
+
+
+def test_app_changelog_capped(tmp_path, set_streamlink_version):
+    set_streamlink_version(STREAMLINK_CURRENT)
+    config = make_config(tmp_path)
+    commits = "\n".join(f"commit {i}" for i in range(12))
+    script = app_up_to_date_script(remote="def5678", count="12", subject="commit 11", commits=commits)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=FakeRunCmd(script), http=plugin_http())
+    report = asyncio.run(u.check(notify=False))
+    cl = report["app"]["changelog"]
+    assert len(cl) == 11
+    assert cl[-1] == "…and 2 more"
 
 
 def test_default_client_follows_redirects(tmp_path):

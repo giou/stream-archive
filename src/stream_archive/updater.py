@@ -16,7 +16,26 @@ _PLUGIN_VERSION_RE = re.compile(r'STREAMLINK_TTVLOL_VERSION\s*=\s*"([^"]+)"')
 _PLUGIN_RELEASES_URL = "https://api.github.com/repos/2bc4/streamlink-ttvlol/releases/latest"
 _PLUGIN_DOWNLOAD_URL = "https://github.com/2bc4/streamlink-ttvlol/releases/download/{tag}/twitch.py"
 _PYPI_STREAMLINK_URL = "https://pypi.org/pypi/streamlink/json"
+_STREAMLINK_RELEASE_NOTES_URL = "https://api.github.com/repos/streamlink/streamlink/releases/tags/{tag}"
 _APP_BRANCH = "main"
+_MAX_CHANGELOG_CHARS = 600
+_MAX_CHANGELOG_COMMITS = 10
+
+
+def _changelog_lines(body, limit=_MAX_CHANGELOG_CHARS):
+    """Normalize a release-notes body into a truncated list of non-empty lines."""
+    lines = [ln.strip() for ln in (body or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    out = []
+    total = 0
+    for ln in lines:
+        total += len(ln) + 1
+        if total > limit:
+            if out:
+                out.append("…")
+            break
+        out.append(ln)
+    return out
 
 
 async def _default_run_cmd(cmd, cwd):
@@ -103,6 +122,11 @@ class UpdateChecker:
             behind = 0
         rc, out, _ = await self._run_cmd(["git", "log", "-1", "--format=%s", "FETCH_HEAD"], self._workdir)
         subject = out.strip() if rc == 0 else None
+        rc, out, _ = await self._run_cmd(["git", "log", "--format=%s", "HEAD..FETCH_HEAD"], self._workdir)
+        commits = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        if len(commits) > _MAX_CHANGELOG_COMMITS:
+            extra = len(commits) - _MAX_CHANGELOG_COMMITS
+            commits = commits[:_MAX_CHANGELOG_COMMITS] + [f"…and {extra} more"]
         status = "update" if behind > 0 else "up_to_date"
         return {
             "status": status,
@@ -110,6 +134,7 @@ class UpdateChecker:
             "remote": remote,
             "behind": behind,
             "subject": subject,
+            "changelog": commits,
         }
 
     def _plugin_version(self):
@@ -143,7 +168,13 @@ class UpdateChecker:
             logger.warning("[updater] plugins/twitch.py not found or version constant missing")
             return {"status": "unknown", "current": None, "latest": tag, "digest": digest}
         status = "up_to_date" if current == tag else "update"
-        return {"status": status, "current": current, "latest": tag, "digest": digest}
+        return {
+            "status": status,
+            "current": current,
+            "latest": tag,
+            "digest": digest,
+            "changelog": data.get("body") or None,
+        }
 
     def _installed_streamlink(self):
         try:
@@ -167,7 +198,20 @@ class UpdateChecker:
             status = "update" if Version(latest) > Version(installed) else "up_to_date"
         except Exception:
             status = "unknown"
-        return {"status": status, "current": installed, "latest": latest}
+        changelog = None
+        if status == "update":
+            changelog = await self._fetch_release_notes("streamlink/streamlink", latest)
+        return {"status": status, "current": installed, "latest": latest, "changelog": changelog}
+
+    async def _fetch_release_notes(self, repo, tag):
+        """Best-effort GitHub release notes for a tag; None on any failure."""
+        try:
+            resp = await self._http.get(_STREAMLINK_RELEASE_NOTES_URL.format(tag=tag))
+            resp.raise_for_status()
+            return resp.json().get("body") or None
+        except Exception as e:
+            logger.warning("[updater] changelog fetch failed for %s %s: %s", repo, tag, e)
+            return None
 
     # ---- check / notify ----------------------------------------------------
 
@@ -198,10 +242,16 @@ class UpdateChecker:
                             lines.append(
                                 f'• stream-archive: {data["behind"]} new commit(s) — "{data["subject"] or ""}"'
                             )
+                            cl = data.get("changelog") or []
                         elif source == "streamlink":
                             lines.append(f"• streamlink: {data['current']} → {latest}")
+                            cl = _changelog_lines(data.get("changelog"))
                         else:
                             lines.append(f"• streamlink-ttvlol: {data['current']} → {latest}")
+                            cl = _changelog_lines(data.get("changelog"))
+                        if cl:
+                            lines.append("  Changelog:")
+                            lines.extend(f"  • {ln}" for ln in cl)
                         self._state[source] = latest
                         state_changed = True
                 elif data["status"] == "up_to_date":
