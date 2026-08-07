@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 import httpx
-from src.twitch_recorder.config import get_config
+from src.stream_archive.config import get_config
 
 logger = logging.getLogger(__name__)
 

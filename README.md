@@ -1,4 +1,4 @@
-# Twitch Monitor & Recorder
+# StreamArchive
 
 Polls the Twitch Helix API for your followed channels and records every live
 stream via [streamlink](https://streamlink.github.io/), using ad-block playlist
@@ -192,18 +192,18 @@ uv run python main.py
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp twitch-monitor.service ~/.config/systemd/user/
+cp stream-archive.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now twitch-monitor
+systemctl --user enable --now stream-archive
 ```
 
-The unit hard-codes the checkout at `~/twitch-recorder` — adjust
+The unit hard-codes the checkout at `~/stream-archive` — adjust
 `WorkingDirectory` and `ExecStart` if you clone elsewhere.
 
 ### Logs
 
 ```sh
-journalctl --user -u twitch-monitor -f
+journalctl --user -u stream-archive -f
 ```
 
 `SIGTERM`/`SIGINT` trigger a graceful shutdown: all recordings stop, active
@@ -222,7 +222,7 @@ with `[scheduler] Shutdown complete`.
 | Stream reported for an unknown user id | Skipped with a warning; the poll cycle never crashes |
 
 Alerts are sent at most once per 30 minutes per channel (`FAILURE_NOTIFY_INTERVAL`
-in `src/twitch_recorder/monitor.py`).
+in `src/stream_archive/monitor.py`).
 
 ## Project layout
 
@@ -230,9 +230,9 @@ in `src/twitch_recorder/monitor.py`).
 config.json.example      # template for runtime config (config.json is gitignored)
 main.py                  # entrypoint: logging setup + asyncio.run(scheduler)
 setup_youtube.py         # one-time YouTube OAuth flow
-twitch-monitor.service   # systemd user unit
+stream-archive.service   # systemd user unit
 pyproject.toml
-src/twitch_recorder/
+src/stream_archive/
   scheduler.py           # poll loop, signal handling, daily retention cleanup
   monitor.py             # start/stop/restart decisions, failure alerts
   recorder.py            # streamlink capture, ffmpeg pipe, task tracking

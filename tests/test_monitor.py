@@ -1,7 +1,7 @@
 import asyncio
 
-from src.twitch_recorder import monitor as monitor_module
-from src.twitch_recorder.monitor import Monitor
+from src.stream_archive import monitor as monitor_module
+from src.stream_archive.monitor import Monitor
 
 
 class FakeTwitchAPI:

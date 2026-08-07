@@ -2,8 +2,8 @@ import asyncio
 import json
 import threading
 
-from src.twitch_recorder.config import _validate
-from src.twitch_recorder.telegram_control import TelegramController
+from src.stream_archive.config import _validate
+from src.stream_archive.telegram_control import TelegramController
 
 
 class FakeRecorder:

@@ -2,13 +2,13 @@ import asyncio
 import logging
 import signal
 import time
-from src.twitch_recorder.config import get_config
-from src.twitch_recorder.twitch_api import TwitchAPI
-from src.twitch_recorder.monitor import Monitor
-from src.twitch_recorder.recorder import Recorder
-from src.twitch_recorder.notifier import Notifier
-from src.twitch_recorder.youtube_streamer import YouTubeStreamer
-from src.twitch_recorder.telegram_control import TelegramController
+from src.stream_archive.config import get_config
+from src.stream_archive.twitch_api import TwitchAPI
+from src.stream_archive.monitor import Monitor
+from src.stream_archive.recorder import Recorder
+from src.stream_archive.notifier import Notifier
+from src.stream_archive.youtube_streamer import YouTubeStreamer
+from src.stream_archive.telegram_control import TelegramController
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ async def run_scheduler():
     channels = config["channels"]
     output_mode = config["output_mode"]
 
-    logger.info("Starting Twitch Monitor...")
+    logger.info("Starting StreamArchive...")
     logger.info("Monitoring channels: %s", ", ".join(channels))
     logger.info("Recording directory: %s", config["recording_dir"])
     logger.info("Monitoring interval: %ss", config["monitoring_interval"])

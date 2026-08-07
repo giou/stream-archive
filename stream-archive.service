@@ -1,10 +1,10 @@
 [Unit]
-Description=Twitch Monitor & Recorder
+Description=StreamArchive - Twitch monitor & recorder
 After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/twitch-recorder
+WorkingDirectory=%h/stream-archive
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=%h
 Environment=PYTHONUNBUFFERED=1

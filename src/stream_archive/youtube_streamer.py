@@ -72,7 +72,7 @@ class YouTubeStreamer:
             f"Twitch stream by {author}\n"
             f"Game: {game}\n"
             f"Originally streamed at: https://twitch.tv/{channel}\n"
-            f"Recorded by twitch-recorder"
+            f"Recorded by StreamArchive"
         )
         from datetime import datetime, timezone
 

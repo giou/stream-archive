@@ -731,6 +731,35 @@ wheels = [
 ]
 
 [[package]]
+name = "stream-archive"
+version = "1.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "google-auth" },
+    { name = "google-auth-oauthlib" },
+    { name = "httpx" },
+    { name = "python-telegram-bot" },
+    { name = "streamlink" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "google-auth", specifier = ">=2.0" },
+    { name = "google-auth-oauthlib", specifier = ">=1.0" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "python-telegram-bot", specifier = ">=20.0" },
+    { name = "streamlink", specifier = ">=8.4.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+
+[[package]]
 name = "streamlink"
 version = "8.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -842,35 +871,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d1/3c/8b4358e81f2f2cfe7
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/19/eb640a397bba49ba49ef9dbe2e7e5c04202ba045b6ce2ec36e9cadc51e04/trio_websocket-0.12.2-py3-none-any.whl", hash = "sha256:df605665f1db533f4a386c94525870851096a223adcb97f72a07e8b4beba45b6", size = 21221, upload-time = "2025-02-25T05:16:57.545Z" },
 ]
-
-[[package]]
-name = "twitch-recorder"
-version = "1.0.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "google-auth" },
-    { name = "google-auth-oauthlib" },
-    { name = "httpx" },
-    { name = "python-telegram-bot" },
-    { name = "streamlink" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "google-auth", specifier = ">=2.0" },
-    { name = "google-auth-oauthlib", specifier = ">=1.0" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "python-telegram-bot", specifier = ">=20.0" },
-    { name = "streamlink", specifier = ">=8.4.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.1.1" }]
 
 [[package]]
 name = "typing-extensions"

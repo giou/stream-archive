@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from src.twitch_recorder.scheduler import main
+from src.stream_archive.scheduler import main
 
 logging.basicConfig(
     level=logging.INFO,

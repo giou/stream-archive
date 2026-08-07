@@ -1,6 +1,6 @@
 import pytest
 
-from src.twitch_recorder.config import _validate
+from src.stream_archive.config import _validate
 
 
 def valid_config():

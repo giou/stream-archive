@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from streamlink.exceptions import NoStreamsError
 
-from src.twitch_recorder.recorder import Recorder, _sanitize_filename
+from src.stream_archive.recorder import Recorder, _sanitize_filename
 
 
 def make_config(tmp_path):

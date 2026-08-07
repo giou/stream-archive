@@ -1,7 +1,7 @@
 [project]
-name = "twitch-recorder"
+name = "stream-archive"
 version = "1.0.0"
-description = "Twitch channel monitor and recorder"
+description = "StreamArchive - Twitch channel monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

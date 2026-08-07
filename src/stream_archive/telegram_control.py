@@ -4,7 +4,7 @@ import logging
 
 from telegram.ext import Application, CommandHandler, filters
 
-from src.twitch_recorder.config import _CHANNEL_RE, reload_config, save_config
+from src.stream_archive.config import _CHANNEL_RE, reload_config, save_config
 
 logger = logging.getLogger(__name__)
 

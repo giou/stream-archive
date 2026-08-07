@@ -1,7 +1,7 @@
 import asyncio
 
-from src.twitch_recorder import notifier
-from src.twitch_recorder.notifier import Notifier
+from src.stream_archive import notifier
+from src.stream_archive.notifier import Notifier
 
 
 class FakeBot:
