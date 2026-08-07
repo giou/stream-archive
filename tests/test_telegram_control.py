@@ -187,6 +187,61 @@ def test_mode_invalid_rejected(tmp_path):
     assert read_file(tmp_path) == before
 
 
+def test_mode_per_channel_sets_override(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    text = ctrl.handle_mode(["channel1", "youtube"])
+    assert text == "Output mode for channel1 set to youtube"
+    assert read_file(tmp_path)["channel_output_modes"] == {"channel1": "youtube"}
+    assert config["channel_output_modes"] == {"channel1": "youtube"}
+
+
+def test_mode_per_channel_reset(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    ctrl.handle_mode(["channel1", "youtube"])
+    text = ctrl.handle_mode(["channel1", "default"])
+    assert text == "Output mode for channel1 reset to global (disk)"
+    assert read_file(tmp_path)["channel_output_modes"] == {}
+    assert config["output_mode"] == "disk"
+
+
+def test_mode_per_channel_invalid_mode_rejected(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text = ctrl.handle_mode(["channel1", "cloud"])
+    assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_mode_per_channel_invalid_name_rejected(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text = ctrl.handle_mode(["bad name!", "disk"])
+    assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_mode_usage_too_many_args(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text = ctrl.handle_mode(["a", "b", "c"])
+    assert text == "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
+    assert read_file(tmp_path) == before
+
+
+def test_remove_clears_override(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path, channels=["channel1", "ch"])
+    ctrl.handle_mode(["channel1", "youtube"])
+    asyncio.run(ctrl.handle_remove(["channel1"]))
+    assert read_file(tmp_path)["channel_output_modes"] == {}
+    assert "channel1" not in read_file(tmp_path)["channels"]
+
+
+def test_status_shows_per_channel_modes(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    ctrl.handle_mode(["channel1", "youtube"])
+    assert "Per-channel modes: channel1=youtube" in ctrl.handle_status()
+
+
 def test_reload_picks_up_disk_edits(tmp_path):
     config, ctrl, _, _ = make_controller(tmp_path)
     file_config = read_file(tmp_path)

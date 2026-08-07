@@ -62,7 +62,7 @@ class Recorder:
         if channel in self._recordings:
             return True
 
-        mode = self._config["output_mode"]
+        mode = self._config.get("channel_output_modes", {}).get(channel, self._config["output_mode"])
         self._load_plugin()
         loop = asyncio.get_running_loop()
 

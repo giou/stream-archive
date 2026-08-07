@@ -68,7 +68,7 @@ class TelegramController:
             "/add <channel> - start monitoring a channel\n"
             "/remove <channel> - stop monitoring a channel\n"
             "/retention <days> - recording retention\n"
-            "/mode <disk|youtube|both> - output mode\n"
+            "/mode [channel] <disk|youtube|both|default> - output mode (per-channel override when a channel is given)\n"
             "/reload - re-read config.json\n"
             "/restart - restart the service"
         )
@@ -78,9 +78,16 @@ class TelegramController:
         active = self._recorder.active_channels()
         days = c["retention_days"]
         retention = f"Retention: {days} day" + ("s" if days != 1 else "") if days else "Retention: disabled"
+        overrides = c.get("channel_output_modes") or {}
+        per_channel = ""
+        if overrides:
+            per_channel = (
+                f"Per-channel modes: {', '.join(f'{k}={v}' for k, v in sorted(overrides.items()))}\n"
+            )
         return (
             f"Channels ({len(c['channels'])}): {', '.join(c['channels'])}\n"
             f"Output mode: {c['output_mode']}\n"
+            f"{per_channel}"
             f"{retention}\n"
             f"Monitoring interval: {c['monitoring_interval']}s\n"
             f"Recording now: {', '.join(active) if active else 'none'}"
@@ -112,6 +119,7 @@ class TelegramController:
             if ch not in candidate["channels"]:
                 raise ValueError(f"{ch} is not in the monitored list")
             candidate["channels"].remove(ch)
+            candidate.setdefault("channel_output_modes", {}).pop(ch, None)
 
         result = self._apply(mutate, lambda c: f"Removed {ch} \u2014 {len(c['channels'])} channel(s) monitored")
         if not result.startswith("\u274c") and self._recorder.is_recording(ch):
@@ -133,14 +141,31 @@ class TelegramController:
         return self._apply(mutate, lambda c: f"Retention set to {n} day(s)")
 
     def handle_mode(self, args):
-        if len(args) != 1:
-            return "Usage: /mode <disk|youtube|both>"
-        m = args[0].lower()
+        if len(args) == 1:
+            m = args[0].lower()
 
-        def mutate(candidate):
-            candidate["output_mode"] = m
+            def mutate(candidate):
+                candidate["output_mode"] = m
 
-        return self._apply(mutate, lambda c: f"Output mode set to {m}")
+            return self._apply(mutate, lambda c: f"Output mode set to {m}")
+
+        if len(args) == 2:
+            ch, m = args[0], args[1].lower()
+            if not _CHANNEL_RE.match(ch):
+                return f"\u274c Invalid channel name: {ch!r}"
+            if m == "default":
+                def mutate(candidate):
+                    candidate.setdefault("channel_output_modes", {}).pop(ch, None)
+                return self._apply(
+                    mutate, lambda c: f"Output mode for {ch} reset to global ({c['output_mode']})"
+                )
+
+            def mutate(candidate):
+                candidate.setdefault("channel_output_modes", {})[ch] = m
+
+            return self._apply(mutate, lambda c: f"Output mode for {ch} set to {m}")
+
+        return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
 
     def handle_reload(self):
         try:

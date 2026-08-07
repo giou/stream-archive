@@ -124,6 +124,7 @@ def _validate(config):
         raise ValueError("retention_days must be a non-negative number (0 disables cleanup)")
 
     _validate_output_mode(config)
+    _validate_channel_output_modes(config)
     _validate_youtube(config)
 
 
@@ -132,6 +133,19 @@ def _validate_output_mode(config):
     valid_modes = {"disk", "youtube", "both"}
     if config["output_mode"] not in valid_modes:
         raise ValueError(f"output_mode must be one of {valid_modes}, got {config['output_mode']!r}")
+
+
+def _validate_channel_output_modes(config):
+    config.setdefault("channel_output_modes", {})
+    modes = config["channel_output_modes"]
+    if not isinstance(modes, dict):
+        raise ValueError("channel_output_modes must be an object")
+    valid_modes = {"disk", "youtube", "both"}
+    for ch, mode in modes.items():
+        if not isinstance(ch, str) or not _CHANNEL_RE.match(ch):
+            raise ValueError(f"Invalid channel name in channel_output_modes: {ch!r}")
+        if not isinstance(mode, str) or mode not in valid_modes:
+            raise ValueError(f"output_mode for {ch} must be one of {valid_modes}, got {mode!r}")
 
 
 def _validate_youtube(config):

@@ -53,6 +53,25 @@ def test_start_success(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_start_uses_per_channel_override(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["channel_output_modes"] = {"ch": "youtube"}
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert rec._recordings["ch"]["filepath"] is None
+        await rec.stop("ch")
+
+        assert await rec.start("other") is True
+        assert rec._recordings["other"]["filepath"] is not None
+        await rec.stop("other")
+
+    asyncio.run(scenario())
+
+
 def test_start_nostreams_returns_false(tmp_path, monkeypatch):
     rec = Recorder(make_config(tmp_path))
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)

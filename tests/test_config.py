@@ -90,3 +90,36 @@ def test_positive_retention_days_passes():
     config["retention_days"] = 7
     _validate(config)
     assert config["retention_days"] == 7
+
+
+def test_valid_config_sets_channel_output_modes_default():
+    config = valid_config()
+    _validate(config)
+    assert config["channel_output_modes"] == {}
+
+
+def test_valid_channel_output_modes_passes():
+    config = valid_config()
+    config["channel_output_modes"] = {"channel1": "youtube", "other": "both"}
+    _validate(config)
+
+
+def test_invalid_channel_output_mode_value_raises():
+    config = valid_config()
+    config["channel_output_modes"] = {"channel1": "cloud"}
+    with pytest.raises(ValueError):
+        _validate(config)
+
+
+def test_invalid_channel_output_mode_name_raises():
+    config = valid_config()
+    config["channel_output_modes"] = {"bad name!": "disk"}
+    with pytest.raises(ValueError):
+        _validate(config)
+
+
+def test_channel_output_modes_non_dict_raises():
+    config = valid_config()
+    config["channel_output_modes"] = []
+    with pytest.raises(ValueError):
+        _validate(config)

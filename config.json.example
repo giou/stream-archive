@@ -13,6 +13,7 @@
     "plugin_dir": "plugins",
     "recording_dir": "recordings",
     "output_mode": "disk",
+    "channel_output_modes": {},
     "retention_days": 0,
     "youtube": {
         "privacy_status": "unlisted",
