@@ -320,7 +320,7 @@ UPDATE_REPORT = {
 UPDATE_RESULTS = {
     "app": ("applied", "pulled 2 commit(s) — Fix retention"),
     "plugin": ("applied", "plugins/twitch.py replaced (8.3.0-20260701 → 9.0.0-20260801)"),
-    "streamlink": ("applied", "uv.lock updated (8.4.0 → 8.5.0); venv syncs on restart"),
+    "streamlink": ("applied", "uv.lock updated — now active"),
 }
 
 
@@ -334,8 +334,9 @@ def test_update_applies_and_schedules_restart(tmp_path):
         text = await ctrl.handle_update()
         assert "\U0001f504 Updates applied" in text
         assert 'stream-archive: pulled 2 commit(s) — "Fix retention"' in text
-        assert "streamlink: 8.4.0 → 8.5.0 (uv.lock updated)" in text
+        assert "streamlink: 8.4.0 → 8.5.0 (uv.lock updated — now active)" in text
         assert "streamlink-ttvlol: 8.3.0-20260701 → 9.0.0-20260801 (plugins/twitch.py replaced)" in text
+        assert "Run on the host:" not in text
         assert "Restarting the service..." in text
         await asyncio.sleep(0.6)
         assert flag.is_set()
@@ -388,6 +389,59 @@ def test_update_apply_failure_no_restart(tmp_path):
         assert "No restart triggered." in text
         await asyncio.sleep(0.6)
         assert not flag.is_set()
+
+    asyncio.run(scenario())
+
+
+DOCKER_LOCK_ONLY_REPORT = {
+    "app": {"status": "up_to_date", "local": "abc1234", "remote": "abc1234", "behind": 0, "subject": None},
+    "plugin": {"status": "up_to_date", "current": "8.3.0-20260701", "latest": "8.3.0-20260701"},
+    "streamlink": {"status": "update", "current": "8.4.0", "latest": "8.5.0"},
+}
+
+
+def test_update_docker_streamlink_lock_requires_rebuild(tmp_path):
+    flag = threading.Event()
+    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    results = {
+        "app": ("skipped", "no update available"),
+        "plugin": ("skipped", "no update available"),
+        "streamlink": ("applied_rebuild", "uv.lock updated — rebuild required"),
+    }
+    fake = FakeUpdater(DOCKER_LOCK_ONLY_REPORT, results)
+    ctrl._updater = fake
+
+    async def scenario():
+        text = await ctrl.handle_update()
+        assert "\U0001f504 Updates applied" in text
+        assert "• streamlink: 8.4.0 → 8.5.0 (uv.lock updated — rebuild required)" in text
+        assert "Run on the host:" in text
+        assert "docker compose up -d --build" in text
+        assert "Restarting the service..." not in text
+        await asyncio.sleep(0.6)
+        assert not flag.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_update_docker_app_and_streamlink_restarts_and_rebuilds(tmp_path):
+    flag = threading.Event()
+    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    results = {
+        "app": ("applied", "pulled 2 commit(s) — Fix retention"),
+        "plugin": ("skipped", "no update available"),
+        "streamlink": ("applied_rebuild", "uv.lock updated — rebuild required"),
+    }
+    fake = FakeUpdater(DOCKER_LOCK_ONLY_REPORT, results)
+    ctrl._updater = fake
+
+    async def scenario():
+        text = await ctrl.handle_update()
+        assert "Restarting the service..." in text
+        assert "docker compose up -d --build" in text
+        assert "• streamlink: 8.4.0 → 8.5.0 (uv.lock updated — rebuild required)" in text
+        await asyncio.sleep(0.6)
+        assert flag.is_set()
 
     asyncio.run(scenario())
 

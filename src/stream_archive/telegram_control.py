@@ -78,7 +78,7 @@ class TelegramController:
             "/mode [channel] <disk|youtube|both|default> - output mode (per-channel override when a channel is given)\n"
             "/reload - re-read config.json\n"
             "/restart - restart the service\n"
-            "/update - check for and apply updates (restarts the service)\n"
+            "/update - check for and apply updates (restarts after app/plugin changes; Docker streamlink needs an image rebuild)\n"
             "/quality [value] - preferred stream quality (best, 1080p, 720p, ...)\n"
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
@@ -228,7 +228,8 @@ class TelegramController:
         results = await self._updater.apply(report)
         display = {"app": "stream-archive", "streamlink": "streamlink", "plugin": "streamlink-ttvlol"}
         lines = []
-        applied = 0
+        applied = 0              # running code/plugin actually changed
+        rebuild_required = False
         for source in ("app", "streamlink", "plugin"):
             if source not in results:
                 continue
@@ -238,17 +239,23 @@ class TelegramController:
                 if source == "app":
                     lines.append(f'• stream-archive: pulled {report["app"].get("behind")} commit(s) — "{report["app"].get("subject")}"')
                 elif source == "streamlink":
-                    lines.append(f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} (uv.lock updated)")
+                    lines.append(f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} ({detail})")
                 else:
                     lines.append(f"• streamlink-ttvlol: {report['plugin'].get('current')} → {report['plugin'].get('latest')} (plugins/twitch.py replaced)")
+            elif status == "applied_rebuild":
+                rebuild_required = True
+                lines.append(f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} ({detail})")
             elif status == "failed":
                 lines.append(f"• {display[source]}: {detail}")
         body = "\n".join(lines)
+        rebuild_block = "\n\nRun on the host:\ndocker compose up -d --build" if rebuild_required else ""
         if applied and self._on_restart is not None:
             asyncio.get_running_loop().call_later(0.5, self._on_restart)
-            return f"\U0001f504 Updates applied\n{body}\nRestarting the service..."
+            return f"\U0001f504 Updates applied\n{body}{rebuild_block}\nRestarting the service..."
         if applied:
-            return f"\U0001f504 Updates applied\n{body}\nRestart is not available (foreground run) — restart manually"
+            return f"\U0001f504 Updates applied\n{body}{rebuild_block}\nRestart is not available (foreground run) — restart manually"
+        if rebuild_required:
+            return f"\U0001f504 Updates applied\n{body}{rebuild_block}"
         return f"\u274c Update failed\n{body}\nNo restart triggered."
 
     def handle_quality(self, args):

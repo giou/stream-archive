@@ -83,8 +83,6 @@ recorder / monitor on the next poll cycle — see
 - [`uv`](https://docs.astral.sh/uv/) — dependency management and the systemd
   unit uses `uv run`
 - `ffmpeg` — required for YouTube re-streaming (and used for the pipe)
-- `chromium` — required by the vendored plugin for client-integrity token
-  acquisition
 - **Twitch** app credentials — register at
   <https://dev.twitch.tv/console> (client id + client secret)
 - **Telegram** bot token — create one with
@@ -171,7 +169,7 @@ a failed command leaves both memory and disk untouched.
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode` (no channel) or a per-channel override; `default` clears the override; applies to new recordings |
 | `/reload` | Re-read `config.json` from disk |
 | `/restart` | Gracefully restart the service |
-| `/update` | Check for updates now and apply any available; restarts the service |
+| `/update` | Check for updates now and apply any available; restarts after app/plugin changes, and in Docker reports when an image rebuild is required |
 
 Notes:
 
@@ -227,11 +225,13 @@ docker compose stop                  # graceful shutdown: recordings stopped, br
   compose file with `USER_UID=<uid>` and `USER_GID=<gid>`.
 - Log timestamps follow the container timezone (`UTC` by default); set
   `TZ=Europe/Madrid` in the same `.env` to match `config.json`'s `timezone`.
-- Updates: `git pull && docker compose restart` ships app changes (the mounted
-  code runs directly); `docker compose up -d --build` additionally installs new
-  dependencies. Telegram `/update` still applies app (`git pull`) and plugin
-  changes; its streamlink arm only rewrites `uv.lock` — rebuild the image to
-  apply it.
+- Updates: app and plugin changes from Telegram `/update` apply immediately
+  (the mounted code runs directly; the service restarts after them).
+  Streamlink differs: on a host (systemd) run `/update` also runs `uv sync`,
+  so the new streamlink is active after the restart. Inside the container the
+  image is the source of truth for the venv (`/opt/venv`), so `/update` only
+  rewrites `uv.lock` and the reply tells you to run `docker compose up -d
+  --build` — the running streamlink is unchanged until you rebuild.
 - One-time YouTube OAuth: `docker compose run --rm stream-archive setup_youtube.py`
 
 ### Logs

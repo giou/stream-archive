@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from src.stream_archive.config import _validate
+from src.stream_archive import updater as _updater_module
 from src.stream_archive.updater import (
     _PLUGIN_DOWNLOAD_URL,
     _PLUGIN_RELEASES_URL,
@@ -13,6 +14,10 @@ from src.stream_archive.updater import (
     _STREAMLINK_RELEASE_NOTES_URL,
     UpdateChecker,
 )
+
+# Captured at import time, before the autouse not_docker fixture patches the
+# module attribute, so test_in_docker_detection can exercise the real function.
+_REAL_IN_DOCKER = _updater_module._in_docker
 
 PLUGIN_CURRENT = "8.3.0-20260701"
 PLUGIN_LATEST = "9.0.0-20260801"
@@ -125,6 +130,13 @@ def set_streamlink_version(monkeypatch):
 
 def read_plugin(tmp_path):
     return (tmp_path / "plugins" / "twitch.py").read_text()
+
+
+@pytest.fixture(autouse=True)
+def not_docker(monkeypatch):
+    """Pin updater tests to the host (non-container) path; Docker-path tests
+    override _in_docker explicitly."""
+    monkeypatch.setattr("src.stream_archive.updater._in_docker", lambda: False)
 
 
 def test_check_all_up_to_date_no_notify_and_records_state(tmp_path, set_streamlink_version):
@@ -278,12 +290,13 @@ def update_report(plugin_digest):
     }
 
 
-def apply_fakes(new_content, git_diff_rc=0, git_pull=(0, "", ""), uv_lock=(0, "", "")):
+def apply_fakes(new_content, git_diff_rc=0, git_pull=(0, "", ""), uv_lock=(0, "", ""), uv_sync=(0, "", "")):
     digest = "sha256:" + hashlib.sha256(new_content).hexdigest()
     run_cmd = FakeRunCmd({
         ("git", "pull", "--ff-only"): git_pull,
         ("git", "diff", "--quiet", "--", "plugins/twitch.py"): (git_diff_rc, "", ""),
         ("uv", "lock", "--upgrade-package", "streamlink"): uv_lock,
+        ("uv", "sync"): uv_sync,
     })
     http = FakeHttp({
         _PLUGIN_DOWNLOAD_URL.format(tag=PLUGIN_LATEST): FakeResponse(200, content=new_content),
@@ -304,6 +317,7 @@ def test_apply_applies_all_in_order(tmp_path):
         ["git", "pull", "--ff-only"],
         ["git", "diff", "--quiet", "--", "plugins/twitch.py"],
         ["uv", "lock", "--upgrade-package", "streamlink"],
+        ["uv", "sync"],
     ]
     assert read_plugin(tmp_path) == new_content.decode()
     assert not (tmp_path / "plugins" / "twitch.py.bak").exists()
@@ -349,6 +363,56 @@ def test_apply_app_failure_continues_with_others(tmp_path):
     )
     assert results["plugin"][0] == "applied"
     assert results["streamlink"][0] == "applied"
+
+
+def test_in_docker_detection(monkeypatch):
+    # not_docker (autouse) pins _in_docker to host mode; restore the real
+    # function so this test exercises the detection logic itself.
+    monkeypatch.setattr("src.stream_archive.updater._in_docker", _REAL_IN_DOCKER)
+    from src.stream_archive.updater import _in_docker
+
+    monkeypatch.delenv("STREAM_ARCHIVE_IN_DOCKER", raising=False)
+    monkeypatch.setattr("pathlib.Path.exists", lambda self: False)
+    assert _in_docker() is False
+    monkeypatch.setattr("pathlib.Path.exists", lambda self: True)
+    assert _in_docker() is True
+    monkeypatch.setenv("STREAM_ARCHIVE_IN_DOCKER", "1")
+    monkeypatch.setattr("pathlib.Path.exists", lambda self: False)
+    assert _in_docker() is True
+
+
+def test_apply_streamlink_docker_lock_only(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.stream_archive.updater._in_docker", lambda: True)
+    config = make_config(tmp_path)
+    new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()
+    run_cmd, http, digest = apply_fakes(new_content)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["streamlink"] == ("applied_rebuild", "uv.lock updated — rebuild required")
+    cmds = [cmd for cmd, _ in run_cmd.calls]
+    assert ["uv", "lock", "--upgrade-package", "streamlink"] in cmds
+    assert ["uv", "sync"] not in cmds
+
+
+def test_apply_streamlink_host_syncs_venv(tmp_path):
+    config = make_config(tmp_path)
+    new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()
+    run_cmd, http, digest = apply_fakes(new_content)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["streamlink"] == ("applied", "uv.lock updated — now active")
+    cmds = [cmd for cmd, _ in run_cmd.calls]
+    assert ["uv", "sync"] in cmds
+
+
+def test_apply_streamlink_sync_failure(tmp_path):
+    config = make_config(tmp_path)
+    new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()
+    run_cmd, http, digest = apply_fakes(new_content, uv_sync=(1, "", "error: failed to install streamlink"))
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["streamlink"][0] == "failed"
+    assert "uv.lock updated (8.4.0 → 8.5.0) — uv sync failed: error: failed to install streamlink" == results["streamlink"][1]
 
 
 def test_changelog_lines_truncates_long_body():

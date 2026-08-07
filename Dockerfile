@@ -1,8 +1,10 @@
 FROM python:3.12-slim
 
-# Runtime deps. Chromium is NOT needed: plugins/twitch.py has zero references
-# to any browser (grep-verified) — ttvlol v1/v2 proxies handle client-integrity
-# server-side; the README "chromium" requirement is stale for this setup.
+# Runtime deps. Chromium is NOT needed: the recorder plays live streams through
+# the ttvlol playlist proxies (config proxy_list -> plugin option proxy-playlist),
+# which handle client-integrity server-side. plugins/twitch.py does contain a
+# browser (CDP) fallback for token acquisition, but this app never triggers it:
+# the recorder sets neither proxy-playlist-exclude nor proxy-playlist-fallback.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg git tzdata ca-certificates \
  && rm -rf /var/lib/apt/lists/*

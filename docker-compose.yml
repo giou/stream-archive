@@ -10,5 +10,6 @@ services:
       - .:/app                     # the checkout: config.json, recordings/, plugins/, tokens, state
     environment:
       - PYTHONUNBUFFERED=1
+      - STREAM_ARCHIVE_IN_DOCKER=1
       - TZ=${TZ:-UTC}
     stop_grace_period: 90s         # graceful shutdown stops recordings + ends YouTube broadcasts

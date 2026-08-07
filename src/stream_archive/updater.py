@@ -56,6 +56,13 @@ async def _default_run_cmd(cmd, cwd):
     return (proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace"))
 
 
+def _in_docker() -> bool:
+    """True when running inside a container. The Docker engine creates
+    /.dockerenv; docker-compose also sets STREAM_ARCHIVE_IN_DOCKER=1 so the
+    check does not depend on the engine. Host (systemd/foreground) = False."""
+    return Path("/.dockerenv").exists() or os.environ.get("STREAM_ARCHIVE_IN_DOCKER") == "1"
+
+
 class UpdateChecker:
     """Periodic update checks (app repo, streamlink, vendored plugin) and /update.
 
@@ -275,6 +282,7 @@ class UpdateChecker:
     async def apply(self, report):
         async with self._lock:
             results = {}
+            # plugin + streamlink form a compatibility unit: apply both when both are pending
             for source in ("app", "plugin", "streamlink"):
                 data = report.get(source) or {}
                 if data.get("status") != "update":
@@ -331,11 +339,27 @@ class UpdateChecker:
         return ("applied", msg)
 
     async def _apply_streamlink(self, data):
+        """Update uv.lock, then sync the venv — but only on host.
+
+        In Docker the venv lives at /opt/venv inside the image (outside the
+        bind mount); a lock change alone must not claim the new streamlink is
+        active. Return applied_rebuild so the caller tells the user to run
+        `docker compose up -d --build` instead of restarting for nothing.
+        """
         rc, _, err = await self._run_cmd(["uv", "lock", "--upgrade-package", "streamlink"], self._workdir)
         if rc != 0:
             detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
             return ("failed", f"uv lock: {detail}")
-        return ("applied", f"uv.lock updated ({data.get('current')} → {data.get('latest')}); venv syncs on restart")
+        if not _in_docker():
+            rc, _, err = await self._run_cmd(["uv", "sync"], self._workdir)
+            if rc != 0:
+                detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
+                return (
+                    "failed",
+                    f"uv.lock updated ({data.get('current')} → {data.get('latest')}) — uv sync failed: {detail}",
+                )
+            return ("applied", "uv.lock updated — now active")
+        return ("applied_rebuild", "uv.lock updated — rebuild required")
 
     # ---- loop / lifecycle --------------------------------------------------
 
