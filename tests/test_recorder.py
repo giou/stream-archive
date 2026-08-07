@@ -398,6 +398,40 @@ def test_recording_failure_stops_chat(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_stop_chat_stops_only_chat(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert rec.is_recording("ch")
+        cr = FakeChatRecorder.instances[0]
+        assert not cr.stopped
+        await rec.stop_chat("ch")
+        assert cr.stopped
+        assert "chat_recorder" not in rec._recordings["ch"]
+        assert rec.is_recording("ch")  # video continues
+        await rec.stop("ch")
+        assert cr.stopped
+
+    asyncio.run(scenario())
+
+
+def test_stop_chat_unknown_channel_is_noop(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        await rec.stop_chat("nope")  # must not raise
+
+    asyncio.run(scenario())
+
+
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     config["record_chat"] = True

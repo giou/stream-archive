@@ -11,6 +11,7 @@ class FakeRecorder:
         self._active = list(active)
         self._recording = set(recording)
         self.stop_calls = []
+        self.chat_stop_calls = []
         self.snapshot = {
             "free_gb": 100.0,
             "total_fs_gb": 500.0,
@@ -26,6 +27,12 @@ class FakeRecorder:
     async def stop(self, channel):
         self.stop_calls.append(channel)
         self._recording.discard(channel)
+
+    def active_channels(self):
+        return sorted(self._recording)
+
+    async def stop_chat(self, channel):
+        self.chat_stop_calls.append(channel)
 
     async def disk_snapshot(self):
         return self.snapshot
@@ -566,3 +573,42 @@ def test_help_lists_new_commands(tmp_path):
     assert "/maxrecordings <n>" in text
     assert "/maxyoutube <n>" in text
     assert "/disk <minfree|maxsize|fill|interval|evict> <value>" in text
+    assert "/chat [on|off]" in text
+
+
+def test_chat_show_state(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert "Chat recording: enabled" in asyncio.run(ctrl.handle_chat([]))
+    asyncio.run(ctrl.handle_chat(["off"]))
+    assert "Chat recording: disabled" in asyncio.run(ctrl.handle_chat([]))
+    assert "Chat recording: disabled" in asyncio.run(ctrl.handle_status())
+
+
+def test_chat_on_persists(tmp_path):
+    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1"])
+    asyncio.run(ctrl.handle_chat(["off"]))
+    text = asyncio.run(ctrl.handle_chat(["on"]))
+    assert text == "Chat recording enabled"
+    assert read_file(tmp_path)["record_chat"] is True
+    assert config["record_chat"] is True
+    assert recorder.chat_stop_calls == ["channel1"]  # from the earlier /chat off, not re-triggered by on
+
+
+def test_chat_off_persists_and_stops_inflight(tmp_path):
+    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1", "ch"])
+    text = asyncio.run(ctrl.handle_chat(["off"]))
+    assert text == "Chat recording disabled"
+    assert read_file(tmp_path)["record_chat"] is False
+    assert config["record_chat"] is False
+    assert recorder.chat_stop_calls == ["ch", "channel1"]
+    assert recorder.stop_calls == []
+
+
+def test_chat_invalid_rejected(tmp_path):
+    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1"])
+    before = read_file(tmp_path)
+    assert asyncio.run(ctrl.handle_chat([])) == "Chat recording: enabled"
+    assert asyncio.run(ctrl.handle_chat(["maybe"])) == "Usage: /chat <on|off>"
+    assert asyncio.run(ctrl.handle_chat(["on", "off"])) == "Usage: /chat <on|off>"
+    assert read_file(tmp_path) == before
+    assert recorder.chat_stop_calls == []

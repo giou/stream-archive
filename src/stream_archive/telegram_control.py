@@ -44,6 +44,7 @@ class TelegramController:
             CommandHandler("maxrecordings", self._cmd_maxrecordings, filters=admin),
             CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
             CommandHandler("disk", self._cmd_disk, filters=admin),
+            CommandHandler("chat", self._cmd_chat, filters=admin),
         ])
         await self._app.initialize()
         await self._app.start()
@@ -83,7 +84,8 @@ class TelegramController:
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
             "/disk - show disk limits\n"
-            "/disk <minfree|maxsize|fill|interval|evict> <value> - set disk limit"
+            "/disk <minfree|maxsize|fill|interval|evict> <value> - set disk limit\n"
+            "/chat [on|off] - enable or disable live chat recording (off stops in-flight capture)"
         )
 
     async def handle_status(self):
@@ -93,6 +95,7 @@ class TelegramController:
         c_disk = c.get("disk", {})
         days = c["retention_days"]
         retention = f"Retention: {days} day" + ("s" if days != 1 else "") if days else "Retention: disabled"
+        chat_state = "enabled" if c.get("record_chat", True) else "disabled"
         overrides = c.get("channel_output_modes") or {}
         per_channel = ""
         if overrides:
@@ -111,6 +114,7 @@ class TelegramController:
             f"Output mode: {c['output_mode']}\n"
             f"{per_channel}"
             f"{retention}\n"
+            f"Chat recording: {chat_state}\n"
             f"Monitoring interval: {c['monitoring_interval']}s\n"
             f"Quality: {c.get('preferred_quality', 'best')}\n"
             f"Concurrent limit: {c.get('max_concurrent_recordings', 0)} recording(s), {c.get('max_concurrent_youtube_streams', 0)} YouTube re-stream(s) (0 = unlimited)\n"
@@ -350,6 +354,22 @@ class TelegramController:
             )
         return usage
 
+    async def handle_chat(self, args):
+        if not args:
+            state = "enabled" if self._config.get("record_chat", True) else "disabled"
+            return f"Chat recording: {state}"
+        if len(args) == 1 and args[0].lower() in ("on", "off"):
+            enabled = args[0].lower() == "on"
+            text = self._apply(
+                lambda candidate: candidate.__setitem__("record_chat", enabled),
+                lambda candidate: f"Chat recording {'enabled' if enabled else 'disabled'}",
+            )
+            if not enabled and not text.startswith("\u274c"):
+                for channel in self._recorder.active_channels():
+                    await self._recorder.stop_chat(channel)
+            return text
+        return "Usage: /chat <on|off>"
+
     async def _cmd_help(self, update, context):
         await update.effective_message.reply_text(self.handle_help())
 
@@ -391,3 +411,6 @@ class TelegramController:
 
     async def _cmd_disk(self, update, context):
         await update.effective_message.reply_text(self.handle_disk(context.args or []))
+
+    async def _cmd_chat(self, update, context):
+        await update.effective_message.reply_text(await self.handle_chat(context.args or []))

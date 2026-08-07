@@ -7,8 +7,8 @@ ad-block workaround still record. Optionally re-streams recordings to
 [YouTube Live](https://www.youtube.com/live) and sends Telegram alerts on
 live/offline events and start failures. The admin can also manage the
 recorder over Telegram — add/remove monitored channels, set retention and
-output mode, view status, reload, or restart — with no other user able to
-issue commands.
+output mode, toggle chat recording, view status, reload, or restart — with no
+other user able to issue commands.
 
 The system is designed to be set-and-forget: failures are logged, alerted
 (rate-limited), and retried automatically on the next poll cycle — including
@@ -30,9 +30,9 @@ recording processes that die mid-stream.
   channels and app version, and shutdown/restart).
 - **Telegram control** — the admin (`telegram_user_id`) can manage the recorder
   over the bot: add/remove monitored channels, set retention and output mode,
-  view status, reload `config.json`, or restart the service. Every change is
-  validated and persisted atomically, then applied live on the next poll cycle;
-  non-admin senders get no reply.
+  toggle chat recording, view status, reload `config.json`, or restart the
+  service. Every change is validated and persisted atomically, then applied
+  live on the next poll cycle; non-admin senders get no reply.
 - **Self-healing**:
   - Recording tasks that die mid-stream (ffmpeg crash, disk error, proxy death)
     are detected and restarted on the next poll cycle.
@@ -146,6 +146,14 @@ All keys from `config.json.example`:
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
 | `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
 | `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
+| `preferred_quality` | no | `best` | Stream quality to request from streamlink (`best`, `1080p`, `720p`, …); falls back to `best` |
+| `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings; `0` = unlimited |
+| `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams; `0` = unlimited |
+| `disk.min_free_gb` | no | `0` | Stop a recording when free disk space drops below this (GB); `0` = disabled |
+| `disk.max_total_gb` | no | `0` | Evict oldest recordings when the archive exceeds this (GB); `0` = disabled |
+| `disk.check_interval_s` | no | `60` | How often the disk watchdog re-checks free space/archive size |
+| `disk.min_time_to_full_min` | no | `0` | Stop a recording when the disk is estimated to fill within this many minutes; `0` = disabled |
+| `disk.evict_when_over` | no | `true` | Delete oldest recordings when `disk.max_total_gb` is exceeded; `false` stops new recordings instead |
 | `update_check.enabled` | no | `true` | Periodically check the app, streamlink, and the vendored plugin for updates and send a Telegram notification when one is available |
 | `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
 | `update_check.check_app` | no | `true` | Check the app repo (`git fetch origin`) for new commits |
@@ -191,7 +199,7 @@ a failed command leaves both memory and disk untouched.
 | Command | Action |
 | --- | --- |
 | `/help` | List the available commands |
-| `/status` | Monitored channels, output mode, retention, monitoring interval, and channels currently recording |
+| `/status` | Monitored channels, output mode, retention, chat-recording state, monitoring interval, quality, concurrency limits, disk usage/limits, update-check state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
 | `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |
 | `/remove <channel>` | Stop monitoring a channel; if it is live, stops the recording (sending the offline notification) |
@@ -200,6 +208,12 @@ a failed command leaves both memory and disk untouched.
 | `/reload` | Re-read `config.json` from disk |
 | `/restart` | Gracefully restart the service |
 | `/update` | Check for updates now and apply any available; restarts after app/plugin changes, and in Docker reports when an image rebuild is required |
+| `/quality [value]` | Show the preferred quality, or set it (`best`, `1080p`, `720p`, …) |
+| `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
+| `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
+| `/disk` | Show disk limits |
+| `/disk <minfree\|maxsize\|fill\|interval\|evict> <value>` | Set a disk limit (`minfree`/`maxsize`/`fill` take GB/min numbers, `interval` seconds, `evict` takes `on`/`off`) |
+| `/chat [on\|off]` | Show whether chat recording is enabled, or enable/disable it; `off` also stops and finalizes in-flight chat capture (the video recordings continue) |
 
 Notes:
 
@@ -207,6 +221,9 @@ Notes:
   mode it started with. A per-channel override (`/mode <channel> <mode>`) wins
   over the global `output_mode`; `/status` lists active overrides, and
   `/remove <channel>` clears the channel's override.
+- `/chat off` applies immediately: in-flight chat capture is stopped and
+  finalized (the video recordings continue), and new recordings start without
+  chat until `/chat on`; `/chat on` affects new recordings only.
 - `/retention` and `/reload` apply immediately — the cleanup loop and the
   monitor read the live config every cycle.
 - `/restart` replies first, then triggers the scheduler shutdown; the systemd

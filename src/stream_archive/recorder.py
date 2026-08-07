@@ -257,6 +257,18 @@ class Recorder:
             except Exception as e:
                 logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
+    async def stop_chat(self, channel):
+        """Stop and finalize chat capture for an active recording; the video continues."""
+        entry = self._recordings.get(channel)
+        if entry is None:
+            return
+        chat_recorder = entry.pop("chat_recorder", None)
+        if chat_recorder:
+            try:
+                await chat_recorder.stop()
+            except Exception as e:
+                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+
     def is_recording(self, channel):
         return channel in self._recordings
 
