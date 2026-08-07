@@ -138,6 +138,9 @@ def test_privmsg_with_emotes_badges_color(tmp_path):
         # render duration: TDL chatrender uses video.end - video.start
         assert data["video"]["end"] == offset
         assert data["video"]["length"] == offset
+        # null id (not ""): GUI chat-update preview falls back to content_id
+        # instead of crashing on long.Parse("")
+        assert data["video"]["id"] is None
 
     asyncio.run(scenario())
 

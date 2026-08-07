@@ -282,7 +282,10 @@ class ChatRecorder:
             "video": {
                 "title": self._title,
                 "description": "",
-                "id": "",
+                # null (not ""): the GUI's chat-update tab falls back to
+                # comments[0].content_id when id is null, while "" trips
+                # "".All(char.IsDigit) -> long.Parse("") -> FormatException
+                "id": None,
                 "created_at": self._start_z,
                 "start": 0.0,
                 "end": end,
