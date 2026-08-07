@@ -6,6 +6,7 @@ __pycache__/
 *.pyd
 .tz
 recordings/
+chat/
 *:Zone.Identifier
 client_secret.json
 .venv/

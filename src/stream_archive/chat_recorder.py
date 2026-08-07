@@ -261,6 +261,13 @@ class ChatRecorder:
             streamer_id = int(self._user_id) if self._user_id else 0
         except (TypeError, ValueError):
             streamer_id = 0
+        # TDL convention (ChatDownloader.cs): live chat gets length/end from the
+        # last comment's offset; chatrender derives the render duration from
+        # video.end - video.start, so leaving them 0 renders a 0-second video.
+        if self._comments:
+            end = self._comments[-1]["content_offset_seconds"]
+        else:
+            end = round(time.monotonic() - self._start_mono, 3)
         root = {
             "FileInfo": {
                 "Version": {"Major": 1, "Minor": 4, "Patch": 0},
@@ -278,8 +285,8 @@ class ChatRecorder:
                 "id": "",
                 "created_at": self._start_z,
                 "start": 0.0,
-                "end": 0.0,
-                "length": 0.0,
+                "end": end,
+                "length": end,
                 "viewCount": 0,
                 "game": self._game,
             },

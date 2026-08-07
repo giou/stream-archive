@@ -135,6 +135,9 @@ def test_privmsg_with_emotes_badges_color(tmp_path):
         assert comment == expected
         assert isinstance(offset, float) and offset >= 0
         assert round(offset, 3) == offset
+        # render duration: TDL chatrender uses video.end - video.start
+        assert data["video"]["end"] == offset
+        assert data["video"]["length"] == offset
 
     asyncio.run(scenario())
 
@@ -230,6 +233,9 @@ def test_empty_chat_writes_valid_json(tmp_path):
         assert data["FileInfo"]["Version"] == {"Major": 1, "Minor": 4, "Patch": 0}
         assert data["streamer"]["login"] == "ch"
         assert data["video"]["title"] == "Title"
+        # no comments: end/length fall back to the capture wall-clock duration
+        assert data["video"]["end"] > 0
+        assert data["video"]["length"] == data["video"]["end"]
 
     asyncio.run(scenario())
 
