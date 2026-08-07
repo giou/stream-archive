@@ -257,10 +257,10 @@ tests/                   # pytest suite (recorder, monitor, notifier, config, te
 `plugins/twitch.py` is vendored from
 [streamlink-ttvlol](https://github.com/2bc4/streamlink-ttvlol)
 (currently version `8.3.0-20260701`, constant `STREAMLINK_TTVLOL_VERSION`).
-The plugin version is auto-checked against the upstream GitHub releases on
-the `update_check` interval and refreshed via `/update` (sha256-verified
-download); it can also be replaced manually, bumping the constant — the
-plugin logs its version at load. Upstream bugs go to
+No manual maintenance is needed: the plugin version is auto-checked against
+the upstream GitHub releases on the `update_check` interval and refreshed
+via `/update` (sha256-verified download). The plugin logs its version at
+load. Upstream bugs go to
 <https://github.com/2bc4/streamlink-ttvlol/issues>.
 
 ## Development
