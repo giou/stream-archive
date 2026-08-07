@@ -282,10 +282,13 @@ class ChatRecorder:
             "video": {
                 "title": self._title,
                 "description": "",
-                # null (not ""): the GUI's chat-update tab falls back to
-                # comments[0].content_id when id is null, while "" trips
-                # "".All(char.IsDigit) -> long.Parse("") -> FormatException
-                "id": None,
+                # Sentinel "0": the GUI's chat-update preview takes the VOD
+                # branch (numeric id) and handles data.video == null gracefully.
+                # "" crashes long.Parse(""); null falls back to comments'
+                # content_id (channel login), and a bogus clip slug makes
+                # GetClipInfo return data.clip == null -> NullReferenceException
+                # in the GUI (TDL 1.56.5 PageChatUpdate).
+                "id": "0",
                 "created_at": self._start_z,
                 "start": 0.0,
                 "end": end,
