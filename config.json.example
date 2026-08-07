@@ -5,8 +5,11 @@
     "twitch_client_secret": "<your_twitch_client_secret>",
     "channels": ["channel1", "channel2"],
     "proxy_list": [
-        "httpproxy://user:pass@host:port",
-        "https://proxy2.example.com"
+        "httpproxy://firefox.api.cdn-perfprod.com:2023",
+        "httpproxy://chromium.api.cdn-perfprod.com:2023",
+        "https://eu2.luminous.dev",
+        "https://eu.luminous.dev",
+        "https://lb-eu3.cdn-perfprod.com"
     ],
     "monitoring_interval": 60,
     "timezone": "Europe/Madrid",

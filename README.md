@@ -134,7 +134,7 @@ All keys from `config.json.example`:
 | `twitch_client_id` | yes | — | Twitch app client id |
 | `twitch_client_secret` | yes | — | Twitch app client secret |
 | `channels` | yes | — | Non-empty list of channel names to monitor (1–25 chars; first char `[a-zA-Z0-9]`, then `[a-zA-Z0-9_]`) |
-| `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies: `httpproxy://user:pass@host:port` or `https://…` URLs |
+| `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies: `httpproxy://…` entries are ttvlol v2 proxies (optionally `httpproxy://user:pass@host:port`), `https://…` entries are v1 |
 | `monitoring_interval` | yes | — | Poll interval in seconds; must be > 0 |
 | `timezone` | yes | — | IANA timezone (e.g. `Europe/Madrid`) used for filenames and timestamps |
 | `plugin_dir` | yes | — | Directory containing the vendored streamlink plugin (`plugins`) |
