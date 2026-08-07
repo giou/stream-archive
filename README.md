@@ -207,6 +207,33 @@ systemctl --user enable --now stream-archive
 The unit hard-codes the checkout at `~/stream-archive` — adjust
 `WorkingDirectory` and `ExecStart` if you clone elsewhere.
 
+### Docker
+
+Any clone of the repo works — the checkout is bind-mounted read-write at
+`/app`, so the container uses your `config.json`, `recordings/`, plugins, and
+tokens exactly like a host run. App code changes need no image rebuild.
+
+```sh
+cp config.json.example config.json   # fill in every key — see Configuration reference
+docker compose up -d --build         # build the image and start
+docker compose logs -f               # follow logs
+docker compose stop                  # graceful shutdown: recordings stopped, broadcasts ended
+```
+
+- `config.json`, `client_secret.json`, `youtube_token.json`, and recordings
+  never enter the image (`.dockerignore`) — they live only in your checkout.
+- The container runs as uid/gid 1000 by default so recorded files stay
+  manageable on the host. If your uid differs, create a `.env` next to the
+  compose file with `USER_UID=<uid>` and `USER_GID=<gid>`.
+- Log timestamps follow the container timezone (`UTC` by default); set
+  `TZ=Europe/Madrid` in the same `.env` to match `config.json`'s `timezone`.
+- Updates: `git pull && docker compose restart` ships app changes (the mounted
+  code runs directly); `docker compose up -d --build` additionally installs new
+  dependencies. Telegram `/update` still applies app (`git pull`) and plugin
+  changes; its streamlink arm only rewrites `uv.lock` — rebuild the image to
+  apply it.
+- One-time YouTube OAuth: `docker compose run --rm stream-archive setup_youtube.py`
+
 ### Logs
 
 ```sh

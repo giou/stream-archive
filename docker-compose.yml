@@ -1,0 +1,14 @@
+services:
+  stream-archive:
+    build: .
+    image: stream-archive:latest
+    restart: unless-stopped        # mirrors the systemd unit's Restart=always
+    init: true                     # tini: zombie reaping + SIGTERM forwarding
+    user: "${USER_UID:-1000}:${USER_GID:-1000}"
+    working_dir: /app
+    volumes:
+      - .:/app                     # the checkout: config.json, recordings/, plugins/, tokens, state
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=${TZ:-UTC}
+    stop_grace_period: 90s         # graceful shutdown stops recordings + ends YouTube broadcasts

@@ -11,3 +11,4 @@ client_secret.json
 .venv/
 update_state.json
 plugins/*.bak
+.env

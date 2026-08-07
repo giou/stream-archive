@@ -1,0 +1,11 @@
+.git
+.venv
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+recordings/
+config.json
+client_secret.json
+youtube_token.json
+update_state.json
