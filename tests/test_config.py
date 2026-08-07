@@ -27,6 +27,13 @@ def test_valid_config_passes_and_sets_defaults():
         "client_secrets_file": "client_secret.json",
     }
     assert config["retention_days"] == 0
+    assert config["update_check"] == {
+        "enabled": True,
+        "interval_hours": 24,
+        "check_app": True,
+        "check_streamlink": True,
+        "check_plugin": True,
+    }
 
 
 @pytest.mark.parametrize("key", [
@@ -123,3 +130,32 @@ def test_channel_output_modes_non_dict_raises():
     config["channel_output_modes"] = []
     with pytest.raises(ValueError):
         _validate(config)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: c.__setitem__("update_check", {"enabled": "yes"}),
+    lambda c: c.__setitem__("update_check", {"interval_hours": 0}),
+    lambda c: c.__setitem__("update_check", {"interval_hours": -1}),
+    lambda c: c.__setitem__("update_check", {"check_app": "x"}),
+    lambda c: c.__setitem__("update_check", {"check_plugin": 1}),
+    lambda c: c.__setitem__("update_check", []),
+])
+def test_invalid_update_check_raises(mutate):
+    config = valid_config()
+    mutate(config)
+    with pytest.raises(ValueError):
+        _validate(config)
+
+
+def test_valid_update_check_values_pass():
+    config = valid_config()
+    config["update_check"] = {
+        "enabled": False,
+        "interval_hours": 6.5,
+        "check_app": False,
+        "check_streamlink": False,
+        "check_plugin": False,
+    }
+    _validate(config)
+    assert config["update_check"]["enabled"] is False
+    assert config["update_check"]["interval_hours"] == 6.5

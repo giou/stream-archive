@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import re
 import signal
 import time
+from pathlib import Path
 from src.stream_archive.config import get_config
 from src.stream_archive.twitch_api import TwitchAPI
 from src.stream_archive.monitor import Monitor
@@ -9,6 +11,7 @@ from src.stream_archive.recorder import Recorder
 from src.stream_archive.notifier import Notifier
 from src.stream_archive.youtube_streamer import YouTubeStreamer
 from src.stream_archive.telegram_control import TelegramController
+from src.stream_archive.updater import UpdateChecker
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,16 @@ def _setup_signal_handlers():
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+
+
+def _app_version(workdir):
+    """Best-effort app version from pyproject.toml (the project is not pip-installed)."""
+    try:
+        text = (Path(workdir) / "pyproject.toml").read_text()
+    except OSError:
+        return None
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return m.group(1) if m else None
 
 
 async def run_scheduler():
@@ -56,10 +69,25 @@ async def run_scheduler():
     recorder = Recorder(config, youtube_streamer, notifier)
     monitor = Monitor(recorder, notifier)
 
+    updater = UpdateChecker(config, notifier)
+    updater_task = asyncio.create_task(updater.run_loop())
+    logger.info("[updater] Update check enabled (every %sh)", config["update_check"]["interval_hours"])
+
     telegram = TelegramController(
-        config, recorder, monitor, on_restart=lambda: _shutdown_event.set()
+        config, recorder, monitor, on_restart=lambda: _shutdown_event.set(), updater=updater
     )
     await telegram.start()
+
+    # Startup notification: monitored channels + current version (git short sha).
+    sha = await updater.local_sha()
+    ver = _app_version(config["_workdir"])
+    if ver and sha:
+        version = f"v{ver} ({sha[:7]})"
+    elif ver:
+        version = f"v{ver}"
+    else:
+        version = "unknown"
+    await notifier.notify_startup(config["channels"], version)
 
     try:
         while not _shutdown_event.is_set():
@@ -84,7 +112,11 @@ async def run_scheduler():
         pass
     finally:
         logger.info("[scheduler] Shutting down, stopping all recordings...")
+        await notifier.notify_shutdown()
         await recorder.stop_all()
+        updater_task.cancel()
+        await asyncio.gather(updater_task, return_exceptions=True)
+        await updater.close()
         await telegram.stop()
         await notifier.close()
         await twitch_api.close()

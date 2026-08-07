@@ -17,11 +17,12 @@ class TelegramController:
     leaves both memory and disk untouched.
     """
 
-    def __init__(self, config, recorder, monitor, on_restart=None):
+    def __init__(self, config, recorder, monitor, on_restart=None, updater=None):
         self._config = config
         self._recorder = recorder
         self._monitor = monitor
         self._on_restart = on_restart
+        self._updater = updater
         self._admin_id = config["telegram_user_id"]
         self._app = Application.builder().token(config["bot_telegram_api"]).build()
 
@@ -37,6 +38,7 @@ class TelegramController:
             CommandHandler("mode", self._cmd_mode, filters=admin),
             CommandHandler("reload", self._cmd_reload, filters=admin),
             CommandHandler("restart", self._cmd_restart, filters=admin),
+            CommandHandler("update", self._cmd_update, filters=admin),
         ])
         await self._app.initialize()
         await self._app.start()
@@ -70,7 +72,8 @@ class TelegramController:
             "/retention <days> - recording retention\n"
             "/mode [channel] <disk|youtube|both|default> - output mode (per-channel override when a channel is given)\n"
             "/reload - re-read config.json\n"
-            "/restart - restart the service"
+            "/restart - restart the service\n"
+            "/update - check for and apply updates (restarts the service)"
         )
 
     def handle_status(self):
@@ -90,7 +93,9 @@ class TelegramController:
             f"{per_channel}"
             f"{retention}\n"
             f"Monitoring interval: {c['monitoring_interval']}s\n"
-            f"Recording now: {', '.join(active) if active else 'none'}"
+            f"Recording now: {', '.join(active) if active else 'none'}\n"
+            f"Update check: {'enabled' if (c.get('update_check') or {}).get('enabled', True) else 'disabled'} "
+            f"(every {(c.get('update_check') or {}).get('interval_hours', 24)}h)"
         )
 
     def handle_channels(self):
@@ -180,6 +185,49 @@ class TelegramController:
         asyncio.get_running_loop().call_later(0.5, self._on_restart)
         return "\U0001f504 Restarting... the service will come back in a few seconds"
 
+    async def handle_update(self):
+        if self._updater is None:
+            return "Update checks are not configured"
+        report = await self._updater.check(notify=False)
+        available = [s for s in ("app", "streamlink", "plugin")
+                     if s in report and report[s]["status"] == "update"]
+
+        if not available:
+            lines = []
+            if "app" in report:
+                lines.append(f"• stream-archive: {(report['app'].get('local') or '')[:7]} (main)")
+            if "streamlink" in report:
+                lines.append(f"• streamlink: {report['streamlink'].get('latest')}")
+            if "plugin" in report:
+                lines.append(f"• streamlink-ttvlol: {report['plugin'].get('latest')}")
+            return "\u2705 Up to date\n" + "\n".join(lines)
+
+        results = await self._updater.apply(report)
+        display = {"app": "stream-archive", "streamlink": "streamlink", "plugin": "streamlink-ttvlol"}
+        lines = []
+        applied = 0
+        for source in ("app", "streamlink", "plugin"):
+            if source not in results:
+                continue
+            status, detail = results[source]
+            if status == "applied":
+                applied += 1
+                if source == "app":
+                    lines.append(f'• stream-archive: pulled {report["app"].get("behind")} commit(s) — "{report["app"].get("subject")}"')
+                elif source == "streamlink":
+                    lines.append(f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} (uv.lock updated)")
+                else:
+                    lines.append(f"• streamlink-ttvlol: {report['plugin'].get('current')} → {report['plugin'].get('latest')} (plugins/twitch.py replaced)")
+            elif status == "failed":
+                lines.append(f"• {display[source]}: {detail}")
+        body = "\n".join(lines)
+        if applied and self._on_restart is not None:
+            asyncio.get_running_loop().call_later(0.5, self._on_restart)
+            return f"\U0001f504 Updates applied\n{body}\nRestarting the service..."
+        if applied:
+            return f"\U0001f504 Updates applied\n{body}\nRestart is not available (foreground run) — restart manually"
+        return f"\u274c Update failed\n{body}\nNo restart triggered."
+
     async def _cmd_help(self, update, context):
         await update.effective_message.reply_text(self.handle_help())
 
@@ -206,3 +254,6 @@ class TelegramController:
 
     async def _cmd_restart(self, update, context):
         await update.effective_message.reply_text(self.handle_restart())
+
+    async def _cmd_update(self, update, context):
+        await update.effective_message.reply_text(await self.handle_update())

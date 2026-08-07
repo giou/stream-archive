@@ -31,6 +31,22 @@ class FakeMonitor:
         self.remove_calls.append(channel)
 
 
+class FakeUpdater:
+    def __init__(self, report, results=None):
+        self.report = report
+        self.results = results
+        self.check_calls = []
+        self.apply_calls = []
+
+    async def check(self, notify):
+        self.check_calls.append(notify)
+        return self.report
+
+    async def apply(self, report):
+        self.apply_calls.append(report)
+        return self.results
+
+
 def base_config(tmp_path):
     return {
         "telegram_user_id": 12345,
@@ -279,3 +295,94 @@ def test_restart_without_callback(tmp_path):
     _, ctrl, _, _ = make_controller(tmp_path)
     text = ctrl.handle_restart()
     assert text == "Restart is not available (no shutdown callback configured)"
+
+
+UPDATE_REPORT = {
+    "app": {"status": "update", "behind": 2, "subject": "Fix retention"},
+    "plugin": {"status": "update", "current": "8.3.0-20260701", "latest": "9.0.0-20260801", "digest": None},
+    "streamlink": {"status": "update", "current": "8.4.0", "latest": "8.5.0"},
+}
+
+UPDATE_RESULTS = {
+    "app": ("applied", "pulled 2 commit(s) — Fix retention"),
+    "plugin": ("applied", "plugins/twitch.py replaced (8.3.0-20260701 → 9.0.0-20260801)"),
+    "streamlink": ("applied", "uv.lock updated (8.4.0 → 8.5.0); venv syncs on restart"),
+}
+
+
+def test_update_applies_and_schedules_restart(tmp_path):
+    flag = threading.Event()
+    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    fake = FakeUpdater(UPDATE_REPORT, UPDATE_RESULTS)
+    ctrl._updater = fake
+
+    async def scenario():
+        text = await ctrl.handle_update()
+        assert "\U0001f504 Updates applied" in text
+        assert 'stream-archive: pulled 2 commit(s) — "Fix retention"' in text
+        assert "streamlink: 8.4.0 → 8.5.0 (uv.lock updated)" in text
+        assert "streamlink-ttvlol: 8.3.0-20260701 → 9.0.0-20260801 (plugins/twitch.py replaced)" in text
+        assert "Restarting the service..." in text
+        await asyncio.sleep(0.6)
+        assert flag.is_set()
+
+    asyncio.run(scenario())
+    assert fake.check_calls == [False]
+    assert fake.apply_calls == [UPDATE_REPORT]
+
+
+def test_update_no_updates_no_restart(tmp_path):
+    flag = threading.Event()
+    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    report = {
+        "app": {"status": "up_to_date", "local": "abc1234def5678", "remote": "abc1234def5678", "behind": 0, "subject": "Latest"},
+        "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
+        "plugin": {"status": "up_to_date", "current": "8.3.0-20260701", "latest": "8.3.0-20260701"},
+    }
+    fake = FakeUpdater(report)
+    ctrl._updater = fake
+
+    async def scenario():
+        text = await ctrl.handle_update()
+        assert "\u2705 Up to date" in text
+        assert "stream-archive: abc1234 (main)" in text
+        assert "streamlink: 8.4.0" in text
+        assert "streamlink-ttvlol: 8.3.0-20260701" in text
+        await asyncio.sleep(0.6)
+        assert not flag.is_set()
+
+    asyncio.run(scenario())
+    assert fake.apply_calls == []
+
+
+def test_update_apply_failure_no_restart(tmp_path):
+    flag = threading.Event()
+    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    results = {
+        "app": ("failed", "git pull: fatal: Could not resolve host"),
+        "plugin": ("failed", "sha256 mismatch — download rejected"),
+        "streamlink": ("failed", "uv lock: command not found"),
+    }
+    fake = FakeUpdater(UPDATE_REPORT, results)
+    ctrl._updater = fake
+
+    async def scenario():
+        text = await ctrl.handle_update()
+        assert "\u274c Update failed" in text
+        assert "• stream-archive: git pull: fatal: Could not resolve host" in text
+        assert "• streamlink-ttvlol: sha256 mismatch — download rejected" in text
+        assert "No restart triggered." in text
+        await asyncio.sleep(0.6)
+        assert not flag.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_update_not_configured(tmp_path):
+    _, ctrl, _, _ = make_controller(tmp_path)
+    assert asyncio.run(ctrl.handle_update()) == "Update checks are not configured"
+
+
+def test_status_contains_update_check_line(tmp_path):
+    config, ctrl, _, _ = make_controller(tmp_path)
+    assert "Update check: enabled (every 24h)" in ctrl.handle_status()

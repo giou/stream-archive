@@ -126,6 +126,7 @@ def _validate(config):
     _validate_output_mode(config)
     _validate_channel_output_modes(config)
     _validate_youtube(config)
+    _validate_update_check(config)
 
 
 def _validate_output_mode(config):
@@ -161,3 +162,22 @@ def _validate_youtube(config):
     yt.setdefault("client_secrets_file", "client_secret.json")
     if not isinstance(yt["client_secrets_file"], str) or not yt["client_secrets_file"]:
         raise ValueError("youtube.client_secrets_file must be a non-empty string")
+
+
+def _validate_update_check(config):
+    config.setdefault("update_check", {})
+    uc = config["update_check"]
+    if not isinstance(uc, dict):
+        raise ValueError("update_check must be an object")
+    uc.setdefault("enabled", True)
+    uc.setdefault("interval_hours", 24)
+    uc.setdefault("check_app", True)
+    uc.setdefault("check_streamlink", True)
+    uc.setdefault("check_plugin", True)
+    if not isinstance(uc["enabled"], bool):
+        raise ValueError("update_check.enabled must be a boolean")
+    if not isinstance(uc["interval_hours"], (int, float)) or uc["interval_hours"] <= 0:
+        raise ValueError("update_check.interval_hours must be a number greater than 0")
+    for key in ("check_app", "check_streamlink", "check_plugin"):
+        if not isinstance(uc[key], bool):
+            raise ValueError(f"update_check.{key} must be a boolean")

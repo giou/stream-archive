@@ -25,8 +25,9 @@ recording processes that die mid-stream.
   - `youtube` — pipe the stream through `ffmpeg` to a YouTube Live broadcast
   - `both` — disk recording and YouTube re-stream simultaneously
 - **Telegram alerts** — live (with title/game/URL), offline (with file size and
-  YouTube link), and start-failure (rate-limited to once per 30 minutes per
-  channel).
+  YouTube link), start-failure (rate-limited to once per 30 minutes per
+  channel), and service lifecycle messages (startup with the monitored
+  channels and app version, and shutdown/restart).
 - **Telegram control** — the admin (`telegram_user_id`) can manage the recorder
   over the bot: add/remove monitored channels, set retention and output mode,
   view status, reload `config.json`, or restart the service. Every change is
@@ -141,6 +142,11 @@ All keys from `config.json.example`:
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
 | `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
 | `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
+| `update_check.enabled` | no | `true` | Periodically check the app, streamlink, and the vendored plugin for updates and send a Telegram notification when one is available |
+| `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
+| `update_check.check_app` | no | `true` | Check the app repo (`git fetch origin`) for new commits |
+| `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
+| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `plugins/twitch.py` |
 | `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
 | `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
 
@@ -165,6 +171,7 @@ a failed command leaves both memory and disk untouched.
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode` (no channel) or a per-channel override; `default` clears the override; applies to new recordings |
 | `/reload` | Re-read `config.json` from disk |
 | `/restart` | Gracefully restart the service |
+| `/update` | Check for updates now and apply any available; restarts the service |
 
 Notes:
 
@@ -250,8 +257,10 @@ tests/                   # pytest suite (recorder, monitor, notifier, config, te
 `plugins/twitch.py` is vendored from
 [streamlink-ttvlol](https://github.com/2bc4/streamlink-ttvlol)
 (currently version `8.3.0-20260701`, constant `STREAMLINK_TTVLOL_VERSION`).
-To refresh, replace the file from upstream and bump the constant; the plugin
-logs its version at load. Upstream bugs go to
+The plugin version is auto-checked against the upstream GitHub releases on
+the `update_check` interval and refreshed via `/update` (sha256-verified
+download); it can also be replaced manually, bumping the constant — the
+plugin logs its version at load. Upstream bugs go to
 <https://github.com/2bc4/streamlink-ttvlol/issues>.
 
 ## Development

@@ -15,6 +15,13 @@
     "output_mode": "disk",
     "channel_output_modes": {},
     "retention_days": 0,
+    "update_check": {
+        "enabled": true,
+        "interval_hours": 24,
+        "check_app": true,
+        "check_streamlink": true,
+        "check_plugin": true
+    },
     "youtube": {
         "privacy_status": "unlisted",
         "client_secrets_file": "client_secret.json"

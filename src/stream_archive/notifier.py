@@ -43,5 +43,16 @@ class Notifier:
             parts.append(f"Date: {file_info['date']}")
         await self.notify("\n".join(parts))
 
+    async def notify_startup(self, channels, version):
+        text = (
+            "▶️ StreamArchive started\n"
+            f"Monitoring: {', '.join(channels)}\n"
+            f"Version: {version}"
+        )
+        await self.notify(text)
+
+    async def notify_shutdown(self):
+        await self.notify("⏹ StreamArchive stopping")
+
     async def close(self):
         await self.bot.shutdown()

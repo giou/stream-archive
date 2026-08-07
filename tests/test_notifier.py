@@ -81,3 +81,20 @@ def test_notify_offline_without_file_info(monkeypatch):
     asyncio.run(n.notify_offline("ch"))
     text = n.bot.calls[0][1]
     assert text == "⚫ Offline: ch"
+
+
+def test_notify_startup_contains_channels_and_version(monkeypatch):
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier()
+    asyncio.run(n.notify_startup(["ch1", "ch2"], "v1.0.0 (abc1234)"))
+    text = n.bot.calls[0][1]
+    assert "▶️ StreamArchive started" in text
+    assert "Monitoring: ch1, ch2" in text
+    assert "Version: v1.0.0 (abc1234)" in text
+
+
+def test_notify_shutdown_sends_message(monkeypatch):
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier()
+    asyncio.run(n.notify_shutdown())
+    assert n.bot.calls == [(123, "⏹ StreamArchive stopping")]
