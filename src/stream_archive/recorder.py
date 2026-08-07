@@ -11,6 +11,7 @@ import streamlink
 from streamlink.exceptions import NoPluginError, NoStreamsError, PluginError
 
 from src.stream_archive import disk
+from src.stream_archive.chat_recorder import ChatRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class Recorder:
             game = getattr(plugin, "category", None) or "Unknown"
         return best, author, title, game
 
-    async def start(self, channel, title=None, game=None):
+    async def start(self, channel, title=None, game=None, user_id=None):
         if channel in self._recordings:
             return True
 
@@ -111,11 +112,12 @@ class Recorder:
         tasks = []
         twitch_url = f"https://twitch.tv/{channel}"
 
+        now = datetime.now(ZoneInfo(self._config["timezone"])).strftime("%d_%m_%Y-%H%M%S")
+        safe_title = _sanitize_filename(stream_title)
+
         if mode in ("disk", "both"):
             recording_dir = f"{self._config['recording_dir']}/{channel}"
             os.makedirs(recording_dir, exist_ok=True)
-            now = datetime.now(ZoneInfo(self._config["timezone"])).strftime("%d_%m_%Y-%H%M%S")
-            safe_title = _sanitize_filename(stream_title)
             filename = f"{safe_title}-{now}.ts"
             filepath = os.path.join(recording_dir, filename)
             entry["filepath"] = filepath
@@ -144,10 +146,19 @@ class Recorder:
             del self._recordings[channel]
             return False
 
+        if self._config.get("record_chat", True):
+            chat_dir = disk.chat_dir_path(self._config)
+            chat_path = os.path.join(chat_dir, channel, f"{safe_title}-{now}.chat.json")
+            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+            chat_recorder = ChatRecorder(channel, chat_path, stream_title, stream_game,
+                                         author=author, user_id=user_id)
+            entry["chat_recorder"] = chat_recorder
+            entry["chat_task"] = chat_recorder.start()
+
         entry["tasks"] = tasks
 
-        disk = self._config.get("disk", {})
-        if disk.get("min_free_gb", 0) > 0 or disk.get("max_total_gb", 0) > 0 or disk.get("min_time_to_full_min", 0) > 0:
+        disk_cfg = self._config.get("disk", {})
+        if disk_cfg.get("min_free_gb", 0) > 0 or disk_cfg.get("max_total_gb", 0) > 0 or disk_cfg.get("min_time_to_full_min", 0) > 0:
             entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
@@ -167,7 +178,17 @@ class Recorder:
         logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
         entry = self._recordings.get(channel)
         if entry is not None and task in entry.get("tasks", []):
+            chat_recorder = entry.pop("chat_recorder", None)
+            if chat_recorder:
+                asyncio.create_task(self._finalize_chat(channel, chat_recorder))
             del self._recordings[channel]
+
+    async def _finalize_chat(self, channel, chat_recorder):
+        """Fire-and-forget chat finalize for the failure path; never raises."""
+        try:
+            await chat_recorder.stop()
+        except Exception as e:
+            logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
 
     async def _watch_growth(self, channel):
         try:
@@ -222,6 +243,14 @@ class Recorder:
         for task in entry.get("tasks", []):
             task.cancel()
         await asyncio.gather(*entry.get("tasks", []), return_exceptions=True)
+
+        chat_recorder = entry.pop("chat_recorder", None)
+        if chat_recorder:
+            try:
+                await chat_recorder.stop()
+            except Exception as e:
+                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+
         if entry.get("youtube_info"):
             try:
                 await self._youtube.end_stream(entry["youtube_info"]["broadcast_id"])
@@ -467,6 +496,13 @@ class Recorder:
         if entry.get("tasks") or wd:
             await asyncio.gather(*(entry.get("tasks", []) + ([wd] if wd else [])), return_exceptions=True)
 
+        chat_recorder = entry.pop("chat_recorder", None)
+        if chat_recorder:
+            try:
+                await chat_recorder.stop()
+            except Exception as e:
+                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+
         youtube_info = entry.get("youtube_info")
 
         if youtube_info:
@@ -518,23 +554,32 @@ class Recorder:
         return await loop.run_in_executor(None, _evict)
 
     async def cleanup_old_recordings(self, retention_days):
-        """Delete .ts files under recording_dir older than retention_days days; returns count removed."""
+        """Delete .ts and .chat.json files older than retention_days days; returns count removed."""
         if retention_days <= 0:
             return 0
         base = disk.recording_dir_path(self._config)
-        if not base.exists():
+        chat_base = disk.chat_dir_path(self._config)
+        if not base.exists() and not chat_base.exists():
             return 0
         cutoff = time.time() - retention_days * 86400
         loop = asyncio.get_running_loop()
 
         def _scan():
             found = []
-            for path in base.rglob("*.ts"):
-                try:
-                    if path.stat().st_mtime < cutoff:
-                        found.append(path)
-                except OSError:
-                    continue
+            if base.exists():
+                for path in base.rglob("*.ts"):
+                    try:
+                        if path.stat().st_mtime < cutoff:
+                            found.append(path)
+                    except OSError:
+                        continue
+            if chat_base.exists():
+                for path in chat_base.rglob("*.chat.json"):
+                    try:
+                        if path.stat().st_mtime < cutoff:
+                            found.append(path)
+                    except OSError:
+                        continue
             return found
 
         removed = 0

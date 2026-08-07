@@ -15,6 +15,8 @@
     "timezone": "Europe/Madrid",
     "plugin_dir": "plugins",
     "recording_dir": "recordings",
+    "record_chat": true,
+    "chat_dir": "chat",
     "output_mode": "disk",
     "channel_output_modes": {},
     "retention_days": 0,

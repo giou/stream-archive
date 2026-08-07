@@ -14,6 +14,14 @@ def recording_dir_path(config) -> Path:
     return d
 
 
+def chat_dir_path(config) -> Path:
+    """Resolve chat_dir against _workdir when relative (same rule as recording_dir_path)."""
+    d = Path(config.get("chat_dir", "chat"))
+    if not d.is_absolute():
+        d = config["_workdir"] / d
+    return d
+
+
 async def disk_snapshot(config) -> dict:
     """Fresh fs + recordings-dir usage. Slow .ts scan runs in the default executor."""
     loop = asyncio.get_running_loop()

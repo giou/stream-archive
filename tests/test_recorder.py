@@ -15,12 +15,36 @@ def make_config(tmp_path):
     return {
         "output_mode": "disk",
         "recording_dir": str(tmp_path / "recordings"),
+        "record_chat": False,
         "timezone": "UTC",
         "plugin_dir": "plugins",
         "proxy_list": ["httpproxy://u:p@h:1"],
         "_workdir": tmp_path,
         "channels": ["ch"],
     }
+
+
+class FakeChatRecorder:
+    instances = []
+
+    def __init__(self, channel, chat_path, title, game, author=None, user_id=None):
+        self.channel = channel
+        self.chat_path = chat_path
+        self.title = title
+        self.game = game
+        self.author = author
+        self.user_id = user_id
+        self.started = False
+        self.stopped = False
+        FakeChatRecorder.instances.append(self)
+
+    def start(self):
+        self.started = True
+        return object()  # task-like sentinel
+
+    async def stop(self):
+        self.stopped = True
+        return 0
 
 
 class FakeStream:
@@ -305,6 +329,90 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
         await asyncio.sleep(0.05)
         assert rec.is_recording("ch")
         assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
+
+    asyncio.run(scenario())
+
+
+def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        entry = rec._recordings["ch"]
+        assert entry["chat_task"] is not None
+        assert len(FakeChatRecorder.instances) == 1
+        cr = FakeChatRecorder.instances[0]
+        assert cr.channel == "ch"
+        assert cr.started
+        assert cr.title == "Title"
+        assert cr.game == "Game"
+        assert cr.author == "author"
+        assert cr.user_id is None
+        assert cr.chat_path.startswith(str(tmp_path / "chat" / "ch"))
+        assert "Title-" in cr.chat_path
+        assert cr.chat_path.endswith(".chat.json")
+        await rec.stop("ch")
+        assert cr.stopped
+
+    asyncio.run(scenario())
+
+
+def test_start_chat_disabled(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))  # record_chat defaults to False in make_config
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert "chat_task" not in rec._recordings["ch"]
+        assert FakeChatRecorder.instances == []
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_recording_failure_stops_chat(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.1)
+        assert not rec.is_recording("ch")
+        assert len(FakeChatRecorder.instances) == 1
+        assert FakeChatRecorder.instances[0].stopped
+
+    asyncio.run(scenario())
+
+
+def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch1") is True
+        assert await rec.start("ch2") is True
+        assert len(FakeChatRecorder.instances) == 2
+        await rec.stop_all()
+        assert all(cr.stopped for cr in FakeChatRecorder.instances)
 
     asyncio.run(scenario())
 

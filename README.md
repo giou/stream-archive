@@ -39,6 +39,10 @@ recording processes that die mid-stream.
   - YouTube rate-limit / `403` / quota errors fall back to disk recording.
   - Transient Twitch API errors are logged and retried next cycle; unknown user
     ids in a stream response are skipped instead of crashing the poll.
+- **Live chat recording** — captures the channel's Twitch IRC chat while a
+  stream is being recorded and writes a TwitchDownloader-compatible chat JSON
+  into `chat_dir/<channel>/` (usable directly with `TwitchDownloaderCLI
+  chatupdate` / `chatrender`).
 - **Retention cleanup** — optional automatic deletion of recordings older than
   `retention_days`, run at startup and then daily.
 - **YouTube Live integration** — private/unlisted/public broadcasts, DVR
@@ -137,6 +141,8 @@ All keys from `config.json.example`:
 | `timezone` | yes | — | IANA timezone (e.g. `Europe/Madrid`) used for filenames and timestamps |
 | `plugin_dir` | yes | — | Directory containing the vendored streamlink plugin (`plugins`) |
 | `recording_dir` | yes | — | Directory where `.ts` recordings are stored |
+| `record_chat` | no | `true` | Record live chat alongside the video; `false` disables chat capture entirely |
+| `chat_dir` | no | `chat` | Directory where chat JSON files are stored (`chat_dir/<channel>/<title>-<ts>.chat.json`) |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
 | `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
 | `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
@@ -150,6 +156,30 @@ All keys from `config.json.example`:
 
 `output_mode: youtube` additionally requires `youtube_token.json` (see
 [YouTube setup](#youtube-setup)).
+
+### Live chat recording
+
+When `record_chat` is enabled (the default), every recording — in any output
+mode (`disk`, `youtube`, or `both`) — also connects to the channel's Twitch
+IRC chat and writes a chat JSON in the `TwitchDownloader` `ChatRoot` format to
+`chat_dir/<channel>/<title>-<ts>.chat.json`. It is the format
+`TwitchDownloaderCLI` consumes directly:
+
+```sh
+# enrich the file (embed emotes/badges/avatars) and/or render it:
+TwitchDownloaderCLI chatupdate -i chat/<channel>/<title>-<ts>.chat.json -o out.chat.json -E
+TwitchDownloaderCLI chatrender -i out.chat.json -o chat.mp4
+```
+
+StreamArchive only **saves the JSON** — it performs no rendering (no ffmpeg,
+no HTML/MP4 generation). Emotes and badges are parsed into the file's
+`fragments`/`emoticons`/`user_badges` fields; use `chatupdate -E` to embed the
+artwork into a copy if you want a fully self-contained file. Chat is held in
+memory for the stream and written atomically on stop (every termination path
+— stream going offline, disk watchdog abort, recording-task failure, restart,
+`SIGTERM`/`SIGINT` — finalizes the file), so a crash can never corrupt an
+existing `.chat.json`. `retention_days` cleanup also removes old
+`*.chat.json` files alongside the `.ts` recordings.
 
 ## Telegram control
 

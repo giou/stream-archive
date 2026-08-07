@@ -36,7 +36,7 @@ class FakeRecorder:
         self.evict_calls = []
         self.mode = "disk"
 
-    async def start(self, channel, title=None, game=None):
+    async def start(self, channel, title=None, game=None, user_id=None):
         self.started.append(channel)
         return self.ok
 

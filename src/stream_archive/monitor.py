@@ -49,6 +49,7 @@ class Monitor:
                     stream.get("game_name"),
                     config,
                     snapshot,
+                    user_id=user_id,
                 )
                 if ok:
                     self._live_channels.add(channel)
@@ -64,6 +65,7 @@ class Monitor:
                     stream.get("game_name"),
                     config,
                     snapshot,
+                    user_id=user_id,
                 )
                 if ok:
                     self._last_failure_notify.pop(channel, None)
@@ -85,13 +87,13 @@ class Monitor:
     def remove_channel(self, channel):
         self._live_channels.discard(channel)
 
-    async def _start_or_block(self, channel, title, game, config, snapshot):
+    async def _start_or_block(self, channel, title, game, config, snapshot, user_id=None):
         reason, snapshot = await self._start_blocked_reason(channel, config, snapshot)
         if reason:
             logger.warning("[monitor] %s not started: %s", channel, reason)
             await self._notify_blocked(channel, reason)
             return False, snapshot
-        ok = await self.recorder.start(channel, title=title, game=game)
+        ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
         return ok, snapshot
 
     async def _start_blocked_reason(self, channel, config, snapshot):

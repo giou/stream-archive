@@ -37,6 +37,8 @@ def test_valid_config_passes_and_sets_defaults():
     assert config["preferred_quality"] == "best"
     assert config["max_concurrent_recordings"] == 0
     assert config["max_concurrent_youtube_streams"] == 0
+    assert config["record_chat"] is True
+    assert config["chat_dir"] == "chat"
     assert config["disk"] == {
         "min_free_gb": 0,
         "max_total_gb": 0,
@@ -71,6 +73,8 @@ def test_valid_disk_values_pass():
     lambda c: c.__setitem__("disk", {"check_interval_s": -5}),
     lambda c: c.__setitem__("disk", {"min_time_to_full_min": -1}),
     lambda c: c.__setitem__("disk", {"evict_when_over": "yes"}),
+    lambda c: c.__setitem__("record_chat", "yes"),
+    lambda c: c.__setitem__("chat_dir", ""),
 ])
 def test_invalid_new_settings_raise(mutate):
     config = valid_config()

@@ -130,6 +130,7 @@ def _validate(config):
     _validate_quality(config)
     _validate_concurrency(config)
     _validate_disk(config)
+    _validate_chat(config)
 
 
 def _validate_output_mode(config):
@@ -220,3 +221,12 @@ def _validate_disk(config):
         raise ValueError("disk.min_time_to_full_min must be a number >= 0 (0 = disabled)")
     if not isinstance(d["evict_when_over"], bool):
         raise ValueError("disk.evict_when_over must be a boolean")
+
+
+def _validate_chat(config):
+    config.setdefault("record_chat", True)
+    if not isinstance(config["record_chat"], bool):
+        raise ValueError("record_chat must be a boolean")
+    config.setdefault("chat_dir", "chat")
+    if not isinstance(config["chat_dir"], str) or not config["chat_dir"]:
+        raise ValueError("chat_dir must be a non-empty string")
