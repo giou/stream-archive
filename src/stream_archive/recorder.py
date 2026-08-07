@@ -39,15 +39,31 @@ class Recorder:
     def _resolve_stream(self, channel, title, game):
         url = f"https://twitch.tv/{channel}"
         plugin_name, plugin_class, resolved_url = self._session.resolve_url(url)
-        plugin = plugin_class(
-            self._session,
-            resolved_url,
-            options={
-                "proxy-playlist": self._config["proxy_list"],
-                "supported-codecs": ["h264"],
-            },
-        )
-        streams = plugin.streams()
+        proxies = list(self._config["proxy_list"])
+        while True:
+            plugin = plugin_class(
+                self._session,
+                resolved_url,
+                options={
+                    "proxy-playlist": proxies,
+                    "supported-codecs": ["h264"],
+                },
+            )
+            try:
+                streams = plugin.streams()
+                break
+            except NoStreamsError:
+                raise  # channel offline, or all proxies exhausted — never retried
+            except (PluginError, OSError) as err:
+                # Mirrors the plugin's proxy loop: skip the failing proxy and try
+                # the next; after the last proxy, match the plugin's NoStreamsError.
+                if len(proxies) <= 1:
+                    raise NoStreamsError
+                logger.warning(
+                    "[recorder] [%s] proxy '%s' failed (%s); trying next proxy",
+                    channel, proxies[0], err,
+                )
+                proxies = proxies[1:]
         if not streams or "best" not in streams:
             raise PluginError("No best stream available")
         best = streams["best"]

@@ -5,7 +5,8 @@ import time
 import types
 from datetime import datetime, timezone
 
-from streamlink.exceptions import NoStreamsError
+import pytest
+from streamlink.exceptions import NoStreamsError, PluginError
 
 from src.stream_archive.recorder import Recorder, _sanitize_filename
 
@@ -83,6 +84,98 @@ def test_start_nostreams_returns_false(tmp_path, monkeypatch):
 
     assert asyncio.run(rec.start("ch")) is False
     assert "ch" not in rec._recordings
+
+
+class FakePlugin:
+    author = "author"
+    title = "Title"
+    category = "Game"
+
+    def __init__(self, session, url, options):
+        self.session = session
+        self.url = url
+        self.options = options
+
+    def streams(self):
+        raise AssertionError("streams() not scripted")
+
+
+def _make_proxy_config(tmp_path, proxies):
+    config = make_config(tmp_path)
+    config["proxy_list"] = proxies
+    return config
+
+
+def test_resolve_stream_tries_next_proxy_on_plugin_error(tmp_path, monkeypatch):
+    rec = Recorder(_make_proxy_config(
+        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    calls = []
+    stream = FakeStream()
+
+    monkeypatch.setattr(
+        rec._session, "resolve_url",
+        lambda url: ("twitch", FakePlugin, url))
+
+    def scripted_streams(self):
+        calls.append(self.options["proxy-playlist"])
+        if len(calls) == 1:
+            raise PluginError("proxy boom")
+        return {"best": stream}
+
+    monkeypatch.setattr(FakePlugin, "streams", scripted_streams)
+
+    best, author, title, game = rec._resolve_stream("ch", None, None)
+
+    assert best is stream
+    assert calls == [
+        ["httpproxy://u:p@h:1", "https://proxy2.example.com"],
+        ["https://proxy2.example.com"],
+    ]
+
+
+def test_resolve_stream_all_proxies_fail_raises_nostreams(tmp_path, monkeypatch):
+    rec = Recorder(_make_proxy_config(
+        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    calls = []
+
+    monkeypatch.setattr(
+        rec._session, "resolve_url",
+        lambda url: ("twitch", FakePlugin, url))
+
+    def scripted_streams(self):
+        calls.append(self.options["proxy-playlist"])
+        raise PluginError("proxy boom")
+
+    monkeypatch.setattr(FakePlugin, "streams", scripted_streams)
+
+    with pytest.raises(NoStreamsError):
+        rec._resolve_stream("ch", None, None)
+
+    assert calls == [
+        ["httpproxy://u:p@h:1", "https://proxy2.example.com"],
+        ["https://proxy2.example.com"],
+    ]
+
+
+def test_resolve_stream_nostreams_not_retried(tmp_path, monkeypatch):
+    rec = Recorder(_make_proxy_config(
+        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    calls = []
+
+    monkeypatch.setattr(
+        rec._session, "resolve_url",
+        lambda url: ("twitch", FakePlugin, url))
+
+    def scripted_streams(self):
+        calls.append(self.options["proxy-playlist"])
+        raise NoStreamsError()
+
+    monkeypatch.setattr(FakePlugin, "streams", scripted_streams)
+
+    with pytest.raises(NoStreamsError):
+        rec._resolve_stream("ch", None, None)
+
+    assert len(calls) == 1
 
 
 def test_start_duplicate_resolves_once(tmp_path, monkeypatch):

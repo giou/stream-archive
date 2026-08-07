@@ -380,8 +380,6 @@ class PlaylistProxyService:
                     return self.plugin._get_hls_streams_live(channel)
                 except OSError as err:
                     log.error(err)
-                except PluginError as err:
-                    log.error(err)
                 finally:
                     self.plugin.session.http.proxies = {}
             else:
@@ -397,8 +395,6 @@ class PlaylistProxyService:
                 try:
                     return TwitchHLSStream.parse_variant_playlist(self.plugin.session, url, **kwargs)
                 except OSError as err:
-                    log.error(err)
-                except PluginError as err:
                     log.error(err)
 
         if self.plugin.get_option("proxy-playlist-fallback"):
