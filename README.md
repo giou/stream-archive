@@ -139,6 +139,7 @@ All keys from `config.json.example`:
 | `plugin_dir` | yes | — | Directory containing the vendored streamlink plugin (`plugins`) |
 | `recording_dir` | yes | — | Directory where `.ts` recordings are stored |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
+| `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
 | `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
 | `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
 | `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
@@ -161,14 +162,16 @@ a failed command leaves both memory and disk untouched.
 | `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |
 | `/remove <channel>` | Stop monitoring a channel; if it is live, stops the recording (sending the offline notification) |
 | `/retention <days>` | Set `retention_days`; `0` disables cleanup |
-| `/mode <disk\|youtube\|both>` | Set `output_mode`; applies to new recordings |
+| `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode` (no channel) or a per-channel override; `default` clears the override; applies to new recordings |
 | `/reload` | Re-read `config.json` from disk |
 | `/restart` | Gracefully restart the service |
 
 Notes:
 
 - `/mode` applies to new recordings; an in-flight recording finishes in the
-  mode it started with.
+  mode it started with. A per-channel override (`/mode <channel> <mode>`) wins
+  over the global `output_mode`; `/status` lists active overrides, and
+  `/remove <channel>` clears the channel's override.
 - `/retention` and `/reload` apply immediately — the cleanup loop and the
   monitor read the live config every cycle.
 - `/restart` replies first, then triggers the scheduler shutdown; the systemd
