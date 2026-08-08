@@ -27,10 +27,8 @@
     "max_concurrent_recordings": 0,
     "max_concurrent_youtube_streams": 0,
     "disk": {
-        "min_free_gb": 0,
         "max_total_gb": 0,
         "check_interval_s": 60,
-        "min_time_to_full_min": 0,
         "delete_oldest": true
     },
     "update_check": {

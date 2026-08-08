@@ -7,9 +7,16 @@ from telegram import (
     BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
 from telegram.error import BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from src.stream_archive import disk
 from src.stream_archive.config import _CHANNEL_RE, reload_config, save_config
@@ -17,11 +24,6 @@ from src.stream_archive.config import _CHANNEL_RE, reload_config, save_config
 logger = logging.getLogger(__name__)
 
 _QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p")
-
-
-def _keyboards_equal(a, b):
-    """True when both inline keyboards render identically (None == no keyboard)."""
-    return (a.to_dict() if a is not None else {}) == (b.to_dict() if b is not None else {})
 
 
 class TelegramController:
@@ -41,9 +43,10 @@ class TelegramController:
         self._updater = updater
         self._admin_id = config["telegram_user_id"]
         self._app = Application.builder().token(config["bot_telegram_api"]).build()
-        self._panel_message = None  # latest settings-panel message (auto-refresh target)
-        self._panel_menu = "root"   # which submenu the panel currently shows
-        self._refresh_task = None   # asyncio task keeping the panel current
+        self._menu = "root"        # current reply-keyboard menu
+        self._menu_channel = None  # channel name when _menu == "channel"
+        self._custom_setting = None  # parent setting when _menu == "custom"
+        self._confirm_done = set()   # callback_data already confirmed (double-tap guard)
 
     def command_list(self):
         """BotCommand entries for the Telegram /-menu, shown only to the admin."""
@@ -64,7 +67,7 @@ class TelegramController:
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
             BotCommand("chat", "Toggle live chat recording"),
-            BotCommand("settings", "Open the settings panel with buttons"),
+            BotCommand("settings", "Open the settings menu (reply keyboard buttons)"),
         ]
 
     async def start(self):
@@ -87,6 +90,7 @@ class TelegramController:
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
             CommandHandler("start", self._cmd_start, filters=admin),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=self._admin_id), self._on_text),
             CallbackQueryHandler(self._on_callback),
         ])
         await self._app.initialize()
@@ -97,13 +101,10 @@ class TelegramController:
             )
         except Exception:
             logger.warning("[telegram] Failed to register command menu", exc_info=True)
-        self._refresh_task = asyncio.create_task(self._panel_refresh_loop())
         await self._app.updater.start_polling(allowed_updates=["message", "callback_query"])
         logger.info("[telegram] Bot polling started (admin id=%s)", self._admin_id)
 
     async def stop(self):
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
         await self._app.updater.stop()
         await self._app.stop()
         await self._app.shutdown()
@@ -119,63 +120,245 @@ class TelegramController:
         self._config.update(candidate)
         return ok_text(candidate)
 
-    @staticmethod
-    def _back_row():
-        return [InlineKeyboardButton("\u2190 Back", callback_data="back")]
+    def reply_keyboard(self, menu="root", channel=None):
+        """Reply-keyboard rows for ``menu``; button labels are the routing literals."""
+        if menu == "root":
+            rows = [["Channels", "Status"], ["Chat recording", "Output mode"],
+                    ["Quality", "Retention"], ["Max recordings", "Max YouTube"],
+                    ["Disk"]]
+        elif menu == "channels":
+            rows = [["Add channel"],
+                    *([f"\u2022 {ch}"] for ch in self._config["channels"]),
+                    ["Back"]]
+        elif menu == "channel":
+            rows = [["Delete channel"], ["Mode: disk", "Mode: youtube"],
+                    ["Mode: both", "Mode: default"], ["Back"]]
+        elif menu == "chat":
+            rows = [["On", "Off"], ["Back"]]
+        elif menu == "mode":
+            rows = [["disk", "youtube", "both"], ["Back"]]
+        elif menu == "quality":
+            rows = [["best", "1080p", "720p"], ["480p", "360p"], ["Back"]]
+        elif menu == "retention":
+            rows = [["1 day", "3 days", "7 days"], ["14 days", "30 days", "Off"],
+                    ["Custom", "Back"]]
+        elif menu in ("maxrec", "maxyt"):
+            rows = [["0 (unlimited)", "1", "2"], ["3", "5"], ["Custom", "Back"]]
+        elif menu == "disk":
+            rows = [["Max total", "Check interval"], ["Delete oldest"], ["Back"]]
+        elif menu == "disk_maxsize":
+            rows = [["0", "25", "50"], ["100", "200"], ["Custom", "Back"]]
+        elif menu == "disk_interval":
+            rows = [["30", "60", "120"], ["300"], ["Custom", "Back"]]
+        else:  # add_channel, custom
+            rows = [["Back"]]
+        return ReplyKeyboardMarkup(
+            rows, resize_keyboard=True,
+            input_field_placeholder="Tap a button or type a command",
+        )
 
-    def settings_keyboard(self, menu="root"):
-        """Inline buttons for the settings panel; ``menu`` selects the submenu.
-
-        Root shows one row per setting (current value in the label); each row
-        opens a submenu with that setting's choices. callback_data literals
-        are the wire format.
-        """
-        if menu == "chat":
-            return InlineKeyboardMarkup([
-                [InlineKeyboardButton("Chat: on", callback_data="chat:on"),
-                 InlineKeyboardButton("Chat: off", callback_data="chat:off")],
-                self._back_row(),
-            ])
-        if menu == "mode":
-            return InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"Mode: {m}", callback_data=f"mode:{m}")
-                 for m in ("disk", "youtube", "both")],
-                self._back_row(),
-            ])
-        if menu == "quality":
-            return InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
-                 for q in _QUALITY_PRESETS[:3]],
-                [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
-                 for q in _QUALITY_PRESETS[3:]],
-                self._back_row(),
-            ])
-        if menu == "delete_oldest":
-            return InlineKeyboardMarkup([
-                [InlineKeyboardButton("Delete oldest: on", callback_data="delete_oldest:on"),
-                 InlineKeyboardButton("Delete oldest: off", callback_data="delete_oldest:off")],
-                self._back_row(),
-            ])
+    async def menu_text(self, menu="root", channel=None):
+        """Status/instruction body shown above the reply keyboard for ``menu``."""
         c = self._config
-        chat = "on" if c.get("record_chat", True) else "off"
-        mode = c.get("output_mode", "disk")
-        quality = c.get("preferred_quality", "best")
-        oldest = "on" if c.get("disk", {}).get("delete_oldest", True) else "off"
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Chat: {chat} \u203a", callback_data="menu:chat")],
-            [InlineKeyboardButton(f"Mode: {mode} \u203a", callback_data="menu:mode")],
-            [InlineKeyboardButton(f"Quality: {quality} \u203a", callback_data="menu:quality")],
-            [InlineKeyboardButton(f"Delete oldest: {oldest} \u203a", callback_data="menu:delete_oldest")],
-        ])
+        if menu == "root":
+            return await self.handle_status()
+        if menu == "channels":
+            return (f"Channels ({len(c['channels'])}): {', '.join(c['channels'])}\n\n"
+                    "Tap a channel to manage it, or add a new one.")
+        if menu == "add_channel":
+            return "Send the channel name to monitor (letters, numbers, underscores):"
+        if menu == "channel":
+            ch = channel
+            override = (c.get("channel_output_modes") or {}).get(ch)
+            mode = override or f"default (global: {c['output_mode']})"
+            return (f"Channel: {ch}\nOutput mode: {mode}\n\n"
+                    "Tap Delete to remove it, or set its output mode.")
+        if menu == "chat":
+            return f"Chat recording: {'on' if c.get('record_chat', True) else 'off'}. Choose:"
+        if menu == "mode":
+            return f"Output mode: {c['output_mode']}. Choose:"
+        if menu == "quality":
+            return f"Quality: {c.get('preferred_quality', 'best')}. Choose:"
+        if menu == "retention":
+            return f"Retention: {c['retention_days']} day(s) (0 = disabled). Choose:"
+        if menu == "maxrec":
+            return f"Max recordings: {c.get('max_concurrent_recordings', 0)} (0 = unlimited). Choose:"
+        if menu == "maxyt":
+            return f"Max YouTube re-streams: {c.get('max_concurrent_youtube_streams', 0)} (0 = unlimited). Choose:"
+        if menu == "disk":
+            return self.handle_disk([]) + "\n\nChoose a limit:"
+        d = c.get("disk") or {}
+        if menu == "disk_maxsize":
+            return (f"Max total: {d.get('max_total_gb', 0):g} GB (0 = disabled)\n"
+                    "Limits total recording size; when exceeded, the oldest recordings are deleted "
+                    "(or recording stops). Choose:")
+        if menu == "disk_interval":
+            return (f"Check interval: {d.get('check_interval_s', 60):g} s\n"
+                    "How often the disk limits are checked. Choose:")
+        if menu == "custom":
+            labels = {
+                "retention": (f"Retention: {c['retention_days']} day(s) (0 = disabled)", " in days"),
+                "maxrec": (f"Max recordings: {c.get('max_concurrent_recordings', 0)} (0 = unlimited)", ""),
+                "maxyt": (f"Max YouTube re-streams: {c.get('max_concurrent_youtube_streams', 0)} (0 = unlimited)", ""),
+                "disk_maxsize": (f"Max total: {d.get('max_total_gb', 0):g} GB (0 = disabled)", " in GB"),
+                "disk_interval": (f"Check interval: {d.get('check_interval_s', 60):g} s", " in seconds"),
+            }
+            label, units = labels[self._custom_setting]
+            return f"{label}. Send the new value{units}:"
+        return await self.handle_status()
 
-    def help_keyboard(self):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="panel")],
-        ])
+    async def handle_reply_text(self, text):
+        """Route one reply-keyboard press or typed value.
 
-    async def settings_panel(self, menu="root"):
-        """Current status text + the settings keyboard — the /settings message body."""
-        return await self.handle_status(), self.settings_keyboard(menu)
+        Returns ``(reply_text, reply_markup)`` for ``reply_text(..., reply_markup=)``
+        (both markup kinds are valid there), or ``None`` to ignore the message.
+        """
+        if text == "Back":
+            if self._menu == "custom":
+                parent = "root" if self._custom_setting in ("retention", "maxrec", "maxyt") else "disk"
+            else:
+                parent = {
+                    "channels": "root", "add_channel": "channels", "channel": "channels",
+                    "chat": "root", "mode": "root", "quality": "root",
+                    "retention": "root", "maxrec": "root", "maxyt": "root", "disk": "root",
+                    "disk_maxsize": "disk", "disk_interval": "disk",
+                }.get(self._menu)
+            if parent is None:  # no Back button on root
+                return None
+            self._menu, self._menu_channel = parent, None
+            return await self.menu_text(parent), self.reply_keyboard(parent)
+        if self._menu == "add_channel":  # any text is a candidate channel name
+            result = await self.handle_add([text])
+            if result.startswith("\u274c") or result.startswith("Usage"):
+                return result, self.reply_keyboard("add_channel")
+            self._menu = "channels"
+            return result, self.reply_keyboard("channels")
+        if self._menu == "custom":  # any text is a value for _custom_setting
+            setting = self._custom_setting
+            if setting == "retention":
+                result = self.handle_retention([text])
+            elif setting == "maxrec":
+                result = self.handle_maxrecordings([text])
+            elif setting == "maxyt":
+                result = self.handle_maxyoutube([text])
+            else:
+                cmd = {"disk_maxsize": "maxsize", "disk_interval": "interval"}[setting]
+                result = self.handle_disk([cmd, text])
+            if result.startswith("\u274c") or result.startswith("Usage"):
+                return result, self.reply_keyboard("custom")
+            parent = "root" if setting in ("retention", "maxrec", "maxyt") else "disk"
+            self._menu = parent
+            return result, self.reply_keyboard(parent)
+        menu = self._menu
+        if menu == "root":
+            if text == "Status":
+                return await self.handle_status(), self.reply_keyboard("root")
+            new_menu = {
+                "Channels": "channels", "Chat recording": "chat", "Output mode": "mode",
+                "Quality": "quality", "Retention": "retention", "Max recordings": "maxrec",
+                "Max YouTube": "maxyt", "Disk": "disk",
+            }.get(text)
+            if new_menu is None:
+                return None
+            self._menu = new_menu
+            return await self.menu_text(new_menu), self.reply_keyboard(new_menu)
+        if menu == "channels":
+            if text == "Add channel":
+                self._menu = "add_channel"
+                return await self.menu_text("add_channel"), self.reply_keyboard("add_channel")
+            if text.startswith("\u2022 ") and text[2:] in self._config["channels"]:
+                self._menu, self._menu_channel = "channel", text[2:]
+                return (await self.menu_text("channel", text[2:]),
+                        self.reply_keyboard("channel"))
+            return None
+        if menu == "channel":
+            ch = self._menu_channel
+            if ch is None:
+                return None
+            if text == "Delete channel":
+                return (f"Remove {ch} from monitoring? This stops any active recording "
+                        f"and removes its output-mode override.",
+                        self._confirm_keyboard("confirm_remove", ch))
+            values = {"Mode: disk": "disk", "Mode: youtube": "youtube",
+                      "Mode: both": "both", "Mode: default": "default"}
+            if text in values:
+                result = self.handle_mode([ch, values[text]])
+                return result, self.reply_keyboard("channel")
+            return None
+        if menu == "chat":
+            if text in ("On", "Off"):
+                result = await self.handle_chat([text.lower()])
+                self._menu = "root"
+                return result, self.reply_keyboard("root")
+            return None
+        if menu == "mode":
+            if text in ("disk", "youtube", "both"):
+                result = self.handle_mode([text])
+                self._menu = "root"
+                return result, self.reply_keyboard("root")
+            return None
+        if menu == "quality":
+            if text in _QUALITY_PRESETS:
+                result = self.handle_quality([text])
+                self._menu = "root"
+                return result, self.reply_keyboard("root")
+            return None
+        if menu == "retention":
+            values = {"1 day": "1", "3 days": "3", "7 days": "7",
+                      "14 days": "14", "30 days": "30", "Off": "0"}
+            if text in values:
+                result = self.handle_retention([values[text]])
+                self._menu = "root"
+                return result, self.reply_keyboard("root")
+            if text == "Custom":
+                self._custom_setting, self._menu = "retention", "custom"
+                return await self.menu_text("custom"), self.reply_keyboard("custom")
+            return None
+        if menu in ("maxrec", "maxyt"):
+            values = {"0 (unlimited)": "0", "1": "1", "2": "2", "3": "3", "5": "5"}
+            if text in values:
+                handler = self.handle_maxrecordings if menu == "maxrec" else self.handle_maxyoutube
+                result = handler([values[text]])
+                self._menu = "root"
+                return result, self.reply_keyboard("root")
+            if text == "Custom":
+                self._custom_setting, self._menu = menu, "custom"
+                return await self.menu_text("custom"), self.reply_keyboard("custom")
+            return None
+        if menu == "disk":
+            subs = {"Max total": "disk_maxsize", "Check interval": "disk_interval"}
+            if text in subs:
+                self._menu = subs[text]
+                return await self.menu_text(subs[text]), self.reply_keyboard(subs[text])
+            if text == "Delete oldest":
+                if (self._config.get("disk") or {}).get("delete_oldest", True):
+                    result = self.handle_disk(["delete_oldest", "off"])
+                    return result, self.reply_keyboard("disk")
+                return ("Enable 'delete oldest'? When the disk is over the max total, "
+                        "the oldest recordings will be deleted.",
+                        self._confirm_keyboard("confirm_delete_oldest", "on"))
+            return None
+        if menu in ("disk_maxsize", "disk_interval"):
+            cmds = {"disk_maxsize": "maxsize", "disk_interval": "interval"}
+            values = {
+                "disk_maxsize": {"0": "0", "25": "25", "50": "50", "100": "100", "200": "200"},
+                "disk_interval": {"30": "30", "60": "60", "120": "120", "300": "300"},
+            }[menu]
+            if text in values:
+                result = self.handle_disk([cmds[menu], values[text]])
+                self._menu = "disk"
+                return result, self.reply_keyboard("disk")
+            if text == "Custom":
+                self._custom_setting, self._menu = menu, "custom"
+                return await self.menu_text("custom"), self.reply_keyboard("custom")
+            return None
+        return None
+
+    def _confirm_keyboard(self, action, value):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Confirm", callback_data=f"confirm_{action}:{value}"),
+             InlineKeyboardButton("Cancel", callback_data="cancel")],
+        ])
 
     def handle_help(self):
         return (
@@ -194,9 +377,9 @@ class TelegramController:
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
             "/disk - show disk limits\n"
-            "/disk <minfree|maxsize|fill|interval|delete_oldest> <value> - set disk limit\n"
+            "/disk <maxsize|interval|delete_oldest> <value> - set disk limit\n"
             "/chat [on|off] - enable or disable live chat recording (off stops in-flight capture)\n"
-            "/settings - open the settings panel with buttons\n"
+            "/settings - open the settings menu (reply keyboard buttons)\n"
             "/start - this help"
         )
 
@@ -226,18 +409,12 @@ class TelegramController:
         rec_limit = "unlimited" if not max_rec else f"{max_rec:g}"
         yt_limit = "unlimited" if not max_yt else f"{max_yt:g}"
         disk_limits = []
-        min_free = c_disk.get("min_free_gb", 0)
         cap = c_disk.get("max_total_gb", 0)
-        fill = c_disk.get("min_time_to_full_min", 0)
-        if min_free > 0:
-            disk_limits.append(f"keep {min_free:g} GB free")
         if cap > 0:
             if c_disk.get("delete_oldest", True):
                 disk_limits.append(f"max {cap:g} GB (delete oldest when over)")
             else:
                 disk_limits.append(f"max {cap:g} GB (stop recording when over)")
-        if fill > 0:
-            disk_limits.append(f"stop if disk fills within {fill:g} min")
         disk_limit_line = "Disk limits: " + " \u00b7 ".join(disk_limits) if disk_limits else "Disk limits: disabled"
         return (
             f"Channels ({len(c['channels'])}): {', '.join(c['channels'])}\n"
@@ -439,14 +616,12 @@ class TelegramController:
 
     def handle_disk(self, args):
         c = self._config
-        usage = "Usage: /disk <minfree|maxsize|fill|interval|delete_oldest> <value>"
+        usage = "Usage: /disk <maxsize|interval|delete_oldest> <value>"
         if not args:
             d = c.get("disk", {})
             return (
                 "Disk limits:\n"
-                f"min free: {d.get('min_free_gb', 0):g} GB (0 = disabled)\n"
                 f"max total: {d.get('max_total_gb', 0):g} GB (0 = disabled, delete oldest: {'on' if d.get('delete_oldest', True) else 'off'})\n"
-                f"stop if full in < {d.get('min_time_to_full_min', 0):g} min (0 = disabled)\n"
                 f"check every {d.get('check_interval_s', 60):g}s"
             )
         if len(args) != 2:
@@ -468,20 +643,10 @@ class TelegramController:
             v = float(val)
         except ValueError:
             return f"\u274c {cmd} must be a number"
-        if cmd == "minfree":
-            return self._apply(
-                lambda candidate: candidate.setdefault("disk", {}).__setitem__("min_free_gb", v),
-                lambda candidate: f"Disk min free set to {v:g} GB",
-            )
         if cmd == "maxsize":
             return self._apply(
                 lambda candidate: candidate.setdefault("disk", {}).__setitem__("max_total_gb", v),
                 lambda candidate: f"Disk max total set to {v:g} GB",
-            )
-        if cmd == "fill":
-            return self._apply(
-                lambda candidate: candidate.setdefault("disk", {}).__setitem__("min_time_to_full_min", v),
-                lambda candidate: f"Disk fill guard set to {v:g} min",
             )
         if cmd == "interval":
             return self._apply(
@@ -507,29 +672,24 @@ class TelegramController:
         return "Usage: /chat <on|off>"
 
     async def handle_callback(self, data):
-        """Apply one inline-button press; returns (reply_text, reply_markup).
-
-        ``menu:<name>``/``back`` only navigate. Value presses delegate to the
-        same validated handlers as the text commands and land back on the root
-        menu (so the updated current value is visible). Unknown/stale callback
-        data is a no-op re-render of the root.
-        """
+        """Apply one confirmation-button press; returns (reply_text, markup) or None."""
+        if data in self._confirm_done:  # double-tap guard
+            return None
         action, _, value = data.partition(":")
-        if action == "menu":
-            menu = value if value in ("chat", "mode", "quality", "delete_oldest") else "root"
-            self._panel_menu = menu
-            return await self.settings_panel(menu)
-        if action == "chat" and value in ("on", "off"):
-            await self.handle_chat([value])
-        elif action == "mode" and value in ("disk", "youtube", "both"):
-            self.handle_mode([value])
-        elif action == "quality" and value in _QUALITY_PRESETS:
-            self.handle_quality([value])
-        elif action == "delete_oldest" and value in ("on", "off"):
-            self.handle_disk(["delete_oldest", value])
-        # "back", "panel", and anything unknown: just re-render the root
-        self._panel_menu = "root"
-        return await self.settings_panel()
+        if action == "cancel":
+            self._confirm_done.add(data)
+            return "Cancelled \u2014 nothing changed", None
+        if action == "confirm_remove" and value in self._config["channels"]:
+            self._confirm_done.add(data)
+            result = await self.handle_remove([value])  # stops recording + eventsub, clears override
+            self._menu, self._menu_channel = "channels", None
+            return result, None
+        if action == "confirm_delete_oldest" and value == "on":
+            self._confirm_done.add(data)
+            result = self.handle_disk(["delete_oldest", "on"])
+            self._menu = "disk"
+            return result, None
+        return None  # unknown -> ignore
 
     async def _on_callback(self, update, context):
         query = update.callback_query
@@ -537,65 +697,48 @@ class TelegramController:
         if user is None or user.id != self._admin_id:  # non-admin presses are ignored
             await query.answer()
             return
-        text, markup = await self.handle_callback(query.data)
-        if query.message is None:  # original message was deleted -> send a fresh one
-            await query.answer()
-            self._panel_message = await context.bot.send_message(
-                chat_id=query.from_user.id, text=text, reply_markup=markup
-            )
-        elif query.message.text == text and _keyboards_equal(query.message.reply_markup, markup):
-            await query.answer("No change")  # state and view already match
-        else:
-            await query.answer()
-            try:
-                self._panel_message = await query.edit_message_text(text, reply_markup=markup)
-            except BadRequest:  # message vanished mid-flight -> resend
-                self._panel_message = await context.bot.send_message(
-                    chat_id=query.from_user.id, text=text, reply_markup=markup
-                )
-
-    async def _panel_refresh_loop(self):
-        """Background task: refresh the open settings panel every 30s."""
-        try:
-            while True:
-                await asyncio.sleep(30)
-                try:
-                    await self._refresh_panel(None)
-                except Exception:
-                    logger.warning("[telegram] Panel auto-refresh failed", exc_info=True)
-        except asyncio.CancelledError:
-            pass
-
-    async def _refresh_panel(self, context):
-        """Job: keep the open settings panel current without user interaction.
-
-        Re-renders the panel body (status text) with the currently displayed
-        submenu every 30s, but only edits when something actually changed.
-        """
-        message = self._panel_message
-        if message is None:
+        result = await self.handle_callback(query.data)
+        if result is None:
+            await query.answer("Already processed" if query.data in self._confirm_done else "")
             return
-        text, markup = await self.settings_panel(self._panel_menu)
-        if message.text == text and _keyboards_equal(message.reply_markup, markup):
-            return
+        text, _ = result
+        await query.answer()
         try:
-            self._panel_message = await message.edit_text(text, reply_markup=markup)
-        except BadRequest:  # panel message was deleted -> stop refreshing it
-            self._panel_message = None
+            await query.edit_message_text(text, reply_markup=None)
+        except BadRequest:  # message vanished mid-flight -> resend
+            await context.bot.send_message(chat_id=query.from_user.id, text=text)
+        await self._send_menu(context)
+
+    async def _send_menu(self, context):
+        """Re-render the reply keyboard for the current menu state."""
+        await context.bot.send_message(
+            chat_id=self._admin_id,
+            text=await self.menu_text(self._menu, self._menu_channel),
+            reply_markup=self.reply_keyboard(self._menu, self._menu_channel),
+        )
+
+    async def _on_text(self, update, context):
+        result = await self.handle_reply_text(update.effective_message.text)
+        if result is None:
+            return
+        text, markup = result
+        await update.effective_message.reply_text(text, reply_markup=markup)
 
     async def _cmd_help(self, update, context):
-        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())
+        self._menu, self._menu_channel = "root", None
+        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.reply_keyboard("root"))
 
     async def _cmd_status(self, update, context):
-        await update.effective_message.reply_text(await self.handle_status(), reply_markup=self.help_keyboard())
+        self._menu, self._menu_channel = "root", None
+        await update.effective_message.reply_text(await self.handle_status(), reply_markup=self.reply_keyboard("root"))
 
     async def _cmd_settings(self, update, context):
-        text, markup = await self.settings_panel()
-        self._panel_message = await update.effective_message.reply_text(text, reply_markup=markup)
-        self._panel_menu = "root"
+        self._menu, self._menu_channel = "root", None
+        await update.effective_message.reply_text(await self.menu_text("root"), reply_markup=self.reply_keyboard("root"))
 
     async def _cmd_start(self, update, context):
-        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())
+        self._menu, self._menu_channel = "root", None
+        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.reply_keyboard("root"))
 
     async def _cmd_channels(self, update, context):
         await update.effective_message.reply_text(self.handle_channels())

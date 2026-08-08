@@ -576,15 +576,15 @@ def test_recording_info_reports_duration_and_size(tmp_path):
     assert info[0]["size_mb"] == pytest.approx(3.0, abs=0.1)
 
 
-def test_watchdog_aborts_on_low_free_space(tmp_path, monkeypatch):
+def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["disk"] = {"min_free_gb": 2, "check_interval_s": 0.01}
+    config["disk"] = {"max_total_gb": 5, "delete_oldest": False, "check_interval_s": 0.01}
     notifier = FakeNotifier()
     rec = Recorder(config, notifier=notifier)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     async def fake_snapshot(config):
-        return {"free_gb": 0.5, "dir_gb": 0.0, "file_count": 0}
+        return {"free_gb": 100.0, "dir_gb": 6.0, "file_count": 1}
 
     monkeypatch.setattr("src.stream_archive.disk.disk_snapshot", fake_snapshot)
 
@@ -595,36 +595,7 @@ def test_watchdog_aborts_on_low_free_space(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert any("Stopped recording ch" in m for m in notifier.messages)
-    assert any("free space dropped below 2" in m for m in notifier.messages)
-
-
-def test_watchdog_aborts_on_fill_rate(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config["disk"] = {"min_time_to_full_min": 10, "check_interval_s": 0.01}
-    notifier = FakeNotifier()
-    rec = Recorder(config, notifier=notifier)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    async def fake_snapshot(config):
-        return {"free_gb": 0.01, "dir_gb": 0.0, "file_count": 0}
-
-    monkeypatch.setattr("src.stream_archive.disk.disk_snapshot", fake_snapshot)
-    sizes = {"n": 0}
-
-    def growing_getsize(path):
-        sizes["n"] += 1
-        return sizes["n"] * 50 * 1024 * 1024
-
-    monkeypatch.setattr(os.path, "getsize", growing_getsize)
-
-    async def scenario():
-        assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
-        assert "ch" not in rec._recordings
-
-    asyncio.run(scenario())
-    assert any("Stopped recording ch" in m for m in notifier.messages)
-    assert any("disk filling too fast" in m for m in notifier.messages)
+    assert any("archive at 5 GB cap" in m for m in notifier.messages)
 
 
 def test_delete_oldest_to_cap_deletes_oldest(tmp_path):

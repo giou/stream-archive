@@ -76,7 +76,7 @@ class Monitor:
 
     async def _snapshot_if_needed(self, config):
         disk_cfg = config.get("disk", {})
-        need_snap = disk_cfg.get("min_free_gb", 0) > 0 or disk_cfg.get("max_total_gb", 0) > 0
+        need_snap = disk_cfg.get("max_total_gb", 0) > 0
         return await self.recorder.disk_snapshot() if need_snap else None
 
     async def _ensure_recording(self, channel, title, game, user_id, config, snapshot):
@@ -145,11 +145,8 @@ class Monitor:
         """Return (reason_or_None, snapshot). Raises nothing: snapshot failures fail open."""
         try:
             disk_cfg = config.get("disk", {})
-            min_free = disk_cfg.get("min_free_gb", 0)
             cap = disk_cfg.get("max_total_gb", 0)
             if snapshot is not None:
-                if min_free > 0 and snapshot["free_gb"] < min_free:
-                    return (f"free disk space below {min_free:g} GB ({snapshot['free_gb']:.1f} GB free)", snapshot)
                 if cap > 0 and snapshot["dir_gb"] >= cap:
                     if disk_cfg.get("delete_oldest", True):
                         await self.recorder.delete_oldest_to_cap()

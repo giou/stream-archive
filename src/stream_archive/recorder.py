@@ -158,7 +158,7 @@ class Recorder:
         entry["tasks"] = tasks
 
         disk_cfg = self._config.get("disk", {})
-        if disk_cfg.get("min_free_gb", 0) > 0 or disk_cfg.get("max_total_gb", 0) > 0 or disk_cfg.get("min_time_to_full_min", 0) > 0:
+        if disk_cfg.get("max_total_gb", 0) > 0:
             entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
@@ -194,19 +194,13 @@ class Recorder:
         try:
             cfg = self._config["disk"]
             interval = cfg["check_interval_s"]
-            prev_size, prev_t = 0.0, time.monotonic()
             while True:
                 await asyncio.sleep(interval)
                 entry = self._recordings.get(channel)
                 if entry is None:
                     return
                 snap = await disk.disk_snapshot(self._config)
-                min_free = cfg.get("min_free_gb", 0)
                 cap = cfg.get("max_total_gb", 0)
-                fill = cfg.get("min_time_to_full_min", 0)
-                if min_free > 0 and snap["free_gb"] < min_free:
-                    await self._abort(channel, f"free space dropped below {min_free:g} GB ({snap['free_gb']:.1f} GB free)")
-                    return
                 if cap > 0 and snap["dir_gb"] >= cap:
                     if cfg.get("delete_oldest", True):
                         await self.delete_oldest_to_cap()
@@ -214,20 +208,6 @@ class Recorder:
                     if snap["dir_gb"] >= cap:
                         await self._abort(channel, f"recording archive at {cap:g} GB cap")
                         return
-                if fill > 0 and entry.get("filepath"):
-                    try:
-                        size = os.path.getsize(entry["filepath"])
-                    except OSError:
-                        size = 0
-                    now = time.monotonic()
-                    dt = now - prev_t
-                    rate = (size - prev_size) / dt if dt > 0 else 0.0
-                    prev_size, prev_t = size, now
-                    if rate > 0:
-                        minutes = (snap["free_gb"] * 1024**3) / rate / 60
-                        if minutes < fill:
-                            await self._abort(channel, f"disk filling too fast (estimated full in ~{minutes:.0f} min)")
-                            return
         except asyncio.CancelledError:
             raise
         except Exception as e:

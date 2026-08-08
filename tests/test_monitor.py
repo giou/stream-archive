@@ -177,21 +177,6 @@ def test_transient_api_error_does_not_raise_or_act():
     assert rec.stopped == []
 
 
-def test_skip_start_when_free_below_threshold():
-    rec = FakeRecorder()
-    rec.snapshot["free_gb"] = 1.0
-    notifier = FakeNotifier()
-    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
-    mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"], "disk": {"min_free_gb": 5}}
-
-    asyncio.run(mon.check_channels(api, config))
-
-    assert rec.started == []
-    assert any("Not recording ch" in m for m in notifier.messages)
-    assert any("free disk space below 5" in m for m in notifier.messages)
-
-
 def test_delete_oldest_and_starts_when_over_cap():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0

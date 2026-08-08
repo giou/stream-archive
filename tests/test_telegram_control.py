@@ -548,18 +548,10 @@ def test_maxyoutube_set(tmp_path):
 
 def test_disk_subcommands(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text = ctrl.handle_disk(["minfree", "5"])
-    assert text == "Disk min free set to 5 GB"
-    assert read_file(tmp_path)["disk"]["min_free_gb"] == 5
-    assert config["disk"]["min_free_gb"] == 5
-
     text = ctrl.handle_disk(["maxsize", "20"])
     assert text == "Disk max total set to 20 GB"
     assert read_file(tmp_path)["disk"]["max_total_gb"] == 20
-
-    text = ctrl.handle_disk(["fill", "10"])
-    assert text == "Disk fill guard set to 10 min"
-    assert read_file(tmp_path)["disk"]["min_time_to_full_min"] == 10
+    assert config["disk"]["max_total_gb"] == 20
 
     text = ctrl.handle_disk(["interval", "30"])
     assert text == "Disk check interval set to 30s"
@@ -572,9 +564,9 @@ def test_disk_subcommands(tmp_path):
     assert text == "Delete oldest enabled"
     assert read_file(tmp_path)["disk"]["delete_oldest"] is True
 
-    assert ctrl.handle_disk(["bogus", "1"]) == "Usage: /disk <minfree|maxsize|fill|interval|delete_oldest> <value>"
+    assert ctrl.handle_disk(["bogus", "1"]) == "Usage: /disk <maxsize|interval|delete_oldest> <value>"
     before = read_file(tmp_path)
-    assert ctrl.handle_disk(["minfree", "x"]).startswith("\u274c")
+    assert ctrl.handle_disk(["maxsize", "x"]).startswith("\u274c")
     assert read_file(tmp_path) == before
 
 
@@ -582,9 +574,7 @@ def test_disk_show_block(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_disk([])
     assert "Disk limits:" in text
-    assert "min free: 0 GB (0 = disabled)" in text
     assert "max total: 0 GB (0 = disabled, delete oldest: on)" in text
-    assert "stop if full in < 0 min (0 = disabled)" in text
     assert "check every 60s" in text
 
 
@@ -594,7 +584,7 @@ def test_help_lists_new_commands(tmp_path):
     assert "/quality [value]" in text
     assert "/maxrecordings <n>" in text
     assert "/maxyoutube <n>" in text
-    assert "/disk <minfree|maxsize|fill|interval|delete_oldest> <value>" in text
+    assert "/disk <maxsize|interval|delete_oldest> <value>" in text
     assert "/chat [on|off]" in text
     assert "/settings" in text
     assert "/start" in text
@@ -684,71 +674,23 @@ def test_status_limits_in_plain_words_when_set(tmp_path):
 
 def test_status_disk_limits_in_plain_words(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    ctrl.handle_disk(["minfree", "5"])
     ctrl.handle_disk(["maxsize", "100"])
     text = asyncio.run(ctrl.handle_status())
-    assert "keep 5 GB free" in text
     assert "max 100 GB (delete oldest when over)" in text
     ctrl.handle_disk(["delete_oldest", "off"])
     text = asyncio.run(ctrl.handle_status())
     assert "max 100 GB (stop recording when over)" in text
-    ctrl.handle_disk(["fill", "15"])
-    text = asyncio.run(ctrl.handle_status())
-    assert "stop if disk fills within 15 min" in text
 
 
-def labels(markup):
-    rows = markup.to_dict()["inline_keyboard"]
+def kb_labels(markup):
+    data = markup.to_dict()
+    rows = data.get("inline_keyboard") or data.get("keyboard")
     return [b["text"] for row in rows for b in row]
 
 
-def test_settings_panel_returns_status_and_buttons(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.settings_panel())
-    assert "Output mode: disk" in text
-    # root menu: one category row per setting, no value buttons
-    assert labels(markup) == [
-        "Chat: on \u203a",
-        "Mode: disk \u203a",
-        "Quality: best \u203a",
-        "Delete oldest: on \u203a",
-    ]
-
-
-def test_callback_chat_off_persists_and_stops_chat(tmp_path):
-    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1"])
-    text, markup = asyncio.run(ctrl.handle_callback("chat:off"))
-    assert read_file(tmp_path)["record_chat"] is False
-    assert recorder.chat_stop_calls == ["channel1"]
-    assert "Chat recording: disabled" in text
-
-
-def test_callback_mode_sets_global(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("mode:youtube"))
-    assert read_file(tmp_path)["output_mode"] == "youtube"
-    assert config["output_mode"] == "youtube"
-
-
-def test_callback_quality_sets(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("quality:1080p"))
-    assert read_file(tmp_path)["preferred_quality"] == "1080p"
-    assert config["preferred_quality"] == "1080p"
-
-
-def test_callback_delete_oldest_toggle(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("delete_oldest:off"))
-    assert read_file(tmp_path)["disk"]["delete_oldest"] is False
-
-
-def test_callback_unknown_data_noop(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    before = read_file(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("bogus:data"))
-    assert read_file(tmp_path) == before
-    assert text and markup
+ROOT_LABELS = ["Channels", "Status", "Chat recording", "Output mode",
+               "Quality", "Retention", "Max recordings", "Max YouTube", "Disk"]
+DISK_LABELS = ["Max total", "Check interval", "Delete oldest", "Back"]
 
 
 def test_command_list_covers_all_handlers(tmp_path):
@@ -761,90 +703,279 @@ def test_command_list_covers_all_handlers(tmp_path):
     }
 
 
-def test_settings_submenus(tmp_path):
+def test_reply_keyboard_root_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    cases = {
-        "chat": ["Chat: on", "Chat: off", "\u2190 Back"],
-        "mode": ["Mode: disk", "Mode: youtube", "Mode: both", "\u2190 Back"],
-        "quality": ["Quality: best", "Quality: 1080p", "Quality: 720p",
-                    "Quality: 480p", "Quality: 360p", "\u2190 Back"],
-        "delete_oldest": ["Delete oldest: on", "Delete oldest: off", "\u2190 Back"],
-    }
-    for menu, expected in cases.items():
-        text, markup = asyncio.run(ctrl.handle_callback(f"menu:{menu}"))
-        assert labels(markup) == expected
-        assert "Output mode: disk" in text
-
-
-def test_callback_apply_returns_to_root(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_callback("menu:quality"))
-    text, markup = asyncio.run(ctrl.handle_callback("quality:720p"))
-    assert labels(markup) == [
-        "Chat: on \u203a",
-        "Mode: disk \u203a",
-        "Quality: 720p \u203a",
-        "Delete oldest: on \u203a",
+    d = ctrl.reply_keyboard("root").to_dict()
+    assert d["keyboard"] == [
+        [{"text": "Channels"}, {"text": "Status"}],
+        [{"text": "Chat recording"}, {"text": "Output mode"}],
+        [{"text": "Quality"}, {"text": "Retention"}],
+        [{"text": "Max recordings"}, {"text": "Max YouTube"}],
+        [{"text": "Disk"}],
     ]
-    assert read_file(tmp_path)["preferred_quality"] == "720p"
-    assert config["preferred_quality"] == "720p"
+    assert d["resize_keyboard"] is True
 
 
-def test_callback_back_returns_root(tmp_path):
+def test_reply_keyboard_channels_layout(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    assert ctrl.reply_keyboard("channels").to_dict()["keyboard"] == [
+        [{"text": "Add channel"}],
+        [{"text": "\u2022 channel1"}],
+        [{"text": "\u2022 ch"}],
+        [{"text": "Back"}],
+    ]
+
+
+def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_callback("menu:mode"))
+    assert ctrl.reply_keyboard("channel", "channel1").to_dict()["keyboard"] == [
+        [{"text": "Delete channel"}],
+        [{"text": "Mode: disk"}, {"text": "Mode: youtube"}],
+        [{"text": "Mode: both"}, {"text": "Mode: default"}],
+        [{"text": "Back"}],
+    ]
+
+
+def test_reply_text_navigates_to_channels(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_reply_text("Channels"))
+    assert "Channels (1): channel1" in text
+    assert kb_labels(markup) == ["Add channel", "\u2022 channel1", "Back"]
+    assert ctrl._menu == "channels"
+
+
+def test_reply_text_status(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_reply_text("Status"))
+    assert "Output mode: disk" in text
+    assert kb_labels(markup) == ROOT_LABELS
+    assert ctrl._menu == "root"
+
+
+def test_reply_text_add_channel_flow(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Add channel"))
+    assert "Send the channel name" in text
+    assert kb_labels(markup) == ["Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("newch"))
+    assert text.startswith("Added newch")
+    assert eventsub.added == ["newch"]
+    assert "newch" in config["channels"]
+    assert ctrl._menu == "channels"
+
+
+def test_reply_text_add_channel_invalid_stays(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("back"))
-    assert labels(markup) == [
-        "Chat: on \u203a",
-        "Mode: disk \u203a",
-        "Quality: best \u203a",
-        "Delete oldest: on \u203a",
-    ]
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    asyncio.run(ctrl.handle_reply_text("Add channel"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Bad Name!"))
+    assert text.startswith("\u274c")
+    assert ctrl._menu == "add_channel"
     assert read_file(tmp_path) == before
 
 
-def test_refresh_panel_edits_only_when_changed(tmp_path):
+def test_reply_text_channel_submenu_mode(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.settings_panel())
-
-    class FakeMessage:
-        def __init__(self):
-            self.text = text
-            self.reply_markup = markup
-            self.edits = 0
-
-        async def edit_text(self, text, reply_markup=None):
-            self.edits += 1
-            self.text = text
-            self.reply_markup = reply_markup
-            return self
-
-    msg = FakeMessage()
-    ctrl._panel_message = msg
-    asyncio.run(ctrl._refresh_panel(None))
-    assert msg.edits == 0  # nothing changed -> no edit
-    ctrl.handle_mode(["youtube"])
-    asyncio.run(ctrl._refresh_panel(None))
-    assert msg.edits == 1  # status text changed -> auto edit
-    assert "Output mode: youtube" in msg.text
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("\u2022 channel1"))
+    assert "Channel: channel1" in text
+    assert "default (global: disk)" in text
+    text, markup = asyncio.run(ctrl.handle_reply_text("Mode: youtube"))
+    assert read_file(tmp_path)["channel_output_modes"] == {"channel1": "youtube"}
+    assert config["channel_output_modes"] == {"channel1": "youtube"}
+    assert ctrl._menu_channel == "channel1"
 
 
-def test_refresh_panel_clears_when_message_deleted(tmp_path):
-    from telegram.error import BadRequest
-
+def test_reply_text_channel_delete_asks_confirm(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.settings_panel())
+    before = read_file(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    asyncio.run(ctrl.handle_reply_text("\u2022 channel1"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete channel"))
+    assert "Remove channel1 from monitoring?" in text
+    assert kb_labels(markup) == ["Confirm", "Cancel"]
+    assert read_file(tmp_path) == before
+    assert ctrl._menu == "channel"
 
-    class DeletedMessage:
-        reply_markup = markup
 
-        async def edit_text(self, text, reply_markup=None):
-            raise BadRequest("message is not modified")
+def test_reply_text_chat_quick(tmp_path):
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1"])
+    asyncio.run(ctrl.handle_reply_text("Chat recording"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    assert read_file(tmp_path)["record_chat"] is False
+    assert recorder.chat_stop_calls == ["channel1"]
+    assert kb_labels(markup) == ROOT_LABELS
+    assert ctrl._menu == "root"
 
-    message = DeletedMessage()
-    message.text = text
-    ctrl._panel_message = message
-    ctrl.handle_mode(["youtube"])
-    asyncio.run(ctrl._refresh_panel(None))
-    assert ctrl._panel_message is None  # stop refreshing a vanished message
+
+def test_reply_text_mode_quick(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Output mode"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("youtube"))
+    assert read_file(tmp_path)["output_mode"] == "youtube"
+    assert config["output_mode"] == "youtube"
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_quality_quick(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Quality"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("1080p"))
+    assert read_file(tmp_path)["preferred_quality"] == "1080p"
+    assert config["preferred_quality"] == "1080p"
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_retention_quick(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Retention"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("14 days"))
+    assert read_file(tmp_path)["retention_days"] == 14
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_retention_off_quick(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Retention"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    assert read_file(tmp_path)["retention_days"] == 0
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_retention_custom(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Retention"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Custom"))
+    assert "Send the new value in days" in text
+    assert kb_labels(markup) == ["Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("11"))
+    assert read_file(tmp_path)["retention_days"] == 11
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_custom_invalid_keeps_state(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Retention"))
+    asyncio.run(ctrl.handle_reply_text("Custom"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("x"))
+    assert text.startswith("\u274c")
+    assert ctrl._menu == "custom"
+    assert read_file(tmp_path) == before
+
+
+def test_reply_text_maxrec_quick(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Max recordings"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("3"))
+    assert read_file(tmp_path)["max_concurrent_recordings"] == 3
+    assert config["max_concurrent_recordings"] == 3
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_disk_quick_returns_disk_menu(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Disk"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Max total"))
+    assert "Max total: 0 GB (0 = disabled)" in text
+    text, markup = asyncio.run(ctrl.handle_reply_text("50"))
+    assert read_file(tmp_path)["disk"]["max_total_gb"] == 50
+    assert config["disk"]["max_total_gb"] == 50
+    assert ctrl._menu == "disk"
+    assert kb_labels(markup) == DISK_LABELS
+
+
+def test_reply_text_disk_submenu_descriptions(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Disk"))
+    cases = [
+        ("Max total", "Limits total recording size"),
+        ("Check interval", "How often the disk limits are checked"),
+    ]
+    for button, desc in cases:
+        text, markup = asyncio.run(ctrl.handle_reply_text(button))
+        assert desc in text
+        asyncio.run(ctrl.handle_reply_text("Back"))  # return to the disk menu
+
+
+def test_reply_text_disk_delete_oldest_on_confirms(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl.handle_disk(["delete_oldest", "off"])
+    before = read_file(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Disk"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete oldest"))
+    assert "oldest recordings will be deleted" in text
+    assert kb_labels(markup) == ["Confirm", "Cancel"]
+    assert read_file(tmp_path) == before
+
+
+def test_reply_text_disk_delete_oldest_off_direct(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Disk"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete oldest"))
+    assert read_file(tmp_path)["disk"]["delete_oldest"] is False
+    assert config["disk"]["delete_oldest"] is False
+    assert kb_labels(markup) == DISK_LABELS
+
+
+def test_reply_text_back_navigation(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    asyncio.run(ctrl.handle_reply_text("\u2022 channel1"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert ctrl._menu == "channels"
+    assert kb_labels(markup) == ["Add channel", "\u2022 channel1", "Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert ctrl._menu == "root"
+    assert kb_labels(markup) == ROOT_LABELS
+
+
+def test_reply_text_unknown_ignored(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    assert asyncio.run(ctrl.handle_reply_text("hello")) is None
+    assert read_file(tmp_path) == before
+
+
+def test_callback_confirm_remove_applies(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:channel1"))
+    assert text.startswith("Removed channel1")
+    assert "channel1" not in config["channels"]
+    assert "channel1" not in read_file(tmp_path)["channels"]
+    assert eventsub.removed == ["channel1"]
+    assert ctrl._menu == "channels"
+
+
+def test_callback_confirm_remove_dedup(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    asyncio.run(ctrl.handle_callback("confirm_remove:channel1"))
+    assert asyncio.run(ctrl.handle_callback("confirm_remove:channel1")) is None
+    assert eventsub.removed == ["channel1"]
+
+
+def test_callback_confirm_delete_oldest_applies(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl.handle_disk(["delete_oldest", "off"])
+    text, markup = asyncio.run(ctrl.handle_callback("confirm_delete_oldest:on"))
+    assert read_file(tmp_path)["disk"]["delete_oldest"] is True
+    assert config["disk"]["delete_oldest"] is True
+    assert ctrl._menu == "disk"
+
+
+def test_callback_cancel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("cancel"))
+    assert text == "Cancelled \u2014 nothing changed"
+    assert markup is None
+    assert read_file(tmp_path) == before
+
+
+def test_callback_unknown_ignored(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    assert asyncio.run(ctrl.handle_callback("bogus:data")) is None
+    assert read_file(tmp_path) == before

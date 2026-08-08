@@ -170,10 +170,8 @@ All keys from `config.json.example`:
 | `preferred_quality` | no | `best` | Stream quality to request from streamlink (`best`, `1080p`, `720p`, …); falls back to `best` |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings; `0` = unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams; `0` = unlimited |
-| `disk.min_free_gb` | no | `0` | Stop a recording when free disk space drops below this (GB); `0` = disabled |
 | `disk.max_total_gb` | no | `0` | Delete oldest recordings when the archive exceeds this (GB); `0` = disabled |
-| `disk.check_interval_s` | no | `60` | How often the disk watchdog re-checks free space/archive size |
-| `disk.min_time_to_full_min` | no | `0` | Stop a recording when the disk is estimated to fill within this many minutes; `0` = disabled |
+| `disk.check_interval_s` | no | `60` | How often the disk watchdog re-checks the archive size |
 | `disk.delete_oldest` | no | `true` | Delete oldest recordings when `disk.max_total_gb` is exceeded; `false` stops new recordings instead |
 | `update_check.enabled` | no | `true` | Periodically check the app, streamlink, and the vendored plugin for updates and send a Telegram notification when one is available |
 | `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
@@ -214,16 +212,18 @@ existing `.chat.json`. `retention_days` cleanup also removes old
 
 The admin user (`telegram_user_id`) can manage the recorder by messaging the
 bot; anyone else gets no reply at all. The bot registers a command menu (type
-`/`) for the admin and a `/settings` panel with submenu buttons for the common
-settings. Every change is validated before being
+`/`) for the admin and a `/settings` reply keyboard (buttons above the input
+bar) that covers every setting in submenus; inline buttons are used only for
+destructive confirmations (removing a channel, enabling delete-oldest).
+Every change is validated before being
 written atomically to `config.json` and takes effect on the next poll cycle —
 a failed command leaves both memory and disk untouched.
 
 | Command | Action |
 | --- | --- |
 | `/help` | List the available commands |
-| `/start` | Show the command list with a button to open the settings panel |
-| `/settings` | Open the settings panel: submenu buttons for chat recording, output mode, quality, and delete-oldest-on-over-cap; the panel auto-refreshes every 30s |
+| `/start` | Show the available commands and open the settings menu |
+| `/settings` | Open the settings menu (reply keyboard buttons): channels, chat recording, output mode, quality, retention, recording limits, disk limits |
 | `/status` | Monitored channels, output mode, retention, chat-recording state, quality, concurrency limits, disk usage/limits, update-check state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
 | `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |
@@ -237,7 +237,7 @@ a failed command leaves both memory and disk untouched.
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
 | `/disk` | Show disk limits |
-| `/disk <minfree\|maxsize\|fill\|interval\|delete_oldest> <value>` | Set a disk limit (`minfree`/`maxsize`/`fill` take GB/min numbers, `interval` seconds, `delete_oldest` takes `on`/`off`) |
+| `/disk <maxsize\|interval\|delete_oldest> <value>` | Set a disk limit (`maxsize` takes GB, `interval` seconds, `delete_oldest` takes `on`/`off`) |
 | `/chat [on\|off]` | Show whether chat recording is enabled, or enable/disable it; `off` also stops and finalizes in-flight chat capture (the video recordings continue) |
 
 Notes:

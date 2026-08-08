@@ -207,19 +207,15 @@ def _validate_disk(config):
     d = config["disk"]
     if not isinstance(d, dict):
         raise ValueError("disk must be an object")
-    d.setdefault("min_free_gb", 0)
+    d.pop("min_free_gb", None)
+    d.pop("min_time_to_full_min", None)
     d.setdefault("max_total_gb", 0)
     d.setdefault("check_interval_s", 60)
-    d.setdefault("min_time_to_full_min", 0)
     d.setdefault("delete_oldest", True)
-    if not isinstance(d["min_free_gb"], (int, float)) or d["min_free_gb"] < 0:
-        raise ValueError("disk.min_free_gb must be a number >= 0 (0 = disabled)")
     if not isinstance(d["max_total_gb"], (int, float)) or d["max_total_gb"] < 0:
         raise ValueError("disk.max_total_gb must be a number >= 0 (0 = disabled)")
     if not isinstance(d["check_interval_s"], (int, float)) or d["check_interval_s"] <= 0:
         raise ValueError("disk.check_interval_s must be a number > 0")
-    if not isinstance(d["min_time_to_full_min"], (int, float)) or d["min_time_to_full_min"] < 0:
-        raise ValueError("disk.min_time_to_full_min must be a number >= 0 (0 = disabled)")
     if not isinstance(d["delete_oldest"], bool):
         raise ValueError("disk.delete_oldest must be a boolean")
 

@@ -40,10 +40,8 @@ def test_valid_config_passes_and_sets_defaults():
     assert config["record_chat"] is True
     assert config["chat_dir"] == "chat"
     assert config["disk"] == {
-        "min_free_gb": 0,
         "max_total_gb": 0,
         "check_interval_s": 60,
-        "min_time_to_full_min": 0,
         "delete_oldest": True,
     }
     assert config["eventsub"] == {"enabled": True}
@@ -52,15 +50,26 @@ def test_valid_config_passes_and_sets_defaults():
 def test_valid_disk_values_pass():
     config = valid_config()
     config["disk"] = {
-        "min_free_gb": 5.5,
         "max_total_gb": 100,
         "check_interval_s": 30,
-        "min_time_to_full_min": 15,
         "delete_oldest": False,
     }
     _validate(config)
-    assert config["disk"]["min_free_gb"] == 5.5
+    assert config["disk"]["max_total_gb"] == 100
     assert config["disk"]["delete_oldest"] is False
+
+
+def test_obsolete_disk_keys_are_dropped():
+    config = valid_config()
+    config["disk"] = {
+        "min_free_gb": 5,
+        "min_time_to_full_min": 15,
+        "max_total_gb": 100,
+    }
+    _validate(config)
+    assert "min_free_gb" not in config["disk"]
+    assert "min_time_to_full_min" not in config["disk"]
+    assert config["disk"]["max_total_gb"] == 100
 
 
 @pytest.mark.parametrize("mutate", [
@@ -68,11 +77,9 @@ def test_valid_disk_values_pass():
     lambda c: c.__setitem__("max_concurrent_recordings", -1),
     lambda c: c.__setitem__("max_concurrent_youtube_streams", -1),
     lambda c: c.__setitem__("disk", []),
-    lambda c: c.__setitem__("disk", {"min_free_gb": -1}),
     lambda c: c.__setitem__("disk", {"max_total_gb": -1}),
     lambda c: c.__setitem__("disk", {"check_interval_s": 0}),
     lambda c: c.__setitem__("disk", {"check_interval_s": -5}),
-    lambda c: c.__setitem__("disk", {"min_time_to_full_min": -1}),
     lambda c: c.__setitem__("disk", {"delete_oldest": "yes"}),
     lambda c: c.__setitem__("record_chat", "yes"),
     lambda c: c.__setitem__("chat_dir", ""),
