@@ -125,16 +125,25 @@ Only needed when `output_mode` is `youtube` or `both`:
 1. Create a Google Cloud project, enable the **YouTube Data API v3**, and
    download an OAuth desktop client as `client_secret.json` (see
    [Google's guide](https://developers.google.com/youtube/registering_an_application)).
-2. Run the one-time authorization flow:
+2. Publish the OAuth consent screen so the token does not expire:
+   **Google Cloud Console → APIs & Services → OAuth consent screen → Audience
+   tab → Publishing status → Publish app** (set to *In production*). While
+   the app is *Testing*, refresh tokens expire after **7 days** (you would
+   have to re-run `setup_youtube.py` weekly) and only test users can
+   authorize.
+3. Run the one-time authorization flow:
 
    ```sh
    uv run python setup_youtube.py
    ```
 
-   It prints a URL, asks for the authorization code, and saves the token to
-   `youtube_token.json` (chmod 600). The token is refreshed automatically
-   while it is still refreshable; if it expires irrecoverably, run
-   `setup_youtube.py` again.
+   It opens the authorization page in your browser and completes
+   automatically: after you authorize, the redirect page shows
+   "Authorization successful!" and the token is saved to `youtube_token.json`
+   (chmod 600). If the redirect page cannot load — SSH session, Docker,
+   headless box — copy the **full URL** from the address bar and paste it
+   when prompted. The token is refreshed automatically while it is still
+   refreshable; if it expires irrecoverably, run `setup_youtube.py` again.
 
 ## Configuration reference
 
@@ -292,6 +301,8 @@ docker compose stop                  # graceful shutdown: recordings stopped, br
   rewrites `uv.lock` and the reply tells you to run `docker compose up -d
   --build` — the running streamlink is unchanged until you rebuild.
 - One-time YouTube OAuth: `docker compose run --rm stream-archive setup_youtube.py`
+  (the browser opens on your host; the localhost redirect can't reach the
+  container, so paste the full address-bar URL when prompted)
 
 ### Logs
 
@@ -323,7 +334,7 @@ in `src/stream_archive/monitor.py`).
 ```
 config.json.example      # template for runtime config (config.json is gitignored)
 main.py                  # entrypoint: logging setup + asyncio.run(scheduler)
-setup_youtube.py         # one-time YouTube OAuth flow
+setup_youtube.py         # one-time YouTube OAuth flow (auto-captures the code, or paste the redirect URL)
 stream-archive.service   # systemd user unit
 pyproject.toml
 src/stream_archive/

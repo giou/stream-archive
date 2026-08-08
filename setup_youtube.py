@@ -1,10 +1,52 @@
 import json
 import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    """Serves the OAuth redirect; captures the code into server.auth_code."""
+
+    def do_GET(self):
+        query = parse_qs(urlparse(self.path).query)
+        if query.get("code"):
+            self.server.auth_code = query["code"][0]
+            body = (
+                "<html><body><h2>Authorization successful!</h2>"
+                "<p>You can close this tab and return to the terminal.</p></body></html>"
+            ).encode()
+            self.send_response(200)
+        else:
+            body = (
+                "<html><body><h2>Authorization failed</h2>"
+                "<p>No code was received. Close this tab and try again.</p></body></html>"
+            ).encode()
+            self.send_response(400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # keep the OAuth prompt clean
+
+
+def extract_code(text):
+    """Return the code from a pasted redirect URL, or the text itself if it is already a code."""
+    if "code=" not in text and "error=" not in text:
+        return text
+    query = parse_qs(urlparse(text).query)
+    if "error" in query:
+        raise ValueError(f"Authorization failed: {query['error'][0]}")
+    codes = query.get("code", [])
+    return codes[0] if codes else ""
 
 
 def main():
@@ -25,18 +67,51 @@ def main():
     print()
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
-    flow.redirect_uri = "http://localhost"
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-    print("1. Visit this URL in a browser:")
-    print(f"   {auth_url}")
-    print()
-    print("2. After authorizing, you will be redirected to a page that shows an authorization code.")
-    print("   (or the code may appear in the redirect URL after 'code=')")
-    print("3. Paste the authorization code below:")
-    print()
-    code = input("   Code: ").strip()
 
-    flow.fetch_token(code=code)
+    # Local callback server: when the browser can reach localhost the code is
+    # captured automatically; otherwise the user pastes the redirect URL.
+    server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)  # port 0 -> free port
+    server.auth_code = None
+    flow.redirect_uri = f"http://localhost:{server.server_address[1]}/"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    print("1. Open this URL in your browser (trying to open it automatically):")
+    print(f"   {auth_url}")
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass  # headless/SSH: the printed URL is the fallback
+    print()
+    print("2. Authorize the app. Google redirects you to a local page.")
+    print("   - If it shows 'Authorization successful!', return here and press Enter.")
+    print("   - If the page fails to load (SSH/Docker/headless), copy the FULL")
+    print("     URL from the address bar and paste it below.")
+    print()
+
+    code = None
+    for _ in range(3):
+        pasted = input("   Press Enter after authorizing, or paste the redirect URL: ").strip()
+        try:
+            candidate = server.auth_code or extract_code(pasted)
+        except ValueError as exc:
+            print(f"   {exc}")
+            continue
+        if not candidate:
+            print("   No code found — wait for the success page, or paste the full redirect URL.")
+            continue
+        try:
+            flow.fetch_token(code=candidate)
+            code = candidate
+            break
+        except Exception as exc:
+            print(f"   Could not exchange the code ({exc}); paste the full URL from the address bar.")
+    else:
+        print("ERROR: no valid token after 3 attempts. Re-run the script.", file=sys.stderr)
+        sys.exit(1)
+
+    server.shutdown()
+    server.server_close()
 
     token_path = Path("youtube_token.json")
     data = json.loads(flow.credentials.to_json())
@@ -47,6 +122,10 @@ def main():
     print()
     print(f"Token saved to {token_path}")
     print("YouTube authentication complete.")
+    print()
+    print("Tip: if the Google Cloud OAuth consent screen is still 'Testing' (Audience tab ->")
+    print("Publishing status), publish the app to 'In production', or the token will stop")
+    print("refreshing after 7 days.")
 
 
 if __name__ == "__main__":
