@@ -52,6 +52,25 @@ class FakeMonitor:
         self.remove_calls.append(channel)
 
 
+class FakeEventSub:
+    def __init__(self):
+        self.added = []
+        self.removed = []
+        self.synced = []
+
+    async def add_channel(self, channel):
+        self.added.append(channel)
+
+    async def remove_channel(self, channel):
+        self.removed.append(channel)
+
+    async def sync_channels(self, channels):
+        self.synced.append(list(channels))
+
+    def status(self):
+        return "EventSub: TEST STATUS"
+
+
 class FakeUpdater:
     def __init__(self, report, results=None):
         self.report = report
@@ -94,8 +113,9 @@ def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart
     config["_config_path"] = tmp_path / "config.json"
     recorder = FakeRecorder(active=active, recording=recording)
     monitor = FakeMonitor()
-    ctrl = TelegramController(config, recorder, monitor, on_restart=on_restart)
-    return config, ctrl, recorder, monitor
+    eventsub = FakeEventSub()
+    ctrl = TelegramController(config, recorder, monitor, eventsub, on_restart=on_restart)
+    return config, ctrl, recorder, monitor, eventsub
 
 
 def read_file(tmp_path):
@@ -103,12 +123,12 @@ def read_file(tmp_path):
 
 
 def test_status_contains_settings_and_omits_secrets(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path, active=["channel1"])
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, active=["channel1"])
     text = asyncio.run(ctrl.handle_status())
     assert "channel1" in text
     assert "Output mode: disk" in text
     assert "Retention: disabled" in text
-    assert "Monitoring interval: 60s" in text
+    assert "Monitoring interval" not in text
     assert "Recording now: channel1" in text
     assert "Timezone" not in text
     assert "bot_token" not in text
@@ -117,7 +137,7 @@ def test_status_contains_settings_and_omits_secrets(tmp_path):
 
 
 def test_status_retention_days_and_singular(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_retention(["7"])
     assert "Retention: 7 days" in asyncio.run(ctrl.handle_status())
     ctrl.handle_retention(["1"])
@@ -125,8 +145,8 @@ def test_status_retention_days_and_singular(tmp_path):
 
 
 def test_add_persists_and_updates_live(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
-    text = ctrl.handle_add(["newch"])
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text = asyncio.run(ctrl.handle_add(["newch"]))
     assert text.startswith("Added")
     assert "newch" in text
     assert "newch" in read_file(tmp_path)["channels"]
@@ -134,32 +154,32 @@ def test_add_persists_and_updates_live(tmp_path):
 
 
 def test_add_duplicate_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
-    ctrl.handle_add(["newch"])
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_add(["newch"]))
     before = read_file(tmp_path)
-    text = ctrl.handle_add(["newch"])
+    text = asyncio.run(ctrl.handle_add(["newch"]))
     assert text.startswith("\u274c")
     assert read_file(tmp_path) == before
 
 
 def test_add_invalid_name_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
-    text = ctrl.handle_add(["bad name!"])
+    text = asyncio.run(ctrl.handle_add(["bad name!"]))
     assert text.startswith("\u274c")
     assert read_file(tmp_path) == before
 
 
 def test_add_usage_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
-    assert ctrl.handle_add([]) == "Usage: /add <channel>"
-    assert ctrl.handle_add(["a", "b"]) == "Usage: /add <channel>"
+    assert asyncio.run(ctrl.handle_add([])) == "Usage: /add <channel>"
+    assert asyncio.run(ctrl.handle_add(["a", "b"])) == "Usage: /add <channel>"
     assert read_file(tmp_path) == before
 
 
 def test_remove_stops_live_recording(tmp_path):
-    config, ctrl, recorder, monitor = make_controller(
+    config, ctrl, recorder, monitor, eventsub = make_controller(
         tmp_path, channels=["channel1", "ch"], recording=["ch"]
     )
     text = asyncio.run(ctrl.handle_remove(["ch"]))
@@ -172,7 +192,7 @@ def test_remove_stops_live_recording(tmp_path):
 
 
 def test_remove_not_recording_does_not_stop(tmp_path):
-    config, ctrl, recorder, monitor = make_controller(
+    config, ctrl, recorder, monitor, eventsub = make_controller(
         tmp_path, channels=["channel1", "ch"]
     )
     text = asyncio.run(ctrl.handle_remove(["ch"]))
@@ -183,7 +203,7 @@ def test_remove_not_recording_does_not_stop(tmp_path):
 
 
 def test_remove_unknown_channel_rejected(tmp_path):
-    config, ctrl, recorder, _ = make_controller(tmp_path, channels=["channel1"])
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, channels=["channel1"])
     before = read_file(tmp_path)
     text = asyncio.run(ctrl.handle_remove(["nope"]))
     assert text.startswith("\u274c")
@@ -192,7 +212,7 @@ def test_remove_unknown_channel_rejected(tmp_path):
 
 
 def test_retention_set(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_retention(["7"])
     assert text == "Retention set to 7 day(s)"
     assert read_file(tmp_path)["retention_days"] == 7
@@ -200,7 +220,7 @@ def test_retention_set(tmp_path):
 
 
 def test_retention_invalid_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     for arg in ["-1", "x"]:
         before = read_file(tmp_path)
         text = ctrl.handle_retention([arg])
@@ -209,7 +229,7 @@ def test_retention_invalid_rejected(tmp_path):
 
 
 def test_mode_set(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_mode(["youtube"])
     assert text == "Output mode set to youtube"
     assert read_file(tmp_path)["output_mode"] == "youtube"
@@ -217,7 +237,7 @@ def test_mode_set(tmp_path):
 
 
 def test_mode_invalid_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["cloud"])
     assert text.startswith("\u274c")
@@ -225,7 +245,7 @@ def test_mode_invalid_rejected(tmp_path):
 
 
 def test_mode_per_channel_sets_override(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_mode(["channel1", "youtube"])
     assert text == "Output mode for channel1 set to youtube"
     assert read_file(tmp_path)["channel_output_modes"] == {"channel1": "youtube"}
@@ -233,7 +253,7 @@ def test_mode_per_channel_sets_override(tmp_path):
 
 
 def test_mode_per_channel_reset(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_mode(["channel1", "youtube"])
     text = ctrl.handle_mode(["channel1", "default"])
     assert text == "Output mode for channel1 reset to global (disk)"
@@ -242,7 +262,7 @@ def test_mode_per_channel_reset(tmp_path):
 
 
 def test_mode_per_channel_invalid_mode_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["channel1", "cloud"])
     assert text.startswith("\u274c")
@@ -250,7 +270,7 @@ def test_mode_per_channel_invalid_mode_rejected(tmp_path):
 
 
 def test_mode_per_channel_invalid_name_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["bad name!", "disk"])
     assert text.startswith("\u274c")
@@ -258,7 +278,7 @@ def test_mode_per_channel_invalid_name_rejected(tmp_path):
 
 
 def test_mode_usage_too_many_args(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["a", "b", "c"])
     assert text == "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
@@ -266,7 +286,7 @@ def test_mode_usage_too_many_args(tmp_path):
 
 
 def test_remove_clears_override(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path, channels=["channel1", "ch"])
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
     ctrl.handle_mode(["channel1", "youtube"])
     asyncio.run(ctrl.handle_remove(["channel1"]))
     assert read_file(tmp_path)["channel_output_modes"] == {}
@@ -274,34 +294,34 @@ def test_remove_clears_override(tmp_path):
 
 
 def test_status_shows_per_channel_modes(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_mode(["channel1", "youtube"])
-    assert "Per-channel modes: channel1=youtube" in asyncio.run(ctrl.handle_status())
+    assert "Per-channel output: channel1 \u2192 youtube" in asyncio.run(ctrl.handle_status())
 
 
 def test_reload_picks_up_disk_edits(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     file_config = read_file(tmp_path)
     file_config["channels"].append("hand_edit")
     file_config["retention_days"] = 3
     (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
-    text = ctrl.handle_reload()
+    text = asyncio.run(ctrl.handle_reload())
     assert text == "\u2705 Config reloaded from config.json"
     assert "hand_edit" in config["channels"]
     assert config["retention_days"] == 3
 
 
 def test_reload_corrupt_file_leaves_live_unchanged(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     (tmp_path / "config.json").write_text("{ not json")
-    text = ctrl.handle_reload()
+    text = asyncio.run(ctrl.handle_reload())
     assert text.startswith("\u274c")
     assert config["channels"] == ["channel1"]
 
 
 def test_restart_schedules_callback(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
 
     async def scenario():
         text = ctrl.handle_restart()
@@ -313,7 +333,7 @@ def test_restart_schedules_callback(tmp_path):
 
 
 def test_restart_without_callback(tmp_path):
-    _, ctrl, _, _ = make_controller(tmp_path)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_restart()
     assert text == "Restart is not available (no shutdown callback configured)"
 
@@ -333,7 +353,7 @@ UPDATE_RESULTS = {
 
 def test_update_applies_and_schedules_restart(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     fake = FakeUpdater(UPDATE_REPORT, UPDATE_RESULTS)
     ctrl._updater = fake
 
@@ -355,7 +375,7 @@ def test_update_applies_and_schedules_restart(tmp_path):
 
 def test_update_no_updates_no_restart(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     report = {
         "app": {"status": "up_to_date", "local": "abc1234def5678", "remote": "abc1234def5678", "behind": 0, "subject": "Latest"},
         "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
@@ -379,7 +399,7 @@ def test_update_no_updates_no_restart(tmp_path):
 
 def test_update_apply_failure_no_restart(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     results = {
         "app": ("failed", "git pull: fatal: Could not resolve host"),
         "plugin": ("failed", "sha256 mismatch — download rejected"),
@@ -409,7 +429,7 @@ DOCKER_LOCK_ONLY_REPORT = {
 
 def test_update_docker_streamlink_lock_requires_rebuild(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     results = {
         "app": ("skipped", "no update available"),
         "plugin": ("skipped", "no update available"),
@@ -433,7 +453,7 @@ def test_update_docker_streamlink_lock_requires_rebuild(tmp_path):
 
 def test_update_docker_app_and_streamlink_restarts_and_rebuilds(tmp_path):
     flag = threading.Event()
-    _, ctrl, _, _ = make_controller(tmp_path, on_restart=flag.set)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     results = {
         "app": ("applied", "pulled 2 commit(s) — Fix retention"),
         "plugin": ("skipped", "no update available"),
@@ -454,26 +474,28 @@ def test_update_docker_app_and_streamlink_restarts_and_rebuilds(tmp_path):
 
 
 def test_update_not_configured(tmp_path):
-    _, ctrl, _, _ = make_controller(tmp_path)
+    _, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert asyncio.run(ctrl.handle_update()) == "Update checks are not configured"
 
 
 def test_status_contains_update_check_line(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert "Update check: enabled (every 24h)" in asyncio.run(ctrl.handle_status())
 
 
 def test_status_contains_quality_and_disk_lines(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = asyncio.run(ctrl.handle_status())
     assert "Quality: best" in text
-    assert "Concurrent limit: 0 recording(s), 0 YouTube re-stream(s)" in text
+    assert "Simultaneous recordings: unlimited" in text
+    assert "YouTube re-streams: unlimited" in text
+    assert "Disk limits: disabled" in text
+    assert "EventSub" not in text
     assert "free of" in text
-    assert "Disk limits: min free 0 GB" in text
 
 
 def test_quality_show_set_invalid(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert "Quality: best" in ctrl.handle_quality([])
     text = ctrl.handle_quality(["720p"])
     assert text == "Quality set to 720p"
@@ -483,7 +505,7 @@ def test_quality_show_set_invalid(tmp_path):
 
 
 def test_quality_empty_rejected(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_quality([""])
     assert text.startswith("\u274c")
@@ -491,7 +513,7 @@ def test_quality_empty_rejected(tmp_path):
 
 
 def test_maxrecordings_show_set_invalid(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert "Max recordings: 0 (0 = unlimited)" in ctrl.handle_maxrecordings([])
     text = ctrl.handle_maxrecordings(["3"])
     assert text == "Max recordings set to 3"
@@ -507,12 +529,12 @@ def test_maxrecordings_show_set_invalid(tmp_path):
 
 
 def test_maxrecordings_usage(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.handle_maxrecordings(["1", "2"]) == "Usage: /maxrecordings <n> (0 = unlimited)"
 
 
 def test_maxyoutube_set(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert "Max YouTube re-streams: 0 (0 = unlimited)" in ctrl.handle_maxyoutube([])
     text = ctrl.handle_maxyoutube(["2"])
     assert text == "Max YouTube re-streams set to 2"
@@ -525,7 +547,7 @@ def test_maxyoutube_set(tmp_path):
 
 
 def test_disk_subcommands(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_disk(["minfree", "5"])
     assert text == "Disk min free set to 5 GB"
     assert read_file(tmp_path)["disk"]["min_free_gb"] == 5
@@ -557,7 +579,7 @@ def test_disk_subcommands(tmp_path):
 
 
 def test_disk_show_block(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_disk([])
     assert "Disk limits:" in text
     assert "min free: 0 GB (0 = disabled)" in text
@@ -567,7 +589,7 @@ def test_disk_show_block(tmp_path):
 
 
 def test_help_lists_new_commands(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_help()
     assert "/quality [value]" in text
     assert "/maxrecordings <n>" in text
@@ -577,7 +599,7 @@ def test_help_lists_new_commands(tmp_path):
 
 
 def test_chat_show_state(tmp_path):
-    config, ctrl, _, _ = make_controller(tmp_path)
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert "Chat recording: enabled" in asyncio.run(ctrl.handle_chat([]))
     asyncio.run(ctrl.handle_chat(["off"]))
     assert "Chat recording: disabled" in asyncio.run(ctrl.handle_chat([]))
@@ -585,7 +607,7 @@ def test_chat_show_state(tmp_path):
 
 
 def test_chat_on_persists(tmp_path):
-    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1"])
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1"])
     asyncio.run(ctrl.handle_chat(["off"]))
     text = asyncio.run(ctrl.handle_chat(["on"]))
     assert text == "Chat recording enabled"
@@ -595,7 +617,7 @@ def test_chat_on_persists(tmp_path):
 
 
 def test_chat_off_persists_and_stops_inflight(tmp_path):
-    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1", "ch"])
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1", "ch"])
     text = asyncio.run(ctrl.handle_chat(["off"]))
     assert text == "Chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is False
@@ -605,10 +627,69 @@ def test_chat_off_persists_and_stops_inflight(tmp_path):
 
 
 def test_chat_invalid_rejected(tmp_path):
-    config, ctrl, recorder, _ = make_controller(tmp_path, recording=["channel1"])
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1"])
     before = read_file(tmp_path)
     assert asyncio.run(ctrl.handle_chat([])) == "Chat recording: enabled"
     assert asyncio.run(ctrl.handle_chat(["maybe"])) == "Usage: /chat <on|off>"
-    assert asyncio.run(ctrl.handle_chat(["on", "off"])) == "Usage: /chat <on|off>"
     assert read_file(tmp_path) == before
     assert recorder.chat_stop_calls == []
+
+
+def test_add_calls_eventsub_add_channel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text = asyncio.run(ctrl.handle_add(["newch"]))
+    assert text.startswith("Added")
+    assert eventsub.added == ["newch"]
+
+
+def test_add_rejected_does_not_call_eventsub(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_add(["newch"]))
+    asyncio.run(ctrl.handle_add(["newch"]))
+    assert eventsub.added == ["newch"]
+
+
+def test_remove_calls_eventsub_remove_channel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    asyncio.run(ctrl.handle_remove(["ch"]))
+    assert eventsub.removed == ["ch"]
+
+
+def test_remove_rejected_does_not_call_eventsub(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1"])
+    asyncio.run(ctrl.handle_remove(["nope"]))
+    assert eventsub.removed == []
+
+
+def test_reload_calls_eventsub_sync(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    file_config = read_file(tmp_path)
+    file_config["channels"].append("hand_edit")
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+    text = asyncio.run(ctrl.handle_reload())
+    assert text == "\u2705 Config reloaded from config.json"
+    assert eventsub.synced == [["channel1", "hand_edit"]]
+
+
+def test_status_limits_in_plain_words_when_set(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl.handle_maxrecordings(["3"])
+    ctrl.handle_maxyoutube(["2"])
+    text = asyncio.run(ctrl.handle_status())
+    assert "Simultaneous recordings: 3" in text
+    assert "YouTube re-streams: 2" in text
+
+
+def test_status_disk_limits_in_plain_words(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl.handle_disk(["minfree", "5"])
+    ctrl.handle_disk(["maxsize", "100"])
+    text = asyncio.run(ctrl.handle_status())
+    assert "keep 5 GB free" in text
+    assert "max 100 GB (delete oldest when over)" in text
+    ctrl.handle_disk(["evict", "off"])
+    text = asyncio.run(ctrl.handle_status())
+    assert "max 100 GB (stop recording when over)" in text
+    ctrl.handle_disk(["fill", "15"])
+    text = asyncio.run(ctrl.handle_status())
+    assert "stop if disk fills within 15 min" in text

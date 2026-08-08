@@ -131,6 +131,7 @@ def _validate(config):
     _validate_concurrency(config)
     _validate_disk(config)
     _validate_chat(config)
+    _validate_eventsub(config)
 
 
 def _validate_output_mode(config):
@@ -230,3 +231,13 @@ def _validate_chat(config):
     config.setdefault("chat_dir", "chat")
     if not isinstance(config["chat_dir"], str) or not config["chat_dir"]:
         raise ValueError("chat_dir must be a non-empty string")
+
+
+def _validate_eventsub(config):
+    config.setdefault("eventsub", {})
+    es = config["eventsub"]
+    if not isinstance(es, dict):
+        raise ValueError("eventsub must be an object")
+    es.setdefault("enabled", True)
+    if not isinstance(es["enabled"], bool):
+        raise ValueError("eventsub.enabled must be a boolean")

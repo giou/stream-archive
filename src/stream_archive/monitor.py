@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 
@@ -14,6 +15,12 @@ class Monitor:
         self._live_channels = set()
         self._last_failure_notify = {}
         self._last_disk_notify = 0.0
+        self._locks = {}
+
+    def _lock_for(self, channel):
+        if channel not in self._locks:
+            self._locks[channel] = asyncio.Lock()
+        return self._locks[channel]
 
     async def check_channels(self, twitch_api, config):
         try:
@@ -33,36 +40,56 @@ class Monitor:
 
         user_to_channel = {v: k for k, v in user_ids.items()}
 
-        disk_cfg = config.get("disk", {})
-        need_snap = disk_cfg.get("min_free_gb", 0) > 0 or disk_cfg.get("max_total_gb", 0) > 0
-        snapshot = await self.recorder.disk_snapshot() if need_snap else None
+        snapshot = await self._snapshot_if_needed(config)
 
         for user_id, stream in sorted(streams.items(), key=lambda kv: user_to_channel.get(kv[0], "")):
             channel = user_to_channel.get(user_id)
             if channel is None:
                 logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
                 continue
-            if channel not in self._live_channels:
-                ok, snapshot = await self._start_or_block(
-                    channel,
-                    stream.get("title"),
-                    stream.get("game_name"),
-                    config,
-                    snapshot,
-                    user_id=user_id,
-                )
-                if ok:
-                    self._live_channels.add(channel)
-                    self._last_failure_notify.pop(channel, None)
-                    logger.info("[monitor] %s is LIVE", channel)
-                else:
-                    await self._handle_start_failure(channel)
-            elif not self.recorder.is_recording(channel):
+            snapshot = await self._ensure_recording(
+                channel,
+                stream.get("title"),
+                stream.get("game_name"),
+                user_id,
+                config,
+                snapshot,
+            )
+
+        for channel in config["channels"]:
+            user_id = user_ids.get(channel)
+            if channel in self._live_channels and user_id not in streams:
+                await self._ensure_stopped(channel, config)
+
+    async def handle_online(self, channel, title, game, user_id, config):
+        """EventSub stream.online entry point."""
+        if channel not in config["channels"]:
+            return
+        snapshot = await self._snapshot_if_needed(config)
+        await self._ensure_recording(channel, title, game, user_id, config, snapshot)
+
+    async def handle_offline(self, channel, config):
+        """EventSub stream.offline entry point."""
+        if channel not in config["channels"]:
+            return
+        await self._ensure_stopped(channel, config)
+
+    async def _snapshot_if_needed(self, config):
+        disk_cfg = config.get("disk", {})
+        need_snap = disk_cfg.get("min_free_gb", 0) > 0 or disk_cfg.get("max_total_gb", 0) > 0
+        return await self.recorder.disk_snapshot() if need_snap else None
+
+    async def _ensure_recording(self, channel, title, game, user_id, config, snapshot):
+        """Start (or restart) the recording for a channel that is live. Returns the snapshot."""
+        async with self._lock_for(channel):
+            if channel in self._live_channels:
+                if self.recorder.is_recording(channel):
+                    return snapshot
                 logger.warning("[monitor] %s recording stopped unexpectedly, restarting", channel)
                 ok, snapshot = await self._start_or_block(
                     channel,
-                    stream.get("title"),
-                    stream.get("game_name"),
+                    title,
+                    game,
                     config,
                     snapshot,
                     user_id=user_id,
@@ -72,17 +99,35 @@ class Monitor:
                     logger.info("[monitor] %s recording restarted", channel)
                 else:
                     await self._handle_start_failure(channel)
+                return snapshot
+            ok, snapshot = await self._start_or_block(
+                channel,
+                title,
+                game,
+                config,
+                snapshot,
+                user_id=user_id,
+            )
+            if ok:
+                self._live_channels.add(channel)
+                self._last_failure_notify.pop(channel, None)
+                logger.info("[monitor] %s is LIVE", channel)
+            else:
+                await self._handle_start_failure(channel)
+            return snapshot
 
-        for channel in config["channels"]:
-            user_id = user_ids.get(channel)
-            if channel in self._live_channels and user_id not in streams:
-                self._live_channels.discard(channel)
-                result = await self.recorder.stop(channel)
-                file_info = result.get("file_info") if result else None
-                yt_info = result.get("youtube_info") if result else None
-                youtube_url = yt_info["youtube_url"] if yt_info else None
-                await self.notifier.notify_offline(channel, file_info, youtube_url)
-                logger.info("[monitor] %s is OFFLINE", channel)
+    async def _ensure_stopped(self, channel, config):
+        """Stop the recording for a channel that is no longer live."""
+        async with self._lock_for(channel):
+            if channel not in self._live_channels:
+                return
+            self._live_channels.discard(channel)
+            result = await self.recorder.stop(channel)
+            file_info = result.get("file_info") if result else None
+            yt_info = result.get("youtube_info") if result else None
+            youtube_url = yt_info["youtube_url"] if yt_info else None
+            await self.notifier.notify_offline(channel, file_info, youtube_url)
+            logger.info("[monitor] %s is OFFLINE", channel)
 
     def remove_channel(self, channel):
         self._live_channels.discard(channel)

@@ -19,6 +19,9 @@
     "chat_dir": "chat",
     "output_mode": "disk",
     "channel_output_modes": {},
+    "eventsub": {
+        "enabled": true
+    },
     "retention_days": 0,
     "preferred_quality": "best",
     "max_concurrent_recordings": 0,

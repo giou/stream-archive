@@ -12,6 +12,7 @@ dependencies = [
     "python-telegram-bot>=20.0",
     "streamlink>=8.4.0",
     "packaging>=24",
+    "websockets>=12.0",
 ]
 
 [tool.pytest.ini_options]

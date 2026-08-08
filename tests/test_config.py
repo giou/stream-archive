@@ -46,6 +46,7 @@ def test_valid_config_passes_and_sets_defaults():
         "min_time_to_full_min": 0,
         "evict_when_over": True,
     }
+    assert config["eventsub"] == {"enabled": True}
 
 
 def test_valid_disk_values_pass():
@@ -75,6 +76,8 @@ def test_valid_disk_values_pass():
     lambda c: c.__setitem__("disk", {"evict_when_over": "yes"}),
     lambda c: c.__setitem__("record_chat", "yes"),
     lambda c: c.__setitem__("chat_dir", ""),
+    lambda c: c.__setitem__("eventsub", {"enabled": "yes"}),
+    lambda c: c.__setitem__("eventsub", 5),
 ])
 def test_invalid_new_settings_raise(mutate):
     config = valid_config()
@@ -206,3 +209,10 @@ def test_valid_update_check_values_pass():
     _validate(config)
     assert config["update_check"]["enabled"] is False
     assert config["update_check"]["interval_hours"] == 6.5
+
+
+def test_eventsub_disabled_passes():
+    config = valid_config()
+    config["eventsub"] = {"enabled": False}
+    _validate(config)
+    assert config["eventsub"] == {"enabled": False}

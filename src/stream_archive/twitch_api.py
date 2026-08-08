@@ -74,5 +74,104 @@ class TwitchAPI:
             logger.error("[twitch_api] get_live_streams failed: %s", e)
             raise
 
+    async def _eventsub_headers(self):
+        token = await self._get_token()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Client-Id": self._client_id,
+        }
+
+    async def list_conduits(self):
+        """Return existing EventSub conduits (each dict has id, shard_count)."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.get("https://api.twitch.tv/helix/eventsub/conduits", headers=headers)
+        resp.raise_for_status()
+        return resp.json()["data"]
+
+    async def create_conduit(self, shard_count=1):
+        headers = await self._eventsub_headers()
+        resp = await self.client.post(
+            "https://api.twitch.tv/helix/eventsub/conduits",
+            headers=headers,
+            json={"shard_count": shard_count},
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]
+
+    async def delete_conduit(self, conduit_id):
+        """Delete a conduit (also cascades to its subscriptions). 404 is success."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.delete(
+            "https://api.twitch.tv/helix/eventsub/conduits", headers=headers, params={"id": conduit_id}
+        )
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+
+    async def update_conduit_shards(self, conduit_id, session_id):
+        """Associate the single WebSocket shard ('0') with an EventSub session."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.patch(
+            "https://api.twitch.tv/helix/eventsub/conduits/shards",
+            headers=headers,
+            json={
+                "conduit_id": conduit_id,
+                "shards": [{"id": "0", "transport": {"method": "websocket", "session_id": session_id}}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]
+
+    async def create_eventsub_subscription(self, payload):
+        """Create a subscription; returns (status_code, body) without raising on 202/400/403/409."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.post(
+            "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, json=payload
+        )
+        if resp.status_code in (202, 400, 403, 409):
+            return resp.status_code, resp.json()
+        resp.raise_for_status()
+        return resp.status_code, resp.json()
+
+    async def delete_eventsub_subscription(self, sub_id):
+        """Delete a subscription. 404 is success."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.delete(
+            "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, params={"id": sub_id}
+        )
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+
+    async def list_eventsub_subscriptions(self):
+        """All subscriptions, cursor-paginated (max 10 pages of 100)."""
+        headers = await self._eventsub_headers()
+        data = []
+        cursor = None
+        for _ in range(10):
+            params = {"first": 100}
+            if cursor:
+                params["after"] = cursor
+            resp = await self.client.get(
+                "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, params=params
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data.extend(body["data"])
+            cursor = body.get("pagination", {}).get("cursor")
+            if not cursor:
+                break
+        return data
+
+    async def get_stream(self, user_id):
+        """Single stream snapshot (title/game_name); None when offline."""
+        headers = await self._eventsub_headers()
+        resp = await self.client.get(
+            "https://api.twitch.tv/helix/streams", headers=headers, params={"user_id": user_id}
+        )
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        return data[0] if data else None
+
     async def close(self):
         await self.client.aclose()

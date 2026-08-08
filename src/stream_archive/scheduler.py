@@ -12,6 +12,7 @@ from src.stream_archive.notifier import Notifier
 from src.stream_archive.youtube_streamer import YouTubeStreamer
 from src.stream_archive.telegram_control import TelegramController
 from src.stream_archive.updater import UpdateChecker
+from src.stream_archive.eventsub import EventSubClient
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +70,15 @@ async def run_scheduler():
     recorder = Recorder(config, youtube_streamer, notifier)
     monitor = Monitor(recorder, notifier)
 
+    eventsub = EventSubClient(twitch_api, monitor, config)
+    await eventsub.start()
+
     updater = UpdateChecker(config, notifier)
     updater_task = asyncio.create_task(updater.run_loop())
     logger.info("[updater] Update check enabled (every %sh)", config["update_check"]["interval_hours"])
 
     telegram = TelegramController(
-        config, recorder, monitor, on_restart=lambda: _shutdown_event.set(), updater=updater
+        config, recorder, monitor, eventsub, on_restart=lambda: _shutdown_event.set(), updater=updater
     )
     await telegram.start()
 
@@ -88,6 +92,8 @@ async def run_scheduler():
     else:
         version = "unknown"
     await notifier.notify_startup(config["channels"], version)
+    await eventsub.wait_ready(timeout=15)
+    logger.info("[scheduler] EventSub: %s", eventsub.status())
 
     try:
         while not _shutdown_event.is_set():
@@ -119,6 +125,7 @@ async def run_scheduler():
         await updater.close()
         await telegram.stop()
         await notifier.close()
+        await eventsub.close()
         await twitch_api.close()
         await youtube_streamer.close()
         logger.info("[scheduler] Shutdown complete")

@@ -1,12 +1,17 @@
 # StreamArchive
 
-Polls the Twitch Helix API for your followed channels and records every live
-stream via [streamlink](https://streamlink.github.io/), using ad-block playlist
-proxies (vendored `streamlink-ttvlol` plugin) so streams playable only via
-ad-block workaround still record. Optionally re-streams recordings to
-[YouTube Live](https://www.youtube.com/live) and sends Telegram alerts on
-live/offline events and start failures. The admin can also manage the
-recorder over Telegram — add/remove monitored channels, set retention and
+Receives near-instant live/offline signals for your followed channels via
+Twitch EventSub (delivered over a conduit WebSocket shard, authenticated with
+the existing app credentials — covers ALL configured channels) and records
+every live stream via [streamlink](https://streamlink.github.io/), using
+ad-block playlist proxies (vendored `streamlink-ttvlol` plugin) so streams
+playable only via ad-block workaround still record. A Helix poll at
+`monitoring_interval` stays as the reconciliation/fallback: it catches events
+EventSub missed (EventSub has no replay), picks up channels already live at
+boot, and restarts recordings that died mid-stream. Optionally re-streams
+recordings to [YouTube Live](https://www.youtube.com/live) and sends Telegram
+alerts on live/offline events and start failures. The admin can also manage
+the recorder over Telegram — add/remove monitored channels, set retention and
 output mode, toggle chat recording, view status, reload, or restart — with no
 other user able to issue commands.
 
@@ -16,8 +21,11 @@ recording processes that die mid-stream.
 
 ## Features
 
-- **Multi-channel monitoring** — polls Helix every `monitoring_interval`
-  seconds and starts/stops recordings as channels go live/offline.
+- **Multi-channel monitoring** — EventSub fast-path (stream.online /
+  stream.offline over a conduit WebSocket shard) starts/stops recordings
+  within seconds; the Helix poll at `monitoring_interval` seconds reconciles
+  state and covers EventSub outages, boot-time already-live channels, and
+  recordings that died mid-stream.
 - **Ad-block proxy support** — playlist URLs from the vendored `streamlink-ttvlol`
   plugin, with `httpproxy://user:pass@host:port` entries for upstream proxies.
 - **Three output modes**:
@@ -57,8 +65,11 @@ flowchart TD
     Recorder["recorder"]
     Notifier["notifier"]
     Telegram["telegram_control<br/>admin-only bot commands"]
+    EventSub["eventsub<br/>conduit WebSocket"]
 
     Scheduler -->|"every monitoring_interval"| Monitor
+    Scheduler -->|starts| EventSub
+    EventSub -->|"stream.online / stream.offline"| Monitor
     Monitor -->|"resolve user ids + live streams"| Twitch["Twitch Helix API"]
     Monitor -->|"start / stop / restart"| Recorder
     Recorder -->|"proxied playlist → stream"| Streamlink["streamlink"]
@@ -145,6 +156,7 @@ All keys from `config.json.example`:
 | `chat_dir` | no | `chat` | Directory where chat JSON files are stored (`chat_dir/<channel>/<title>-<ts>.chat.json`) |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
 | `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
+| `eventsub.enabled` | no | `true` | EventSub fast-path via conduit (uses the existing app credentials; no extra setup); `false` = polling only |
 | `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
 | `preferred_quality` | no | `best` | Stream quality to request from streamlink (`best`, `1080p`, `720p`, …); falls back to `best` |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings; `0` = unlimited |
@@ -199,7 +211,7 @@ a failed command leaves both memory and disk untouched.
 | Command | Action |
 | --- | --- |
 | `/help` | List the available commands |
-| `/status` | Monitored channels, output mode, retention, chat-recording state, monitoring interval, quality, concurrency limits, disk usage/limits, update-check state, and channels currently recording |
+| `/status` | Monitored channels, output mode, retention, chat-recording state, quality, concurrency limits, disk usage/limits, update-check state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
 | `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |
 | `/remove <channel>` | Stop monitoring a channel; if it is live, stops the recording (sending the offline notification) |
@@ -300,6 +312,7 @@ with `[scheduler] Shutdown complete`.
 | Other YouTube broadcast-creation error | Task fails loudly; channel restarted next cycle |
 | Recording dies mid-stream (ffmpeg killed, disk write error, proxy death) | Entry removed, `Recording task failed` logged, monitor restarts within one poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
 | Transient Twitch API error (token/request) | Logged, nothing acted on, retried next cycle |
+| EventSub connection lost / conduit shard disabled | Auto-reconnect with backoff; shard re-associated with the new WebSocket session; missed events covered by the polling cycle |
 | Stream reported for an unknown user id | Skipped with a warning; the poll cycle never crashes |
 
 Alerts are sent at most once per 30 minutes per channel (`FAILURE_NOTIFY_INTERVAL`
@@ -316,6 +329,7 @@ pyproject.toml
 src/stream_archive/
   scheduler.py           # poll loop, signal handling, daily retention cleanup
   monitor.py             # start/stop/restart decisions, failure alerts
+  eventsub.py            # EventSub conduit client (stream.online/offline fast-path)
   recorder.py            # streamlink capture, ffmpeg pipe, task tracking
   youtube_streamer.py    # YouTube Live API (broadcast/stream/bind/end)
   twitch_api.py          # Twitch Helix client (token, users, streams)

@@ -18,10 +18,11 @@ class TelegramController:
     leaves both memory and disk untouched.
     """
 
-    def __init__(self, config, recorder, monitor, on_restart=None, updater=None):
+    def __init__(self, config, recorder, monitor, eventsub, on_restart=None, updater=None):
         self._config = config
         self._recorder = recorder
         self._monitor = monitor
+        self._eventsub = eventsub
         self._on_restart = on_restart
         self._updater = updater
         self._admin_id = config["telegram_user_id"]
@@ -100,7 +101,7 @@ class TelegramController:
         per_channel = ""
         if overrides:
             per_channel = (
-                f"Per-channel modes: {', '.join(f'{k}={v}' for k, v in sorted(overrides.items()))}\n"
+                f"Per-channel output: {', '.join(f'{k} \u2192 {v}' for k, v in sorted(overrides.items()))}\n"
             )
         rec_parts = []
         for info in active:
@@ -109,18 +110,36 @@ class TelegramController:
                 part += f", {disk.format_bytes(int(info['size_mb'] * 1024 * 1024))}"
             rec_parts.append(part + ")")
         rec_now = ", ".join(rec_parts) if rec_parts else "none"
+        max_rec = c.get("max_concurrent_recordings", 0)
+        max_yt = c.get("max_concurrent_youtube_streams", 0)
+        rec_limit = "unlimited" if not max_rec else f"{max_rec:g}"
+        yt_limit = "unlimited" if not max_yt else f"{max_yt:g}"
+        disk_limits = []
+        min_free = c_disk.get("min_free_gb", 0)
+        cap = c_disk.get("max_total_gb", 0)
+        fill = c_disk.get("min_time_to_full_min", 0)
+        if min_free > 0:
+            disk_limits.append(f"keep {min_free:g} GB free")
+        if cap > 0:
+            if c_disk.get("evict_when_over", True):
+                disk_limits.append(f"max {cap:g} GB (delete oldest when over)")
+            else:
+                disk_limits.append(f"max {cap:g} GB (stop recording when over)")
+        if fill > 0:
+            disk_limits.append(f"stop if disk fills within {fill:g} min")
+        disk_limit_line = "Disk limits: " + " \u00b7 ".join(disk_limits) if disk_limits else "Disk limits: disabled"
         return (
             f"Channels ({len(c['channels'])}): {', '.join(c['channels'])}\n"
             f"Output mode: {c['output_mode']}\n"
             f"{per_channel}"
             f"{retention}\n"
             f"Chat recording: {chat_state}\n"
-            f"Monitoring interval: {c['monitoring_interval']}s\n"
             f"Quality: {c.get('preferred_quality', 'best')}\n"
-            f"Concurrent limit: {c.get('max_concurrent_recordings', 0)} recording(s), {c.get('max_concurrent_youtube_streams', 0)} YouTube re-stream(s) (0 = unlimited)\n"
+            f"Simultaneous recordings: {rec_limit}\n"
+            f"YouTube re-streams: {yt_limit}\n"
             f"Recording now: {rec_now}\n"
-            f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB \u2014 recordings dir: {disk_snap['dir_gb']:.1f} GB ({disk_snap['file_count']:,} files)\n"
-            f"Disk limits: min free {c_disk.get('min_free_gb', 0):g} GB \u00b7 max total {c_disk.get('max_total_gb', 0):g} GB (evict: {'on' if c_disk.get('evict_when_over', True) else 'off'}) \u00b7 stop if full in < {c_disk.get('min_time_to_full_min', 0):g} min \u00b7 check every {c_disk.get('check_interval_s', 60):g}s\n"
+            f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB \u00b7 recordings: {disk_snap['dir_gb']:.1f} GB\n"
+            f"{disk_limit_line}\n"
             f"Update check: {'enabled' if (c.get('update_check') or {}).get('enabled', True) else 'disabled'} "
             f"(every {(c.get('update_check') or {}).get('interval_hours', 24)}h)"
         )
@@ -128,7 +147,7 @@ class TelegramController:
     def handle_channels(self):
         return "\n".join(f"{i}. {ch}" for i, ch in enumerate(self._config["channels"], 1))
 
-    def handle_add(self, args):
+    async def handle_add(self, args):
         if len(args) != 1:
             return "Usage: /add <channel>"
         ch = args[0]
@@ -140,7 +159,10 @@ class TelegramController:
                 raise ValueError(f"{ch} is already monitored")
             candidate["channels"].append(ch)
 
-        return self._apply(mutate, lambda c: f"Added {ch} \u2014 {len(c['channels'])} channel(s) monitored")
+        result = self._apply(mutate, lambda c: f"Added {ch} \u2014 {len(c['channels'])} channel(s) monitored")
+        if not result.startswith("\u274c"):
+            await self._eventsub.add_channel(ch)
+        return result
 
     async def handle_remove(self, args):
         if len(args) != 1:
@@ -157,6 +179,8 @@ class TelegramController:
         if not result.startswith("\u274c") and self._recorder.is_recording(ch):
             await self._recorder.stop(ch)
             self._monitor.remove_channel(ch)
+        if not result.startswith("\u274c"):
+            await self._eventsub.remove_channel(ch)
         return result
 
     def handle_retention(self, args):
@@ -199,11 +223,12 @@ class TelegramController:
 
         return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
 
-    def handle_reload(self):
+    async def handle_reload(self):
         try:
             reload_config(self._config)
         except ValueError as e:
             return f"\u274c Reload failed: {e}"
+        await self._eventsub.sync_channels(self._config["channels"])
         return "\u2705 Config reloaded from config.json"
 
     def handle_restart(self):
@@ -380,7 +405,7 @@ class TelegramController:
         await update.effective_message.reply_text(self.handle_channels())
 
     async def _cmd_add(self, update, context):
-        await update.effective_message.reply_text(self.handle_add(context.args or []))
+        await update.effective_message.reply_text(await self.handle_add(context.args or []))
 
     async def _cmd_remove(self, update, context):
         await update.effective_message.reply_text(await self.handle_remove(context.args or []))
@@ -392,7 +417,7 @@ class TelegramController:
         await update.effective_message.reply_text(self.handle_mode(context.args or []))
 
     async def _cmd_reload(self, update, context):
-        await update.effective_message.reply_text(self.handle_reload())
+        await update.effective_message.reply_text(await self.handle_reload())
 
     async def _cmd_restart(self, update, context):
         await update.effective_message.reply_text(self.handle_restart())

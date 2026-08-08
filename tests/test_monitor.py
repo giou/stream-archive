@@ -65,6 +65,7 @@ class FakeRecorder:
 class FakeNotifier:
     def __init__(self):
         self.messages = []
+        self.offline = []
 
     async def notify(self, m):
         self.messages.append(m)
@@ -73,7 +74,7 @@ class FakeNotifier:
         pass
 
     async def notify_offline(self, *a, **k):
-        pass
+        self.offline.append((a, k))
 
 
 def make_monitor(recorder=None, notifier=None):
@@ -255,3 +256,91 @@ def test_youtube_limit_blocks_restreams():
 
     assert rec.started == ["ch_a"]
     assert any("YouTube re-stream limit reached" in m for m in notifier.messages)
+
+
+def test_handle_online_starts_recording():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+
+    assert rec.started == ["ch"]
+    assert rec.stopped == []
+
+
+def test_handle_online_twice_is_noop():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+
+    assert rec.started == ["ch"]
+
+
+def test_handle_online_restarts_dead_recording():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    rec._recording = False
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+
+    assert rec.started == ["ch", "ch"]
+    assert rec.stopped == []
+
+
+def test_handle_online_ignores_unknown_channel():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["other"]}
+
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+
+    assert rec.started == []
+
+
+def test_handle_offline_stops_and_notifies():
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_offline("ch", config))
+
+    assert rec.stopped == ["ch"]
+    assert len(notifier.offline) == 1
+
+
+def test_handle_offline_ignores_when_not_live():
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch"]}
+
+    asyncio.run(mon.handle_offline("ch", config))
+
+    assert rec.stopped == []
+    assert notifier.offline == []
+
+
+def test_poll_and_event_lock_same_channel():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = {"channels": ["ch"]}
+
+    async def concurrent():
+        await asyncio.gather(
+            mon.check_channels(api, config),
+            mon.handle_online("ch", "T", "G", "u1", config),
+        )
+
+    asyncio.run(concurrent())
+
+    assert rec.started == ["ch"]
+    assert rec.stopped == []
