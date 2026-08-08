@@ -565,14 +565,14 @@ def test_disk_subcommands(tmp_path):
     assert text == "Disk check interval set to 30s"
     assert read_file(tmp_path)["disk"]["check_interval_s"] == 30
 
-    text = ctrl.handle_disk(["evict", "off"])
-    assert text == "Disk eviction disabled"
-    assert read_file(tmp_path)["disk"]["evict_when_over"] is False
-    text = ctrl.handle_disk(["evict", "on"])
-    assert text == "Disk eviction enabled"
-    assert read_file(tmp_path)["disk"]["evict_when_over"] is True
+    text = ctrl.handle_disk(["delete_oldest", "off"])
+    assert text == "Delete oldest disabled"
+    assert read_file(tmp_path)["disk"]["delete_oldest"] is False
+    text = ctrl.handle_disk(["delete_oldest", "on"])
+    assert text == "Delete oldest enabled"
+    assert read_file(tmp_path)["disk"]["delete_oldest"] is True
 
-    assert ctrl.handle_disk(["bogus", "1"]) == "Usage: /disk <minfree|maxsize|fill|interval|evict> <value>"
+    assert ctrl.handle_disk(["bogus", "1"]) == "Usage: /disk <minfree|maxsize|fill|interval|delete_oldest> <value>"
     before = read_file(tmp_path)
     assert ctrl.handle_disk(["minfree", "x"]).startswith("\u274c")
     assert read_file(tmp_path) == before
@@ -583,7 +583,7 @@ def test_disk_show_block(tmp_path):
     text = ctrl.handle_disk([])
     assert "Disk limits:" in text
     assert "min free: 0 GB (0 = disabled)" in text
-    assert "max total: 0 GB (0 = disabled, evict: on)" in text
+    assert "max total: 0 GB (0 = disabled, delete oldest: on)" in text
     assert "stop if full in < 0 min (0 = disabled)" in text
     assert "check every 60s" in text
 
@@ -594,8 +594,10 @@ def test_help_lists_new_commands(tmp_path):
     assert "/quality [value]" in text
     assert "/maxrecordings <n>" in text
     assert "/maxyoutube <n>" in text
-    assert "/disk <minfree|maxsize|fill|interval|evict> <value>" in text
+    assert "/disk <minfree|maxsize|fill|interval|delete_oldest> <value>" in text
     assert "/chat [on|off]" in text
+    assert "/settings" in text
+    assert "/start" in text
 
 
 def test_chat_show_state(tmp_path):
@@ -687,9 +689,72 @@ def test_status_disk_limits_in_plain_words(tmp_path):
     text = asyncio.run(ctrl.handle_status())
     assert "keep 5 GB free" in text
     assert "max 100 GB (delete oldest when over)" in text
-    ctrl.handle_disk(["evict", "off"])
+    ctrl.handle_disk(["delete_oldest", "off"])
     text = asyncio.run(ctrl.handle_status())
     assert "max 100 GB (stop recording when over)" in text
     ctrl.handle_disk(["fill", "15"])
     text = asyncio.run(ctrl.handle_status())
     assert "stop if disk fills within 15 min" in text
+
+
+def labels(markup):
+    rows = markup.to_dict()["inline_keyboard"]
+    return [b["text"] for row in rows for b in row]
+
+
+def test_settings_panel_returns_status_and_buttons(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.settings_panel())
+    assert "Output mode: disk" in text
+    flat = labels(markup)
+    assert "Chat: on" in flat
+    assert "Mode: youtube" in flat
+    assert "Quality: 1080p" in flat
+    assert "Delete oldest: on" in flat
+    assert "\U0001f504 Refresh" in flat
+
+
+def test_callback_chat_off_persists_and_stops_chat(tmp_path):
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["channel1"])
+    text, markup = asyncio.run(ctrl.handle_callback("chat:off"))
+    assert read_file(tmp_path)["record_chat"] is False
+    assert recorder.chat_stop_calls == ["channel1"]
+    assert "Chat recording: disabled" in text
+
+
+def test_callback_mode_sets_global(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("mode:youtube"))
+    assert read_file(tmp_path)["output_mode"] == "youtube"
+    assert config["output_mode"] == "youtube"
+
+
+def test_callback_quality_sets(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("quality:1080p"))
+    assert read_file(tmp_path)["preferred_quality"] == "1080p"
+    assert config["preferred_quality"] == "1080p"
+
+
+def test_callback_delete_oldest_toggle(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("delete_oldest:off"))
+    assert read_file(tmp_path)["disk"]["delete_oldest"] is False
+
+
+def test_callback_unknown_data_noop(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("bogus:data"))
+    assert read_file(tmp_path) == before
+    assert text and markup
+
+
+def test_command_list_covers_all_handlers(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    commands = {c.command for c in ctrl.command_list()}
+    assert commands >= {
+        "start", "help", "status", "channels", "add", "remove", "retention",
+        "mode", "reload", "restart", "update", "quality", "maxrecordings",
+        "maxyoutube", "disk", "chat", "settings",
+    }

@@ -208,8 +208,8 @@ class Recorder:
                     await self._abort(channel, f"free space dropped below {min_free:g} GB ({snap['free_gb']:.1f} GB free)")
                     return
                 if cap > 0 and snap["dir_gb"] >= cap:
-                    if cfg.get("evict_when_over", True):
-                        await self.evict_to_cap()
+                    if cfg.get("delete_oldest", True):
+                        await self.delete_oldest_to_cap()
                         snap = await disk.disk_snapshot(self._config)
                     if snap["dir_gb"] >= cap:
                         await self._abort(channel, f"recording archive at {cap:g} GB cap")
@@ -537,14 +537,14 @@ class Recorder:
 
         return {"file_info": file_info, "youtube_info": youtube_info}
 
-    async def evict_to_cap(self):
+    async def delete_oldest_to_cap(self):
         """Delete oldest .ts files until under disk.max_total_gb; returns (files_removed, freed_gb)."""
         cap = self._config["disk"]["max_total_gb"]
         if cap <= 0:
             return (0, 0.0)
         loop = asyncio.get_running_loop()
 
-        def _evict():
+        def _delete_oldest():
             base = disk.recording_dir_path(self._config)
             if not base.exists():
                 return (0, 0.0)
@@ -560,10 +560,10 @@ class Recorder:
                 total -= size
                 removed += 1
                 freed += size
-                logger.info("[recorder] Evicted to stay under %s GB cap: %s", cap, p)
+                logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, p)
             return removed, freed
 
-        return await loop.run_in_executor(None, _evict)
+        return await loop.run_in_executor(None, _delete_oldest)
 
     async def cleanup_old_recordings(self, retention_days):
         """Delete .ts and .chat.json files older than retention_days days; returns count removed."""

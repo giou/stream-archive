@@ -151,11 +151,11 @@ class Monitor:
                 if min_free > 0 and snapshot["free_gb"] < min_free:
                     return (f"free disk space below {min_free:g} GB ({snapshot['free_gb']:.1f} GB free)", snapshot)
                 if cap > 0 and snapshot["dir_gb"] >= cap:
-                    if disk_cfg.get("evict_when_over", True):
-                        await self.recorder.evict_to_cap()
+                    if disk_cfg.get("delete_oldest", True):
+                        await self.recorder.delete_oldest_to_cap()
                         snapshot = await self.recorder.disk_snapshot()
                         if snapshot["dir_gb"] >= cap:
-                            return (f"recording archive at {cap:g} GB cap (nothing to evict)", snapshot)
+                            return (f"recording archive at {cap:g} GB cap (nothing to delete)", snapshot)
                     else:
                         return (f"recording archive at {cap:g} GB cap", snapshot)
             max_rec = config.get("max_concurrent_recordings", 0)

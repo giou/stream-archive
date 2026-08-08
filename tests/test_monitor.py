@@ -33,7 +33,7 @@ class FakeRecorder:
             "file_count": 0,
             "dir": "recordings",
         }
-        self.evict_calls = []
+        self.delete_oldest_calls = []
         self.mode = "disk"
 
     async def start(self, channel, title=None, game=None, user_id=None):
@@ -53,8 +53,8 @@ class FakeRecorder:
     async def disk_snapshot(self):
         return self.snapshot
 
-    async def evict_to_cap(self):
-        self.evict_calls.append(1)
+    async def delete_oldest_to_cap(self):
+        self.delete_oldest_calls.append(1)
         self.snapshot["dir_gb"] = 0.0
         return (0, 0.0)
 
@@ -192,32 +192,32 @@ def test_skip_start_when_free_below_threshold():
     assert any("free disk space below 5" in m for m in notifier.messages)
 
 
-def test_evicts_and_starts_when_over_cap():
+def test_delete_oldest_and_starts_when_over_cap():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "evict_when_over": True}}
+    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "delete_oldest": True}}
 
     asyncio.run(mon.check_channels(api, config))
 
-    assert rec.evict_calls == [1]
+    assert rec.delete_oldest_calls == [1]
     assert rec.started == ["ch"]
 
 
-def test_block_when_cap_reached_and_nothing_evictable():
+def test_block_when_cap_reached_and_nothing_to_delete():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "evict_when_over": True}}
+    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "delete_oldest": True}}
 
     async def keep_full():
-        rec.evict_calls.append(1)
+        rec.delete_oldest_calls.append(1)
         return (0, 0.0)
 
-    rec.evict_to_cap = keep_full
+    rec.delete_oldest_to_cap = keep_full
 
     asyncio.run(mon.check_channels(api, config))
 

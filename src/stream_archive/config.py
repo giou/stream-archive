@@ -211,7 +211,7 @@ def _validate_disk(config):
     d.setdefault("max_total_gb", 0)
     d.setdefault("check_interval_s", 60)
     d.setdefault("min_time_to_full_min", 0)
-    d.setdefault("evict_when_over", True)
+    d.setdefault("delete_oldest", True)
     if not isinstance(d["min_free_gb"], (int, float)) or d["min_free_gb"] < 0:
         raise ValueError("disk.min_free_gb must be a number >= 0 (0 = disabled)")
     if not isinstance(d["max_total_gb"], (int, float)) or d["max_total_gb"] < 0:
@@ -220,8 +220,8 @@ def _validate_disk(config):
         raise ValueError("disk.check_interval_s must be a number > 0")
     if not isinstance(d["min_time_to_full_min"], (int, float)) or d["min_time_to_full_min"] < 0:
         raise ValueError("disk.min_time_to_full_min must be a number >= 0 (0 = disabled)")
-    if not isinstance(d["evict_when_over"], bool):
-        raise ValueError("disk.evict_when_over must be a boolean")
+    if not isinstance(d["delete_oldest"], bool):
+        raise ValueError("disk.delete_oldest must be a boolean")
 
 
 def _validate_chat(config):

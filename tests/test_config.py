@@ -44,7 +44,7 @@ def test_valid_config_passes_and_sets_defaults():
         "max_total_gb": 0,
         "check_interval_s": 60,
         "min_time_to_full_min": 0,
-        "evict_when_over": True,
+        "delete_oldest": True,
     }
     assert config["eventsub"] == {"enabled": True}
 
@@ -56,11 +56,11 @@ def test_valid_disk_values_pass():
         "max_total_gb": 100,
         "check_interval_s": 30,
         "min_time_to_full_min": 15,
-        "evict_when_over": False,
+        "delete_oldest": False,
     }
     _validate(config)
     assert config["disk"]["min_free_gb"] == 5.5
-    assert config["disk"]["evict_when_over"] is False
+    assert config["disk"]["delete_oldest"] is False
 
 
 @pytest.mark.parametrize("mutate", [
@@ -73,7 +73,7 @@ def test_valid_disk_values_pass():
     lambda c: c.__setitem__("disk", {"check_interval_s": 0}),
     lambda c: c.__setitem__("disk", {"check_interval_s": -5}),
     lambda c: c.__setitem__("disk", {"min_time_to_full_min": -1}),
-    lambda c: c.__setitem__("disk", {"evict_when_over": "yes"}),
+    lambda c: c.__setitem__("disk", {"delete_oldest": "yes"}),
     lambda c: c.__setitem__("record_chat", "yes"),
     lambda c: c.__setitem__("chat_dir", ""),
     lambda c: c.__setitem__("eventsub", {"enabled": "yes"}),

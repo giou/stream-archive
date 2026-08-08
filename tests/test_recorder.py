@@ -627,7 +627,7 @@ def test_watchdog_aborts_on_fill_rate(tmp_path, monkeypatch):
     assert any("disk filling too fast" in m for m in notifier.messages)
 
 
-def test_evict_to_cap_deletes_oldest(tmp_path):
+def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     config = make_config(tmp_path)
     config["disk"] = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
     rec = Recorder(config)
@@ -639,7 +639,7 @@ def test_evict_to_cap_deletes_oldest(tmp_path):
         p.write_bytes(b"x" * 1024)
         os.utime(p, (t0 + i, t0 + i))
 
-    removed, freed = asyncio.run(rec.evict_to_cap())
+    removed, freed = asyncio.run(rec.delete_oldest_to_cap())
 
     assert removed == 1
     assert freed == 1024

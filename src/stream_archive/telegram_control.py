@@ -2,12 +2,21 @@ import asyncio
 import copy
 import logging
 
-from telegram.ext import Application, CommandHandler, filters
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.error import BadRequest
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, filters
 
 from src.stream_archive import disk
 from src.stream_archive.config import _CHANNEL_RE, reload_config, save_config
 
 logger = logging.getLogger(__name__)
+
+_QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p")
 
 
 class TelegramController:
@@ -28,6 +37,28 @@ class TelegramController:
         self._admin_id = config["telegram_user_id"]
         self._app = Application.builder().token(config["bot_telegram_api"]).build()
 
+    def command_list(self):
+        """BotCommand entries for the Telegram /-menu, shown only to the admin."""
+        return [
+            BotCommand("start", "Show available commands and open settings"),
+            BotCommand("help", "Show available commands"),
+            BotCommand("status", "Show current status and settings"),
+            BotCommand("channels", "List monitored channels"),
+            BotCommand("add", "Start monitoring a channel"),
+            BotCommand("remove", "Stop monitoring a channel"),
+            BotCommand("retention", "Set recording retention in days"),
+            BotCommand("mode", "Set output mode (disk, youtube, both)"),
+            BotCommand("reload", "Re-read config.json from disk"),
+            BotCommand("restart", "Restart the service"),
+            BotCommand("update", "Check for and apply updates"),
+            BotCommand("quality", "Show or set preferred quality"),
+            BotCommand("maxrecordings", "Set concurrent recording limit"),
+            BotCommand("maxyoutube", "Set YouTube re-stream limit"),
+            BotCommand("disk", "Show or set disk limits"),
+            BotCommand("chat", "Toggle live chat recording"),
+            BotCommand("settings", "Open the settings panel with buttons"),
+        ]
+
     async def start(self):
         admin = filters.User(user_id=self._admin_id)
         self._app.add_handlers([
@@ -46,10 +77,19 @@ class TelegramController:
             CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
+            CommandHandler("settings", self._cmd_settings, filters=admin),
+            CommandHandler("start", self._cmd_start, filters=admin),
+            CallbackQueryHandler(self._on_callback),
         ])
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling(allowed_updates=["message"])
+        try:
+            await self._app.bot.set_my_commands(
+                self.command_list(), scope=BotCommandScopeChat(chat_id=self._admin_id)
+            )
+        except Exception:
+            logger.warning("[telegram] Failed to register command menu", exc_info=True)
+        await self._app.updater.start_polling(allowed_updates=["message", "callback_query"])
         logger.info("[telegram] Bot polling started (admin id=%s)", self._admin_id)
 
     async def stop(self):
@@ -68,6 +108,32 @@ class TelegramController:
         self._config.update(candidate)
         return ok_text(candidate)
 
+    def settings_keyboard(self):
+        """Inline buttons for the common toggles. callback_data literals are the wire format."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Chat: on", callback_data="chat:on"),
+             InlineKeyboardButton("Chat: off", callback_data="chat:off")],
+            [InlineKeyboardButton("Mode: disk", callback_data="mode:disk"),
+             InlineKeyboardButton("Mode: youtube", callback_data="mode:youtube"),
+             InlineKeyboardButton("Mode: both", callback_data="mode:both")],
+            [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
+             for q in _QUALITY_PRESETS[:3]],
+            [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
+             for q in _QUALITY_PRESETS[3:]],
+            [InlineKeyboardButton("Delete oldest: on", callback_data="delete_oldest:on"),
+             InlineKeyboardButton("Delete oldest: off", callback_data="delete_oldest:off")],
+            [InlineKeyboardButton("\U0001f504 Refresh", callback_data="refresh")],
+        ])
+
+    def help_keyboard(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="panel")],
+        ])
+
+    async def settings_panel(self):
+        """Current status text + the toggle keyboard — the /settings message body."""
+        return await self.handle_status(), self.settings_keyboard()
+
     def handle_help(self):
         return (
             "Available commands:\n"
@@ -85,8 +151,10 @@ class TelegramController:
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
             "/disk - show disk limits\n"
-            "/disk <minfree|maxsize|fill|interval|evict> <value> - set disk limit\n"
-            "/chat [on|off] - enable or disable live chat recording (off stops in-flight capture)"
+            "/disk <minfree|maxsize|fill|interval|delete_oldest> <value> - set disk limit\n"
+            "/chat [on|off] - enable or disable live chat recording (off stops in-flight capture)\n"
+            "/settings - open the settings panel with buttons\n"
+            "/start - this help"
         )
 
     async def handle_status(self):
@@ -121,7 +189,7 @@ class TelegramController:
         if min_free > 0:
             disk_limits.append(f"keep {min_free:g} GB free")
         if cap > 0:
-            if c_disk.get("evict_when_over", True):
+            if c_disk.get("delete_oldest", True):
                 disk_limits.append(f"max {cap:g} GB (delete oldest when over)")
             else:
                 disk_limits.append(f"max {cap:g} GB (stop recording when over)")
@@ -328,29 +396,29 @@ class TelegramController:
 
     def handle_disk(self, args):
         c = self._config
-        usage = "Usage: /disk <minfree|maxsize|fill|interval|evict> <value>"
+        usage = "Usage: /disk <minfree|maxsize|fill|interval|delete_oldest> <value>"
         if not args:
             d = c.get("disk", {})
             return (
                 "Disk limits:\n"
                 f"min free: {d.get('min_free_gb', 0):g} GB (0 = disabled)\n"
-                f"max total: {d.get('max_total_gb', 0):g} GB (0 = disabled, evict: {'on' if d.get('evict_when_over', True) else 'off'})\n"
+                f"max total: {d.get('max_total_gb', 0):g} GB (0 = disabled, delete oldest: {'on' if d.get('delete_oldest', True) else 'off'})\n"
                 f"stop if full in < {d.get('min_time_to_full_min', 0):g} min (0 = disabled)\n"
                 f"check every {d.get('check_interval_s', 60):g}s"
             )
         if len(args) != 2:
             return usage
         cmd, val = args[0].lower(), args[1]
-        if cmd == "evict":
+        if cmd == "delete_oldest":
             if val == "on":
                 return self._apply(
-                    lambda candidate: candidate.setdefault("disk", {}).__setitem__("evict_when_over", True),
-                    lambda candidate: "Disk eviction enabled",
+                    lambda candidate: candidate.setdefault("disk", {}).__setitem__("delete_oldest", True),
+                    lambda candidate: "Delete oldest enabled",
                 )
             if val == "off":
                 return self._apply(
-                    lambda candidate: candidate.setdefault("disk", {}).__setitem__("evict_when_over", False),
-                    lambda candidate: "Disk eviction disabled",
+                    lambda candidate: candidate.setdefault("disk", {}).__setitem__("delete_oldest", False),
+                    lambda candidate: "Delete oldest disabled",
                 )
             return usage
         try:
@@ -395,11 +463,59 @@ class TelegramController:
             return text
         return "Usage: /chat <on|off>"
 
+    async def handle_callback(self, data):
+        """Apply one inline-button press; returns (reply_text, reply_markup).
+
+        Delegates to the same validated handlers as the text commands, then
+        re-renders the panel. Unknown/stale callback data is a no-op re-render.
+        """
+        action, _, value = data.partition(":")
+        if action == "chat" and value in ("on", "off"):
+            await self.handle_chat([value])
+        elif action == "mode" and value in ("disk", "youtube", "both"):
+            self.handle_mode([value])
+        elif action == "quality" and value in _QUALITY_PRESETS:
+            self.handle_quality([value])
+        elif action == "delete_oldest" and value in ("on", "off"):
+            self.handle_disk(["delete_oldest", value])
+        # data "panel"/"refresh" and anything unknown: just re-render
+        return await self.settings_panel()
+
+    async def _on_callback(self, update, context):
+        query = update.callback_query
+        user = update.effective_user
+        if user is None or user.id != self._admin_id:  # non-admin presses are ignored
+            await query.answer()
+            return
+        text, markup = await self.handle_callback(query.data)
+        if query.message is None:  # original message was deleted -> send a fresh one
+            await query.answer()
+            await context.bot.send_message(
+                chat_id=query.from_user.id, text=text, reply_markup=markup
+            )
+        elif query.message.text == text:  # toggle already in requested state
+            await query.answer("No change")
+        else:
+            await query.answer()
+            try:
+                await query.edit_message_text(text, reply_markup=markup)
+            except BadRequest:  # message vanished mid-flight -> resend
+                await context.bot.send_message(
+                    chat_id=query.from_user.id, text=text, reply_markup=markup
+                )
+
     async def _cmd_help(self, update, context):
-        await update.effective_message.reply_text(self.handle_help())
+        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())
 
     async def _cmd_status(self, update, context):
-        await update.effective_message.reply_text(await self.handle_status())
+        await update.effective_message.reply_text(await self.handle_status(), reply_markup=self.help_keyboard())
+
+    async def _cmd_settings(self, update, context):
+        text, markup = await self.settings_panel()
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+    async def _cmd_start(self, update, context):
+        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())
 
     async def _cmd_channels(self, update, context):
         await update.effective_message.reply_text(self.handle_channels())
