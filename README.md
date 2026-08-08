@@ -214,7 +214,7 @@ existing `.chat.json`. `retention_days` cleanup also removes old
 
 The admin user (`telegram_user_id`) can manage the recorder by messaging the
 bot; anyone else gets no reply at all. The bot registers a command menu (type
-`/`) for the admin and a `/settings` panel with one-tap buttons for the common
+`/`) for the admin and a `/settings` panel with submenu buttons for the common
 settings. Every change is validated before being
 written atomically to `config.json` and takes effect on the next poll cycle —
 a failed command leaves both memory and disk untouched.
@@ -223,7 +223,7 @@ a failed command leaves both memory and disk untouched.
 | --- | --- |
 | `/help` | List the available commands |
 | `/start` | Show the command list with a button to open the settings panel |
-| `/settings` | Open the settings panel: one-tap buttons for chat recording, output mode, quality, and delete-oldest-on-over-cap |
+| `/settings` | Open the settings panel: submenu buttons for chat recording, output mode, quality, and delete-oldest-on-over-cap; the panel auto-refreshes every 30s |
 | `/status` | Monitored channels, output mode, retention, chat-recording state, quality, concurrency limits, disk usage/limits, update-check state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
 | `/add <channel>` | Start monitoring a channel (validated against the channel-name rules) |

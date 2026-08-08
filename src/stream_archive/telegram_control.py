@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 _QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p")
 
 
+def _keyboards_equal(a, b):
+    """True when both inline keyboards render identically (None == no keyboard)."""
+    return (a.to_dict() if a is not None else {}) == (b.to_dict() if b is not None else {})
+
+
 class TelegramController:
     """Telegram control surface for the admin user (config['telegram_user_id']).
 
@@ -36,6 +41,9 @@ class TelegramController:
         self._updater = updater
         self._admin_id = config["telegram_user_id"]
         self._app = Application.builder().token(config["bot_telegram_api"]).build()
+        self._panel_message = None  # latest settings-panel message (auto-refresh target)
+        self._panel_menu = "root"   # which submenu the panel currently shows
+        self._refresh_task = None   # asyncio task keeping the panel current
 
     def command_list(self):
         """BotCommand entries for the Telegram /-menu, shown only to the admin."""
@@ -89,10 +97,13 @@ class TelegramController:
             )
         except Exception:
             logger.warning("[telegram] Failed to register command menu", exc_info=True)
+        self._refresh_task = asyncio.create_task(self._panel_refresh_loop())
         await self._app.updater.start_polling(allowed_updates=["message", "callback_query"])
         logger.info("[telegram] Bot polling started (admin id=%s)", self._admin_id)
 
     async def stop(self):
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
         await self._app.updater.stop()
         await self._app.stop()
         await self._app.shutdown()
@@ -108,21 +119,53 @@ class TelegramController:
         self._config.update(candidate)
         return ok_text(candidate)
 
-    def settings_keyboard(self):
-        """Inline buttons for the common toggles. callback_data literals are the wire format."""
+    @staticmethod
+    def _back_row():
+        return [InlineKeyboardButton("\u2190 Back", callback_data="back")]
+
+    def settings_keyboard(self, menu="root"):
+        """Inline buttons for the settings panel; ``menu`` selects the submenu.
+
+        Root shows one row per setting (current value in the label); each row
+        opens a submenu with that setting's choices. callback_data literals
+        are the wire format.
+        """
+        if menu == "chat":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("Chat: on", callback_data="chat:on"),
+                 InlineKeyboardButton("Chat: off", callback_data="chat:off")],
+                self._back_row(),
+            ])
+        if menu == "mode":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Mode: {m}", callback_data=f"mode:{m}")
+                 for m in ("disk", "youtube", "both")],
+                self._back_row(),
+            ])
+        if menu == "quality":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
+                 for q in _QUALITY_PRESETS[:3]],
+                [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
+                 for q in _QUALITY_PRESETS[3:]],
+                self._back_row(),
+            ])
+        if menu == "delete_oldest":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("Delete oldest: on", callback_data="delete_oldest:on"),
+                 InlineKeyboardButton("Delete oldest: off", callback_data="delete_oldest:off")],
+                self._back_row(),
+            ])
+        c = self._config
+        chat = "on" if c.get("record_chat", True) else "off"
+        mode = c.get("output_mode", "disk")
+        quality = c.get("preferred_quality", "best")
+        oldest = "on" if c.get("disk", {}).get("delete_oldest", True) else "off"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Chat: on", callback_data="chat:on"),
-             InlineKeyboardButton("Chat: off", callback_data="chat:off")],
-            [InlineKeyboardButton("Mode: disk", callback_data="mode:disk"),
-             InlineKeyboardButton("Mode: youtube", callback_data="mode:youtube"),
-             InlineKeyboardButton("Mode: both", callback_data="mode:both")],
-            [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
-             for q in _QUALITY_PRESETS[:3]],
-            [InlineKeyboardButton(f"Quality: {q}", callback_data=f"quality:{q}")
-             for q in _QUALITY_PRESETS[3:]],
-            [InlineKeyboardButton("Delete oldest: on", callback_data="delete_oldest:on"),
-             InlineKeyboardButton("Delete oldest: off", callback_data="delete_oldest:off")],
-            [InlineKeyboardButton("\U0001f504 Refresh", callback_data="refresh")],
+            [InlineKeyboardButton(f"Chat: {chat} \u203a", callback_data="menu:chat")],
+            [InlineKeyboardButton(f"Mode: {mode} \u203a", callback_data="menu:mode")],
+            [InlineKeyboardButton(f"Quality: {quality} \u203a", callback_data="menu:quality")],
+            [InlineKeyboardButton(f"Delete oldest: {oldest} \u203a", callback_data="menu:delete_oldest")],
         ])
 
     def help_keyboard(self):
@@ -130,9 +173,9 @@ class TelegramController:
             [InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="panel")],
         ])
 
-    async def settings_panel(self):
-        """Current status text + the toggle keyboard — the /settings message body."""
-        return await self.handle_status(), self.settings_keyboard()
+    async def settings_panel(self, menu="root"):
+        """Current status text + the settings keyboard — the /settings message body."""
+        return await self.handle_status(), self.settings_keyboard(menu)
 
     def handle_help(self):
         return (
@@ -466,10 +509,16 @@ class TelegramController:
     async def handle_callback(self, data):
         """Apply one inline-button press; returns (reply_text, reply_markup).
 
-        Delegates to the same validated handlers as the text commands, then
-        re-renders the panel. Unknown/stale callback data is a no-op re-render.
+        ``menu:<name>``/``back`` only navigate. Value presses delegate to the
+        same validated handlers as the text commands and land back on the root
+        menu (so the updated current value is visible). Unknown/stale callback
+        data is a no-op re-render of the root.
         """
         action, _, value = data.partition(":")
+        if action == "menu":
+            menu = value if value in ("chat", "mode", "quality", "delete_oldest") else "root"
+            self._panel_menu = menu
+            return await self.settings_panel(menu)
         if action == "chat" and value in ("on", "off"):
             await self.handle_chat([value])
         elif action == "mode" and value in ("disk", "youtube", "both"):
@@ -478,7 +527,8 @@ class TelegramController:
             self.handle_quality([value])
         elif action == "delete_oldest" and value in ("on", "off"):
             self.handle_disk(["delete_oldest", value])
-        # data "panel"/"refresh" and anything unknown: just re-render
+        # "back", "panel", and anything unknown: just re-render the root
+        self._panel_menu = "root"
         return await self.settings_panel()
 
     async def _on_callback(self, update, context):
@@ -490,19 +540,48 @@ class TelegramController:
         text, markup = await self.handle_callback(query.data)
         if query.message is None:  # original message was deleted -> send a fresh one
             await query.answer()
-            await context.bot.send_message(
+            self._panel_message = await context.bot.send_message(
                 chat_id=query.from_user.id, text=text, reply_markup=markup
             )
-        elif query.message.text == text:  # toggle already in requested state
-            await query.answer("No change")
+        elif query.message.text == text and _keyboards_equal(query.message.reply_markup, markup):
+            await query.answer("No change")  # state and view already match
         else:
             await query.answer()
             try:
-                await query.edit_message_text(text, reply_markup=markup)
+                self._panel_message = await query.edit_message_text(text, reply_markup=markup)
             except BadRequest:  # message vanished mid-flight -> resend
-                await context.bot.send_message(
+                self._panel_message = await context.bot.send_message(
                     chat_id=query.from_user.id, text=text, reply_markup=markup
                 )
+
+    async def _panel_refresh_loop(self):
+        """Background task: refresh the open settings panel every 30s."""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await self._refresh_panel(None)
+                except Exception:
+                    logger.warning("[telegram] Panel auto-refresh failed", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
+    async def _refresh_panel(self, context):
+        """Job: keep the open settings panel current without user interaction.
+
+        Re-renders the panel body (status text) with the currently displayed
+        submenu every 30s, but only edits when something actually changed.
+        """
+        message = self._panel_message
+        if message is None:
+            return
+        text, markup = await self.settings_panel(self._panel_menu)
+        if message.text == text and _keyboards_equal(message.reply_markup, markup):
+            return
+        try:
+            self._panel_message = await message.edit_text(text, reply_markup=markup)
+        except BadRequest:  # panel message was deleted -> stop refreshing it
+            self._panel_message = None
 
     async def _cmd_help(self, update, context):
         await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())
@@ -512,7 +591,8 @@ class TelegramController:
 
     async def _cmd_settings(self, update, context):
         text, markup = await self.settings_panel()
-        await update.effective_message.reply_text(text, reply_markup=markup)
+        self._panel_message = await update.effective_message.reply_text(text, reply_markup=markup)
+        self._panel_menu = "root"
 
     async def _cmd_start(self, update, context):
         await update.effective_message.reply_text(self.handle_help(), reply_markup=self.help_keyboard())

@@ -706,12 +706,13 @@ def test_settings_panel_returns_status_and_buttons(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text, markup = asyncio.run(ctrl.settings_panel())
     assert "Output mode: disk" in text
-    flat = labels(markup)
-    assert "Chat: on" in flat
-    assert "Mode: youtube" in flat
-    assert "Quality: 1080p" in flat
-    assert "Delete oldest: on" in flat
-    assert "\U0001f504 Refresh" in flat
+    # root menu: one category row per setting, no value buttons
+    assert labels(markup) == [
+        "Chat: on \u203a",
+        "Mode: disk \u203a",
+        "Quality: best \u203a",
+        "Delete oldest: on \u203a",
+    ]
 
 
 def test_callback_chat_off_persists_and_stops_chat(tmp_path):
@@ -758,3 +759,92 @@ def test_command_list_covers_all_handlers(tmp_path):
         "mode", "reload", "restart", "update", "quality", "maxrecordings",
         "maxyoutube", "disk", "chat", "settings",
     }
+
+
+def test_settings_submenus(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    cases = {
+        "chat": ["Chat: on", "Chat: off", "\u2190 Back"],
+        "mode": ["Mode: disk", "Mode: youtube", "Mode: both", "\u2190 Back"],
+        "quality": ["Quality: best", "Quality: 1080p", "Quality: 720p",
+                    "Quality: 480p", "Quality: 360p", "\u2190 Back"],
+        "delete_oldest": ["Delete oldest: on", "Delete oldest: off", "\u2190 Back"],
+    }
+    for menu, expected in cases.items():
+        text, markup = asyncio.run(ctrl.handle_callback(f"menu:{menu}"))
+        assert labels(markup) == expected
+        assert "Output mode: disk" in text
+
+
+def test_callback_apply_returns_to_root(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_callback("menu:quality"))
+    text, markup = asyncio.run(ctrl.handle_callback("quality:720p"))
+    assert labels(markup) == [
+        "Chat: on \u203a",
+        "Mode: disk \u203a",
+        "Quality: 720p \u203a",
+        "Delete oldest: on \u203a",
+    ]
+    assert read_file(tmp_path)["preferred_quality"] == "720p"
+    assert config["preferred_quality"] == "720p"
+
+
+def test_callback_back_returns_root(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_callback("menu:mode"))
+    before = read_file(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("back"))
+    assert labels(markup) == [
+        "Chat: on \u203a",
+        "Mode: disk \u203a",
+        "Quality: best \u203a",
+        "Delete oldest: on \u203a",
+    ]
+    assert read_file(tmp_path) == before
+
+
+def test_refresh_panel_edits_only_when_changed(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.settings_panel())
+
+    class FakeMessage:
+        def __init__(self):
+            self.text = text
+            self.reply_markup = markup
+            self.edits = 0
+
+        async def edit_text(self, text, reply_markup=None):
+            self.edits += 1
+            self.text = text
+            self.reply_markup = reply_markup
+            return self
+
+    msg = FakeMessage()
+    ctrl._panel_message = msg
+    asyncio.run(ctrl._refresh_panel(None))
+    assert msg.edits == 0  # nothing changed -> no edit
+    ctrl.handle_mode(["youtube"])
+    asyncio.run(ctrl._refresh_panel(None))
+    assert msg.edits == 1  # status text changed -> auto edit
+    assert "Output mode: youtube" in msg.text
+
+
+def test_refresh_panel_clears_when_message_deleted(tmp_path):
+    from telegram.error import BadRequest
+
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.settings_panel())
+
+    class DeletedMessage:
+        reply_markup = markup
+
+        async def edit_text(self, text, reply_markup=None):
+            raise BadRequest("message is not modified")
+
+    message = DeletedMessage()
+    message.text = text
+    ctrl._panel_message = message
+    ctrl.handle_mode(["youtube"])
+    asyncio.run(ctrl._refresh_panel(None))
+    assert ctrl._panel_message is None  # stop refreshing a vanished message
