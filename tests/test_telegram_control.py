@@ -941,7 +941,7 @@ def test_reply_text_unknown_ignored(tmp_path):
 
 def test_callback_confirm_remove_applies(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
-    text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:channel1"))
+    text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:channel1:deadbeef"))
     assert text.startswith("Removed channel1")
     assert "channel1" not in config["channels"]
     assert "channel1" not in read_file(tmp_path)["channels"]
@@ -951,15 +951,64 @@ def test_callback_confirm_remove_applies(tmp_path):
 
 def test_callback_confirm_remove_dedup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
-    asyncio.run(ctrl.handle_callback("confirm_remove:channel1"))
-    assert asyncio.run(ctrl.handle_callback("confirm_remove:channel1")) is None
+    asyncio.run(ctrl.handle_callback("confirm_remove:channel1:deadbeef"))
+    assert asyncio.run(ctrl.handle_callback("confirm_remove:channel1:deadbeef")) is None
     assert eventsub.removed == ["channel1"]
+
+
+def test_callback_confirm_remove_stale_channel_feedback(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1"])
+    before = read_file(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:ghost:deadbeef"))
+    assert text == "ghost is no longer monitored"
+    assert read_file(tmp_path) == before
+    assert eventsub.removed == []
+
+
+def test_callback_cancel_works_per_confirm_message(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_callback("cancel:aaaa1111"))
+    assert text == "Cancelled \u2014 nothing changed"
+    # a second confirm message has a different nonce -> its cancel still works
+    text, markup = asyncio.run(ctrl.handle_callback("cancel:bbbb2222"))
+    assert text == "Cancelled \u2014 nothing changed"
+    assert read_file(tmp_path) == before
+
+
+def test_confirm_keyboard_roundtrip_applies(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    kb = ctrl._confirm_keyboard("confirm_remove", "channel1").to_dict()
+    data = kb["inline_keyboard"][0][0]["callback_data"]
+    text, markup = asyncio.run(ctrl.handle_callback(data))
+    assert text.startswith("Removed channel1")
+    assert "channel1" not in config["channels"]
+    assert eventsub.removed == ["channel1"]
+
+
+def test_confirm_keyboard_data_unique_per_message(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    kb1 = ctrl._confirm_keyboard("confirm_remove", "channel1").to_dict()
+    kb2 = ctrl._confirm_keyboard("confirm_remove", "channel1").to_dict()
+    data1 = [b["callback_data"] for row in kb1["inline_keyboard"] for b in row]
+    data2 = [b["callback_data"] for row in kb2["inline_keyboard"] for b in row]
+    assert data1[0].startswith("confirm_remove:channel1:")
+    assert data1[1].startswith("cancel:")
+    assert data1 != data2  # nonce differs per message
+
+
+def test_callback_old_format_ignored(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    assert asyncio.run(ctrl.handle_callback("confirm_remove:channel1")) is None
+    assert asyncio.run(ctrl.handle_callback("cancel")) is None
+    assert read_file(tmp_path) == before
 
 
 def test_callback_confirm_delete_oldest_applies(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_disk(["delete_oldest", "off"])
-    text, markup = asyncio.run(ctrl.handle_callback("confirm_delete_oldest:on"))
+    text, markup = asyncio.run(ctrl.handle_callback("confirm_delete_oldest:on:deadbeef"))
     assert read_file(tmp_path)["disk"]["delete_oldest"] is True
     assert config["disk"]["delete_oldest"] is True
     assert ctrl._menu == "disk"
@@ -968,7 +1017,7 @@ def test_callback_confirm_delete_oldest_applies(tmp_path):
 def test_callback_cancel(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_callback("cancel"))
+    text, markup = asyncio.run(ctrl.handle_callback("cancel:deadbeef"))
     assert text == "Cancelled \u2014 nothing changed"
     assert markup is None
     assert read_file(tmp_path) == before
@@ -1017,7 +1066,7 @@ def test_callback_double_tap_silent_no_toast(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
     update = _FakeUpdate(12345)
     ctx = _FakeContext()
-    update.callback_query.data = "confirm_remove:channel1"
+    update.callback_query.data = "confirm_remove:channel1:deadbeef"
     asyncio.run(ctrl._on_callback(update, ctx))
     asyncio.run(ctrl._on_callback(update, ctx))
     assert update.callback_query.answers == [None, None]  # no "Already processed" toast
@@ -1034,7 +1083,7 @@ def test_callback_error_surfaces_instead_of_silent_failure(tmp_path):
     ctrl.handle_callback = boom
     update = _FakeUpdate(12345)
     ctx = _FakeContext()
-    update.callback_query.data = "confirm_remove:channel1"
+    update.callback_query.data = "confirm_remove:channel1:deadbeef"
     asyncio.run(ctrl._on_callback(update, ctx))
     assert update.callback_query.answers == [None]
     assert update.callback_query.edits == ["\u274c Unexpected error \u2014 see logs"]

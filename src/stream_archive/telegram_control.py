@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import logging
+import secrets
 
 from telegram import (
     BotCommand,
@@ -355,9 +356,12 @@ class TelegramController:
         return None
 
     def _confirm_keyboard(self, action, value):
+        # Nonce makes the callback data unique per confirm message, so the
+        # double-tap guard never swallows a later confirm/cancel on a new message.
+        nonce = secrets.token_hex(4)
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Confirm", callback_data=f"confirm_{action}:{value}"),
-             InlineKeyboardButton("Cancel", callback_data="cancel")],
+            [InlineKeyboardButton("Confirm", callback_data=f"{action}:{value}:{nonce}"),
+             InlineKeyboardButton("Cancel", callback_data=f"cancel:{nonce}")],
         ])
 
     def handle_help(self):
@@ -672,19 +676,32 @@ class TelegramController:
         return "Usage: /chat <on|off>"
 
     async def handle_callback(self, data):
-        """Apply one confirmation-button press; returns (reply_text, markup) or None."""
-        if data in self._confirm_done:  # double-tap guard
-            return None
-        action, _, value = data.partition(":")
-        if action == "cancel":
+        """Apply one confirmation-button press; returns (reply_text, markup) or None.
+
+        Wire format (from ``_confirm_keyboard``): ``confirm_<action>:<value>:<nonce>``
+        and ``cancel:<nonce>``. The nonce makes every confirm message's buttons
+        unique, so the double-tap guard only ever guards the same message.
+        """
+        parts = data.split(":")
+        action = parts[0]
+        if action == "cancel" and len(parts) == 2:
+            if data in self._confirm_done:  # double-tap on the same message
+                return None
             self._confirm_done.add(data)
             return "Cancelled \u2014 nothing changed", None
-        if action == "confirm_remove" and value in self._config["channels"]:
+        if action == "confirm_remove" and len(parts) == 3:
+            if data in self._confirm_done:  # double-tap on the same message
+                return None
+            value = parts[1]
+            if value not in self._config["channels"]:
+                return f"{value} is no longer monitored", None  # stale confirm message
             self._confirm_done.add(data)
             result = await self.handle_remove([value])  # stops recording + eventsub, clears override
             self._menu, self._menu_channel = "channels", None
             return result, None
-        if action == "confirm_delete_oldest" and value == "on":
+        if action == "confirm_delete_oldest" and len(parts) == 3 and parts[1] == "on":
+            if data in self._confirm_done:  # double-tap on the same message
+                return None
             self._confirm_done.add(data)
             result = self.handle_disk(["delete_oldest", "on"])
             self._menu = "disk"
