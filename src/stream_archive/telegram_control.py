@@ -697,12 +697,31 @@ class TelegramController:
         if user is None or user.id != self._admin_id:  # non-admin presses are ignored
             await query.answer()
             return
-        result = await self.handle_callback(query.data)
-        if result is None:
-            await query.answer("Already processed" if query.data in self._confirm_done else "")
+        try:
+            result = await self.handle_callback(query.data)
+        except Exception:
+            logger.exception("[telegram] Callback %s failed", query.data)
+            error_text = "\u274c Unexpected error \u2014 see logs"
+            try:
+                await query.answer()
+            except BadRequest:
+                pass
+            try:
+                await query.edit_message_text(error_text, reply_markup=None)
+            except BadRequest:  # confirm message vanished -> send a fresh one
+                await context.bot.send_message(chat_id=query.from_user.id, text=error_text)
+            return
+        if result is None:  # double-tap or unknown data: silent ack, no toast
+            try:
+                await query.answer()
+            except BadRequest:
+                pass
             return
         text, _ = result
-        await query.answer()
+        try:
+            await query.answer()
+        except BadRequest:
+            pass
         try:
             await query.edit_message_text(text, reply_markup=None)
         except BadRequest:  # message vanished mid-flight -> resend

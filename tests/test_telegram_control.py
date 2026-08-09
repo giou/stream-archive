@@ -979,3 +979,74 @@ def test_callback_unknown_ignored(tmp_path):
     before = read_file(tmp_path)
     assert asyncio.run(ctrl.handle_callback("bogus:data")) is None
     assert read_file(tmp_path) == before
+
+
+class _FakeBot:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+
+
+class _FakeQuery:
+    def __init__(self):
+        self.answers = []
+        self.edits = []
+        self.data = None
+
+    async def answer(self, text=None):
+        self.answers.append(text)
+
+    async def edit_message_text(self, text, reply_markup=None):
+        self.edits.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self, user_id):
+        self.effective_user = type("U", (), {"id": user_id})()
+        self.callback_query = _FakeQuery()
+
+
+class _FakeContext:
+    def __init__(self):
+        self.bot = _FakeBot()
+
+
+def test_callback_double_tap_silent_no_toast(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1", "ch"])
+    update = _FakeUpdate(12345)
+    ctx = _FakeContext()
+    update.callback_query.data = "confirm_remove:channel1"
+    asyncio.run(ctrl._on_callback(update, ctx))
+    asyncio.run(ctrl._on_callback(update, ctx))
+    assert update.callback_query.answers == [None, None]  # no "Already processed" toast
+    assert len(update.callback_query.edits) == 1  # second tap does not re-edit
+    assert "Removed channel1" in update.callback_query.edits[0]
+    assert eventsub.removed == ["channel1"]
+    assert len(ctx.bot.sent) == 1  # menu re-rendered once, after the first tap
+
+
+def test_callback_error_surfaces_instead_of_silent_failure(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["channel1"])
+    async def boom(data):
+        raise RuntimeError("boom")
+    ctrl.handle_callback = boom
+    update = _FakeUpdate(12345)
+    ctx = _FakeContext()
+    update.callback_query.data = "confirm_remove:channel1"
+    asyncio.run(ctrl._on_callback(update, ctx))
+    assert update.callback_query.answers == [None]
+    assert update.callback_query.edits == ["\u274c Unexpected error \u2014 see logs"]
+    assert ctx.bot.sent == []  # failed tap does not re-render the menu
+
+
+def test_callback_unknown_data_silent(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    update = _FakeUpdate(12345)
+    ctx = _FakeContext()
+    update.callback_query.data = "bogus:data"
+    asyncio.run(ctrl._on_callback(update, ctx))
+    assert update.callback_query.answers == [None]
+    assert update.callback_query.edits == []
+    assert ctx.bot.sent == []
