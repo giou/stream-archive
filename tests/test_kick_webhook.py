@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import time
 
 import httpx
 import pytest
@@ -9,7 +10,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from src.stream_archive.kick_api import KickAPI
-from src.stream_archive.kick_webhook import KickWebhook
+from src.stream_archive.kick_webhook import KickWebhook, _RateLimiter
+
+
+def _fresh_ts():
+    """Current epoch-second timestamp string; webhook events must be fresh."""
+    return str(int(time.time()))
 
 
 def base_config():
@@ -65,7 +71,7 @@ class FakeKickAPI:
         self.public_key_pem = public_key_pem
         self.fetch_count = 0
 
-    async def get_public_key(self):
+    async def get_public_key(self, force=False):
         self.fetch_count += 1
         return self.public_key_pem
 
@@ -200,7 +206,7 @@ def test_live_event_dispatches_online(keypair):
             await client.post(
                 "/kick/webhook",
                 data=live_event(is_live=True),
-                headers=_signed_headers(private_key, "m1", "1750000000", live_event(is_live=True), wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), live_event(is_live=True), wh.EVENT_LIVE),
             )
 
     asyncio.run(scenario())
@@ -223,7 +229,7 @@ def test_live_event_dispatches_offline(keypair):
             await client.post(
                 "/kick/webhook",
                 data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", body, wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
             )
 
     asyncio.run(scenario())
@@ -243,7 +249,7 @@ def test_chat_event_dispatches_normalized_payload(keypair):
             await client.post(
                 "/kick/webhook",
                 data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", body, wh.EVENT_CHAT),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
             )
 
     asyncio.run(scenario())
@@ -278,7 +284,7 @@ def test_bad_signature_returns_401_and_no_dispatch(keypair):
             resp = await client.post(
                 "/kick/webhook",
                 data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", b"tampered", wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), b"tampered", wh.EVENT_LIVE),
             )
             assert resp.status == 401
 
@@ -308,7 +314,7 @@ def test_unknown_event_type_returns_204(keypair):
             resp = await client.post(
                 "/kick/webhook",
                 data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", body, "some.future.event"),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, "some.future.event"),
             )
             assert resp.status == 204
 
@@ -328,7 +334,7 @@ def test_live_event_unmonitored_channel_ignored(keypair):
             await client.post(
                 "/kick/webhook",
                 data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", body, wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
             )
 
     asyncio.run(scenario())
@@ -389,12 +395,12 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
             body = live_event()
             await client.post(
                 "/kick/webhook", data=body,
-                headers=_signed_headers(private_key, "m1", "1750000000", body, wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
             )
             # A second event must stay silent.
             await client.post(
                 "/kick/webhook", data=body,
-                headers=_signed_headers(private_key, "m2", "1750000000", body, wh.EVENT_LIVE),
+                headers=_signed_headers(private_key, "m2", _fresh_ts(), body, wh.EVENT_LIVE),
             )
 
     asyncio.run(scenario())
@@ -529,3 +535,137 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
     assert len(notifier.messages) == 1  # only the out-of-sync warning; sync never confirms
     assert "Kick webhook subscriptions out of sync" in notifier.messages[0]
     assert wh._sync_failed_notified is False  # flag cleared after the last success
+
+
+# ---- replay protection & flood hardening -----------------------------------
+
+
+def test_stale_timestamp_rejected_401(keypair):
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
+    body = live_event(is_live=True)
+    stale = str(int(time.time()) - 600)   # outside the 5-minute window
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook", data=body,
+                headers=_signed_headers(private_key, "m1", stale, body, wh.EVENT_LIVE),
+            )
+            assert resp.status == 401
+
+    asyncio.run(scenario())
+    assert monitor.online == []
+
+
+def test_future_timestamp_rejected_401(keypair):
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
+    body = live_event(is_live=True)
+    future = str(int(time.time()) + 600)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook", data=body,
+                headers=_signed_headers(private_key, "m1", future, body, wh.EVENT_LIVE),
+            )
+            assert resp.status == 401
+
+    asyncio.run(scenario())
+    assert monitor.online == []
+
+
+def test_unparseable_timestamp_rejected_401(keypair):
+    private_key, public_pem = keypair
+    wh = make_webhook(api=FakeKickAPI(public_pem))
+    body = live_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook", data=body,
+                headers=_signed_headers(private_key, "m1", "not-a-date", body, wh.EVENT_LIVE),
+            )
+            assert resp.status == 401
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_message_id_dropped(keypair):
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
+    body = live_event(is_live=True)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            headers = _signed_headers(private_key, "dup-1", _fresh_ts(), body, wh.EVENT_LIVE)
+            first = await client.post("/kick/webhook", data=body, headers=headers)
+            replay = await client.post("/kick/webhook", data=body, headers=headers)
+            assert first.status == 200
+            assert replay.status == 200  # replayed: acknowledged, not dispatched
+
+    asyncio.run(scenario())
+    assert len(monitor.online) == 1
+
+
+class CachingFakeKickAPI(FakeKickAPI):
+    """Mimics KickAPI's in-memory public-key cache so fetch counts are real."""
+
+    def __init__(self, public_key_pem=None):
+        super().__init__(public_key_pem)
+        self._cached = None
+
+    async def get_public_key(self, force=False):
+        if force or self._cached is None:
+            self._cached = self.public_key_pem
+            self.fetch_count += 1
+        return self._cached
+
+    def clear_public_key_cache(self):
+        self._cached = None
+
+
+def test_bad_signature_key_refetch_rate_limited(keypair):
+    private_key, public_pem = keypair
+    api = CachingFakeKickAPI(public_pem)
+    wh = make_webhook(api=api)
+    body = live_event(is_live=True)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            headers = _signed_headers(private_key, "m1", _fresh_ts(), b"tampered", wh.EVENT_LIVE)
+            for _ in range(5):
+                resp = await client.post("/kick/webhook", data=body, headers=headers)
+                assert resp.status == 401
+            # 1 initial fetch + 1 refetch for the first request; the 60s
+            # negative cache keeps the other 4 requests purely local.
+            assert api.fetch_count == 2
+            # After the refetch window elapses, one more refetch is allowed.
+            wh._next_key_refetch = 0.0
+            resp = await client.post("/kick/webhook", data=body, headers=headers)
+            assert resp.status == 401
+            assert api.fetch_count == 3
+
+    asyncio.run(scenario())
+
+
+def test_rate_limit_returns_429(keypair):
+    _, public_pem = keypair
+    wh = make_webhook(api=FakeKickAPI(public_pem))
+    wh._rate_limiter = _RateLimiter(2, 60)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            statuses = []
+            for _ in range(4):
+                resp = await client.post("/kick/webhook", data=b"{}")
+                statuses.append(resp.status)
+            # The bucket starts full: max=2 admits a burst of 2, refill drift
+            # lets the 3rd through, and the 4th is blocked.
+            assert statuses == [401, 401, 401, 429]
+
+    asyncio.run(scenario())

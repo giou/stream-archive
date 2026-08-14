@@ -39,7 +39,8 @@ recording processes that die mid-stream.
 - **Kick webhooks** — `livestream.status.updated` (live/offline) and
   `chat.message.sent` (chat) v1 events, verified against Kick's published
   signing key (RSA PKCS1v15/SHA-256 over `message_id.timestamp.body`, with a
-  key-rotation refetch). Subscriptions are auto-created for monitored Kick
+  key-rotation refetch) and protected against replay by a signed-timestamp
+  window. Subscriptions are auto-created for monitored Kick
   channels and reconciled every poll cycle; the bot also drives the whole
   setup — tunnel included — from `/settings` (see
   [Kick webhook setup](#kick-webhook-setup)).
@@ -223,7 +224,7 @@ All keys from `config.json.example`:
 | `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
 | `update_check.check_app` | no | `true` | Check the app repo (`git fetch origin`) for new commits |
 | `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
-| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `plugins/twitch.py` |
+| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `plugins/twitch.py`; a download is applied only when the release publishes a matching sha256 digest, and the file must be valid Python declaring the new version |
 | `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
 | `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
 
@@ -260,8 +261,13 @@ you get a new notification if so).
 Internals: the receiver is `POST /kick/webhook` on
 `kick.webhook.listen_host:listen_port`. Every request is verified against
 Kick's published signing key (the `Kick-Event-Signature` header, over
-`Kick-Event-Message-Id.Kick-Event-Message-Timestamp.<body>`); failures get
-`401` and are logged. The subscription sync loop reconciles
+`Kick-Event-Message-Id.Kick-Event-Message-Timestamp.<body>`) and rejected
+unless the signed timestamp is within a 5-minute freshness window — so a
+captured request cannot be replayed to kill recordings or forge chat lines.
+Verified events are deduplicated by message id within that window, the
+public-key rotation refetch is rate-limited, and per-client-IP rate limiting
+plus a concurrency cap bound floods; failures get `401` and are logged. The
+subscription sync loop reconciles
 `livestream.status.updated` + `chat.message.sent` subscriptions against the
 monitored Kick channels every poll cycle (and immediately on `/add`,
 `/remove`, `/reload`, or enabling). If sync fails — usually the URL is not

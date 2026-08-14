@@ -2,6 +2,8 @@ import asyncio
 import base64
 import json
 import logging
+import time
+from datetime import datetime
 
 from aiohttp import web
 from cryptography.hazmat.primitives import hashes, serialization
@@ -10,6 +12,70 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from src.stream_archive.config import is_kick_channel, kick_bare_name, save_config
 
 logger = logging.getLogger(__name__)
+
+# Signed events are accepted only within this freshness window. The header
+# timestamp is covered by Kick's signature, so an attacker cannot move it —
+# this is what stops replay of captured events (recording kill / forged chat).
+_VERIFY_WINDOW_S = 300
+# message_id dedup store: one entry per unique signed event, kept for the
+# freshness window. Bounded so a flood cannot grow memory.
+_MAX_SEEN_IDS = 50_000
+# A failed signature triggers a public-key refetch (key-rotation retry). This
+# negative cache bounds that refetch so unauthenticated floods cannot force an
+# outbound Kick API call per request (rate-limit self-DoS).
+_KEY_REFETCH_INTERVAL_S = 60
+# Per-client-IP token bucket; a coarse backstop behind signature verification.
+# Behind a tunnel every request shares the tunnel's origin IP, so the budget
+# is sized for aggregate legit chat volume, not per-event precision.
+_RATE_LIMIT_PER_IP = 1200      # requests per window
+_RATE_LIMIT_WINDOW_S = 60
+_MAX_RATE_LIMIT_IPS = 10_000
+# Cap on concurrent in-flight webhook requests; flood protection.
+_MAX_CONCURRENT = 16
+
+
+class _RateLimiter:
+    """Per-key token bucket (key = client IP), with a bounded bucket table."""
+
+    def __init__(self, max_requests, window_s, max_keys=_MAX_RATE_LIMIT_IPS):
+        self._max = max_requests
+        self._window = window_s
+        self._max_keys = max_keys
+        self._buckets = {}   # key -> [tokens, last_refill (monotonic)]
+
+    def allow(self, key) -> bool:
+        now = time.monotonic()
+        buckets = self._buckets
+        bucket = buckets.get(key)
+        if bucket is None:
+            if len(buckets) >= self._max_keys:
+                for k, (tokens, _) in list(buckets.items()):
+                    if tokens >= self._max:   # fully refilled: safe to evict
+                        del buckets[k]
+                if len(buckets) >= self._max_keys:
+                    buckets.pop(next(iter(buckets)))
+            buckets[key] = [self._max, now]
+            return True
+        tokens, refill = bucket
+        tokens = min(self._max, tokens + (now - refill) * (self._max / self._window))
+        if tokens < 1:
+            bucket[0], bucket[1] = tokens, now
+            return False
+        bucket[0], bucket[1] = tokens - 1, now
+        return True
+
+
+def _parse_timestamp(value):
+    """Kick sends ISO-8601; epoch seconds are accepted too. None when unparseable."""
+    value = value.strip()
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 class KickWebhook:
@@ -27,6 +93,10 @@ class KickWebhook:
         self._sync_task = None
         self._sync_failed_notified = False
         self._subs = {}   # bare slug -> set(subscription ids)
+        self._seen_ids = {}            # message_id -> expires (monotonic)
+        self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
+        self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
+        self._next_key_refetch = 0.0   # monotonic; gates the rotation refetch
         self._app = web.Application()
         self._app.router.add_post("/kick/webhook", self._handle)
 
@@ -89,20 +159,53 @@ class KickWebhook:
             await asyncio.sleep(self._config["monitoring_interval"])
 
     async def _handle(self, request):
-        body = await request.read()
-        event_type = request.headers.get("Kick-Event-Type", "")
-        if not await self._verify(request, body):
-            logger.warning("[kick_webhook] signature verification failed (event=%s)", event_type)
-            return web.Response(status=401, text="unauthorized")
-        await self._maybe_confirm_delivery()
-        if event_type == self.EVENT_LIVE:
-            await self._dispatch_live(body)
-        elif event_type == self.EVENT_CHAT:
-            await self._dispatch_chat(body)
-        else:
-            logger.debug("[kick_webhook] unknown event type %r", event_type)
-            return web.Response(status=204)
-        return web.Response(status=200, text="ok")
+        client = request.remote or "unknown"
+        if not self._rate_limiter.allow(client):
+            return web.Response(status=429, text="too many requests")
+        try:
+            await asyncio.wait_for(self._sem.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return web.Response(status=503, text="busy")
+        try:
+            body = await request.read()
+            event_type = request.headers.get("Kick-Event-Type", "")
+            if not await self._verify(request, body):
+                # event_type is attacker-controlled: only log known values.
+                known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
+                logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
+                return web.Response(status=401, text="unauthorized")
+            if not self._remember_id(request.headers.get("Kick-Event-Message-Id")):
+                logger.debug("[kick_webhook] duplicate event, ignoring")
+                return web.Response(status=200, text="ok")
+            await self._maybe_confirm_delivery()
+            if event_type == self.EVENT_LIVE:
+                await self._dispatch_live(body)
+            elif event_type == self.EVENT_CHAT:
+                await self._dispatch_chat(body)
+            else:
+                logger.debug("[kick_webhook] unknown event type %r", event_type)
+                return web.Response(status=204)
+            return web.Response(status=200, text="ok")
+        finally:
+            self._sem.release()
+
+    def _remember_id(self, message_id) -> bool:
+        """True when the message id is new within the freshness window; False for replays."""
+        if not message_id:
+            return True
+        now = time.monotonic()
+        seen = self._seen_ids
+        expires = seen.get(message_id)
+        if expires is not None and expires > now:
+            return False
+        if len(seen) >= _MAX_SEEN_IDS:
+            for mid, exp in list(seen.items()):
+                if exp <= now:
+                    del seen[mid]
+        if len(seen) >= _MAX_SEEN_IDS:
+            seen.pop(next(iter(seen)))
+        seen[message_id] = now + _VERIFY_WINDOW_S
+        return True
 
     async def _verify(self, request, body) -> bool:
         message_id = request.headers.get("Kick-Event-Message-Id")
@@ -114,17 +217,28 @@ class KickWebhook:
             signature = base64.b64decode(signature_b64)
         except Exception:
             return False
-        message = f"{message_id}.{timestamp}.{body.decode()}".encode()
+        event_time = _parse_timestamp(timestamp)
+        if event_time is None or abs(time.time() - event_time) > _VERIFY_WINDOW_S:
+            logger.warning("[kick_webhook] event timestamp outside freshness window")
+            return False
         try:
+            message = f"{message_id}.{timestamp}.{body.decode()}".encode()
             public_key = await self._api.get_public_key()
             self._verify_signature(public_key, message, signature)
             return True
         except Exception:
             pass
-        # The key may have rotated: refetch once and retry before failing.
-        self._api.clear_public_key_cache()
+        # The key may have rotated: refetch (rate-limited) and retry once.
+        # The refetch bypasses the cache (force), so rotation is actually
+        # detected; a flood of bad signatures keeps verifying against the
+        # cached key with no outbound calls, and only one refetch per
+        # interval is ever attempted.
+        now = time.monotonic()
+        if now < self._next_key_refetch:
+            return False
+        self._next_key_refetch = now + _KEY_REFETCH_INTERVAL_S
         try:
-            public_key = await self._api.get_public_key()
+            public_key = await self._api.get_public_key(force=True)
             self._verify_signature(public_key, message, signature)
             return True
         except Exception:

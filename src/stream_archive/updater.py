@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import hashlib
 import importlib.metadata
@@ -326,10 +327,26 @@ class UpdateChecker:
         except Exception as e:
             return ("failed", str(e))
         digest = data.get("digest")
-        if digest:
-            expected = digest.removeprefix("sha256:")
-            if hashlib.sha256(content).hexdigest() != expected:
-                return ("failed", "sha256 mismatch — download rejected")
+        if not digest:
+            return ("failed", "release publishes no sha256 digest — refusing unverified plugin download")
+        expected = digest.removeprefix("sha256:")
+        if hashlib.sha256(content).hexdigest() != expected:
+            return ("failed", "sha256 mismatch — download rejected")
+        # The plugin runs in-process (streamlink loads it at recording start),
+        # so refuse anything that is not valid Python declaring the new version.
+        # Keeps unattended updates working while failing closed on tampering,
+        # truncation, or a release that forgot to bump its version constant.
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return ("failed", "downloaded plugin is not valid UTF-8 — rejected")
+        try:
+            ast.parse(text)
+        except SyntaxError:
+            return ("failed", "downloaded plugin is not valid Python — rejected")
+        m = _PLUGIN_VERSION_RE.search(text)
+        if m is None or m.group(1) != latest:
+            return ("failed", f"downloaded plugin does not declare version {latest} — rejected")
         tmp = Path(str(path) + ".tmp")
         tmp.write_bytes(content)
         os.replace(tmp, path)

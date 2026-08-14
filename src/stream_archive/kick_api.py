@@ -70,9 +70,14 @@ class KickAPI:
                 }
         return out
 
-    async def get_public_key(self):
-        """PEM string used to verify webhook signatures; cached in memory."""
-        if self._public_key:
+    async def get_public_key(self, force=False):
+        """PEM string used to verify webhook signatures; cached in memory.
+
+        ``force`` bypasses the cache (key-rotation refetch on signature
+        failure). On fetch failure the previous key is kept, so verification
+        still runs against the last known-good key.
+        """
+        if self._public_key and not force:
             return self._public_key
         resp = await self.client.get(self.PUBLIC_KEY_URL)
         resp.raise_for_status()
@@ -86,13 +91,19 @@ class KickAPI:
         self._public_key = None
 
     async def list_event_subscriptions(self):
-        """All webhook subscriptions for this app (defensive app_id filter)."""
+        """All webhook subscriptions for this app (fail-closed app_id filter).
+
+        Subscriptions we cannot prove belong to this app are never returned:
+        the webhook reconcile deletes subscriptions for unmonitored
+        broadcasters, so a wrong filter would destroy another app's
+        subscriptions. Without a client_id configured, nothing is managed.
+        """
         resp = await self.client.get(self.EVENTS_SUBS_URL, headers=await self._headers())
         resp.raise_for_status()
         data = resp.json()["data"]
         if not self._client_id:
-            return data
-        return [s for s in data if not s.get("app_id") or s["app_id"] == self._client_id]
+            return []
+        return [s for s in data if s.get("app_id") == self._client_id]
 
     async def create_event_subscriptions(self, broadcaster_user_id, events):
         """Create webhook subscriptions; returns created items (each has subscription_id)."""

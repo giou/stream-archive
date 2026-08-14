@@ -348,6 +348,55 @@ def test_apply_sha256_mismatch_rejects_download(tmp_path):
     assert results["streamlink"][0] == "applied"
 
 
+def test_apply_plugin_missing_digest_refused(tmp_path):
+    config = make_config(tmp_path)
+    old = read_plugin(tmp_path)
+    new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()
+    run_cmd, http, _ = apply_fakes(new_content)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(None)))
+    assert results["plugin"] == (
+        "failed",
+        "release publishes no sha256 digest — refusing unverified plugin download",
+    )
+    assert read_plugin(tmp_path) == old
+
+
+def test_apply_plugin_invalid_utf8_rejected(tmp_path):
+    config = make_config(tmp_path)
+    old = read_plugin(tmp_path)
+    run_cmd, http, digest = apply_fakes(b"\x00\xfe\xff not a plugin")
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["plugin"][0] == "failed"
+    assert "not valid UTF-8" in results["plugin"][1]
+    assert read_plugin(tmp_path) == old
+
+
+def test_apply_plugin_syntax_rejected(tmp_path):
+    config = make_config(tmp_path)
+    old = read_plugin(tmp_path)
+    content = 'STREAMLINK_TTVLOL_VERSION = "9.9.9" ((((\n'.encode()
+    run_cmd, http, digest = apply_fakes(content)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["plugin"][0] == "failed"
+    assert "not valid Python" in results["plugin"][1]
+    assert read_plugin(tmp_path) == old
+
+
+def test_apply_plugin_version_mismatch_rejected(tmp_path):
+    config = make_config(tmp_path)
+    old = read_plugin(tmp_path)
+    content = 'STREAMLINK_TTVLOL_VERSION = "9.9.9"\n'.encode()
+    run_cmd, http, digest = apply_fakes(content)
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
+    results = asyncio.run(u.apply(update_report(digest)))
+    assert results["plugin"][0] == "failed"
+    assert f"does not declare version {PLUGIN_LATEST}" in results["plugin"][1]
+    assert read_plugin(tmp_path) == old
+
+
 def test_apply_app_failure_continues_with_others(tmp_path):
     config = make_config(tmp_path)
     new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()

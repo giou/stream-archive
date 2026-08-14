@@ -13,7 +13,7 @@ FROM python:3.12-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg git tzdata ca-certificates curl \
  && curl -fsSL https://tailscale.com/install.sh | sh \
- && curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared \
+ && curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.8.2/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared \
  && chmod +x /usr/local/bin/cloudflared \
  && rm -rf /var/lib/apt/lists/*
 

@@ -159,7 +159,24 @@ def test_list_event_subscriptions_filters_foreign_app():
     api = make_api(handler)
     result = asyncio.run(api.list_event_subscriptions())
 
-    assert [s["id"] for s in result] == ["ours-1", "no-app"]
+    # Fail-closed: only subscriptions provably owned by this app are returned;
+    # a missing app_id is never assumed to be ours (the reconcile deletes
+    # subscriptions for unmonitored broadcasters).
+    assert [s["id"] for s in result] == ["ours-1"]
+
+
+def test_list_event_subscriptions_without_client_id_returns_empty():
+    subs = [{"id": "ours-1", "app_id": "cid", "broadcaster_user_id": 1}]
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+        return httpx.Response(200, json={"data": subs})
+
+    api = KickAPI({"kick": {"client_secret": "csec"}})  # no client_id
+    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert asyncio.run(api.list_event_subscriptions()) == []
 
 
 def test_create_event_subscriptions_posts_documented_body():
