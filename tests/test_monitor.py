@@ -79,8 +79,8 @@ class FakeRecorder:
     def youtube_active_count(self):
         return len(self.started) if self.mode in ("youtube", "both") else 0
 
-    def restart_blocked_until(self, channel):
-        return 0.0
+    def youtube_restart_blocked_reason(self, channel):
+        return None
 
 
 class FakeNotifier:
@@ -311,8 +311,8 @@ def test_handle_online_ignores_unknown_channel():
 
 def test_recorder_backoff_blocks_restart():
     class BackoffRecorder(FakeRecorder):
-        def restart_blocked_until(self, channel):
-            return time.monotonic() + 60
+        def youtube_restart_blocked_reason(self, channel):
+            return "restarting in 60s (short recording, YouTube quota guard)"
 
     rec = BackoffRecorder()
     notifier = FakeNotifier()

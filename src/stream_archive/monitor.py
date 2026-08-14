@@ -179,10 +179,9 @@ class Monitor:
 
     async def _start_blocked_reason(self, channel, config, snapshot):
         """Return (reason_or_None, snapshot). Raises nothing: snapshot failures fail open."""
-        blocked_until = self.recorder.restart_blocked_until(channel)
-        remaining = blocked_until - time.monotonic()
-        if remaining > 0:
-            return (f"restarting in {remaining:.0f}s (short recording, YouTube quota guard)", snapshot)
+        reason = self.recorder.youtube_restart_blocked_reason(channel)
+        if reason:
+            return (reason, snapshot)
         try:
             disk_cfg = config.get("disk", {})
             cap = disk_cfg.get("max_total_gb", 0)

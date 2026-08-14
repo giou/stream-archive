@@ -19,12 +19,18 @@ from src.stream_archive.kick_chat import build_chat_root, embed_kick_emotes
 logger = logging.getLogger(__name__)
 
 # After a YouTube recording ends quickly (feed stall, flaky stream), restarts
-# back off exponentially per channel: each liveBroadcast.insert costs 50 YouTube
-# API quota units (default 10k/day), so rapid restart loops would exhaust the
-# daily quota. A recording that survives _QUICK_END_S resets the backoff.
+# back off exponentially per channel. The binding limit is NOT the Data API
+# quota (10k units/day; a full start+end cycle costs ~200 units) but YouTube's
+# per-channel cap on broadcast creations per day (~20/day; API error
+# limitExceeded/userBroadcastsExceedLimit, resets after ~24h). All re-streams
+# go to the same YouTube channel, so the hard guard is a rolling 24h budget
+# shared across every monitored channel; the backoff smooths the ramp. A
+# recording that survives _QUICK_END_S resets the per-channel backoff.
 _QUICK_END_S = 120
-_BACKOFF_BASE_S = 60
-_BACKOFF_MAX_S = 600
+_BACKOFF_BASE_S = 120
+_BACKOFF_MAX_S = 1800
+_YOUTUBE_DAILY_BUDGET = 10
+_YOUTUBE_BUDGET_WINDOW_S = 86400
 
 
 def _sanitize_filename(name):
@@ -49,6 +55,7 @@ class Recorder:
         self._last_kick_block_notify = {}
         self._quick_ends = {}      # channel -> consecutive short YouTube recordings
         self._backoff_until = {}   # channel -> monotonic time before restart allowed
+        self._youtube_starts = []  # wall-clock times of broadcast creations (rolling 24h)
 
     def _load_plugin(self):
         if self._plugin_loaded:
@@ -275,9 +282,33 @@ class Recorder:
             self._quick_ends.pop(channel, None)
             self._backoff_until.pop(channel, None)
 
-    def restart_blocked_until(self, channel):
-        """Monotonic time before which the monitor must not restart the channel."""
-        return self._backoff_until.get(channel, 0.0)
+    def youtube_restart_blocked_reason(self, channel):
+        """Why a youtube-mode recording for this channel must not start yet, or None.
+
+        Consults both the per-channel quick-end backoff and the global rolling
+        24h broadcast budget (all re-streams share one YouTube channel).
+        """
+        mode = self._config.get("channel_output_modes", {}).get(channel, self._config["output_mode"])
+        if mode not in ("youtube", "both"):
+            return None
+        now = time.monotonic()
+        backoff = self._backoff_until.get(channel, 0.0)
+        if backoff > now:
+            return f"restarting in {backoff - now:.0f}s (short recording, YouTube quota guard)"
+        now_wall = time.time()
+        self._youtube_starts = [t for t in self._youtube_starts if t > now_wall - _YOUTUBE_BUDGET_WINDOW_S]
+        if len(self._youtube_starts) >= _YOUTUBE_DAILY_BUDGET:
+            wait = self._youtube_starts[0] + _YOUTUBE_BUDGET_WINDOW_S - now_wall
+            return (
+                f"YouTube daily broadcast limit reached "
+                f"({len(self._youtube_starts)}/{_YOUTUBE_DAILY_BUDGET} in the last 24h), "
+                f"next slot in {wait / 60:.0f} min"
+            )
+        return None
+
+    def _record_youtube_start(self):
+        """Record a broadcast creation against the rolling daily budget."""
+        self._youtube_starts.append(time.time())
 
     async def _end_broadcast(self, channel, broadcast_id):
         """Transition a YouTube broadcast to complete; never raises."""
@@ -461,6 +492,7 @@ class Recorder:
             youtube_info = await self._youtube.create_stream(
                 author, title, channel, game
             )
+            self._record_youtube_start()
         except Exception as e:
             logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
             if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():

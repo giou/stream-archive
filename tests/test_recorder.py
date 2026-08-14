@@ -369,6 +369,28 @@ def test_session_rides_through_playlist_stalls(tmp_path):
     assert rec._session.get_option("stream-segmented-queue-deadline") == 10
 
 
+def test_youtube_daily_budget_blocks_and_releases(tmp_path):
+    config = make_config(tmp_path)
+    config["output_mode"] = "youtube"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    # 10 creations inside the rolling 24h window: shared across channels.
+    rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+    reason = rec.youtube_restart_blocked_reason("kick:a")
+    assert reason is not None
+    assert "daily broadcast limit" in reason
+    assert "10/10" in reason
+    assert rec.youtube_restart_blocked_reason("kick:b") is not None  # global, not per channel
+    # One slot ages out of the window: recording is allowed again.
+    rec._youtube_starts[0] = time.time() - 90000
+    assert rec.youtube_restart_blocked_reason("kick:a") is None
+
+
+def test_youtube_daily_budget_ignores_disk_mode(tmp_path):
+    rec = Recorder(make_config(tmp_path))  # output_mode disk
+    rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+    assert rec.youtube_restart_blocked_reason("ch") is None
+
+
 def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     config["output_mode"] = "youtube"
@@ -389,15 +411,15 @@ def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
         await task
 
     asyncio.run(finish_with(10))
-    first = rec.restart_blocked_until("ch")
-    assert first > time.monotonic()            # 60s backoff after a quick end
+    first = rec._backoff_until["ch"]
+    assert "restarting in" in rec.youtube_restart_blocked_reason("ch")
 
     asyncio.run(finish_with(10))
-    second = rec.restart_blocked_until("ch")
-    assert second > first                      # exponential: 120s on the second
+    second = rec._backoff_until["ch"]
+    assert second > first                      # exponential growth
 
     asyncio.run(finish_with(300))
-    assert rec.restart_blocked_until("ch") == 0.0   # a long recording resets
+    assert rec.youtube_restart_blocked_reason("ch") is None   # long recording resets
 
 
 def test_disk_end_no_backoff(tmp_path, monkeypatch):
@@ -418,7 +440,7 @@ def test_disk_end_no_backoff(tmp_path, monkeypatch):
         await task
 
     asyncio.run(scenario())
-    assert rec.restart_blocked_until("ch") == 0.0
+    assert rec.youtube_restart_blocked_reason("ch") is None
 
 
 def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypatch):
