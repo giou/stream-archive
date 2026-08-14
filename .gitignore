@@ -1,6 +1,7 @@
 config.json
 youtube_token.json
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -13,3 +14,4 @@ client_secret.json
 update_state.json
 plugins/*.bak
 .env
+cloudflared/

@@ -3,12 +3,67 @@ import logging
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
 
 _CHANNEL_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_]{0,24}$')
+_KICK_CHANNEL_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,24}$')  # slug: 1-25 chars, alnum start, then alnum/_/-
 _PROXY_RE = re.compile(r'^(https?|httpproxy)://')
+
+KICK_PREFIX = "kick:"
+TWITCH_PREFIX = "twitch:"
+
+
+def is_kick_channel(channel: str) -> bool:
+    return channel.startswith(KICK_PREFIX)
+
+
+def bare_name(channel: str) -> str:
+    """Channel identity without the platform prefix (kick:xqc -> xqc)."""
+    for prefix in (KICK_PREFIX, TWITCH_PREFIX):
+        if channel.startswith(prefix):
+            return channel[len(prefix):]
+    return channel
+
+
+def kick_bare_name(channel: str) -> str:
+    return bare_name(channel)
+
+
+def channel_url(channel: str) -> str:
+    """Public profile URL used in notifications."""
+    return f"https://kick.com/{bare_name(channel)}" if is_kick_channel(channel) else f"https://twitch.tv/{bare_name(channel)}"
+
+
+def normalize_channel_name(name: str) -> str | None:
+    """Canonical monitored-channel identity; None when invalid.
+
+    Accepts bare names, platform-prefixed names, and profile URLs. Canonical
+    form is prefixed: bare/twitch:<x>/https://twitch.tv/x -> twitch:<x>;
+    kick:<x>/https://kick.com/x -> kick:<x.lower()>."""
+    name = name.strip()
+    if name.startswith(("http://", "https://")):
+        try:
+            parts = urlsplit(name)
+        except ValueError:
+            return None
+        host = (parts.hostname or "").lower()
+        path = parts.path.strip("/")
+        if host in ("twitch.tv", "www.twitch.tv"):
+            return f"twitch:{path}" if _CHANNEL_RE.match(path) else None
+        if host in ("kick.com", "www.kick.com"):
+            return f"kick:{path.lower()}" if _KICK_CHANNEL_RE.match(path) else None
+        return None
+    lower = name.lower()
+    if lower.startswith("kick:"):
+        bare = name[len(KICK_PREFIX):]
+        return f"kick:{bare.lower()}" if _KICK_CHANNEL_RE.match(bare) else None
+    if lower.startswith("twitch:"):
+        bare = name[len(TWITCH_PREFIX):]
+        return f"twitch:{bare}" if _CHANNEL_RE.match(bare) else None
+    return f"twitch:{name}" if _CHANNEL_RE.match(name) else None
 
 
 def get_config():
@@ -109,9 +164,15 @@ def _validate(config):
 
     if not isinstance(config["channels"], list) or not config["channels"]:
         raise ValueError("channels must be a non-empty list")
+    normalized = []
     for ch in config["channels"]:
-        if not isinstance(ch, str) or not _CHANNEL_RE.match(ch):
+        if not isinstance(ch, str):
             raise ValueError(f"Invalid channel name: {ch!r}")
+        norm = normalize_channel_name(ch)
+        if norm is None:
+            raise ValueError(f"Invalid channel name: {ch!r}")
+        normalized.append(norm)
+    config["channels"] = normalized
 
     if not isinstance(config["proxy_list"], list) or not config["proxy_list"]:
         raise ValueError("proxy_list must be a non-empty list")
@@ -132,6 +193,7 @@ def _validate(config):
     _validate_disk(config)
     _validate_chat(config)
     _validate_eventsub(config)
+    _validate_kick(config)
 
 
 def _validate_output_mode(config):
@@ -147,11 +209,17 @@ def _validate_channel_output_modes(config):
     if not isinstance(modes, dict):
         raise ValueError("channel_output_modes must be an object")
     valid_modes = {"disk", "youtube", "both"}
+    normalized_modes = {}
     for ch, mode in modes.items():
-        if not isinstance(ch, str) or not _CHANNEL_RE.match(ch):
+        if not isinstance(ch, str):
+            raise ValueError(f"Invalid channel name in channel_output_modes: {ch!r}")
+        norm = normalize_channel_name(ch)
+        if norm is None:
             raise ValueError(f"Invalid channel name in channel_output_modes: {ch!r}")
         if not isinstance(mode, str) or mode not in valid_modes:
             raise ValueError(f"output_mode for {ch} must be one of {valid_modes}, got {mode!r}")
+        normalized_modes[norm] = mode
+    config["channel_output_modes"] = normalized_modes
 
 
 def _validate_youtube(config):
@@ -237,3 +305,59 @@ def _validate_eventsub(config):
     es.setdefault("enabled", True)
     if not isinstance(es["enabled"], bool):
         raise ValueError("eventsub.enabled must be a boolean")
+
+
+def _validate_kick(config):
+    config.setdefault("kick", {})
+    kick = config["kick"]
+    if not isinstance(kick, dict):
+        raise ValueError("kick config must be an object")
+
+    if any(is_kick_channel(ch) for ch in config["channels"]):
+        cid = kick.get("client_id")
+        if not isinstance(cid, str) or not cid:
+            raise ValueError("kick.client_id is required when kick channels are configured")
+        csec = kick.get("client_secret")
+        if not isinstance(csec, str) or not csec:
+            raise ValueError("kick.client_secret is required when kick channels are configured")
+
+    kick.setdefault("record_chat", True)
+    if not isinstance(kick["record_chat"], bool):
+        raise ValueError("kick.record_chat must be a boolean")
+
+    kick.setdefault("webhook", {})
+    wh = kick["webhook"]
+    if not isinstance(wh, dict):
+        raise ValueError("kick.webhook must be an object")
+    wh.setdefault("enabled", False)
+    if not isinstance(wh["enabled"], bool):
+        raise ValueError("kick.webhook.enabled must be a boolean")
+    wh.setdefault("listen_host", "127.0.0.1")
+    if not isinstance(wh["listen_host"], str) or not wh["listen_host"]:
+        raise ValueError("kick.webhook.listen_host must be a non-empty string")
+    wh.setdefault("listen_port", 8787)
+    if (
+        not isinstance(wh["listen_port"], int)
+        or isinstance(wh["listen_port"], bool)
+        or not 1 <= wh["listen_port"] <= 65535
+    ):
+        raise ValueError("kick.webhook.listen_port must be an integer in 1-65535")
+    wh.setdefault("public_url", "")
+    if not isinstance(wh["public_url"], str):
+        raise ValueError("kick.webhook.public_url must be a string")
+    if wh["enabled"] and not (
+        wh["public_url"].startswith("http://") or wh["public_url"].startswith("https://")
+    ):
+        raise ValueError("kick.webhook.public_url is required when kick.webhook.enabled is true")
+    wh.setdefault("setup_notified", False)
+    if not isinstance(wh["setup_notified"], bool):
+        raise ValueError("kick.webhook.setup_notified must be a boolean")
+    wh.setdefault("tunnel", "")
+    if wh["tunnel"] not in ("", "cloudflare", "tailscale"):
+        raise ValueError("kick.webhook.tunnel must be one of '', 'cloudflare', 'tailscale'")
+    wh.setdefault("cloudflare_token", "")
+    if not isinstance(wh["cloudflare_token"], str):
+        raise ValueError("kick.webhook.cloudflare_token must be a string")
+    wh.setdefault("cloudflare_managed", False)
+    if not isinstance(wh["cloudflare_managed"], bool):
+        raise ValueError("kick.webhook.cloudflare_managed must be a boolean")

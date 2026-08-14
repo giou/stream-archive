@@ -1,6 +1,6 @@
 import pytest
 
-from src.stream_archive.config import _validate
+from src.stream_archive.config import _validate, normalize_channel_name
 
 
 def valid_config():
@@ -9,7 +9,7 @@ def valid_config():
         "bot_telegram_api": "bot_token",
         "twitch_client_id": "client_id",
         "twitch_client_secret": "client_secret",
-        "channels": ["channel1"],
+        "channels": ["twitch:channel1"],
         "proxy_list": ["httpproxy://user:pass@host:port"],
         "monitoring_interval": 60,
         "timezone": "UTC",
@@ -223,3 +223,204 @@ def test_eventsub_disabled_passes():
     config["eventsub"] = {"enabled": False}
     _validate(config)
     assert config["eventsub"] == {"enabled": False}
+
+
+def kick_config(channels=None):
+    config = valid_config()
+    config["channels"] = channels or ["kick:xqc"]
+    config["kick"] = {
+        "client_id": "cid",
+        "client_secret": "csec",
+        "record_chat": True,
+        "webhook": {
+            "enabled": False,
+            "listen_host": "127.0.0.1",
+            "listen_port": 8787,
+            "public_url": "",
+        },
+    }
+    return config
+
+
+def test_kick_channel_with_creds_passes_and_sets_defaults():
+    config = kick_config()
+    _validate(config)
+    assert config["channels"] == ["kick:xqc"]
+    assert config["kick"]["record_chat"] is True
+    assert config["kick"]["webhook"]["enabled"] is False
+    assert config["kick"]["webhook"]["listen_host"] == "127.0.0.1"
+    assert config["kick"]["webhook"]["listen_port"] == 8787
+
+
+def test_kick_channel_normalized_lowercase():
+    config = kick_config(["kick:XQC"])
+    _validate(config)
+    assert config["channels"] == ["kick:xqc"]
+
+
+def test_kick_channel_without_creds_raises():
+    config = kick_config()
+    del config["kick"]["client_id"]
+    with pytest.raises(ValueError, match="kick.client_id is required"):
+        _validate(config)
+
+    config = kick_config()
+    del config["kick"]["client_secret"]
+    with pytest.raises(ValueError, match="kick.client_secret is required"):
+        _validate(config)
+
+
+@pytest.mark.parametrize("ch", ["kick:", "kick:bad name", "kick:.dot", "kick:", "kick:a" * 26])
+def test_invalid_kick_channel_raises(ch):
+    config = kick_config([ch])
+    with pytest.raises(ValueError):
+        _validate(config)
+
+
+def test_twitch_prefix_normalized_to_bare():
+    config = valid_config()
+    config["channels"] = ["twitch:foo"]
+    _validate(config)
+    assert config["channels"] == ["twitch:foo"]
+
+
+def test_kick_channel_output_modes_key_passes():
+    config = kick_config()
+    config["channel_output_modes"] = {"kick:xqc": "youtube"}
+    _validate(config)
+    assert config["channel_output_modes"] == {"kick:xqc": "youtube"}
+
+
+def test_kick_webhook_enabled_requires_public_url():
+    config = kick_config()
+    config["kick"]["webhook"]["enabled"] = True
+    with pytest.raises(ValueError, match="kick.webhook.public_url is required"):
+        _validate(config)
+
+    config = kick_config()
+    config["kick"]["webhook"]["enabled"] = True
+    config["kick"]["webhook"]["public_url"] = "ftp://nope"
+    with pytest.raises(ValueError, match="kick.webhook.public_url is required"):
+        _validate(config)
+
+    config = kick_config()
+    config["kick"]["webhook"]["enabled"] = True
+    config["kick"]["webhook"]["public_url"] = "https://host.ts.net/kick/webhook"
+    _validate(config)
+
+
+def test_kick_record_chat_non_bool_raises():
+    config = kick_config()
+    config["kick"]["record_chat"] = "yes"
+    with pytest.raises(ValueError, match="kick.record_chat must be a boolean"):
+        _validate(config)
+
+
+def test_kick_webhook_invalid_values_raise():
+    config = kick_config()
+    config["kick"]["webhook"]["listen_port"] = 0
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["listen_port"] = 70000
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["listen_port"] = "8787"
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["listen_host"] = ""
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["enabled"] = "yes"
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["setup_notified"] = "yes"
+    with pytest.raises(ValueError):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["tunnel"] = "wireguard"
+    with pytest.raises(ValueError, match="kick.webhook.tunnel"):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["cloudflare_token"] = 42
+    with pytest.raises(ValueError, match="kick.webhook.cloudflare_token"):
+        _validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["cloudflare_managed"] = "yes"
+    with pytest.raises(ValueError, match="kick.webhook.cloudflare_managed"):
+        _validate(config)
+
+
+def test_bare_channels_valid_without_kick_section():
+    config = valid_config()
+    _validate(config)
+    assert config["kick"] == {
+        "record_chat": True,
+        "webhook": {
+            "enabled": False,
+            "listen_host": "127.0.0.1",
+            "listen_port": 8787,
+            "public_url": "",
+            "setup_notified": False,
+            "tunnel": "",
+            "cloudflare_token": "",
+            "cloudflare_managed": False,
+        },
+    }
+
+
+def test_bare_name_and_channel_url_helpers():
+    from src.stream_archive.config import bare_name, channel_url
+    assert bare_name("kick:xqc") == "xqc"
+    assert bare_name("twitch:streamer1") == "streamer1"
+    assert bare_name("streamer1") == "streamer1"
+    assert channel_url("kick:xqc") == "https://kick.com/xqc"
+    assert channel_url("twitch:streamer1") == "https://twitch.tv/streamer1"
+    assert channel_url("streamer1") == "https://twitch.tv/streamer1"
+
+
+def test_kick_url_normalized_to_slug():
+    config = kick_config(["https://kick.com/xqc"])
+    _validate(config)
+    assert config["channels"] == ["kick:xqc"]
+
+
+def test_twitch_url_normalized_to_bare():
+    config = valid_config()
+    config["channels"] = ["https://www.twitch.tv/foo/"]
+    _validate(config)
+    assert config["channels"] == ["twitch:foo"]
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("https://kick.com/xqc", "kick:xqc"),
+    ("https://KICK.com/XQC", "kick:xqc"),
+    ("https://kick.com/xqc/", "kick:xqc"),
+    ("https://kick.com/x?ref=1", "kick:x"),
+    ("https://twitch.tv/foo", "twitch:foo"),
+    ("https://www.twitch.tv/foo/", "twitch:foo"),
+    ("https://twitch.tv/foo?ref=1", "twitch:foo"),
+    ("  https://twitch.tv/foo  ", "twitch:foo"),
+])
+def test_normalize_channel_name_urls(name, expected):
+    assert normalize_channel_name(name) == expected
+
+
+@pytest.mark.parametrize("name", [
+    "https://kick.com/",
+    "https://kick.com/bad name",
+    "https://kick.com/foo/bar",
+    "https://other.com/x",
+    "https://twitch.tv/",
+    "https://twitch.tv/bad name!",
+    "https://twitch.tv/foo/bar",
+    "kick.com/x",
+    "http://",
+    "https://",
+])
+def test_normalize_channel_name_invalid_urls(name):
+    assert normalize_channel_name(name) is None

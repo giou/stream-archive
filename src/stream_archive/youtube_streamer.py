@@ -5,10 +5,23 @@ import httpx
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
+from src.stream_archive.config import channel_url, is_kick_channel
+
 logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
 _API_BASE = "https://www.googleapis.com/youtube/v3"
+
+
+def build_video_description(author, channel, game):
+    """Description for a re-streamed broadcast; platform-aware (Twitch/Kick)."""
+    platform = "Kick" if is_kick_channel(channel) else "Twitch"
+    return (
+        f"{platform} stream by {author}\n"
+        f"Game: {game}\n"
+        f"Originally streamed at: {channel_url(channel)}\n"
+        f"Recorded by StreamArchive"
+    )
 
 
 class YouTubeStreamer:
@@ -68,12 +81,7 @@ class YouTubeStreamer:
         broadcast_title = raw_title[:100]
         if raw_title != broadcast_title:
             logger.info("[youtube] Title truncated to 100 chars: %r", broadcast_title)
-        description = (
-            f"Twitch stream by {author}\n"
-            f"Game: {game}\n"
-            f"Originally streamed at: https://twitch.tv/{channel}\n"
-            f"Recorded by StreamArchive"
-        )
+        description = build_video_description(author, channel, game)
         from datetime import datetime, timezone
 
         scheduled_start = datetime.now(timezone.utc).isoformat()

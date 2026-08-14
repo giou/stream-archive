@@ -1,7 +1,7 @@
 [project]
 name = "stream-archive"
 version = "1.0.0"
-description = "StreamArchive - Twitch channel monitor, recorder, and YouTube restreamer"
+description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ dependencies = [
     "streamlink>=8.4.0",
     "packaging>=24",
     "websockets>=12.0",
+    "aiohttp>=3.9",
+    "cryptography>=42.0",
 ]
 
 [tool.pytest.ini_options]

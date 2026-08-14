@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import time
 import types
@@ -9,6 +10,15 @@ import pytest
 from streamlink.exceptions import NoStreamsError, PluginError
 
 from src.stream_archive.recorder import Recorder, _sanitize_filename
+
+
+@pytest.fixture(autouse=True)
+def _no_network_emote_embed(monkeypatch):
+    """Keep kick chat finalize offline in recorder tests (embedding is covered in test_kick_chat)."""
+    async def noop(root, client=None):
+        return None
+
+    monkeypatch.setattr("src.stream_archive.recorder.embed_kick_emotes", noop)
 
 
 def make_config(tmp_path):
@@ -55,12 +65,13 @@ class FakeStream:
 class FakeNotifier:
     def __init__(self):
         self.messages = []
+        self.live = []
 
     async def notify(self, m):
         self.messages.append(m)
 
     async def notify_live(self, *a, **k):
-        pass
+        self.live.append((a, k))
 
     async def notify_offline(self, *a, **k):
         pass
@@ -432,6 +443,49 @@ def test_stop_chat_unknown_channel_is_noop(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_stop_chat_platform_kick_keeps_twitch_irc(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        cr = FakeChatRecorder.instances[0]
+        await rec.stop_chat("ch", "kick")  # kick-only stop must not touch the IRC recorder
+        assert not cr.stopped
+        assert "chat_recorder" in rec._recordings["ch"]
+        await rec.stop("ch")
+        assert cr.stopped
+
+    asyncio.run(scenario())
+
+
+def test_stop_chat_platform_twitch_keeps_kick_buffer(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        await rec.add_kick_chat("kick:xqc", {"content": "kept"})
+        await rec.stop_chat("kick:xqc", "twitch")  # twitch-only stop must not finalize kick chat
+        assert "kick_chat" in rec._recordings["kick:xqc"]
+        assert rec._recordings["kick:xqc"]["kick_chat"]["messages"] == [{"content": "kept"}]
+        chat_path = rec._recordings["kick:xqc"]["kick_chat"]["path"]
+        assert not os.path.exists(chat_path)
+        await rec.stop("kick:xqc")
+        with open(chat_path) as f:
+            comments = json.load(f)["comments"]
+        assert [c["message"]["body"] for c in comments] == ["kept"]
+
+    asyncio.run(scenario())
+
+
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     config["record_chat"] = True
@@ -617,3 +671,233 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     assert not (base / "old.ts").exists()
     assert (base / "mid.ts").exists()
     assert (base / "new.ts").exists()
+
+
+def make_kick_config(tmp_path, record_chat=True):
+    config = make_config(tmp_path)
+    config["channels"] = ["kick:xqc"]
+    config["record_chat"] = True
+    config["kick"] = {"record_chat": record_chat}
+    return config
+
+
+class CapturingFakePlugin(FakePlugin):
+    instances = []
+
+    def __init__(self, session, url, options):
+        super().__init__(session, url, options)
+        CapturingFakePlugin.instances.append((url, options))
+
+
+def test_resolve_stream_kick_uses_plugin_directly(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    stream = FakeStream()
+    seen = {}
+
+    def resolve_url(url):
+        seen["url"] = url
+        return ("kick", CapturingFakePlugin, url)
+
+    monkeypatch.setattr(rec._session, "resolve_url", resolve_url)
+    monkeypatch.setattr(CapturingFakePlugin, "streams", lambda self: {"best": stream})
+    CapturingFakePlugin.instances.clear()
+
+    best, author, title, game = rec._resolve_stream("kick:xqc", None, None)
+
+    assert best is stream
+    assert seen["url"] == "https://kick.com/xqc"
+    assert CapturingFakePlugin.instances == [("https://kick.com/xqc", {})]
+    assert author == "author"  # plugin metadata wins
+    assert title == "Title"
+    assert game == "Game"
+
+    # without plugin metadata, the bare slug is the author fallback
+    CapturingFakePlugin.author = None
+    best, author, title, game = rec._resolve_stream("kick:xqc", None, None)
+    assert author == "xqc"
+
+
+def test_start_twitch_prefixed_uses_twitch_dir(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["channels"] = ["twitch:streamer1"]
+    config["record_chat"] = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("twitch:streamer1") is True
+        entry = rec._recordings["twitch:streamer1"]
+        assert entry["filepath"].startswith(str(tmp_path / "recordings" / "twitch" / "streamer1"))
+        cr = FakeChatRecorder.instances[0]
+        assert cr.channel == "streamer1"  # bare login for IRC JOIN
+        assert cr.chat_path.startswith(str(tmp_path / "chat" / "twitch" / "streamer1"))
+        assert cr.chat_path.endswith(".chat.json")
+        await rec.stop("twitch:streamer1")
+
+    asyncio.run(scenario())
+
+
+def test_start_kick_uses_kick_dir_and_chat(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path, record_chat=True)
+    rec = Recorder(config, notifier=FakeNotifier())
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    FakeChatRecorder.instances.clear()
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        entry = rec._recordings["kick:xqc"]
+        assert entry["filepath"].startswith(str(tmp_path / "recordings" / "kick" / "xqc"))
+        assert "Title-" in os.path.basename(entry["filepath"])
+        # no Twitch IRC chat recorder for kick channels
+        assert FakeChatRecorder.instances == []
+        assert "chat_task" not in entry
+        # kick chat buffer prepared under chat/kick/xqc/
+        assert entry["kick_chat"]["path"].startswith(str(tmp_path / "chat" / "kick" / "xqc"))
+        assert entry["kick_chat"]["path"].endswith(".chat.json")
+        assert entry["kick_chat"]["channel"] == "kick:xqc"
+        assert rec._notifier.live == [(("kick:xqc", "Title", "Game", "https://kick.com/xqc"), {})]
+        await rec.stop("kick:xqc")
+
+    asyncio.run(scenario())
+
+
+def test_start_kick_record_chat_false_skips_buffer(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path, record_chat=False)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        assert "kick_chat" not in rec._recordings["kick:xqc"]
+        await rec.stop("kick:xqc")
+
+    asyncio.run(scenario())
+
+
+def test_start_kick_403_block_warns_once_per_30min(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    def blocked(*a):
+        raise PluginError("Error while querying Kick API: 403 Forbidden")
+
+    monkeypatch.setattr(rec, "_resolve_stream", blocked)
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is False
+        assert await rec.start("kick:xqc") is False
+
+    asyncio.run(scenario())
+
+    assert notifier.messages == [
+        "\u26a0\ufe0f Kick is blocking requests from this server (anti-bot challenge). "
+        "Recording kick:xqc failed: Error while querying Kick API: 403 Forbidden. Will retry automatically. "
+        "Install a browser on this host (streamlink then solves the challenge automatically) "
+        "or run from a non-blocked IP."
+    ]
+
+
+def test_start_kick_plugin_error_without_403_no_warning(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    def other_error(*a):
+        raise PluginError("other error")
+
+    monkeypatch.setattr(rec, "_resolve_stream", other_error)
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is False
+
+    asyncio.run(scenario())
+
+    assert notifier.messages == []
+
+
+def test_add_kick_chat_appends_and_stop_writes_file(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    payload = {"created_at": "2026-08-13T10:00:00Z", "content": "hello"}
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        await rec.add_kick_chat("kick:xqc", payload)
+        await rec.add_kick_chat("kick:xqc", {"content": "world"})
+        entry = rec._recordings["kick:xqc"]
+        chat_path = entry["kick_chat"]["path"]
+        await rec.stop("kick:xqc")
+        assert os.path.exists(chat_path)
+        with open(chat_path) as f:
+            data = json.load(f)
+        # TwitchDownloader ChatRoot shape
+        assert data["FileInfo"]["Version"] == {"Major": 1, "Minor": 4, "Patch": 0}
+        assert data["streamer"]["login"] == "xqc"
+        assert data["video"]["title"] == "Title"
+        assert data["video"]["id"].startswith("kick-xqc-")
+        assert len(data["comments"]) == 2
+        assert data["comments"][0]["message"]["body"] == "hello"
+        assert data["comments"][0]["content_offset_seconds"] >= 0
+        assert data["comments"][1]["message"]["body"] == "world"
+        assert "embeddedData" not in data  # embed patched off in tests
+        assert not os.path.exists(chat_path + ".tmp")
+
+    asyncio.run(scenario())
+
+
+def test_add_kick_chat_unrecorded_channel_noop(tmp_path, monkeypatch):
+    rec = Recorder(make_kick_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        await rec.add_kick_chat("kick:other", {"content": "x"})  # must not raise
+        assert rec._recordings == {}
+
+    asyncio.run(scenario())
+
+
+def test_stop_with_empty_kick_chat_writes_no_file(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        chat_path = rec._recordings["kick:xqc"]["kick_chat"]["path"]
+        await rec.stop("kick:xqc")
+        assert not os.path.exists(chat_path)
+
+    asyncio.run(scenario())
+
+
+def test_stop_chat_finalizes_kick_chat_midstream(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        chat_path = rec._recordings["kick:xqc"]["kick_chat"]["path"]
+        await rec.add_kick_chat("kick:xqc", {"content": "saved"})
+        await rec.stop_chat("kick:xqc")
+        assert "kick_chat" not in rec._recordings["kick:xqc"]
+        assert rec.is_recording("kick:xqc")  # video continues
+        with open(chat_path) as f:
+            comments = json.load(f)["comments"]
+        assert [c["message"]["body"] for c in comments] == ["saved"]
+        await rec.stop("kick:xqc")
+
+    asyncio.run(scenario())

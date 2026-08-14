@@ -8,6 +8,14 @@ services:
     working_dir: /app
     volumes:
       - .:/app                     # the checkout: config.json, recordings/, plugins/, tokens, state
+      # Host tailscaled socket: lets the bot run `tailscale funnel` for the
+      # kick webhook tunnel. Requires tailscale installed on the docker host.
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+    ports:
+      # Kick webhook receiver: the host's tailscale funnel forwards to the
+      # host loopback, so publish the container listener there (requires
+      # kick.webhook.listen_host = "0.0.0.0" in config.json under docker).
+      - "127.0.0.1:8787:8787"
     environment:
       - PYTHONUNBUFFERED=1
       - STREAM_ARCHIVE_IN_DOCKER=1

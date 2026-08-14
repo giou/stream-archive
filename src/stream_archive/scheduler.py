@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from src.stream_archive.config import get_config
 from src.stream_archive.twitch_api import TwitchAPI
+from src.stream_archive.kick_api import KickAPI
 from src.stream_archive.monitor import Monitor
 from src.stream_archive.recorder import Recorder
 from src.stream_archive.notifier import Notifier
@@ -13,6 +14,7 @@ from src.stream_archive.youtube_streamer import YouTubeStreamer
 from src.stream_archive.telegram_control import TelegramController
 from src.stream_archive.updater import UpdateChecker
 from src.stream_archive.eventsub import EventSubClient
+from src.stream_archive.kick_webhook import KickWebhook
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +72,23 @@ async def run_scheduler():
     recorder = Recorder(config, youtube_streamer, notifier)
     monitor = Monitor(recorder, notifier)
 
+    kick_api = KickAPI(config)
+
     eventsub = EventSubClient(twitch_api, monitor, config)
     await eventsub.start()
+
+    kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
+    if config.get("kick", {}).get("webhook", {}).get("enabled"):
+        await kick_webhook.start()
+        logger.info("[kick_webhook] started (public: %s)", config["kick"]["webhook"].get("public_url", ""))
 
     updater = UpdateChecker(config, notifier)
     updater_task = asyncio.create_task(updater.run_loop())
     logger.info("[updater] Update check enabled (every %sh)", config["update_check"]["interval_hours"])
 
     telegram = TelegramController(
-        config, recorder, monitor, eventsub, on_restart=lambda: _shutdown_event.set(), updater=updater
+        config, recorder, monitor, eventsub, on_restart=lambda: _shutdown_event.set(), updater=updater,
+        kick_webhook=kick_webhook,
     )
     await telegram.start()
 
@@ -98,7 +108,7 @@ async def run_scheduler():
     try:
         while not _shutdown_event.is_set():
             try:
-                await monitor.check_channels(twitch_api, config)
+                await monitor.check_channels(twitch_api, kick_api, config)
             except Exception as e:
                 logger.error("[scheduler] Error in check_channels: %s", e)
                 await asyncio.sleep(5)
@@ -126,6 +136,9 @@ async def run_scheduler():
         await telegram.stop()
         await notifier.close()
         await eventsub.close()
+        if kick_webhook:
+            await kick_webhook.close()
+        await kick_api.close()
         await twitch_api.close()
         await youtube_streamer.close()
         logger.info("[scheduler] Shutdown complete")

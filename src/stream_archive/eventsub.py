@@ -4,6 +4,8 @@ import logging
 
 import websockets
 
+from src.stream_archive.config import bare_name, is_kick_channel
+
 logger = logging.getLogger(__name__)
 
 BASE_WS_URL = "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=60"
@@ -82,7 +84,7 @@ class EventSubClient:
         if channel in self._subs:
             return
         try:
-            uid = (await self._api.resolve_user_ids([channel])).get(channel)
+            uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
         except Exception as e:
             logger.error("[eventsub] resolve_user_ids failed for %s: %s", channel, e)
             return
@@ -107,6 +109,7 @@ class EventSubClient:
             self._id_to_channel.pop(uid, None)
 
     async def sync_channels(self, channels):
+        channels = [c for c in channels if not is_kick_channel(c)]
         for ch in list(self._subs):
             if ch not in channels:
                 await self.remove_channel(ch)
@@ -156,10 +159,11 @@ class EventSubClient:
                 await self._subscribe_all()
                 self._subscribed = True
                 self._ready.set()
+                twitch_count = len([c for c in self._config["channels"] if not is_kick_channel(c)])
                 logger.info(
                     "[eventsub] session connected, subscribed %d/%d channels",
                     len(self._subs),
-                    len(self._config["channels"]),
+                    twitch_count,
                 )
             while not self._stop.is_set():
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=keepalive + 30))
@@ -202,12 +206,18 @@ class EventSubClient:
             logger.warning("[eventsub] shard status: %s", result.get("status"))
 
     async def _subscribe_all(self):
-        channels = self._config["channels"]
+        channels = [c for c in self._config["channels"] if not is_kick_channel(c)]
         try:
-            user_ids = await self._api.resolve_user_ids(channels)
+            resolved = await self._api.resolve_user_ids([bare_name(c) for c in channels])
         except Exception as e:
             logger.error("[eventsub] resolve_user_ids failed: %s", e)
-            user_ids = {}
+            resolved = {}
+        identity_by_bare = {bare_name(c): c for c in channels}
+        user_ids = {
+            identity_by_bare[bare]: uid
+            for bare, uid in resolved.items()
+            if bare in identity_by_bare
+        }
         self._user_ids = user_ids
         self._id_to_channel = {uid: ch for ch, uid in user_ids.items()}
         for channel in channels:

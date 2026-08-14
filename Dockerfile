@@ -5,8 +5,16 @@ FROM python:3.12-slim
 # which handle client-integrity server-side. plugins/twitch.py does contain a
 # browser (CDP) fallback for token acquisition, but this app never triggers it:
 # the recorder sets neither proxy-playlist-exclude nor proxy-playlist-fallback.
+#
+# Tailscale CLI: the Telegram bot enables `tailscale funnel` for the kick
+# webhook tunnel by talking to the HOST's tailscaled through the socket that
+# docker-compose mounts at /var/run/tailscale/tailscaled.sock.
+# cloudflared: the bot runs the cloudflare quick/named tunnel itself.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg git tzdata ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg git tzdata ca-certificates curl \
+ && curl -fsSL https://tailscale.com/install.sh | sh \
+ && curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared \
+ && chmod +x /usr/local/bin/cloudflared \
  && rm -rf /var/lib/apt/lists/*
 
 # Pinned to the same uv version the project was developed with (host: 0.11.5).

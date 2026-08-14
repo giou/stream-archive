@@ -5,7 +5,13 @@
 .pytest_cache/
 tests/
 recordings/
+chat/
 config.json
 client_secret.json
 youtube_token.json
 update_state.json
+.env
+.tz
+cloudflared/
+plugins/*.bak
+*:Zone.Identifier

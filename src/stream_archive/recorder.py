@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -12,6 +13,8 @@ from streamlink.exceptions import NoPluginError, NoStreamsError, PluginError
 
 from src.stream_archive import disk
 from src.stream_archive.chat_recorder import ChatRecorder
+from src.stream_archive.config import bare_name, channel_url, is_kick_channel, kick_bare_name
+from src.stream_archive.kick_chat import build_chat_root, embed_kick_emotes
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,7 @@ class Recorder:
         self._session = streamlink.Streamlink()
         self._session.set_option("http-timeout", 30)
         self._plugin_loaded = False
+        self._last_kick_block_notify = {}
 
     def _load_plugin(self):
         if self._plugin_loaded:
@@ -40,40 +44,48 @@ class Recorder:
         self._plugin_loaded = True
 
     def _resolve_stream(self, channel, title, game):
-        url = f"https://twitch.tv/{channel}"
-        plugin_name, plugin_class, resolved_url = self._session.resolve_url(url)
-        proxies = list(self._config["proxy_list"])
-        while True:
-            plugin = plugin_class(
-                self._session,
-                resolved_url,
-                options={
-                    "proxy-playlist": proxies,
-                    "supported-codecs": ["h264"],
-                },
-            )
-            try:
-                streams = plugin.streams()
-                break
-            except NoStreamsError:
-                raise  # channel offline, or all proxies exhausted — never retried
-            except (PluginError, OSError) as err:
-                # Mirrors the plugin's proxy loop: skip the failing proxy and try
-                # the next; after the last proxy, match the plugin's NoStreamsError.
-                if len(proxies) <= 1:
-                    raise NoStreamsError
-                logger.warning(
-                    "[recorder] [%s] proxy '%s' failed (%s); trying next proxy",
-                    channel, proxies[0], err,
+        if is_kick_channel(channel):
+            # No proxy loop / ad-block workarounds: streamlink's built-in kick
+            # plugin talks to kick's API itself (and solves the JS challenge
+            # via a browser when one is installed).
+            plugin_name, plugin_class, resolved_url = self._session.resolve_url(channel_url(channel))
+            plugin = plugin_class(self._session, resolved_url, options={})
+            streams = plugin.streams()
+        else:
+            url = channel_url(channel)
+            plugin_name, plugin_class, resolved_url = self._session.resolve_url(url)
+            proxies = list(self._config["proxy_list"])
+            while True:
+                plugin = plugin_class(
+                    self._session,
+                    resolved_url,
+                    options={
+                        "proxy-playlist": proxies,
+                        "supported-codecs": ["h264"],
+                    },
                 )
-                proxies = proxies[1:]
+                try:
+                    streams = plugin.streams()
+                    break
+                except NoStreamsError:
+                    raise  # channel offline, or all proxies exhausted — never retried
+                except (PluginError, OSError) as err:
+                    # Mirrors the plugin's proxy loop: skip the failing proxy and try
+                    # the next; after the last proxy, match the plugin's NoStreamsError.
+                    if len(proxies) <= 1:
+                        raise NoStreamsError
+                    logger.warning(
+                        "[recorder] [%s] proxy '%s' failed (%s); trying next proxy",
+                        channel, proxies[0], err,
+                    )
+                    proxies = proxies[1:]
         if not streams:
             raise PluginError("No streams available")
         quality = self._config.get("preferred_quality", "best")
         best = streams.get(quality) or streams.get("best")
         if best is None:
             raise PluginError(f"No '{quality}' or 'best' stream available")
-        author = getattr(plugin, "author", None) or channel
+        author = getattr(plugin, "author", None) or bare_name(channel)
         if title is None:
             title = getattr(plugin, "title", None) or "Untitled"
         if game is None:
@@ -100,6 +112,18 @@ class Recorder:
             return False
         except (NoPluginError, PluginError) as e:
             logger.error("[recorder] Failed to get streams for %s: %s", channel, e)
+            msg = str(e)
+            if is_kick_channel(channel) and ("403" in msg or "blocked by security policy" in msg):
+                now = time.monotonic()
+                if now - self._last_kick_block_notify.get(channel, 0.0) >= 1800:
+                    self._last_kick_block_notify[channel] = now
+                    if self._notifier:
+                        await self._notifier.notify(
+                            f"\u26a0\ufe0f Kick is blocking requests from this server (anti-bot challenge). "
+                            f"Recording {channel} failed: {msg}. Will retry automatically. "
+                            f"Install a browser on this host (streamlink then solves the challenge automatically) "
+                            f"or run from a non-blocked IP."
+                        )
             return False
         except Exception as e:
             logger.error("[recorder] Unexpected error resolving %s: %s", channel, e)
@@ -110,13 +134,13 @@ class Recorder:
         entry["mode"] = mode
         self._recordings[channel] = entry
         tasks = []
-        twitch_url = f"https://twitch.tv/{channel}"
+        live_url = channel_url(channel)
 
         now = datetime.now(ZoneInfo(self._config["timezone"])).strftime("%d_%m_%Y-%H%M%S")
         safe_title = _sanitize_filename(stream_title)
 
         if mode in ("disk", "both"):
-            recording_dir = f"{self._config['recording_dir']}/{channel}"
+            recording_dir = f"{self._config['recording_dir']}/{self._channel_dir(channel)}"
             os.makedirs(recording_dir, exist_ok=True)
             filename = f"{safe_title}-{now}.ts"
             filepath = os.path.join(recording_dir, filename)
@@ -128,7 +152,7 @@ class Recorder:
             )
             tasks.append(disk_task)
             if self._notifier:
-                await self._notifier.notify_live(channel, stream_title, stream_game, twitch_url)
+                await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
         elif mode == "youtube":
             if self._youtube is not None:
                 yt_task = self._track(
@@ -146,14 +170,26 @@ class Recorder:
             del self._recordings[channel]
             return False
 
-        if self._config.get("record_chat", True):
+        if self._config.get("record_chat", True) and not is_kick_channel(channel):
             chat_dir = disk.chat_dir_path(self._config)
-            chat_path = os.path.join(chat_dir, channel, f"{safe_title}-{now}.chat.json")
+            chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
             os.makedirs(os.path.dirname(chat_path), exist_ok=True)
-            chat_recorder = ChatRecorder(channel, chat_path, stream_title, stream_game,
+            chat_recorder = ChatRecorder(bare_name(channel), chat_path, stream_title, stream_game,
                                          author=author, user_id=user_id)
             entry["chat_recorder"] = chat_recorder
             entry["chat_task"] = chat_recorder.start()
+
+        if is_kick_channel(channel) and self._config.get("kick", {}).get("record_chat", True):
+            chat_dir = disk.chat_dir_path(self._config)
+            chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
+            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+            entry["kick_chat"] = {
+                "path": chat_path,
+                "messages": [],
+                "title": stream_title,
+                "channel": channel,
+                "started_wall": datetime.now(ZoneInfo(self._config["timezone"])).isoformat(),
+            }
 
         entry["tasks"] = tasks
 
@@ -163,6 +199,14 @@ class Recorder:
 
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
         return True
+
+    def _channel_dir(self, channel):
+        """Recording subdirectory: kick/<slug>, twitch/<name>, legacy bare -> bare."""
+        if is_kick_channel(channel):
+            return f"kick/{kick_bare_name(channel)}"
+        if channel.startswith("twitch:"):
+            return f"twitch/{bare_name(channel)}"
+        return channel
 
     def _track(self, channel, coro):
         task = asyncio.create_task(coro)
@@ -181,6 +225,7 @@ class Recorder:
             chat_recorder = entry.pop("chat_recorder", None)
             if chat_recorder:
                 asyncio.create_task(self._finalize_chat(channel, chat_recorder))
+            asyncio.create_task(self._finalize_kick_chat(entry))
             del self._recordings[channel]
 
     async def _finalize_chat(self, channel, chat_recorder):
@@ -230,6 +275,7 @@ class Recorder:
                 await chat_recorder.stop()
             except Exception as e:
                 logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+        await self._finalize_kick_chat(entry)
 
         if entry.get("youtube_info"):
             try:
@@ -237,17 +283,64 @@ class Recorder:
             except Exception as e:
                 logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
-    async def stop_chat(self, channel):
-        """Stop and finalize chat capture for an active recording; the video continues."""
+    async def stop_chat(self, channel, platform=None):
+        """Stop and finalize chat capture for an active recording; the video continues.
+
+        platform=None stops both; "twitch" only the IRC recorder; "kick" only kick chat.
+        """
         entry = self._recordings.get(channel)
         if entry is None:
             return
-        chat_recorder = entry.pop("chat_recorder", None)
-        if chat_recorder:
-            try:
-                await chat_recorder.stop()
-            except Exception as e:
-                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+        if platform in (None, "twitch"):
+            chat_recorder = entry.pop("chat_recorder", None)
+            if chat_recorder:
+                try:
+                    await chat_recorder.stop()
+                except Exception as e:
+                    logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+        if platform in (None, "kick"):
+            await self._finalize_kick_chat(entry)
+
+    async def add_kick_chat(self, channel, payload):
+        """Append one normalized kick chat message to the active recording's buffer.
+
+        No-op when the channel is not being recorded (webhook delivery is
+        best-effort and there is no replay).
+        """
+        entry = self._recordings.get(channel)
+        if entry is not None and entry.get("kick_chat") is not None:
+            entry["kick_chat"]["messages"].append(payload)
+
+    async def _finalize_kick_chat(self, entry):
+        """Write the collected kick chat buffer atomically; skip when empty.
+
+        Output is TwitchDownloader ChatRoot JSON with embedded emote images
+        (see kick_chat.build_chat_root / embed_kick_emotes).
+        """
+        kick_chat = entry.pop("kick_chat", None)
+        if kick_chat is None or not kick_chat.get("messages"):
+            return
+        try:
+            duration_s = time.monotonic() - entry.get("started_at", time.monotonic())
+            root = build_chat_root(
+                kick_chat["channel"],
+                kick_bare_name(kick_chat["channel"]),
+                kick_chat.get("title"),
+                kick_chat.get("started_wall"),
+                kick_chat["messages"],
+                duration_s=duration_s,
+            )
+            await embed_kick_emotes(root)
+            tmp = kick_chat["path"] + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(root, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, kick_chat["path"])
+            logger.info(
+                "[recorder] kick chat saved: %s (%d messages)",
+                kick_chat["path"], len(kick_chat["messages"]),
+            )
+        except Exception as e:
+            logger.error("[recorder] kick chat finalize failed: %s", e)
 
     def is_recording(self, channel):
         return channel in self._recordings
@@ -320,13 +413,13 @@ class Recorder:
                     f"\u26a0\ufe0f YouTube rate limit reached!\n"
                     f"Channel: {channel}\n"
                     f"Stream: {title or 'Unknown'}\n"
-                    f"Stream link: https://twitch.tv/{channel}"
+                    f"Stream link: {channel_url(channel)}"
                 )
                 if self._notifier:
                     await self._notifier.notify(msg)
                 entry = self._recordings.get(channel)
                 if entry is not None:
-                    recording_dir = f"{self._config['recording_dir']}/{channel}"
+                    recording_dir = f"{self._config['recording_dir']}/{self._channel_dir(channel)}"
                     os.makedirs(recording_dir, exist_ok=True)
                     now = datetime.now(ZoneInfo(self._config["timezone"])).strftime("%d_%m_%Y-%H%M%S")
                     safe_title = _sanitize_filename(f"{author} - {title}")
@@ -338,8 +431,7 @@ class Recorder:
                     )
                     entry["tasks"].append(disk_task)
                     if self._notifier:
-                        twitch_url = f"https://twitch.tv/{channel}"
-                        await self._notifier.notify_live(channel, title, game, twitch_url)
+                        await self._notifier.notify_live(channel, title, game, channel_url(channel))
                 return
             raise
 
@@ -348,10 +440,9 @@ class Recorder:
             return
         entry["youtube_info"] = youtube_info
 
-        twitch_url = f"https://twitch.tv/{channel}"
         if self._notifier:
             await self._notifier.notify_live(
-                channel, title, game, twitch_url, youtube_info["youtube_url"]
+                channel, title, game, channel_url(channel), youtube_info["youtube_url"]
             )
 
         rtmp_url = youtube_info["rtmp_url"]
@@ -494,6 +585,7 @@ class Recorder:
                 await chat_recorder.stop()
             except Exception as e:
                 logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+        await self._finalize_kick_chat(entry)
 
         youtube_info = entry.get("youtube_info")
 

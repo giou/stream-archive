@@ -243,6 +243,23 @@ def test_remove_channel_deletes_subs():
     assert client._id_to_channel == {}
 
 
+def test_subscribe_twitch_prefixed_channel_resolves_bare():
+    api = FakeTwitchAPI(user_ids={"streamer1": "u1"})
+    client = make_client(
+        api=api, config={"channels": ["twitch:streamer1"], "eventsub": {"enabled": True}}
+    )
+    client._conduit_id = "c1"
+
+    asyncio.run(client._subscribe_all())
+
+    assert client._user_ids == {"twitch:streamer1": "u1"}
+    assert set(client._subs) == {"twitch:streamer1"}
+    assert all(
+        p["condition"]["broadcaster_user_id"] == "u1"
+        for p in api.subscription_creates
+    )
+
+
 def test_sync_channels_removes_stale_and_adds_new():
     api = FakeTwitchAPI()
     client = make_client(api=api, config={"channels": ["ch1", "ch2"], "eventsub": {"enabled": True}})

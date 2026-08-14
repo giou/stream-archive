@@ -2,6 +2,8 @@ import asyncio
 import logging
 import time
 
+from src.stream_archive.config import bare_name, is_kick_channel, kick_bare_name
+
 logger = logging.getLogger(__name__)
 
 FAILURE_NOTIFY_INTERVAL = 1800
@@ -16,50 +18,84 @@ class Monitor:
         self._last_failure_notify = {}
         self._last_disk_notify = 0.0
         self._locks = {}
+        self._warned_unknown_kick = set()
 
     def _lock_for(self, channel):
         if channel not in self._locks:
             self._locks[channel] = asyncio.Lock()
         return self._locks[channel]
 
-    async def check_channels(self, twitch_api, config):
-        try:
-            user_ids = await twitch_api.resolve_user_ids(config["channels"])
-            if not user_ids:
+    async def check_channels(self, twitch_api, kick_api, config):
+        snapshot = None
+        twitch_channels = [c for c in config["channels"] if not is_kick_channel(c)]
+        if twitch_channels:
+            try:
+                resolved = await twitch_api.resolve_user_ids([bare_name(c) for c in twitch_channels])
+            except Exception as e:
+                logger.error("[monitor] resolve_user_ids failed: %s", e)
+                resolved = {}
+            if not resolved:
                 logger.warning("[monitor] Failed to resolve user IDs")
-                return
-        except Exception as e:
-            logger.error("[monitor] resolve_user_ids failed: %s", e)
-            return
+            else:
+                identity_by_bare = {bare_name(c): c for c in twitch_channels}
+                user_ids = {
+                    identity_by_bare[bare]: uid
+                    for bare, uid in resolved.items()
+                    if bare in identity_by_bare
+                }
+                try:
+                    streams = await twitch_api.get_live_streams(user_ids)
+                except Exception as e:
+                    logger.error("[monitor] get_live_streams failed: %s", e)
+                    streams = {}
 
-        try:
-            streams = await twitch_api.get_live_streams(user_ids)
-        except Exception as e:
-            logger.error("[monitor] get_live_streams failed: %s", e)
-            return
+                user_to_channel = {v: k for k, v in user_ids.items()}
 
-        user_to_channel = {v: k for k, v in user_ids.items()}
+                snapshot = await self._snapshot_if_needed(config)
 
-        snapshot = await self._snapshot_if_needed(config)
+                for user_id, stream in sorted(streams.items(), key=lambda kv: user_to_channel.get(kv[0], "")):
+                    channel = user_to_channel.get(user_id)
+                    if channel is None:
+                        logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
+                        continue
+                    snapshot = await self._ensure_recording(
+                        channel,
+                        stream.get("title"),
+                        stream.get("game_name"),
+                        user_id,
+                        config,
+                        snapshot,
+                    )
 
-        for user_id, stream in sorted(streams.items(), key=lambda kv: user_to_channel.get(kv[0], "")):
-            channel = user_to_channel.get(user_id)
-            if channel is None:
-                logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
-                continue
-            snapshot = await self._ensure_recording(
-                channel,
-                stream.get("title"),
-                stream.get("game_name"),
-                user_id,
-                config,
-                snapshot,
-            )
+                for channel in twitch_channels:
+                    user_id = user_ids.get(channel)
+                    if channel in self._live_channels and user_id not in streams:
+                        await self._ensure_stopped(channel, config)
 
-        for channel in config["channels"]:
-            user_id = user_ids.get(channel)
-            if channel in self._live_channels and user_id not in streams:
-                await self._ensure_stopped(channel, config)
+        kick_channels = [c for c in config["channels"] if is_kick_channel(c)]
+        if kick_channels:
+            try:
+                statuses = await kick_api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
+            except Exception as e:
+                logger.error("[monitor] kick get_channel_statuses failed: %s", e)
+            else:
+                if snapshot is None:
+                    snapshot = await self._snapshot_if_needed(config)
+                for ch in kick_channels:
+                    bare = kick_bare_name(ch)
+                    status = statuses.get(bare)
+                    if status is None:
+                        if bare not in self._warned_unknown_kick:
+                            self._warned_unknown_kick.add(bare)
+                            logger.warning("[monitor] kick channel not found: %s", ch)
+                        if ch in self._live_channels:
+                            await self._ensure_stopped(ch, config)
+                    elif status["is_live"]:
+                        snapshot = await self._ensure_recording(
+                            ch, status["title"], status["game"], None, config, snapshot
+                        )
+                    elif ch in self._live_channels:
+                        await self._ensure_stopped(ch, config)
 
     async def handle_online(self, channel, title, game, user_id, config):
         """EventSub stream.online entry point."""
