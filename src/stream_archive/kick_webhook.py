@@ -148,11 +148,13 @@ class KickWebhook:
                 logger.error("[kick_webhook] subscription sync failed: %s", e)
                 if not self._sync_failed_notified and self._notifier:
                     self._sync_failed_notified = True
+                    detail = str(e).strip() or e.__class__.__name__
                     await self._notifier.notify(
                         "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
                         "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
                         "your app \u2192 Enable webhooks)? "
-                        f"{self._config['kick']['webhook'].get('public_url', '')}"
+                        f"{self._config['kick']['webhook'].get('public_url', '')}\n"
+                        f"Error: {detail}"
                     )
             else:
                 self._sync_failed_notified = False
