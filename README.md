@@ -66,7 +66,11 @@ recording processes that die mid-stream.
   the next poll cycle; non-admin senders get no reply.
 - **Self-healing**:
   - Recording tasks that die mid-stream (ffmpeg crash, disk error, proxy
-    death) are detected and restarted on the next poll cycle.
+    death, or a feed that simply stops delivering segments) are detected and
+    restarted on the next poll cycle.
+  - YouTube re-stream restarts back off exponentially after short recordings,
+    and a rolling 24h budget of 10 broadcast creations (shared across all
+    channels) protects YouTube's per-channel daily limit.
   - YouTube rate-limit / `403` / quota errors fall back to disk recording.
   - Transient Twitch/Kick API errors are logged and retried next cycle;
     unknown ids in a response are skipped instead of crashing the poll.
@@ -115,8 +119,11 @@ flowchart TD
     Telegram -->|"webhook setup · tunnel mgmt"| KickWebhook
 ```
 
-Recording tasks are tracked; a task that fails raises, its channel entry is
-removed, and the monitor restarts the recording on the next poll cycle.
+Recording tasks are tracked; when a task ends — cleanly (the feed stopped
+delivering segments) or with an error — its channel entry is removed, chat and
+the YouTube broadcast are finalized, and the monitor restarts the recording on
+the next poll cycle (YouTube re-streams are gated by a per-channel backoff and
+a global daily broadcast budget).
 
 Control plane: `telegram_control` runs alongside the scheduler as a polling
 bot. Commands are gated to `telegram_user_id`, validated on a copy, written
@@ -439,7 +446,8 @@ with `[scheduler] Shutdown complete`.
 | Kick blocks recording requests (anti-bot challenge / `403`) | Channel skipped, one Telegram alert (rate-limited to 30 min/channel) with a hint to install a browser on the host, retried next cycle |
 | YouTube rate limit / `403` / quota error at broadcast creation | Automatic fallback to disk recording; live alert still sent |
 | Other YouTube broadcast-creation error | Task fails loudly; channel restarted next cycle |
-| Recording dies mid-stream (ffmpeg killed, disk write error, proxy death) | Entry removed, `Recording task failed` logged, monitor restarts within one poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
+| Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, feed stall) | Entry removed (chat + broadcast finalized), monitor restarts on the next poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
+| YouTube re-stream keeps ending shortly after start (flaky feed) | Restarts back off per channel (120s doubling, 30 min cap); a rolling 24h budget of 10 broadcast creations shared across all channels blocks further restarts (one alert with the next-slot time) until a slot frees — guards YouTube's per-channel daily broadcast cap (`userBroadcastsExceedLimit`) |
 | Transient Twitch API error (token/request) | Logged, nothing acted on, retried next cycle |
 | Transient Kick API error (token/request) | Logged, nothing acted on, retried next cycle |
 | Kick channel slug not found | Warned once per channel, treated as offline; never crashes the poll |
