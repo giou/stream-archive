@@ -18,6 +18,14 @@ from src.stream_archive.kick_chat import build_chat_root, embed_kick_emotes
 
 logger = logging.getLogger(__name__)
 
+# After a YouTube recording ends quickly (feed stall, flaky stream), restarts
+# back off exponentially per channel: each liveBroadcast.insert costs 50 YouTube
+# API quota units (default 10k/day), so rapid restart loops would exhaust the
+# daily quota. A recording that survives _QUICK_END_S resets the backoff.
+_QUICK_END_S = 120
+_BACKOFF_BASE_S = 60
+_BACKOFF_MAX_S = 600
+
 
 def _sanitize_filename(name):
     return re.sub(r"[<>:\"/\\|?*]", "_", name)[:200]
@@ -31,8 +39,16 @@ class Recorder:
         self._recordings = {}
         self._session = streamlink.Streamlink()
         self._session.set_option("http-timeout", 30)
+        # Ride through short HLS playlist stalls: with the default queue-deadline
+        # factor (3) and Kick's ~2s target duration, streamlink aborts after ~6s
+        # without new segments — which fresh Kick streams routinely hit right
+        # after go-live. Factor 10 raises the tolerance to ~20s; a genuinely dead
+        # feed is still detected (and the poll cycle covers the rest).
+        self._session.set_option("stream-segmented-queue-deadline", 10)
         self._plugin_loaded = False
         self._last_kick_block_notify = {}
+        self._quick_ends = {}      # channel -> consecutive short YouTube recordings
+        self._backoff_until = {}   # channel -> monotonic time before restart allowed
 
     def _load_plugin(self):
         if self._plugin_loaded:
@@ -217,16 +233,58 @@ class Recorder:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is None:
-            return
-        logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
         entry = self._recordings.get(channel)
-        if entry is not None and task in entry.get("tasks", []):
-            chat_recorder = entry.pop("chat_recorder", None)
-            if chat_recorder:
-                asyncio.create_task(self._finalize_chat(channel, chat_recorder))
-            asyncio.create_task(self._finalize_kick_chat(entry))
-            del self._recordings[channel]
+        if entry is None or task not in entry.get("tasks", []):
+            return
+        entry["tasks"].remove(task)
+        if exc is not None:
+            logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
+        else:
+            # A clean stream end (e.g. the HLS feed stalls and streamlink closes
+            # it) must also release the entry once all tasks are done: otherwise
+            # the monitor sees the channel as recording and never restarts, and
+            # the YouTube broadcast lingers until YouTube auto-ends it.
+            logger.info("[recorder] [%s] Recording task ended", channel)
+        if entry["tasks"]:
+            return  # other recording tasks (e.g. the disk fallback) still running
+        chat_recorder = entry.pop("chat_recorder", None)
+        if chat_recorder:
+            asyncio.create_task(self._finalize_chat(channel, chat_recorder))
+        asyncio.create_task(self._finalize_kick_chat(entry))
+        youtube_info = entry.get("youtube_info")
+        if youtube_info:
+            asyncio.create_task(self._end_broadcast(channel, youtube_info["broadcast_id"]))
+        if entry.get("mode") in ("youtube", "both"):
+            self._note_youtube_end(channel, entry)
+        del self._recordings[channel]
+
+    def _note_youtube_end(self, channel, entry):
+        """Apply restart backoff after a short-lived YouTube recording."""
+        started = entry.get("started_at")
+        lifetime = time.monotonic() - started if started else None
+        if lifetime is not None and lifetime < _QUICK_END_S:
+            n = self._quick_ends.get(channel, 0) + 1
+            self._quick_ends[channel] = n
+            wait = min(_BACKOFF_BASE_S * (2 ** (n - 1)), _BACKOFF_MAX_S)
+            self._backoff_until[channel] = time.monotonic() + wait
+            logger.warning(
+                "[recorder] [%s] Recording ended after %.0fs — backing off restarts for %ds",
+                channel, lifetime, wait,
+            )
+        else:
+            self._quick_ends.pop(channel, None)
+            self._backoff_until.pop(channel, None)
+
+    def restart_blocked_until(self, channel):
+        """Monotonic time before which the monitor must not restart the channel."""
+        return self._backoff_until.get(channel, 0.0)
+
+    async def _end_broadcast(self, channel, broadcast_id):
+        """Transition a YouTube broadcast to complete; never raises."""
+        try:
+            await self._youtube.end_stream(broadcast_id)
+        except Exception as e:
+            logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
     async def _finalize_chat(self, channel, chat_recorder):
         """Fire-and-forget chat finalize for the failure path; never raises."""
@@ -278,10 +336,7 @@ class Recorder:
         await self._finalize_kick_chat(entry)
 
         if entry.get("youtube_info"):
-            try:
-                await self._youtube.end_stream(entry["youtube_info"]["broadcast_id"])
-            except Exception as e:
-                logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
+            await self._end_broadcast(channel, entry["youtube_info"]["broadcast_id"])
 
     async def stop_chat(self, channel, platform=None):
         """Stop and finalize chat capture for an active recording; the video continues.
@@ -590,10 +645,7 @@ class Recorder:
         youtube_info = entry.get("youtube_info")
 
         if youtube_info:
-            try:
-                await self._youtube.end_stream(youtube_info["broadcast_id"])
-            except Exception as e:
-                logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
+            await self._end_broadcast(channel, youtube_info["broadcast_id"])
 
         filepath = entry.get("filepath")
         file_info = None

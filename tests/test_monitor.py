@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from src.stream_archive import monitor as monitor_module
 from src.stream_archive.monitor import Monitor
@@ -77,6 +78,9 @@ class FakeRecorder:
 
     def youtube_active_count(self):
         return len(self.started) if self.mode in ("youtube", "both") else 0
+
+    def restart_blocked_until(self, channel):
+        return 0.0
 
 
 class FakeNotifier:
@@ -303,6 +307,24 @@ def test_handle_online_ignores_unknown_channel():
     asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
 
     assert rec.started == []
+
+
+def test_recorder_backoff_blocks_restart():
+    class BackoffRecorder(FakeRecorder):
+        def restart_blocked_until(self, channel):
+            return time.monotonic() + 60
+
+    rec = BackoffRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = {"channels": ["ch"]}
+
+    async def scenario():
+        await mon.handle_online("ch", "T", "G", "u1", config)
+        assert rec.started == []
+        assert any("restarting in" in m for m in notifier.messages)
+
+    asyncio.run(scenario())
 
 
 def test_handle_offline_stops_and_notifies():

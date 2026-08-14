@@ -62,6 +62,24 @@ class FakeStream:
         return io.BytesIO()
 
 
+class SustainedStream:
+    """Stream that keeps returning data until closed, so recording tasks stay
+    alive until cancelled (FakeStream ends instantly with a clean EOF)."""
+
+    def __init__(self, chunk=b"\x00" * 1024):
+        self._chunk = chunk
+        self._closed = False
+
+    def open(self):
+        return self
+
+    def read(self, n):
+        return b"" if self._closed else self._chunk
+
+    def close(self):
+        self._closed = True
+
+
 class FakeNotifier:
     def __init__(self):
         self.messages = []
@@ -310,6 +328,99 @@ def test_recording_task_failure_removes_entry(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+class EndingYouTubeStreamer(FakeYouTubeStreamer):
+    def __init__(self):
+        super().__init__()
+        self.ended = []
+
+    async def end_stream(self, broadcast_id):
+        self.ended.append(broadcast_id)
+
+
+def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
+    """A stream that ends cleanly (feed stall -> streamlink EOF) must release the
+    entry so the monitor can restart on the next poll, and transition the
+    YouTube broadcast to complete instead of leaving it lingering."""
+    config = make_config(tmp_path)
+    config["output_mode"] = "youtube"
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1"},
+            "kick_chat": None,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+        await asyncio.sleep(0.05)  # let the fire-and-forget finalizers run
+        assert "ch" not in rec._recordings
+        assert yt.ended == ["b1"]
+
+    asyncio.run(scenario())
+
+
+def test_session_rides_through_playlist_stalls(tmp_path):
+    rec = Recorder(make_config(tmp_path))
+    assert rec._session.get_option("stream-segmented-queue-deadline") == 10
+
+
+def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config["output_mode"] = "youtube"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def finish_with(lifetime_s):
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1"},
+            "kick_chat": None,
+            "mode": "youtube",
+            "started_at": time.monotonic() - lifetime_s,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+
+    asyncio.run(finish_with(10))
+    first = rec.restart_blocked_until("ch")
+    assert first > time.monotonic()            # 60s backoff after a quick end
+
+    asyncio.run(finish_with(10))
+    second = rec.restart_blocked_until("ch")
+    assert second > first                      # exponential: 120s on the second
+
+    asyncio.run(finish_with(300))
+    assert rec.restart_blocked_until("ch") == 0.0   # a long recording resets
+
+
+def test_disk_end_no_backoff(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))  # output_mode disk
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": None,
+            "kick_chat": None,
+            "mode": "disk",
+            "started_at": time.monotonic() - 10,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+
+    asyncio.run(scenario())
+    assert rec.restart_blocked_until("ch") == 0.0
+
+
 def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     config["output_mode"] = "youtube"
@@ -333,7 +444,7 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
         youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("The user has exceeded their quota")),
     )
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -636,7 +747,7 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     notifier = FakeNotifier()
     rec = Recorder(config, notifier=notifier)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
     async def fake_snapshot(config):
         return {"free_gb": 100.0, "dir_gb": 6.0, "file_count": 1}
 
