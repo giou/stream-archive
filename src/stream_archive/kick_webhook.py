@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime
 
+import httpx
 from aiohttp import web
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -32,6 +33,18 @@ _RATE_LIMIT_WINDOW_S = 60
 _MAX_RATE_LIMIT_IPS = 10_000
 # Cap on concurrent in-flight webhook requests; flood protection.
 _MAX_CONCURRENT = 16
+# Kick-side sync failures (5xx) alert only after persisting this long, so a
+# transient API outage doesn't page the admin. Other failures notify at once.
+_SYNC_SERVER_ERROR_DELAY_S = 600
+
+
+def _is_server_error(exc):
+    """True when Kick's API itself failed (5xx): an outage on their side.
+
+    Config/auth problems (4xx), connectivity errors, and timeouts still
+    notify immediately — they may need action on our side.
+    """
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
 
 
 class _RateLimiter:
@@ -92,6 +105,7 @@ class KickWebhook:
         self._site = None
         self._sync_task = None
         self._sync_failed_notified = False
+        self._sync_failing_since = None   # monotonic start of current failure episode
         self._subs = {}   # bare slug -> set(subscription ids)
         self._seen_ids = {}            # message_id -> expires (monotonic)
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
@@ -146,19 +160,35 @@ class KickWebhook:
                 subscribed = await self._sync_subscriptions(self._config["channels"])
             except Exception as e:
                 logger.error("[kick_webhook] subscription sync failed: %s", e)
-                if not self._sync_failed_notified and self._notifier:
-                    self._sync_failed_notified = True
-                    detail = str(e).strip() or e.__class__.__name__
-                    await self._notifier.notify(
-                        "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
-                        "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
-                        "your app \u2192 Enable webhooks)? "
-                        f"{self._config['kick']['webhook'].get('public_url', '')}\n"
-                        f"Error: {detail}"
-                    )
+                await self._notify_sync_failure(e)
             else:
                 self._sync_failed_notified = False
+                self._sync_failing_since = None
             await asyncio.sleep(self._config["monitoring_interval"])
+
+    async def _notify_sync_failure(self, e):
+        """Alert on a sync failure; one notification per failure episode.
+
+        A Kick-side (5xx) failure only alerts once it has persisted for
+        ``_SYNC_SERVER_ERROR_DELAY_S``, so a transient API blip stays quiet.
+        """
+        if not self._notifier or self._sync_failed_notified:
+            return
+        if _is_server_error(e):
+            now = time.monotonic()
+            if self._sync_failing_since is None:
+                self._sync_failing_since = now
+            if now - self._sync_failing_since < _SYNC_SERVER_ERROR_DELAY_S:
+                return
+        self._sync_failed_notified = True
+        detail = str(e).strip() or e.__class__.__name__
+        await self._notifier.notify(
+            "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
+            "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
+            "your app \u2192 Enable webhooks)? "
+            f"{self._config['kick']['webhook'].get('public_url', '')}\n"
+            f"Error: {detail}"
+        )
 
     async def _handle(self, request):
         client = request.remote or "unknown"

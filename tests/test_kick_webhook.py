@@ -537,6 +537,88 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
     assert wh._sync_failed_notified is False  # flag cleared after the last success
 
 
+def _server_error_500():
+    request = httpx.Request("GET", "https://api.kick.com/public/v1/events/subscriptions")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError(
+        "Server error '500 Internal Server Error'", request=request, response=response
+    )
+
+
+class ScriptedAPI:
+    """Fails with a 500 for the first ``failures`` entries, then succeeds."""
+
+    def __init__(self, failures):
+        self.failures = failures
+        self.n = 0
+
+    async def get_channel_statuses(self, slugs):
+        self.n += 1
+        if self.n <= len(self.failures) and self.failures[self.n - 1]:
+            raise _server_error_500()
+        return {}
+
+    async def list_event_subscriptions(self):
+        return []
+
+
+def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
+    # A Kick-side 500 must not notify while it is shorter than the delay.
+    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 3600)
+    config = base_config()
+    config["monitoring_interval"] = 0.01
+    notifier = FakeNotifier()
+    wh = make_webhook(config=config, api=ScriptedAPI([True] * 100), notifier=notifier)
+
+    async def scenario():
+        await wh.start()
+        await asyncio.sleep(0.08)
+        await wh.close()
+
+    asyncio.run(scenario())
+    assert notifier.messages == []
+    assert wh._sync_failed_notified is False
+    assert wh._sync_failing_since is not None  # episode timer armed
+
+
+def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch):
+    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.02)
+    config = base_config()
+    config["monitoring_interval"] = 0.01
+    notifier = FakeNotifier()
+    # Two episodes of >delay 500s with a recovery in between: one alert each.
+    wh = make_webhook(config=config, api=ScriptedAPI([True] * 6 + [False] + [True] * 6), notifier=notifier)
+
+    async def scenario():
+        await wh.start()
+        await asyncio.sleep(0.22)
+        await wh.close()
+
+    asyncio.run(scenario())
+    assert len(notifier.messages) == 2
+    assert "Kick webhook subscriptions out of sync" in notifier.messages[0]
+    assert "500 Internal Server Error" in notifier.messages[0]
+
+
+def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
+    # Recovery resets the episode timer: brief blips shorter than the delay
+    # (even several in a row, each separated by a success) stay silent.
+    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
+    config = base_config()
+    config["monitoring_interval"] = 0.01
+    notifier = FakeNotifier()
+    wh = make_webhook(config=config, api=ScriptedAPI([True] * 3 + [False] + [True] * 3), notifier=notifier)
+
+    async def scenario():
+        await wh.start()
+        await asyncio.sleep(0.15)
+        await wh.close()
+
+    asyncio.run(scenario())
+    assert notifier.messages == []
+    assert wh._sync_failed_notified is False
+
+
 # ---- replay protection & flood hardening -----------------------------------
 
 
