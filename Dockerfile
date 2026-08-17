@@ -8,7 +8,10 @@ FROM python:3.14-slim
 #
 # Tailscale CLI: the Telegram bot enables `tailscale funnel` for the kick
 # webhook tunnel by talking to the HOST's tailscaled through the socket that
-# docker-compose mounts at /var/run/tailscale/tailscaled.sock.
+# docker-compose mounts at /var/run/tailscale/tailscaled.sock. Installed from
+# the official pkgs.tailscale.com repo via install.sh — the Alpine base was
+# considered but rejected because Tailscale publishes no official Alpine
+# packages (install.sh falls back to the community-maintained apk there).
 # cloudflared: the bot runs the cloudflare quick/named tunnel itself.
 ARG TARGETARCH
 RUN apt-get update \
@@ -44,6 +47,14 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 RUN uv sync --frozen --no-dev
+
+# Entrypoint adopts the data-dir owner's uid/gid (entrypoint.sh) so compose
+# deployments work on hosts whose user's uid/gid isn't 1000: the container
+# starts as root and immediately drops to that identity. setpriv is part of
+# util-linux, which is essential in the slim base image.
+COPY entrypoint.sh /usr/local/bin/stream-archive-entrypoint
+RUN chmod +x /usr/local/bin/stream-archive-entrypoint
+ENTRYPOINT ["stream-archive-entrypoint"]
 
 # Plain `docker run` starts the scheduler; overriding CMD (e.g. `docker compose
 # run --rm stream-archive stream-archive-setup-youtube`) runs other entry points.

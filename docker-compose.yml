@@ -3,7 +3,10 @@ services:
     image: ghcr.io/giou/stream-archive:latest
     restart: unless-stopped
     init: true                     # tini: zombie reaping + SIGTERM forwarding
-    user: "${USER_UID:-1000}:${USER_GID:-1000}"
+    # No `user:` — the entrypoint runs the app as the data-dir owner's
+    # uid/gid, so deployments work on hosts where the user's uid != 1000.
+    # Force a specific identity with USER_UID/USER_GID in `.env` (passed
+    # through below).
     working_dir: /data
     volumes:
       # All state lives in the data dir (default: the folder containing this
@@ -22,6 +25,8 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
       - TZ=${TZ:-UTC}
+      - USER_UID=${USER_UID:-}
+      - USER_GID=${USER_GID:-}
     # The image owns all code; the rootfs is read-only and only the data dir
     # and /tmp (tmpfs) are writable.
     read_only: true

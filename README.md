@@ -410,9 +410,11 @@ docker compose stop    # graceful shutdown: recordings stopped, broadcasts ended
   `update_state.json` — browse and edit it like any folder on the host;
   backup = copy the folder. Override the location with
   `STREAM_ARCHIVE_DATA` in `.env` (see [Quick start](#quick-start)).
-- The container runs as uid/gid 1000 by default so recorded files stay
-  manageable on the host. If your uid differs, create a `.env` next to the
-  compose file with `USER_UID=<uid>` and `USER_GID=<gid>`.
+- The container runs as the owner of the data dir, so recorded files stay
+  manageable on the host no matter what your uid/gid is — no configuration
+  needed. To force a specific identity, set `USER_UID`/`USER_GID` in `.env`
+  (if the data dir is root-owned — e.g. Docker auto-created it — fix it once
+  with `sudo chown -R "$(id -u):$(id -g)" <data-dir>`).
 - Log timestamps follow the container timezone (`UTC` by default); set
   `TZ=America/New_York` in the same `.env` to match `config.json`'s `timezone`.
 - Logs are rotated by compose (10 MB × 3 files).
