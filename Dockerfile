@@ -48,6 +48,14 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PYTHONDONTWRITEBYTECODE=1
 RUN uv sync --frozen --no-dev
 
+# HOME must be writable by the (non-root) runtime user: streamlink's plugin
+# cache defaults to $HOME/.cache. /tmp is a tmpfs under compose and world-
+# writable in the image, so it always works; the cache is per-container,
+# which is fine (it is a cache — the ttvlol plugin re-fetches on restart).
+# Kept AFTER uv sync: at build time HOME=/root so the build's caches don't
+# pollute /tmp with root-owned dirs.
+ENV HOME=/tmp
+
 # Entrypoint adopts the data-dir owner's uid/gid (entrypoint.sh) so compose
 # deployments work on hosts whose user's uid/gid isn't 1000: the container
 # starts as root and immediately drops to that identity. setpriv is part of
