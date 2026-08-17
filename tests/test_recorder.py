@@ -740,6 +740,104 @@ def test_start_records_mode_and_started_at(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_restart_applies_new_mode_preserves_metadata(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "disk"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    def resolve(*a):
+        return (SustainedStream(), "author", "Title", "Game")
+
+    monkeypatch.setattr(rec, "_resolve_stream", resolve)
+
+    async def scenario():
+        assert await rec.start("ch", title="T", game="G") is True
+        assert rec._recordings["ch"]["title"] == "T"
+        config.output_mode = "youtube"
+        assert await rec.restart("ch") is True
+        assert rec._recordings["ch"]["mode"] == "youtube"
+        assert rec._recordings["ch"]["title"] == "T"
+        settings = rec.recording_settings()["ch"]
+        assert settings["output_mode"] == "youtube"
+        assert settings["preferred_quality"] == "best"
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_restart_youtube_sends_youtube_live_notification(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "disk"
+    notifier = FakeNotifier()
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer(), notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    def resolve(*a):
+        return (SustainedStream(), "author", "Title", "Game")
+
+    monkeypatch.setattr(rec, "_resolve_stream", resolve)
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert len(notifier.live) == 1
+        assert len(notifier.live[0][0]) == 4  # disk-mode start: twitch link only
+        config.output_mode = "youtube"
+        assert await rec.restart("ch") is True
+        await asyncio.sleep(0.05)  # let the tracked youtube task create the broadcast
+        assert len(notifier.live) == 2
+        args, _ = notifier.live[1]
+        assert args[0] == "ch"
+        assert len(args) == 5
+        assert args[4] == "https://youtu.be/x"  # new broadcast link
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_restart_disk_suppresses_live_notification(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "disk"
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert len(notifier.live) == 1  # from the initial start
+        assert await rec.restart("ch") is True
+        await asyncio.sleep(0.05)
+        assert len(notifier.live) == 1  # apply-now restart: no extra live notification
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_recording_settings_chat_state_twitch(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.record_chat = True
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert rec.recording_settings()["ch"]["record_chat"] is True
+        await rec.stop_chat("ch")
+        assert rec.recording_settings()["ch"]["record_chat"] is False
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_restart_not_recording_returns_false(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    assert asyncio.run(rec.restart("ch")) is False
+
+
 def test_recording_info_reports_duration_and_size(tmp_path):
     rec = Recorder(make_config(tmp_path))
     filepath = tmp_path / "recordings" / "ch" / "rec.ts"

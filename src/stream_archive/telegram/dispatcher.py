@@ -25,6 +25,7 @@ from telegram.ext import (
 from stream_archive.config import (
     AppConfig,
     _replace_in_place,
+    is_kick_channel,
     save_config,
 )
 from stream_archive.telegram.commands_channels import ChannelsCommands
@@ -33,6 +34,29 @@ from stream_archive.telegram.commands_system import SystemCommands
 from stream_archive.telegram.commands_webhook import _KICK_DASHBOARD_HINT, WebhookCommands, _parse_public_hostname
 
 logger = logging.getLogger(__name__)
+
+
+def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, Any]]) -> list[str]:
+    """Active channels whose in-flight recording is affected by a config change.
+
+    Compared against the settings each recording actually uses (snapshotted at
+    recording start), not the previous config: after a declined change the
+    config already holds the new value while the recording keeps the old
+    settings, so the same change must warn again. Deferred effects: output
+    mode (global or per-channel override), preferred quality, chat capture
+    enabled (chat disable stops in-flight capture immediately and never
+    warns).
+    """
+    affected: set[str] = set()
+    for ch, rec in recordings.items():
+        if (
+            rec.get("output_mode") != new.channel_output_modes.get(ch, new.output_mode)
+            or rec.get("preferred_quality") != new.preferred_quality
+            or (not is_kick_channel(ch) and new.record_chat and not rec.get("record_chat"))
+            or (is_kick_channel(ch) and new.kick.record_chat and not rec.get("kick_record_chat"))
+        ):
+            affected.add(ch)
+    return sorted(affected)
 
 
 class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, SystemCommands):
@@ -50,6 +74,8 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
     _custom_setting: str | None
     _cloudflare_hostname: str | None
     _confirm_done: set[str]
+    _pending_apply: dict[str, tuple[str, list[str]]]
+    _apply_warnings_sent: set[str]
     _cloudflared: Any
     _cloudflared_drain: Any
 
@@ -77,6 +103,8 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         self._custom_setting = None  # parent setting when _menu == "custom"
         self._cloudflare_hostname = None  # hostname picked during the named-tunnel flow
         self._confirm_done = set()  # callback_data already confirmed (double-tap guard)
+        self._pending_apply = {}  # nonce -> (summary, channels) awaiting apply-now confirmation
+        self._apply_warnings_sent = set()  # nonces already messaged to the admin
         self._cloudflared = None  # running cloudflared subprocess (quick or named)
         self._cloudflared_drain = None
 
@@ -168,8 +196,43 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             save_config(candidate)
         except ValueError as e:
             return f"\u274c {e}"
+        affected = _deferred_affected_channels(candidate, self._recorder.recording_settings())
         _replace_in_place(self._config, candidate)
+        if affected:
+            self._pending_apply[secrets.token_hex(4)] = (ok_text(candidate), affected)
         return ok_text(candidate)
+
+    async def _maybe_send_apply_warnings(self) -> None:
+        """Send apply-now warnings stashed by _apply (deferred-effect settings
+        changed while channels are recording).
+
+        Entries stay in ``_pending_apply`` until answered: the nonce in the
+        message's callback data must still resolve when the admin taps a
+        button. ``_apply_warnings_sent`` tracks which nonces were already
+        messaged so a later trigger does not resend.
+        """
+        for nonce in list(self._pending_apply):
+            if nonce in self._apply_warnings_sent:
+                continue
+            summary, channels = self._pending_apply[nonce]
+            text = (
+                f"\u26a0\ufe0f {summary}, but recording in progress for: {', '.join(channels)}\n"
+                "The running recording keeps the previous settings until it ends.\n"
+                "Apply the new settings now (restarts the recording) or keep the current recording?"
+            )
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Apply now", callback_data=f"apply_now:{nonce}"),
+                        InlineKeyboardButton("Keep current recording", callback_data=f"cancel:{nonce}"),
+                    ],
+                ]
+            )
+            try:
+                await self._app.bot.send_message(chat_id=self._admin_id, text=text, reply_markup=markup)
+                self._apply_warnings_sent.add(nonce)
+            except Exception:
+                logger.warning("[telegram] Failed to send apply-now warning", exc_info=True)
 
     def reply_keyboard(self, menu: str = "root", channel: str | None = None) -> ReplyKeyboardMarkup:
         """Reply-keyboard rows for ``menu``; button labels are the routing literals."""
@@ -577,8 +640,9 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         """Apply one confirmation-button press; returns (reply_text, markup) or None.
 
         Wire format (from ``_confirm_keyboard``): ``confirm_<action>:<value>:<nonce>``
-        and ``cancel:<nonce>``. The nonce makes every confirm message's buttons
-        unique, so the double-tap guard only ever guards the same message.
+        and ``cancel:<nonce>``; apply-now warnings use ``apply_now:<nonce>``. The
+        nonce makes every confirm message's buttons unique, so the double-tap
+        guard only ever guards the same message.
         """
         parts = data.split(":")
         action = parts[0]
@@ -606,6 +670,20 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             result = self.handle_disk(["delete_oldest", "on"])
             self._menu = "disk"
             return result, None
+        if action == "apply_now" and len(parts) == 2:
+            if data in self._confirm_done:  # double-tap on the same message
+                return None
+            pending = self._pending_apply.pop(parts[1], None)
+            if pending is None:
+                return None  # stale message: bot restarted or already handled
+            self._apply_warnings_sent.discard(parts[1])
+            self._confirm_done.add(data)
+            summary, channels = pending
+            lines = []
+            for ch in channels:
+                ok = await self._recorder.restart(ch)
+                lines.append(f"{ch}: {'restarted with the new settings' if ok else 'no longer recording'}")
+            return f"\u2705 Applied: {summary}\n" + "\n".join(lines), None
         return None
 
     async def _on_callback(self, update: Any, context: Any) -> None:
@@ -653,6 +731,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             return
         text, markup = result
         await update.effective_message.reply_text(text, reply_markup=markup)
+        await self._maybe_send_apply_warnings()
 
     async def _send_admin(self, text: str) -> None:
         try:
@@ -692,6 +771,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
 
     async def _cmd_mode(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(self.handle_mode(context.args or []))
+        await self._maybe_send_apply_warnings()
 
     async def _cmd_reload(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(await self.handle_reload())
@@ -704,6 +784,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
 
     async def _cmd_quality(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(self.handle_quality(context.args or []))
+        await self._maybe_send_apply_warnings()
 
     async def _cmd_maxrecordings(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(self.handle_maxrecordings(context.args or []))
@@ -716,3 +797,4 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
 
     async def _cmd_chat(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(await self.handle_chat(context.args or []))
+        await self._maybe_send_apply_warnings()

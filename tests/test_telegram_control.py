@@ -2,9 +2,12 @@ import asyncio
 import base64
 import json
 import threading
+import types
+import unittest.mock
 
 from stream_archive.config import get_config
 from stream_archive.telegram import TelegramController
+from stream_archive.telegram.dispatcher import _deferred_affected_channels
 
 
 class FakeRecorder:
@@ -13,6 +16,7 @@ class FakeRecorder:
         self._recording = set(recording)
         self.stop_calls = []
         self.chat_stop_calls = []
+        self.restart_calls = []
         self.snapshot = {
             "free_gb": 100.0,
             "total_fs_gb": 500.0,
@@ -29,8 +33,24 @@ class FakeRecorder:
         self.stop_calls.append(channel)
         self._recording.discard(channel)
 
+    async def restart(self, channel):
+        self.restart_calls.append(channel)
+        self._recording.discard(channel)
+        return True
+
     def active_channels(self):
         return sorted(self._recording)
+
+    def recording_settings(self):
+        return {
+            ch: {
+                "output_mode": "disk",
+                "preferred_quality": "best",
+                "record_chat": True,
+                "kick_record_chat": True,
+            }
+            for ch in sorted(self._recording)
+        }
 
     async def stop_chat(self, channel, platform=None):
         self.chat_stop_calls.append((channel, platform))
@@ -337,6 +357,170 @@ def test_status_shows_per_channel_modes(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_mode(["twitch:channel1", "youtube"])
     assert "Per-channel output: twitch:channel1 \u2192 youtube" in asyncio.run(ctrl.handle_status())
+
+
+def _load_config(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(base_config(tmp_path), indent=4))
+    return get_config(tmp_path / "config.json")
+
+
+def _recordings(channels, mode="disk", quality="best", chat=True, kick_chat=True):
+    return {
+        ch: {
+            "output_mode": mode,
+            "preferred_quality": quality,
+            "record_chat": chat,
+            "kick_record_chat": kick_chat,
+        }
+        for ch in channels
+    }
+
+
+def test_deferred_affected_global_mode_change(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.output_mode = "youtube"
+    assert _deferred_affected_channels(cfg, _recordings(["twitch:channel1"])) == ["twitch:channel1"]
+
+
+def test_deferred_affected_override_immune_to_global_change(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.output_mode = "youtube"
+    cfg.channel_output_modes = {"twitch:channel1": "youtube"}
+    rec = _recordings(["twitch:channel1"], mode="youtube")  # started with the override
+    assert _deferred_affected_channels(cfg, rec) == []
+
+
+def test_deferred_affected_per_channel_override_change(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.channel_output_modes = {"twitch:channel1": "youtube"}
+    rec = _recordings(["twitch:channel1", "twitch:ch"])
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:channel1"]
+
+
+def test_deferred_affected_repeat_change_after_decline(tmp_path):
+    # Config already holds the change (the first prompt was declined); the
+    # recording still runs the old mode, so the same change must warn again.
+    cfg = _load_config(tmp_path)
+    cfg.channel_output_modes = {"twitch:channel1": "disk"}
+    rec = _recordings(["twitch:channel1"], mode="youtube")
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:channel1"]
+
+
+def test_deferred_affected_same_value_noop(tmp_path):
+    cfg = _load_config(tmp_path)
+    rec = _recordings(["twitch:channel1"])  # disk recording, disk config
+    assert _deferred_affected_channels(cfg, rec) == []
+
+
+def test_deferred_affected_quality_change(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.preferred_quality = "720p"
+    rec = _recordings(["twitch:ch", "twitch:channel1"])
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:ch", "twitch:channel1"]
+
+
+def test_deferred_affected_chat_twitch_enable(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.record_chat = True
+    rec = _recordings(["twitch:channel1", "kick:xqc"], chat=False, kick_chat=True)
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:channel1"]
+
+
+def test_deferred_affected_chat_kick_enable(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.kick.record_chat = True
+    rec = _recordings(["twitch:channel1", "kick:xqc"], chat=True, kick_chat=False)
+    assert _deferred_affected_channels(cfg, rec) == ["kick:xqc"]
+
+
+def test_deferred_affected_chat_disable_noop(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.record_chat = False
+    rec = _recordings(["twitch:channel1"], chat=True)  # disable stops capture immediately
+    assert _deferred_affected_channels(cfg, rec) == []
+
+
+def test_deferred_affected_no_active_recordings(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.output_mode = "youtube"
+    assert _deferred_affected_channels(cfg, {}) == []
+
+
+def test_mode_change_sets_pending_apply(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
+    text = ctrl.handle_mode(["youtube"])
+    assert text == "Output mode set to youtube"
+    assert len(ctrl._pending_apply) == 1
+    summary, channels = next(iter(ctrl._pending_apply.values()))
+    assert summary == "Output mode set to youtube"
+    assert channels == ["twitch:channel1"]
+
+
+def test_apply_warning_sent_with_inline_keyboard(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
+    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 1
+    kwargs = bot.send_message.await_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert "twitch:channel1" in kwargs["text"]
+    buttons = kwargs["reply_markup"].to_dict()["inline_keyboard"][0]
+    assert buttons[0]["callback_data"] == "apply_now:abcd"
+    assert buttons[1]["callback_data"] == "cancel:abcd"
+    # the entry stays pending so the button's nonce still resolves on tap
+    assert ctrl._pending_apply == {"abcd": ("Output mode set to youtube", ["twitch:channel1"])}
+    assert ctrl._apply_warnings_sent == {"abcd"}
+    # a second trigger does not resend the same warning
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 1
+
+
+def test_apply_warning_round_trip_restarts(tmp_path):
+    """Full flow: change -> warning sent -> Apply now tap restarts the recording."""
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    ctrl.handle_mode(["youtube"])
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 1
+    data = bot.send_message.await_args.kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["callback_data"]
+    nonce = data.split(":")[1]
+    assert nonce in ctrl._pending_apply  # the tapped nonce must still resolve
+    result = asyncio.run(ctrl.handle_callback(data))
+    assert result is not None
+    text, _ = result
+    assert text.startswith("\u2705 Applied: Output mode set to youtube")
+    assert "twitch:channel1: restarted with the new settings" in text
+    assert recorder.restart_calls == ["twitch:channel1"]
+    assert ctrl._pending_apply == {}
+
+
+def test_apply_now_callback_restarts(tmp_path):
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
+    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    result = asyncio.run(ctrl.handle_callback("apply_now:abcd"))
+    assert result is not None
+    text, _ = result
+    assert text.startswith("\u2705 Applied: Output mode set to youtube")
+    assert "twitch:channel1: restarted with the new settings" in text
+    assert recorder.restart_calls == ["twitch:channel1"]
+    assert ctrl._pending_apply == {}
+    assert ctrl._apply_warnings_sent == set()
+    # double-tap on the same message: silent no-op
+    assert asyncio.run(ctrl.handle_callback("apply_now:abcd")) is None
+    assert recorder.restart_calls == ["twitch:channel1"]
+    # stale/unknown nonce: silent no-op
+    assert asyncio.run(ctrl.handle_callback("apply_now:zzzz")) is None
+    assert recorder.restart_calls == ["twitch:channel1"]
+    # keep current recording: existing cancel branch, nothing restarted;
+    # the entry stays so a later Apply now tap on the same message still works
+    ctrl._pending_apply["wxyz"] = ("Output mode set to youtube", ["twitch:channel1"])
+    result = asyncio.run(ctrl.handle_callback("cancel:wxyz"))
+    assert result == ("Cancelled \u2014 nothing changed", None)
+    assert recorder.restart_calls == ["twitch:channel1"]
+    assert ctrl._pending_apply == {"wxyz": ("Output mode set to youtube", ["twitch:channel1"])}
 
 
 def test_reload_picks_up_disk_edits(tmp_path):

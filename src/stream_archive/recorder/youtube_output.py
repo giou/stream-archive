@@ -96,7 +96,15 @@ class YoutubeOutputMixin:
             logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
     async def _stream_youtube(
-        self, channel: str, author: str, title: str, game: str, stream: Any, filepath: str | None
+        self,
+        channel: str,
+        author: str,
+        title: str,
+        game: str,
+        stream: Any,
+        filepath: str | None,
+        notify: bool = True,
+        youtube_notify: bool = True,
     ) -> None:
         logger.info("[recorder] [youtube] %s resolving...", channel)
         try:
@@ -124,7 +132,7 @@ class YoutubeOutputMixin:
                     logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)
                     disk_task = self._track(channel, self._record_disk(channel, filepath, stream))
                     entry["tasks"].append(disk_task)
-                    if self._notifier:
+                    if self._notifier and notify:
                         await self._notifier.notify_live(channel, title, game, channel_url(channel))
                 return
             raise
@@ -134,7 +142,7 @@ class YoutubeOutputMixin:
             return
         entry["youtube_info"] = youtube_info
 
-        if self._notifier:
+        if self._notifier and youtube_notify:
             await self._notifier.notify_live(channel, title, game, channel_url(channel), youtube_info["youtube_url"])
 
         rtmp_url = youtube_info["rtmp_url"]

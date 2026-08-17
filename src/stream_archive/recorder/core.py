@@ -34,6 +34,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _youtube: Any
     _notifier: Any
     _recordings: dict[str, dict[str, Any]]
+    _locks: dict[str, asyncio.Lock]
     _session: Streamlink
     _plugin_loaded: bool
     _last_kick_block_notify: dict[str, float]
@@ -50,6 +51,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._youtube = youtube_streamer
         self._notifier = notifier
         self._recordings = {}
+        self._locks = {}
         self._session = Streamlink()
         self._session.set_option("http-timeout", 30)
         # Ride through short HLS playlist stalls: with the default queue-deadline
@@ -66,6 +68,23 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
     async def start(
         self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
+    ) -> bool:
+        async with self._lock_for(channel):
+            return await self._start_unlocked(channel, title=title, game=game, user_id=user_id)
+
+    def _lock_for(self, channel: str) -> asyncio.Lock:
+        if channel not in self._locks:
+            self._locks[channel] = asyncio.Lock()
+        return self._locks[channel]
+
+    async def _start_unlocked(
+        self,
+        channel: str,
+        title: str | None = None,
+        game: str | None = None,
+        user_id: str | None = None,
+        notify: bool = True,
+        youtube_notify: bool = True,
     ) -> bool:
         if channel in self._recordings:
             return True
@@ -107,6 +126,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         entry["started_at"] = time.monotonic()
         entry["mode"] = mode
         self._recordings[channel] = entry
+        entry["title"] = title
+        entry["game"] = game
+        entry["user_id"] = user_id
+        entry["quality"] = self._config.preferred_quality
         tasks = []
         live_url = channel_url(channel)
 
@@ -123,18 +146,38 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if mode == "disk":
             disk_task = self._track(channel, self._record_disk(channel, entry["filepath"], best))
             tasks.append(disk_task)
-            if self._notifier:
+            if self._notifier and notify:
                 await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
         elif mode == "youtube":
             if self._youtube is not None:
                 yt_task = self._track(
-                    channel, self._stream_youtube(channel, author, stream_title, stream_game, best, None)
+                    channel,
+                    self._stream_youtube(
+                        channel,
+                        author,
+                        stream_title,
+                        stream_game,
+                        best,
+                        None,
+                        notify=notify,
+                        youtube_notify=youtube_notify,
+                    ),
                 )
                 tasks.append(yt_task)
         elif mode == "both":
             if self._youtube is not None:
                 yt_task = self._track(
-                    channel, self._stream_youtube(channel, author, stream_title, stream_game, best, entry["filepath"])
+                    channel,
+                    self._stream_youtube(
+                        channel,
+                        author,
+                        stream_title,
+                        stream_game,
+                        best,
+                        entry["filepath"],
+                        notify=notify,
+                        youtube_notify=youtube_notify,
+                    ),
                 )
                 tasks.append(yt_task)
 
@@ -174,6 +217,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         return True
 
     async def stop(self, channel: str) -> dict[str, Any] | None:
+        async with self._lock_for(channel):
+            return await self._stop_unlocked(channel)
+
+    async def _stop_unlocked(self, channel: str) -> dict[str, Any] | None:
         if channel not in self._recordings:
             return None
 
@@ -212,6 +259,26 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             }
 
         return {"file_info": file_info, "youtube_info": youtube_info}
+
+    async def restart(self, channel: str) -> bool:
+        """Stop and immediately restart a recording with the current config.
+
+        Bypasses monitor start gates (disk cap, max recordings, YouTube budget)
+        intentionally: this is an admin-forced action. Suppresses the disk-mode
+        live notification (the Telegram apply-result message is the feedback);
+        a youtube-mode restart still sends the live notification once the new
+        broadcast is created, because the apply-now restart ended the old
+        broadcast and the link changed.
+        """
+        async with self._lock_for(channel):
+            entry = self._recordings.get(channel)
+            if entry is None:
+                return False
+            title, game, user_id = entry.get("title"), entry.get("game"), entry.get("user_id")
+            await self._stop_unlocked(channel)
+            return await self._start_unlocked(
+                channel, title=title, game=game, user_id=user_id, notify=False, youtube_notify=True
+            )
 
     async def stop_all(self) -> None:
         for channel in list(self._recordings):
@@ -282,6 +349,23 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     def active_channels(self) -> list[str]:
         """Names of channels currently being recorded, sorted."""
         return sorted(self._recordings)
+
+    def recording_settings(self) -> dict[str, dict[str, Any]]:
+        """Per active channel: settings the in-flight recording actually uses.
+
+        Output mode and preferred quality are snapshotted at recording start;
+        chat capture is the live state (chat disable stops in-flight capture
+        immediately, so only chat-enable is a deferred effect).
+        """
+        out = {}
+        for ch, e in self._recordings.items():
+            out[ch] = {
+                "output_mode": e.get("mode"),
+                "preferred_quality": e.get("quality"),
+                "record_chat": "chat_recorder" in e,
+                "kick_record_chat": e.get("kick_chat") is not None,
+            }
+        return out
 
     def recording_info(self) -> list[dict[str, Any]]:
         """Per active channel: duration + current file size (approx). Sorted by channel."""
