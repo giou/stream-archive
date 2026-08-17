@@ -340,8 +340,11 @@ def get_config(path: Path | None = None) -> AppConfig:
 
     data, placeholders = _interpolate_env(raw)
     cfg = AppConfig.model_validate(data)
-    cfg._workdir = config_path.parent
-    cfg._config_path = config_path
+    # Absolutize so relative settings (recordings/, chat/, tokens, state) resolve
+    # against the config's directory regardless of the process cwd — in Docker
+    # the config lives in the mounted data dir.
+    cfg._workdir = config_path.parent.resolve()
+    cfg._config_path = config_path.resolve()
     cfg._env_placeholders = placeholders
     return cfg
 

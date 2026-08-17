@@ -1,13 +1,15 @@
 services:
   stream-archive:
-    build: .
-    image: stream-archive:latest
-    restart: unless-stopped        # mirrors the systemd unit's Restart=always
+    image: ghcr.io/giou/stream-archive:latest
+    restart: unless-stopped
     init: true                     # tini: zombie reaping + SIGTERM forwarding
     user: "${USER_UID:-1000}:${USER_GID:-1000}"
-    working_dir: /app
+    working_dir: /data
     volumes:
-      - .:/app                     # the checkout: config.json, recordings/, plugins/, tokens, state
+      # All state lives in the data dir (default: the folder containing this
+      # compose file; override with STREAM_ARCHIVE_DATA in .env): config.json,
+      # recordings/, chat/, tokens, update_state.json.
+      - ${STREAM_ARCHIVE_DATA:-.}:/data
       # Host tailscaled socket: lets the bot run `tailscale funnel` for the
       # kick webhook tunnel. Requires tailscale installed on the docker host.
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
@@ -18,6 +20,16 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       - PYTHONUNBUFFERED=1
-      - STREAM_ARCHIVE_IN_DOCKER=1
+      - PYTHONDONTWRITEBYTECODE=1
       - TZ=${TZ:-UTC}
+    # The image owns all code; the rootfs is read-only and only the data dir
+    # and /tmp (tmpfs) are writable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     stop_grace_period: 90s         # graceful shutdown stops recordings + ends YouTube broadcasts

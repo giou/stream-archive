@@ -13,7 +13,7 @@
     ],
     "monitoring_interval": 60,
     "timezone": "America/New_York",
-    "plugin_dir": "plugins",
+    "plugin_dir": "/app/plugins",
     "recording_dir": "recordings",
     "record_chat": true,
     "chat_dir": "chat",

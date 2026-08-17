@@ -13,5 +13,4 @@ update_state.json
 .env
 .tz
 cloudflared/
-plugins/*.bak
 *:Zone.Identifier

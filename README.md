@@ -133,10 +133,7 @@ scheduler / recorder / monitor / webhook on the next poll cycle — see
 
 ## Requirements
 
-- Python 3.10+
-- [`uv`](https://docs.astral.sh/uv/) — dependency management and the systemd
-  unit uses `uv run`
-- `ffmpeg` — required for YouTube re-streaming (and used for the pipe)
+- Docker with the compose plugin (Docker Engine 20.10+ or Docker Desktop)
 - **Twitch** app credentials — register at
   <https://dev.twitch.tv/console> (client id + client secret)
 - **Kick** app credentials — only when `kick:` channels are configured;
@@ -147,19 +144,37 @@ scheduler / recorder / monitor / webhook on the next poll cycle — see
   `output_mode: youtube` or `both`; see
   [YouTube setup](#youtube-setup)
 - **cloudflared** and/or **Tailscale** — only for the Kick webhook tunnel;
-  the bot runs whichever you choose from `/settings`
+  the bot runs whichever you choose from `/settings`. Both ship in the image;
+  Tailscale only needs to be installed on the host when you use the funnel
+  option (the tailscaled socket is mounted into the container)
 
 ## Quick start
 
+One folder holds everything — the compose file, the config, and all data:
+
 ```sh
-uv sync
+mkdir ~/stream-archive && cd ~/stream-archive
+curl -LO https://github.com/giou/stream-archive/releases/latest/download/docker-compose.yml
+curl -LO https://github.com/giou/stream-archive/releases/latest/download/config.json.example
 cp config.json.example config.json
 # fill in every key — see the configuration reference below
-uv run stream-archive
+docker compose up -d
+docker compose logs -f   # follow startup
 ```
 
-The config file is looked up in the current directory and then in the
-repository root, so run from anywhere inside the checkout.
+`STREAM_ARCHIVE_DATA` (via `.env` in that folder) moves the data directory —
+recordings, chat, tokens, state — to another disk:
+
+```sh
+# ~/stream-archive/.env
+STREAM_ARCHIVE_DATA=/mnt/bigdisk/stream-archive-data
+```
+
+Updates are image pulls:
+
+```sh
+docker compose pull && docker compose up -d
+```
 
 ### YouTube setup
 
@@ -177,7 +192,7 @@ Only needed when `output_mode` is `youtube` or `both`:
 3. Run the one-time authorization flow:
 
    ```sh
-   uv run stream-archive-setup-youtube
+   docker compose run --rm stream-archive stream-archive-setup-youtube
    ```
 
    It opens the authorization page in your browser and completes
@@ -185,8 +200,10 @@ Only needed when `output_mode` is `youtube` or `both`:
    "Authorization successful!" and the token is saved to `youtube_token.json`
    (chmod 600). If the redirect page cannot load — SSH session, Docker,
    headless box — copy the **full URL** from the address bar and paste it
-   when prompted. The token is refreshed automatically while it is still
-   refreshable; if it expires irrecoverably, run `stream-archive-setup-youtube` again.
+   when prompted (under Docker the localhost redirect cannot reach the
+   container, so paste the full address-bar URL). The token is refreshed
+   automatically while it is still refreshable; if it expires irrecoverably,
+   run the command again.
 
 ## Configuration reference
 
@@ -208,7 +225,7 @@ placeholder-based `config.json` safe to commit/share.
 | `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies: `httpproxy://…` entries are ttvlol v2 proxies (optionally `httpproxy://user:pass@host:port`), `https://…` entries are v1; Twitch recordings only |
 | `monitoring_interval` | yes | — | Poll interval in seconds; must be > 0 |
 | `timezone` | yes | — | IANA timezone (e.g. `America/New_York`) used for filenames and timestamps |
-| `plugin_dir` | yes | — | Directory containing the vendored streamlink plugin (`plugins`) |
+| `plugin_dir` | yes | — | Directory containing the streamlink-ttvlol plugin: `/app/plugins` in Docker (baked into the image, read-only), relative `plugins` for dev runs |
 | `recording_dir` | yes | — | Directory where `.ts` recordings are stored |
 | `record_chat` | no | `true` | Record Twitch IRC chat alongside the video; `false` disables it (Kick chat has its own flag) |
 | `chat_dir` | no | `chat` | Directory where chat JSON files are stored (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`) |
@@ -235,9 +252,9 @@ placeholder-based `config.json` safe to commit/share.
 | `disk.delete_oldest` | no | `true` | Delete oldest recordings when `disk.max_total_gb` is exceeded; `false` stops new recordings instead |
 | `update_check.enabled` | no | `true` | Periodically check the app, streamlink, and the vendored plugin for updates and send a Telegram notification when one is available |
 | `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
-| `update_check.check_app` | no | `true` | Check the app repo (`git fetch origin`) for new commits |
+| `update_check.check_app` | no | `true` | Check GitHub releases for a newer stream-archive release |
 | `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
-| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `plugins/twitch.py`; a download is applied only when the release publishes a matching sha256 digest, and the file must be valid Python declaring the new version |
+| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`; plugin updates ship in a future image |
 | `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
 | `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
 
@@ -347,7 +364,7 @@ a failed command leaves both memory and disk untouched.
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode` (no channel) or a per-channel override; `default` clears the override; applies to new recordings |
 | `/reload` | Re-read `config.json` from disk (re-syncs webhook/EventSub subscriptions) |
 | `/restart` | Gracefully restart the service |
-| `/update` | Check for updates now and apply any available; restarts after app/plugin changes, and in Docker reports when an image rebuild is required |
+| `/update` | Check for updates now (app, streamlink, plugin); check-only — nothing is downloaded or applied. An app update is applied with `docker compose pull && docker compose up -d`; plugin/streamlink updates ship in a future image |
 | `/quality [value]` | Show the preferred quality, or set it (`best`, `1080p`, `720p`, …) |
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
@@ -369,67 +386,41 @@ Notes:
   (`kick.record_chat`). The other platform's in-flight capture keeps running.
 - `/retention` and `/reload` apply immediately — the cleanup loop and the
   monitor read the live config every cycle.
-- `/restart` replies first, then triggers the scheduler shutdown; the systemd
-  unit's `Restart=always` relaunches the service after `RestartSec`. In a
-  foreground run it simply exits.
+- `/restart` replies first, then triggers the scheduler shutdown; the compose
+  `restart: unless-stopped` policy relaunches the container.
 - Secrets (bot token, Twitch credentials, proxy credentials, Kick
   credentials, tunnel tokens) are never printed by `/status` and cannot be
   changed over Telegram.
 
 ## Running
 
-### Foreground
+The image owns all code; your data dir owns all state. The container runs
+with a read-only rootfs — only the mounted data dir and `/tmp` (tmpfs) are
+writable.
 
 ```sh
-uv run stream-archive
+docker compose up -d   # start
+docker compose logs -f # follow logs
+docker compose stop    # graceful shutdown: recordings stopped, broadcasts ended
 ```
 
-### As a systemd user unit
-
-```sh
-mkdir -p ~/.config/systemd/user
-cp stream-archive.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now stream-archive
-```
-
-The unit hard-codes the checkout at `~/stream-archive` — adjust
-`WorkingDirectory` and `ExecStart` if you clone elsewhere. For the Kick
-webhook's Tailscale funnel, tailscale must be installed and running on the
-host.
-
-### Docker
-
-Any clone of the repo works — the checkout is bind-mounted read-write at
-`/app`, so the container uses your `config.json`, `recordings/`, plugins, and
-tokens exactly like a host run. App code changes need no image rebuild.
-
-```sh
-cp config.json.example config.json   # fill in every key — see Configuration reference
-docker compose up -d --build         # build the image and start
-docker compose logs -f               # follow logs
-docker compose stop                  # graceful shutdown: recordings stopped, broadcasts ended
-```
-
-- `config.json`, `client_secret.json`, `youtube_token.json`, and recordings
-  never enter the image (`.dockerignore`) — they live only in your checkout.
+- The data dir (default: the folder containing `docker-compose.yml`, i.e.
+  `~/stream-archive/`) holds `config.json`, `recordings/`, `chat/`,
+  `youtube_token.json`, `client_secret.json`, `cloudflared/`, and
+  `update_state.json` — browse and edit it like any folder on the host;
+  backup = copy the folder. Override the location with
+  `STREAM_ARCHIVE_DATA` in `.env` (see [Quick start](#quick-start)).
 - The container runs as uid/gid 1000 by default so recorded files stay
   manageable on the host. If your uid differs, create a `.env` next to the
   compose file with `USER_UID=<uid>` and `USER_GID=<gid>`.
 - Log timestamps follow the container timezone (`UTC` by default); set
   `TZ=America/New_York` in the same `.env` to match `config.json`'s `timezone`.
+- Logs are rotated by compose (10 MB × 3 files).
 - Kick webhook under Docker: the host's tailscale funnel forwards to the
   host loopback, and the compose file publishes the receiver on
   `127.0.0.1:8787` — set `kick.webhook.listen_host` to `"0.0.0.0"` in
   `config.json`. The image ships `cloudflared` and the tailscale CLI; the
   tailscaled socket is mounted from the host.
-- Updates: app and plugin changes from Telegram `/update` apply immediately
-  (the mounted code runs directly; the service restarts after them).
-  Streamlink differs: on a host (systemd) run `/update` also runs `uv sync`,
-  so the new streamlink is active after the restart. Inside the container the
-  image is the source of truth for the venv (`/opt/venv`), so `/update` only
-  rewrites `uv.lock` and the reply tells you to run `docker compose up -d
-  --build` — the running streamlink is unchanged until you rebuild.
 - One-time YouTube OAuth: `docker compose run --rm stream-archive stream-archive-setup-youtube`
   (the browser opens on your host; the localhost redirect can't reach the
   container, so paste the full address-bar URL when prompted)
@@ -437,12 +428,28 @@ docker compose stop                  # graceful shutdown: recordings stopped, br
 ### Logs
 
 ```sh
-journalctl --user -u stream-archive -f
+docker compose logs -f
 ```
 
 `SIGTERM`/`SIGINT` trigger a graceful shutdown: all recordings stop, active
 YouTube broadcasts are transitioned to `complete`, and the scheduler exits
 with `[scheduler] Shutdown complete`.
+
+## Migrating from a git-checkout install
+
+The old deployment ran the checkout directly (systemd unit, `uv run`). To
+move to the standalone Docker app:
+
+1. Create the data dir (e.g. `~/stream-archive/` — see
+   [Quick start](#quick-start)) and put `docker-compose.yml` + `config.json`
+   in it.
+2. Copy from the old checkout: `config.json`, `recordings/`, `chat/`,
+   `youtube_token.json`, `client_secret.json`, `cloudflared/`.
+3. In the copied `config.json`, set `plugin_dir` to `"/app/plugins"` (the
+   plugin is baked into the image; a leftover `plugins/` dir in the data dir
+   is ignored and can be deleted).
+4. Delete the old checkout — nothing runs from it anymore.
+5. New update habit: `docker compose pull && docker compose up -d`.
 
 ## Failure handling & recovery
 
@@ -469,7 +476,7 @@ in `src/stream_archive/monitor.py`).
 
 ```
 config.json.example      # template for runtime config (config.json is gitignored)
-stream-archive.service   # systemd user unit
+docker-compose.yml       # standalone deployment: image + data-dir bind mount
 pyproject.toml
 .pre-commit-config.yaml  # ruff + ruff-format + mypy hooks
 src/stream_archive/
@@ -489,9 +496,12 @@ src/stream_archive/
   config.py              # typed config (Pydantic) + ${ENV_VAR} interpolation
   updater.py             # periodic update checks (app / streamlink / plugin)
   disk.py                # disk-size watchdog (max_total_gb)
-plugins/twitch.py        # vendored streamlink-ttvlol plugin
+plugins/twitch.py        # dev-only: fetched from streamlink-ttvlol releases (baked into the image at build)
 tests/                   # pytest suite (config, recorder, monitor, eventsub, kick api/webhook/chat, telegram, …)
 ```
+
+At runtime all state lives in the data dir (see [Running](#running)); the
+repository itself is only needed for development.
 
 ## Development
 
@@ -503,10 +513,35 @@ uv run mypy
 uv run pre-commit run --all-files
 ```
 
-`plugins/twitch.py` (vendored streamlink plugin) is excluded from ruff and
-mypy — it is replaced wholesale by `/update`.
+### Plugin maintenance
+
+The `twitch.py` plugin (2bc4/streamlink-ttvlol) is not in this repo — the
+Dockerfile fetches it at image build from upstream releases, pinned by the
+`TTVLOL_PLUGIN_VERSION` / `TTVLOL_PLUGIN_SHA256` ARGs, and verifies its sha256
+digest, so the plugin ships in the image and updates only when you pull a new
+one.
+
+Refresh procedure — when the bot reports
+"streamlink-ttvlol: X → Y (ships in a future image)":
+
+1. Get the new tag + sha256 digest from
+   `https://api.github.com/repos/2bc4/streamlink-ttvlol/releases/latest`
+   (asset `twitch.py` → `digest` field).
+2. Bump both ARGs in the Dockerfile.
+3. Bump `pyproject.toml`'s `version`, tag `v<version>` — the CI publish
+   workflow asserts they match, then builds and pushes the image.
+
+Dev runs on the host (recordings tests need a local plugin):
+
+```sh
+curl -fsSL -o plugins/twitch.py https://github.com/2bc4/streamlink-ttvlol/releases/download/<tag>/twitch.py
+```
+
+`plugins/twitch.py` is excluded from ruff and mypy — it is a third-party file
+never edited in this repo.
 
 ## License
 
-[MIT](LICENSE). The vendored `plugins/twitch.py` retains its own upstream
-license.
+[MIT](LICENSE). The image contains the third-party `twitch.py`
+(streamlink-ttvlol), fetched at build from upstream releases, retaining its
+upstream license.

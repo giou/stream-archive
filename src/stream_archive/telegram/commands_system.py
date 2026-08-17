@@ -24,7 +24,7 @@ class SystemCommands:
             "/mode [channel] <disk|youtube|both|default> - output mode (per-channel override when a channel is given)\n"
             "/reload - re-read config.json\n"
             "/restart - restart the service\n"
-            "/update - check for and apply updates (restarts after app/plugin changes; Docker streamlink needs an image rebuild)\n"
+            "/update - check for updates (apply by pulling the image)\n"
             "/quality [value] - preferred stream quality (best, 1080p, 720p, ...)\n"
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
@@ -98,55 +98,43 @@ class SystemCommands:
         if self._updater is None:
             return "Update checks are not configured"
         report = await self._updater.check(notify=False)
-        available = [s for s in ("app", "streamlink", "plugin") if s in report and report[s]["status"] == "update"]
-
-        if not available:
-            lines = []
-            if "app" in report:
-                lines.append(f"• stream-archive: {(report['app'].get('local') or '')[:7]} (main)")
-            if "streamlink" in report:
-                lines.append(f"• streamlink: {report['streamlink'].get('latest')}")
-            if "plugin" in report:
-                lines.append(f"• streamlink-ttvlol: {report['plugin'].get('latest')}")
-            return "\u2705 Up to date\n" + "\n".join(lines)
-
-        results = await self._updater.apply(report)
-        display = {"app": "stream-archive", "streamlink": "streamlink", "plugin": "streamlink-ttvlol"}
+        names = {"app": "stream-archive", "streamlink": "streamlink", "plugin": "streamlink-ttvlol"}
         lines = []
-        applied = 0  # running code/plugin actually changed
-        rebuild_required = False
+        any_update = False
+        app_update = False
         for source in ("app", "streamlink", "plugin"):
-            if source not in results:
-                continue
-            status, detail = results[source]
-            if status == "applied":
-                applied += 1
+            data = report.get(source) or {}
+            status = data.get("status")
+            if status == "update":
+                any_update = True
                 if source == "app":
-                    lines.append(
-                        f'• stream-archive: pulled {report["app"].get("behind")} commit(s) — "{report["app"].get("subject")}"'
-                    )
+                    app_update = True
+                    lines.append(f"• stream-archive: v{data.get('current')} → v{data.get('latest')}")
                 elif source == "streamlink":
                     lines.append(
-                        f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} ({detail})"
+                        f"• streamlink: {data.get('current')} → {data.get('latest')} (ships in a future image)"
                     )
                 else:
                     lines.append(
-                        f"• streamlink-ttvlol: {report['plugin'].get('current')} → {report['plugin'].get('latest')} (plugins/twitch.py replaced)"
+                        f"• streamlink-ttvlol: {data.get('current')} → {data.get('latest')} (ships in a future image)"
                     )
-            elif status == "applied_rebuild":
-                rebuild_required = True
-                lines.append(
-                    f"• streamlink: {report['streamlink'].get('current')} → {report['streamlink'].get('latest')} ({detail})"
-                )
-            elif status == "failed":
-                lines.append(f"• {display[source]}: {detail}")
-        body = "\n".join(lines)
-        rebuild_block = "\n\nRun on the host:\ndocker compose up -d --build" if rebuild_required else ""
-        if applied and self._on_restart is not None:
-            asyncio.get_running_loop().call_later(0.5, self._on_restart)
-            return f"\U0001f504 Updates applied\n{body}{rebuild_block}\nRestarting the service..."
-        if applied:
-            return f"\U0001f504 Updates applied\n{body}{rebuild_block}\nRestart is not available (foreground run) — restart manually"
-        if rebuild_required:
-            return f"\U0001f504 Updates applied\n{body}{rebuild_block}"
-        return f"\u274c Update failed\n{body}\nNo restart triggered."
+                cl = data.get("changelog") or []
+                if cl:
+                    lines.append("  Changelog:")
+                    lines.extend(f"  • {ln}" for ln in cl)
+            elif status == "up_to_date":
+                cur = data.get("current")
+                if source == "app":
+                    lines.append(f"• stream-archive: v{cur}")
+                else:
+                    lines.append(f"• {names[source]}: {cur}")
+        if not any_update:
+            if not lines:
+                return "❌ Update check failed — try again later."
+            return "✅ Up to date\n" + "\n".join(lines)
+        footer = (
+            "Apply by running:\ndocker compose pull && docker compose up -d"
+            if app_update
+            else "No action needed — plugin/streamlink updates ship in a future image release."
+        )
+        return "📦 Updates available\n" + "\n".join(lines) + "\n\n" + footer

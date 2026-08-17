@@ -1,10 +1,8 @@
 import asyncio
 import contextlib
 import logging
-import re
 import signal
 import time
-from pathlib import Path
 from typing import Any
 
 from stream_archive.config import get_config
@@ -16,7 +14,7 @@ from stream_archive.notifier import Notifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
 from stream_archive.twitch_api import TwitchAPI
-from stream_archive.updater import UpdateChecker
+from stream_archive.updater import UpdateChecker, _installed_app_version
 from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
@@ -34,16 +32,6 @@ def _setup_signal_handlers() -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
-
-
-def _app_version(workdir: Path) -> str | None:
-    """Best-effort app version from pyproject.toml (the project is not pip-installed)."""
-    try:
-        text = (Path(workdir) / "pyproject.toml").read_text()
-    except OSError:
-        return None
-    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    return m.group(1) if m else None
 
 
 async def run_scheduler() -> None:
@@ -101,15 +89,8 @@ async def run_scheduler() -> None:
     )
     await telegram.start()
 
-    # Startup notification: monitored channels + current version (git short sha).
-    sha = await updater.local_sha()
-    ver = _app_version(config._workdir)
-    if ver and sha:
-        version = f"v{ver} ({sha[:7]})"
-    elif ver:
-        version = f"v{ver}"
-    else:
-        version = "unknown"
+    # Startup notification: monitored channels + current version.
+    version = _installed_app_version() or "unknown"
     await notifier.notify_startup(config.channels, version)
     await eventsub.wait_ready(timeout=15)
     logger.info("[scheduler] EventSub: %s", eventsub.status())

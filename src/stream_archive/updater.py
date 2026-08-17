@@ -1,6 +1,4 @@
-import ast
 import asyncio
-import hashlib
 import importlib.metadata
 import json
 import logging
@@ -18,12 +16,10 @@ logger = logging.getLogger(__name__)
 
 _PLUGIN_VERSION_RE = re.compile(r'STREAMLINK_TTVLOL_VERSION\s*=\s*"([^"]+)"')
 _PLUGIN_RELEASES_URL = "https://api.github.com/repos/2bc4/streamlink-ttvlol/releases/latest"
-_PLUGIN_DOWNLOAD_URL = "https://github.com/2bc4/streamlink-ttvlol/releases/download/{tag}/twitch.py"
 _PYPI_STREAMLINK_URL = "https://pypi.org/pypi/streamlink/json"
 _STREAMLINK_RELEASE_NOTES_URL = "https://api.github.com/repos/streamlink/streamlink/releases/tags/{tag}"
-_APP_BRANCH = "main"
+_APP_RELEASES_URL = "https://api.github.com/repos/giou/stream-archive/releases/latest"
 _MAX_CHANGELOG_CHARS = 600
-_MAX_CHANGELOG_COMMITS = 10
 
 
 def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> list[str]:
@@ -42,49 +38,27 @@ def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> lis
     return out
 
 
-async def _default_run_cmd(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
-    """Run a command, returning (returncode, stdout, stderr). Never raises."""
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
+def _installed_app_version() -> str | None:
+    """Installed package version; None when the distribution is missing."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except (TimeoutError, OSError) as e:
-        return (1, "", str(e))
-    return (
-        proc.returncode if proc.returncode is not None else 1,
-        stdout.decode(errors="replace"),
-        stderr.decode(errors="replace"),
-    )
-
-
-def _in_docker() -> bool:
-    """True when running inside a container. The Docker engine creates
-    /.dockerenv; docker-compose also sets STREAM_ARCHIVE_IN_DOCKER=1 so the
-    check does not depend on the engine. Host (systemd/foreground) = False."""
-    return Path("/.dockerenv").exists() or os.environ.get("STREAM_ARCHIVE_IN_DOCKER") == "1"
+        return importlib.metadata.version("stream-archive")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 class UpdateChecker:
-    """Periodic update checks (app repo, streamlink, vendored plugin) and /update.
+    """Periodic informational update checks (app, streamlink, vendored plugin) and /update.
 
-    Checks are read-only and never raise; ``apply`` applies git pull / uv lock /
-    plugin download for the sources reported as ``"update"``.
+    Checks are read-only and never raise; nothing is downloaded or applied at
+    runtime — updates ship in new images.
     """
 
-    def __init__(self, config: AppConfig, notifier: Any, run_cmd: Any = None, http: Any = None):
+    def __init__(self, config: AppConfig, notifier: Any, http: Any = None):
         self._config = config
         self._notifier = notifier
         self._workdir = config._workdir
-        self._run_cmd = run_cmd or _default_run_cmd
         # GitHub release assets 302-redirect to release-assets.githubusercontent.com,
-        # so redirects must be followed or the plugin download always fails.
+        # so redirects must be followed.
         self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=True)
         self._lock = asyncio.Lock()
         self._state_path = self._workdir / "update_state.json"
@@ -116,39 +90,26 @@ class UpdateChecker:
 
     # ---- checks ------------------------------------------------------------
 
-    async def local_sha(self) -> str | None:
-        rc, out, _ = await self._run_cmd(["git", "rev-parse", "HEAD"], self._workdir)
-        return out.strip() if rc == 0 else None
-
     async def _check_app(self) -> dict[str, Any]:
-        local = await self.local_sha()
-        rc, _, err = await self._run_cmd(["git", "fetch", "origin"], self._workdir)
-        if rc != 0:
-            logger.warning("[updater] app update check failed: %s", err)
-            return {"status": "unknown", "local": local, "remote": None, "behind": 0, "subject": None}
-        rc, out, _ = await self._run_cmd(["git", "rev-parse", "FETCH_HEAD"], self._workdir)
-        remote = out.strip() if rc == 0 else None
-        rc, out, _ = await self._run_cmd(["git", "rev-list", "--count", "HEAD..FETCH_HEAD"], self._workdir)
+        local = _installed_app_version()
         try:
-            behind = int(out.strip()) if rc == 0 else 0
-        except ValueError:
-            behind = 0
-        rc, out, _ = await self._run_cmd(["git", "log", "-1", "--format=%s", "FETCH_HEAD"], self._workdir)
-        subject = out.strip() if rc == 0 else None
-        rc, out, _ = await self._run_cmd(["git", "log", "--format=%s", "HEAD..FETCH_HEAD"], self._workdir)
-        commits = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
-        if len(commits) > _MAX_CHANGELOG_COMMITS:
-            extra = len(commits) - _MAX_CHANGELOG_COMMITS
-            commits = commits[:_MAX_CHANGELOG_COMMITS] + [f"…and {extra} more"]
-        status = "update" if behind > 0 else "up_to_date"
-        return {
-            "status": status,
-            "local": local,
-            "remote": remote,
-            "behind": behind,
-            "subject": subject,
-            "changelog": commits,
-        }
+            resp = await self._http.get(_APP_RELEASES_URL)
+            resp.raise_for_status()
+            data = resp.json()
+            tag = (data.get("tag_name") or "").removeprefix("v")
+            if not tag:
+                raise ValueError("no tag_name in releases payload")
+        except Exception as e:
+            logger.warning("[updater] app update check failed: %s", e)
+            return {"status": "unknown", "current": local, "latest": None}
+        if local is None:
+            return {"status": "unknown", "current": None, "latest": tag}
+        try:
+            status = "update" if Version(tag) > Version(local) else "up_to_date"
+        except Exception:
+            status = "unknown"
+        changelog = _changelog_lines(data.get("body")) if status == "update" else None
+        return {"status": status, "current": local, "latest": tag, "changelog": changelog}
 
     def _plugin_version(self) -> str | None:
         try:
@@ -169,23 +130,15 @@ class UpdateChecker:
                 raise ValueError("no tag_name in releases payload")
         except Exception as e:
             logger.warning("[updater] plugin update check failed: %s", e)
-            return {"status": "unknown", "current": current, "latest": None, "digest": None}
-        digest = None
-        for asset in data.get("assets", []):
-            if asset.get("name") == "twitch.py":
-                d = asset.get("digest") or ""
-                if d.startswith("sha256:"):
-                    digest = d
-                break
+            return {"status": "unknown", "current": current, "latest": None}
         if current is None:
             logger.warning("[updater] plugins/twitch.py not found or version constant missing")
-            return {"status": "unknown", "current": None, "latest": tag, "digest": digest}
+            return {"status": "unknown", "current": None, "latest": tag}
         status = "up_to_date" if current == tag else "update"
         return {
             "status": status,
             "current": current,
             "latest": tag,
-            "digest": digest,
             "changelog": data.get("body") or None,
         }
 
@@ -246,12 +199,12 @@ class UpdateChecker:
             lines = []
             state_changed = False
             for source, data in report.items():
-                latest = data.get("remote") if source == "app" else data.get("latest")
+                latest = data.get("latest")
                 if latest is None:
                     continue
                 if data["status"] == "update" and self._state.get(source) != latest:
                     if source == "app":
-                        lines.append(f'• stream-archive: {data["behind"]} new commit(s) — "{data["subject"] or ""}"')
+                        lines.append(f"• stream-archive: v{data['current']} → v{latest}")
                         cl = data.get("changelog") or []
                     elif source == "streamlink":
                         lines.append(f"• streamlink: {data['current']} → {latest}")
@@ -270,115 +223,17 @@ class UpdateChecker:
                         state_changed = True
 
             if lines:
-                text = (
-                    "📦 Update available for stream-archive\n"
-                    + "\n".join(lines)
-                    + "\nReply /update to apply (service restarts)."
+                app_update = report.get("app", {}).get("status") == "update"
+                footer = (
+                    "Apply: docker compose pull && docker compose up -d"
+                    if app_update
+                    else "No action needed — plugin/streamlink updates ship in a future image release."
                 )
+                text = "📦 Update available for stream-archive\n" + "\n".join(lines) + "\n" + footer
                 await self._notifier.notify(text)
             if state_changed:
                 self._save_state()
             return report
-
-    # ---- apply -------------------------------------------------------------
-
-    async def apply(self, report: dict[str, Any]) -> dict[str, tuple[str, str]]:
-        async with self._lock:
-            results = {}
-            # plugin + streamlink form a compatibility unit: apply both when both are pending
-            for source in ("app", "plugin", "streamlink"):
-                data = report.get(source) or {}
-                if data.get("status") != "update":
-                    results[source] = ("skipped", "no update available")
-                    continue
-                try:
-                    if source == "app":
-                        results[source] = await self._apply_app(data)
-                    elif source == "plugin":
-                        results[source] = await self._apply_plugin(data)
-                    else:
-                        results[source] = await self._apply_streamlink(data)
-                except Exception as e:
-                    logger.exception("[updater] %s apply failed", source)
-                    results[source] = ("failed", str(e))
-            return results
-
-    async def _apply_app(self, data: dict[str, Any]) -> tuple[str, str]:
-        rc, _, err = await self._run_cmd(["git", "pull", "--ff-only"], self._workdir)
-        if rc != 0:
-            detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
-            return ("failed", f"git pull: {detail}")
-        return ("applied", f"pulled {data.get('behind', 0)} commit(s) — {data.get('subject') or ''}")
-
-    async def _apply_plugin(self, data: dict[str, Any]) -> tuple[str, str]:
-        latest = data.get("latest")
-        if not latest:
-            return ("failed", "no latest release tag known")
-        current = data.get("current")
-        if current is None:
-            return ("failed", "plugins/twitch.py not found — cannot replace")
-        path = self._plugin_path()
-        rc, _, _ = await self._run_cmd(["git", "diff", "--quiet", "--", "plugins/twitch.py"], self._workdir)
-        dirty = rc != 0
-        if dirty:
-            (path.with_suffix(path.suffix + ".bak")).write_bytes(path.read_bytes())
-        try:
-            resp = await self._http.get(_PLUGIN_DOWNLOAD_URL.format(tag=latest))
-            resp.raise_for_status()
-            content = resp.content
-        except Exception as e:
-            return ("failed", str(e))
-        digest = data.get("digest")
-        if not digest:
-            return ("failed", "release publishes no sha256 digest — refusing unverified plugin download")
-        expected = digest.removeprefix("sha256:")
-        if hashlib.sha256(content).hexdigest() != expected:
-            return ("failed", "sha256 mismatch — download rejected")
-        # The plugin runs in-process (streamlink loads it at recording start),
-        # so refuse anything that is not valid Python declaring the new version.
-        # Keeps unattended updates working while failing closed on tampering,
-        # truncation, or a release that forgot to bump its version constant.
-        try:
-            text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            return ("failed", "downloaded plugin is not valid UTF-8 — rejected")
-        try:
-            ast.parse(text)
-        except SyntaxError:
-            return ("failed", "downloaded plugin is not valid Python — rejected")
-        m = _PLUGIN_VERSION_RE.search(text)
-        if m is None or m.group(1) != latest:
-            return ("failed", f"downloaded plugin does not declare version {latest} — rejected")
-        tmp = Path(str(path) + ".tmp")
-        tmp.write_bytes(content)
-        os.replace(tmp, path)
-        msg = f"plugins/twitch.py replaced ({current} → {latest})"
-        if dirty:
-            msg += "; previous version backed up to plugins/twitch.py.bak"
-        return ("applied", msg)
-
-    async def _apply_streamlink(self, data: dict[str, Any]) -> tuple[str, str]:
-        """Update uv.lock, then sync the venv — but only on host.
-
-        In Docker the venv lives at /opt/venv inside the image (outside the
-        bind mount); a lock change alone must not claim the new streamlink is
-        active. Return applied_rebuild so the caller tells the user to run
-        `docker compose up -d --build` instead of restarting for nothing.
-        """
-        rc, _, err = await self._run_cmd(["uv", "lock", "--upgrade-package", "streamlink"], self._workdir)
-        if rc != 0:
-            detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
-            return ("failed", f"uv lock: {detail}")
-        if not _in_docker():
-            rc, _, err = await self._run_cmd(["uv", "sync"], self._workdir)
-            if rc != 0:
-                detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
-                return (
-                    "failed",
-                    f"uv.lock updated ({data.get('current')} → {data.get('latest')}) — uv sync failed: {detail}",
-                )
-            return ("applied", "uv.lock updated — now active")
-        return ("applied_rebuild", "uv.lock updated — rebuild required")
 
     # ---- loop / lifecycle --------------------------------------------------
 
