@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import time
+from typing import Any
 
-from src.stream_archive.config import bare_name, is_kick_channel, kick_bare_name
+from stream_archive.config import AppConfig, bare_name, is_kick_channel, kick_bare_name
 
 logger = logging.getLogger(__name__)
 
@@ -11,23 +12,23 @@ DISK_NOTIFY_INTERVAL = 1800
 
 
 class Monitor:
-    def __init__(self, recorder, notifier):
+    def __init__(self, recorder: Any, notifier: Any):
         self.recorder = recorder
         self.notifier = notifier
-        self._live_channels = set()
-        self._last_failure_notify = {}
+        self._live_channels: set[str] = set()
+        self._last_failure_notify: dict[str, float] = {}
         self._last_disk_notify = 0.0
-        self._locks = {}
-        self._warned_unknown_kick = set()
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._warned_unknown_kick: set[str] = set()
 
-    def _lock_for(self, channel):
+    def _lock_for(self, channel: str) -> asyncio.Lock:
         if channel not in self._locks:
             self._locks[channel] = asyncio.Lock()
         return self._locks[channel]
 
-    async def check_channels(self, twitch_api, kick_api, config):
+    async def check_channels(self, twitch_api: Any, kick_api: Any, config: AppConfig) -> None:
         snapshot = None
-        twitch_channels = [c for c in config["channels"] if not is_kick_channel(c)]
+        twitch_channels = [c for c in config.channels if not is_kick_channel(c)]
         if twitch_channels:
             try:
                 resolved = await twitch_api.resolve_user_ids([bare_name(c) for c in twitch_channels])
@@ -38,11 +39,7 @@ class Monitor:
                 logger.warning("[monitor] Failed to resolve user IDs")
             else:
                 identity_by_bare = {bare_name(c): c for c in twitch_channels}
-                user_ids = {
-                    identity_by_bare[bare]: uid
-                    for bare, uid in resolved.items()
-                    if bare in identity_by_bare
-                }
+                user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
                 try:
                     streams = await twitch_api.get_live_streams(user_ids)
                 except Exception as e:
@@ -72,7 +69,7 @@ class Monitor:
                     if channel in self._live_channels and user_id not in streams:
                         await self._ensure_stopped(channel, config)
 
-        kick_channels = [c for c in config["channels"] if is_kick_channel(c)]
+        kick_channels = [c for c in config.channels if is_kick_channel(c)]
         if kick_channels:
             try:
                 statuses = await kick_api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
@@ -97,25 +94,29 @@ class Monitor:
                     elif ch in self._live_channels:
                         await self._ensure_stopped(ch, config)
 
-    async def handle_online(self, channel, title, game, user_id, config):
+    async def handle_online(
+        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
+    ) -> None:
         """EventSub stream.online entry point."""
-        if channel not in config["channels"]:
+        if channel not in config.channels:
             return
         snapshot = await self._snapshot_if_needed(config)
         await self._ensure_recording(channel, title, game, user_id, config, snapshot)
 
-    async def handle_offline(self, channel, config):
+    async def handle_offline(self, channel: str, config: AppConfig) -> None:
         """EventSub stream.offline entry point."""
-        if channel not in config["channels"]:
+        if channel not in config.channels:
             return
         await self._ensure_stopped(channel, config)
 
-    async def _snapshot_if_needed(self, config):
-        disk_cfg = config.get("disk", {})
-        need_snap = disk_cfg.get("max_total_gb", 0) > 0
+    async def _snapshot_if_needed(self, config: AppConfig) -> Any:
+        disk_cfg = config.disk
+        need_snap = disk_cfg.max_total_gb > 0
         return await self.recorder.disk_snapshot() if need_snap else None
 
-    async def _ensure_recording(self, channel, title, game, user_id, config, snapshot):
+    async def _ensure_recording(
+        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig, snapshot: Any
+    ) -> Any:
         """Start (or restart) the recording for a channel that is live. Returns the snapshot."""
         async with self._lock_for(channel):
             if channel in self._live_channels:
@@ -152,7 +153,7 @@ class Monitor:
                 await self._handle_start_failure(channel)
             return snapshot
 
-    async def _ensure_stopped(self, channel, config):
+    async def _ensure_stopped(self, channel: str, config: AppConfig) -> None:
         """Stop the recording for a channel that is no longer live."""
         async with self._lock_for(channel):
             if channel not in self._live_channels:
@@ -165,10 +166,18 @@ class Monitor:
             await self.notifier.notify_offline(channel, file_info, youtube_url)
             logger.info("[monitor] %s is OFFLINE", channel)
 
-    def remove_channel(self, channel):
+    def remove_channel(self, channel: str) -> None:
         self._live_channels.discard(channel)
 
-    async def _start_or_block(self, channel, title, game, config, snapshot, user_id=None):
+    async def _start_or_block(
+        self,
+        channel: str,
+        title: str | None,
+        game: str | None,
+        config: AppConfig,
+        snapshot: Any,
+        user_id: str | None = None,
+    ) -> tuple[bool, Any]:
         reason, snapshot = await self._start_blocked_reason(channel, config, snapshot)
         if reason:
             logger.warning("[monitor] %s not started: %s", channel, reason)
@@ -177,29 +186,28 @@ class Monitor:
         ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
         return ok, snapshot
 
-    async def _start_blocked_reason(self, channel, config, snapshot):
+    async def _start_blocked_reason(self, channel: str, config: AppConfig, snapshot: Any) -> tuple[str | None, Any]:
         """Return (reason_or_None, snapshot). Raises nothing: snapshot failures fail open."""
         reason = self.recorder.youtube_restart_blocked_reason(channel)
         if reason:
             return (reason, snapshot)
         try:
-            disk_cfg = config.get("disk", {})
-            cap = disk_cfg.get("max_total_gb", 0)
-            if snapshot is not None:
-                if cap > 0 and snapshot["dir_gb"] >= cap:
-                    if disk_cfg.get("delete_oldest", True):
-                        await self.recorder.delete_oldest_to_cap()
-                        snapshot = await self.recorder.disk_snapshot()
-                        if snapshot["dir_gb"] >= cap:
-                            return (f"recording archive at {cap:g} GB cap (nothing to delete)", snapshot)
-                    else:
-                        return (f"recording archive at {cap:g} GB cap", snapshot)
-            max_rec = config.get("max_concurrent_recordings", 0)
+            disk_cfg = config.disk
+            cap = disk_cfg.max_total_gb
+            if snapshot is not None and cap > 0 and snapshot["dir_gb"] >= cap:
+                if disk_cfg.delete_oldest:
+                    await self.recorder.delete_oldest_to_cap()
+                    snapshot = await self.recorder.disk_snapshot()
+                    if snapshot["dir_gb"] >= cap:
+                        return (f"recording archive at {cap:g} GB cap (nothing to delete)", snapshot)
+                else:
+                    return (f"recording archive at {cap:g} GB cap", snapshot)
+            max_rec = config.max_concurrent_recordings
             if max_rec > 0 and len(self.recorder.active_channels()) >= max_rec:
                 return (f"concurrent recording limit reached ({max_rec}/{max_rec})", snapshot)
-            max_yt = config.get("max_concurrent_youtube_streams", 0)
+            max_yt = config.max_concurrent_youtube_streams
             if max_yt > 0:
-                mode = config.get("channel_output_modes", {}).get(channel, config.get("output_mode", "disk"))
+                mode = config.channel_output_modes.get(channel, config.output_mode)
                 if mode in ("youtube", "both") and self.recorder.youtube_active_count() >= max_yt:
                     return (f"YouTube re-stream limit reached ({max_yt}/{max_yt})", snapshot)
             return (None, snapshot)
@@ -207,14 +215,14 @@ class Monitor:
             logger.error("[monitor] disk gate failed, proceeding: %s", e)
             return (None, snapshot)
 
-    async def _notify_blocked(self, channel, reason):
+    async def _notify_blocked(self, channel: str, reason: str) -> None:
         now = time.monotonic()
         if now - self._last_disk_notify < DISK_NOTIFY_INTERVAL:
             return
         self._last_disk_notify = now
         await self.notifier.notify(f"\u26a0\ufe0f Not recording {channel}: {reason}")
 
-    async def _handle_start_failure(self, channel):
+    async def _handle_start_failure(self, channel: str) -> None:
         now = time.monotonic()
         if now - self._last_failure_notify.get(channel, 0.0) < FAILURE_NOTIFY_INTERVAL:
             return

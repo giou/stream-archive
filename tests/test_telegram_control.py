@@ -3,8 +3,8 @@ import base64
 import json
 import threading
 
-from src.stream_archive.config import _validate
-from src.stream_archive.telegram_control import TelegramController
+from stream_archive.config import get_config
+from stream_archive.telegram import TelegramController
 
 
 class FakeRecorder:
@@ -39,10 +39,7 @@ class FakeRecorder:
         return self.snapshot
 
     def recording_info(self):
-        return [
-            {"channel": ch, "mode": "disk", "duration_s": 0, "size_mb": None}
-            for ch in self._active
-        ]
+        return [{"channel": ch, "mode": "disk", "duration_s": 0, "size_mb": None} for ch in self._active]
 
 
 class FakeMonitor:
@@ -139,20 +136,22 @@ def base_config(tmp_path):
 
 
 def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart=None):
-    """Mirror get_config(): validate (applies defaults), write file, add internal keys."""
+    """Mirror get_config(): write a valid config file, then load it typed."""
     config = base_config(tmp_path)
     if channels is not None:
         config["channels"] = channels
-    _validate(config)
     (tmp_path / "config.json").write_text(json.dumps(config, indent=4))
-    config["_workdir"] = tmp_path
-    config["_config_path"] = tmp_path / "config.json"
+    config = get_config(tmp_path / "config.json")
     recorder = FakeRecorder(active=active, recording=recording)
     monitor = FakeMonitor()
     eventsub = FakeEventSub()
     kick_webhook = FakeKickWebhook()
     ctrl = TelegramController(
-        config, recorder, monitor, eventsub, on_restart=on_restart,
+        config,
+        recorder,
+        monitor,
+        eventsub,
+        on_restart=on_restart,
         kick_webhook=kick_webhook,
     )
     return config, ctrl, recorder, monitor, eventsub
@@ -164,8 +163,10 @@ def read_file(tmp_path):
 
 def probe_ok(ctrl):
     """Fake the reachability probe so enable flows don't hit the network."""
+
     async def probe(url):
         return True
+
     ctrl._probe_webhook_url = probe
 
 
@@ -197,7 +198,7 @@ def test_add_persists_and_updates_live(tmp_path):
     assert text.startswith("Added")
     assert "twitch:newch" in text
     assert "twitch:newch" in read_file(tmp_path)["channels"]
-    assert "twitch:newch" in config["channels"]
+    assert "twitch:newch" in config.channels
 
 
 def test_add_duplicate_rejected(tmp_path):
@@ -235,13 +236,11 @@ def test_remove_stops_live_recording(tmp_path):
     assert recorder.stop_calls == ["twitch:ch"]
     assert monitor.remove_calls == ["twitch:ch"]
     assert "twitch:ch" not in read_file(tmp_path)["channels"]
-    assert "twitch:ch" not in config["channels"]
+    assert "twitch:ch" not in config.channels
 
 
 def test_remove_not_recording_does_not_stop(tmp_path):
-    config, ctrl, recorder, monitor, eventsub = make_controller(
-        tmp_path, channels=["twitch:channel1", "twitch:ch"]
-    )
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path, channels=["twitch:channel1", "twitch:ch"])
     text = asyncio.run(ctrl.handle_remove(["twitch:ch"]))
     assert text.startswith("Removed")
     assert recorder.stop_calls == []
@@ -263,7 +262,7 @@ def test_retention_set(tmp_path):
     text = ctrl.handle_retention(["7"])
     assert text == "Retention set to 7 day(s)"
     assert read_file(tmp_path)["retention_days"] == 7
-    assert config["retention_days"] == 7
+    assert config.retention_days == 7
 
 
 def test_retention_invalid_rejected(tmp_path):
@@ -280,7 +279,7 @@ def test_mode_set(tmp_path):
     text = ctrl.handle_mode(["youtube"])
     assert text == "Output mode set to youtube"
     assert read_file(tmp_path)["output_mode"] == "youtube"
-    assert config["output_mode"] == "youtube"
+    assert config.output_mode == "youtube"
 
 
 def test_mode_invalid_rejected(tmp_path):
@@ -296,7 +295,7 @@ def test_mode_per_channel_sets_override(tmp_path):
     text = ctrl.handle_mode(["twitch:channel1", "youtube"])
     assert text == "Output mode for twitch:channel1 set to youtube"
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
-    assert config["channel_output_modes"] == {"twitch:channel1": "youtube"}
+    assert config.channel_output_modes == {"twitch:channel1": "youtube"}
 
 
 def test_mode_per_channel_reset(tmp_path):
@@ -305,7 +304,7 @@ def test_mode_per_channel_reset(tmp_path):
     text = ctrl.handle_mode(["twitch:channel1", "default"])
     assert text == "Output mode for twitch:channel1 reset to global (disk)"
     assert read_file(tmp_path)["channel_output_modes"] == {}
-    assert config["output_mode"] == "disk"
+    assert config.output_mode == "disk"
 
 
 def test_mode_per_channel_invalid_mode_rejected(tmp_path):
@@ -354,8 +353,8 @@ def test_reload_picks_up_disk_edits(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
     text = asyncio.run(ctrl.handle_reload())
     assert text == "\u2705 Config reloaded from config.json"
-    assert "twitch:hand_edit" in config["channels"]
-    assert config["retention_days"] == 3
+    assert "twitch:hand_edit" in config.channels
+    assert config.retention_days == 3
 
 
 def test_reload_corrupt_file_leaves_live_unchanged(tmp_path):
@@ -363,7 +362,7 @@ def test_reload_corrupt_file_leaves_live_unchanged(tmp_path):
     (tmp_path / "config.json").write_text("{ not json")
     text = asyncio.run(ctrl.handle_reload())
     assert text.startswith("\u274c")
-    assert config["channels"] == ["twitch:channel1"]
+    assert config.channels == ["twitch:channel1"]
 
 
 def test_restart_schedules_callback(tmp_path):
@@ -424,7 +423,13 @@ def test_update_no_updates_no_restart(tmp_path):
     flag = threading.Event()
     _, ctrl, _, _, eventsub = make_controller(tmp_path, on_restart=flag.set)
     report = {
-        "app": {"status": "up_to_date", "local": "abc1234def5678", "remote": "abc1234def5678", "behind": 0, "subject": "Latest"},
+        "app": {
+            "status": "up_to_date",
+            "local": "abc1234def5678",
+            "remote": "abc1234def5678",
+            "behind": 0,
+            "subject": "Latest",
+        },
         "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
         "plugin": {"status": "up_to_date", "current": "8.3.0-20260701", "latest": "8.3.0-20260701"},
     }
@@ -547,7 +552,7 @@ def test_quality_show_set_invalid(tmp_path):
     text = ctrl.handle_quality(["720p"])
     assert text == "Quality set to 720p"
     assert read_file(tmp_path)["preferred_quality"] == "720p"
-    assert config["preferred_quality"] == "720p"
+    assert config.preferred_quality == "720p"
     assert ctrl.handle_quality(["a", "b"]) == "Usage: /quality <best|1080p|720p|...>"
 
 
@@ -565,7 +570,7 @@ def test_maxrecordings_show_set_invalid(tmp_path):
     text = ctrl.handle_maxrecordings(["3"])
     assert text == "Max recordings set to 3"
     assert read_file(tmp_path)["max_concurrent_recordings"] == 3
-    assert config["max_concurrent_recordings"] == 3
+    assert config.max_concurrent_recordings == 3
     before = read_file(tmp_path)
     text = ctrl.handle_maxrecordings(["x"])
     assert text.startswith("\u274c")
@@ -586,7 +591,7 @@ def test_maxyoutube_set(tmp_path):
     text = ctrl.handle_maxyoutube(["2"])
     assert text == "Max YouTube re-streams set to 2"
     assert read_file(tmp_path)["max_concurrent_youtube_streams"] == 2
-    assert config["max_concurrent_youtube_streams"] == 2
+    assert config.max_concurrent_youtube_streams == 2
     before = read_file(tmp_path)
     assert ctrl.handle_maxyoutube(["x"]).startswith("\u274c")
     assert read_file(tmp_path) == before
@@ -598,7 +603,7 @@ def test_disk_subcommands(tmp_path):
     text = ctrl.handle_disk(["maxsize", "20"])
     assert text == "Disk max total set to 20 GB"
     assert read_file(tmp_path)["disk"]["max_total_gb"] == 20
-    assert config["disk"]["max_total_gb"] == 20
+    assert config.disk.max_total_gb == 20
 
     text = ctrl.handle_disk(["delete_oldest", "off"])
     assert text == "Delete oldest disabled"
@@ -675,7 +680,7 @@ def test_start_resends_settings_keyboard(tmp_path):
     asyncio.run(ctrl.start())
     assert len(sent) == 1
     chat_id, text, markup = sent[0]
-    assert chat_id == config["telegram_user_id"]
+    assert chat_id == config.telegram_user_id
     assert "Channels" in text  # root menu text = status block
     assert kb_labels(markup) == ROOT_LABELS
 
@@ -694,7 +699,7 @@ def test_chat_on_persists(tmp_path):
     text = asyncio.run(ctrl.handle_chat(["on"]))
     assert text == "Chat recording enabled"
     assert read_file(tmp_path)["record_chat"] is True
-    assert config["record_chat"] is True
+    assert config.record_chat is True
     assert recorder.chat_stop_calls == [("twitch:channel1", None)]  # from the earlier /chat off, not re-triggered by on
 
 
@@ -703,7 +708,7 @@ def test_chat_off_persists_and_stops_inflight(tmp_path):
     text = asyncio.run(ctrl.handle_chat(["off"]))
     assert text == "Chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is False
-    assert config["record_chat"] is False
+    assert config.record_chat is False
     assert recorder.chat_stop_calls == [("twitch:ch", None), ("twitch:channel1", None)]
     assert recorder.stop_calls == []
 
@@ -778,8 +783,18 @@ def kb_labels(markup):
     return [b["text"] for row in rows for b in row]
 
 
-ROOT_LABELS = ["Channels", "Status", "Chat recording", "Output mode",
-               "Quality", "Retention", "Max recordings", "Max YouTube", "Disk", "Kick webhook"]
+ROOT_LABELS = [
+    "Channels",
+    "Status",
+    "Chat recording",
+    "Output mode",
+    "Quality",
+    "Retention",
+    "Max recordings",
+    "Max YouTube",
+    "Disk",
+    "Kick webhook",
+]
 CHAT_LABELS = ["Twitch", "Kick", "Back"]
 CHAT_PLATFORM_LABELS = ["On", "Off", "Back"]
 KICK_WEBHOOK_LABELS = ["Off", "Cloudflare tunnel", "Tailscale funnel", "Back"]
@@ -792,9 +807,23 @@ def test_command_list_covers_all_handlers(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     commands = {c.command for c in ctrl.command_list()}
     assert commands >= {
-        "start", "help", "status", "channels", "add", "remove", "retention",
-        "mode", "reload", "restart", "update", "quality", "maxrecordings",
-        "maxyoutube", "disk", "chat", "settings",
+        "start",
+        "help",
+        "status",
+        "channels",
+        "add",
+        "remove",
+        "retention",
+        "mode",
+        "reload",
+        "restart",
+        "update",
+        "quality",
+        "maxrecordings",
+        "maxyoutube",
+        "disk",
+        "chat",
+        "settings",
     }
 
 
@@ -857,7 +886,7 @@ def test_reply_text_add_channel_flow(tmp_path):
     text, markup = asyncio.run(ctrl.handle_reply_text("twitch:newch"))
     assert text.startswith("Added twitch:newch")
     assert eventsub.added == ["twitch:newch"]
-    assert "twitch:newch" in config["channels"]
+    assert "twitch:newch" in config.channels
     assert ctrl._menu == "channels"
 
 
@@ -880,7 +909,7 @@ def test_reply_text_channel_submenu_mode(tmp_path):
     assert "default (global: disk)" in text
     text, markup = asyncio.run(ctrl.handle_reply_text("Mode: youtube"))
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
-    assert config["channel_output_modes"] == {"twitch:channel1": "youtube"}
+    assert config.channel_output_modes == {"twitch:channel1": "youtube"}
     assert ctrl._menu_channel == "twitch:channel1"
 
 
@@ -967,7 +996,7 @@ def test_reply_text_mode_quick(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Output mode"))
     text, markup = asyncio.run(ctrl.handle_reply_text("youtube"))
     assert read_file(tmp_path)["output_mode"] == "youtube"
-    assert config["output_mode"] == "youtube"
+    assert config.output_mode == "youtube"
     assert kb_labels(markup) == ROOT_LABELS
 
 
@@ -976,7 +1005,7 @@ def test_reply_text_quality_quick(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Quality"))
     text, markup = asyncio.run(ctrl.handle_reply_text("1080p"))
     assert read_file(tmp_path)["preferred_quality"] == "1080p"
-    assert config["preferred_quality"] == "1080p"
+    assert config.preferred_quality == "1080p"
     assert kb_labels(markup) == ROOT_LABELS
 
 
@@ -1023,7 +1052,7 @@ def test_reply_text_maxrec_quick(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Max recordings"))
     text, markup = asyncio.run(ctrl.handle_reply_text("3"))
     assert read_file(tmp_path)["max_concurrent_recordings"] == 3
-    assert config["max_concurrent_recordings"] == 3
+    assert config.max_concurrent_recordings == 3
     assert kb_labels(markup) == ROOT_LABELS
 
 
@@ -1034,7 +1063,7 @@ def test_reply_text_disk_quick_returns_disk_menu(tmp_path):
     assert "Max total: 0 GB (0 = disabled)" in text
     text, markup = asyncio.run(ctrl.handle_reply_text("50"))
     assert read_file(tmp_path)["disk"]["max_total_gb"] == 50
-    assert config["disk"]["max_total_gb"] == 50
+    assert config.disk.max_total_gb == 50
     assert ctrl._menu == "disk"
     assert kb_labels(markup) == DISK_LABELS
 
@@ -1067,7 +1096,7 @@ def test_reply_text_disk_delete_oldest_off_direct(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Disk"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Delete oldest"))
     assert read_file(tmp_path)["disk"]["delete_oldest"] is False
-    assert config["disk"]["delete_oldest"] is False
+    assert config.disk.delete_oldest is False
     assert kb_labels(markup) == DISK_LABELS
 
 
@@ -1094,7 +1123,7 @@ def test_callback_confirm_remove_applies(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1", "twitch:ch"])
     text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:twitch:channel1:deadbeef"))
     assert text.startswith("Removed twitch:channel1")
-    assert "twitch:channel1" not in config["channels"]
+    assert "twitch:channel1" not in config.channels
     assert "twitch:channel1" not in read_file(tmp_path)["channels"]
     assert eventsub.removed == ["twitch:channel1"]
     assert ctrl._menu == "channels"
@@ -1106,7 +1135,7 @@ def test_callback_confirm_remove_kick_channel(tmp_path):
     )
     text, markup = asyncio.run(ctrl.handle_callback("confirm_remove:kick:xqc:deadbeef"))
     assert text.startswith("Removed kick:xqc")
-    assert "kick:xqc" not in config["channels"]
+    assert "kick:xqc" not in config.channels
     assert "kick:xqc" not in read_file(tmp_path)["channels"]
     assert recorder.stop_calls == ["kick:xqc"]
     assert monitor.remove_calls == ["kick:xqc"]
@@ -1122,7 +1151,7 @@ def test_confirm_keyboard_roundtrip_kick_channel_applies(tmp_path):
     assert data.startswith("confirm_remove:kick:xqc:")
     text, markup = asyncio.run(ctrl.handle_callback(data))
     assert text.startswith("Removed kick:xqc")
-    assert "kick:xqc" not in config["channels"]
+    assert "kick:xqc" not in config.channels
     assert ctrl._kick_webhook.removed == ["kick:xqc"]
 
 
@@ -1159,7 +1188,7 @@ def test_confirm_keyboard_roundtrip_applies(tmp_path):
     data = kb["inline_keyboard"][0][0]["callback_data"]
     text, markup = asyncio.run(ctrl.handle_callback(data))
     assert text.startswith("Removed twitch:channel1")
-    assert "twitch:channel1" not in config["channels"]
+    assert "twitch:channel1" not in config.channels
     assert eventsub.removed == ["twitch:channel1"]
 
 
@@ -1187,7 +1216,7 @@ def test_callback_confirm_delete_oldest_applies(tmp_path):
     ctrl.handle_disk(["delete_oldest", "off"])
     text, markup = asyncio.run(ctrl.handle_callback("confirm_delete_oldest:on:deadbeef"))
     assert read_file(tmp_path)["disk"]["delete_oldest"] is True
-    assert config["disk"]["delete_oldest"] is True
+    assert config.disk.delete_oldest is True
     assert ctrl._menu == "disk"
 
 
@@ -1255,8 +1284,10 @@ def test_callback_double_tap_silent_no_toast(tmp_path):
 
 def test_callback_error_surfaces_instead_of_silent_failure(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1"])
+
     async def boom(data):
         raise RuntimeError("boom")
+
     ctrl.handle_callback = boom
     update = _FakeUpdate(12345)
     ctx = _FakeContext()
@@ -1278,6 +1309,7 @@ class _FakeProc:
     def __await__(self):  # create_subprocess_exec is awaited before the process is used
         async def _resolve():
             return self
+
         return _resolve().__await__()
 
     async def communicate(self):
@@ -1363,11 +1395,19 @@ def test_tailscale_webhook_url_funnel_failure(tmp_path, monkeypatch):
 
 def test_tailscale_webhook_url_funnel_already_enabled(tmp_path, monkeypatch):
     calls = []
-    serve_json = json.dumps({"Foreground": {"cap1": {
-        "Web": {"box.tail1234.ts.net:443": {
-            "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}},
-        }},
-    }}}).encode()
+    serve_json = json.dumps(
+        {
+            "Foreground": {
+                "cap1": {
+                    "Web": {
+                        "box.tail1234.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}},
+                        }
+                    },
+                }
+            }
+        }
+    ).encode()
 
     def fake_exec(*args, **kwargs):
         calls.append(args)
@@ -1395,11 +1435,19 @@ def test_tailscale_webhook_url_funnel_already_enabled(tmp_path, monkeypatch):
 
 
 def test_tailscale_webhook_url_listener_conflict_other_port(tmp_path, monkeypatch):
-    serve_json = json.dumps({"Foreground": {"cap1": {
-        "Web": {"other.ts.net:443": {
-            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
-        }},
-    }}}).encode()
+    serve_json = json.dumps(
+        {
+            "Foreground": {
+                "cap1": {
+                    "Web": {
+                        "other.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
+                        }
+                    },
+                }
+            }
+        }
+    ).encode()
 
     def fake_exec(*args, **kwargs):
         if args[1] == "status":
@@ -1418,9 +1466,7 @@ def test_tailscale_webhook_url_listener_conflict_other_port(tmp_path, monkeypatc
 
 
 def test_tailscale_webhook_url_funnel_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "src.stream_archive.telegram_control._TAILSCALE_FUNNEL_TIMEOUT", 0.01
-    )
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook._TAILSCALE_FUNNEL_TIMEOUT", 0.01)
     procs = []
 
     def fake_exec(*args, **kwargs):
@@ -1487,6 +1533,7 @@ class _CloudflaredFakeProc:
     def __await__(self):  # create_subprocess_exec is awaited before use
         async def _resolve():
             return self
+
         return _resolve().__await__()
 
     def kill(self):
@@ -1500,11 +1547,13 @@ def test_cloudflared_quick_start_parses_url(tmp_path, monkeypatch):
     def fake_exec(*args, **kwargs):
         assert args[:3] == ("cloudflared", "--no-autoupdate", "tunnel")
         assert "--url" in args
-        return _CloudflaredFakeProc(lines=[
-            b"2026-08-14T00:00:00Z INF +-----------------------------+\n",
-            b"INF |  https://abc123.trycloudflare.com  |\n",
-            b"INF +-----------------------------+\n",
-        ])
+        return _CloudflaredFakeProc(
+            lines=[
+                b"2026-08-14T00:00:00Z INF +-----------------------------+\n",
+                b"INF |  https://abc123.trycloudflare.com  |\n",
+                b"INF +-----------------------------+\n",
+            ]
+        )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
@@ -1531,9 +1580,7 @@ def test_cloudflared_quick_start_exit_reports_output(tmp_path, monkeypatch):
 
 
 def test_cloudflared_quick_start_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "src.stream_archive.telegram_control._CLOUDFLARED_QUICK_TIMEOUT", 0.01
-    )
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook._CLOUDFLARED_QUICK_TIMEOUT", 0.01)
     proc = _CloudflaredFakeProc(lines=[], hang=True)
 
     def fake_exec(*args, **kwargs):
@@ -1566,9 +1613,11 @@ def test_cloudflared_named_start_registered(tmp_path, monkeypatch):
     def fake_exec(*args, **kwargs):
         assert args[:4] == ("cloudflared", "tunnel", "--no-autoupdate", "run")
         assert "--token" in args
-        return _CloudflaredFakeProc(lines=[
-            b"INF Registered tunnel connection connIndex=0\n",
-        ])
+        return _CloudflaredFakeProc(
+            lines=[
+                b"INF Registered tunnel connection connIndex=0\n",
+            ]
+        )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
@@ -1582,9 +1631,12 @@ def test_cloudflared_named_start_registered(tmp_path, monkeypatch):
 
 def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
     def fake_exec(*args, **kwargs):
-        return _CloudflaredFakeProc(lines=[
-            b"ERR failed to register tunnel connection: invalid token\n",
-        ], returncode=1)
+        return _CloudflaredFakeProc(
+            lines=[
+                b"ERR failed to register tunnel connection: invalid token\n",
+            ],
+            returncode=1,
+        )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
@@ -1597,9 +1649,7 @@ def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
 
 
 def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "src.stream_archive.telegram_control._CLOUDFLARED_RUN_TIMEOUT", 0.01
-    )
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook._CLOUDFLARED_RUN_TIMEOUT", 0.01)
     proc = _CloudflaredFakeProc(lines=[], hang=True, returncode=None)
 
     def fake_exec(*args, **kwargs):
@@ -1615,20 +1665,18 @@ def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
 
 
 def test_cloudflared_token_and_url_helpers():
-    from src.stream_archive.telegram_control import (
+    from stream_archive.telegram.commands_webhook import (
         _normalize_webhook_url,
         _valid_cloudflare_token,
     )
 
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun", "s": "sec"}).encode()).decode()
     assert token.endswith("=")
     assert _valid_cloudflare_token(token)
     assert _valid_cloudflare_token(token.rstrip("="))  # unpadded still decodes
     assert not _valid_cloudflare_token("nope")
     assert not _valid_cloudflare_token(base64.b64encode(b"not json").decode())
-    assert not _valid_cloudflare_token(base64.b64encode(
-        json.dumps({"a": "acct"}).encode()).decode())  # missing t/s
+    assert not _valid_cloudflare_token(base64.b64encode(json.dumps({"a": "acct"}).encode()).decode())  # missing t/s
     assert _normalize_webhook_url("https://x.example.com") == "https://x.example.com/kick/webhook"
     assert _normalize_webhook_url("https://x.example.com/") == "https://x.example.com/kick/webhook"
     assert _normalize_webhook_url("https://x.example.com/kick/webhook") == "https://x.example.com/kick/webhook"
@@ -1651,7 +1699,7 @@ def test_add_kick_channel_stores_and_skips_eventsub(tmp_path):
     text = asyncio.run(ctrl.handle_add(["kick:xqc"]))
     assert text.startswith("Added kick:xqc")
     assert "kick:xqc" in read_file(tmp_path)["channels"]
-    assert "kick:xqc" in config["channels"]
+    assert "kick:xqc" in config.channels
     assert eventsub.added == []
     assert ctrl._kick_webhook.added == ["kick:xqc"]
 
@@ -1660,14 +1708,14 @@ def test_add_kick_channel_normalizes_case(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = asyncio.run(ctrl.handle_add(["kick:XQC"]))
     assert text.startswith("Added kick:xqc")
-    assert config["channels"] == ["twitch:channel1", "kick:xqc"]
+    assert config.channels == ["twitch:channel1", "kick:xqc"]
 
 
 def test_add_kick_url_stores_canonical(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = asyncio.run(ctrl.handle_add(["https://kick.com/xqc"]))
     assert text.startswith("Added kick:xqc")
-    assert config["channels"] == ["twitch:channel1", "kick:xqc"]
+    assert config.channels == ["twitch:channel1", "kick:xqc"]
     assert read_file(tmp_path)["channels"] == ["twitch:channel1", "kick:xqc"]
     assert eventsub.added == []
     assert ctrl._kick_webhook.added == ["kick:xqc"]
@@ -1677,7 +1725,7 @@ def test_add_twitch_url_stores_bare(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = asyncio.run(ctrl.handle_add(["https://www.twitch.tv/newch/"]))
     assert text.startswith("Added twitch:newch")
-    assert config["channels"] == ["twitch:channel1", "twitch:newch"]
+    assert config.channels == ["twitch:channel1", "twitch:newch"]
     assert eventsub.added == ["twitch:newch"]
     assert ctrl._kick_webhook.added == []
 
@@ -1756,7 +1804,7 @@ def test_mode_per_channel_kick_override(tmp_path):
     text = ctrl.handle_mode(["kick:xqc", "youtube"])
     assert text == "Output mode for kick:xqc set to youtube"
     assert read_file(tmp_path)["channel_output_modes"] == {"kick:xqc": "youtube"}
-    assert config["channel_output_modes"] == {"kick:xqc": "youtube"}
+    assert config.channel_output_modes == {"kick:xqc": "youtube"}
 
 
 def test_mode_per_channel_kick_invalid_name_rejected(tmp_path):
@@ -1773,8 +1821,8 @@ def test_chat_off_toggles_both_platform_flags(tmp_path):
     assert text == "Chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is False
     assert read_file(tmp_path)["kick"]["record_chat"] is False
-    assert config["record_chat"] is False
-    assert config["kick"]["record_chat"] is False
+    assert config.record_chat is False
+    assert config.kick.record_chat is False
     assert recorder.chat_stop_calls == [("twitch:channel1", None)]
 
     text = asyncio.run(ctrl.handle_chat(["on"]))
@@ -1790,8 +1838,8 @@ def test_chat_off_twitch_only(tmp_path):
     assert text == "Twitch chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is False
     assert read_file(tmp_path)["kick"]["record_chat"] is True
-    assert config["record_chat"] is False
-    assert config["kick"]["record_chat"] is True
+    assert config.record_chat is False
+    assert config.kick.record_chat is True
     # only the twitch channel's chat is stopped; the kick buffer keeps collecting
     assert recorder.chat_stop_calls == [("twitch:channel1", "twitch")]
 
@@ -1804,8 +1852,8 @@ def test_chat_off_kick_only(tmp_path):
     assert text == "Kick chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is True
     assert read_file(tmp_path)["kick"]["record_chat"] is False
-    assert config["record_chat"] is True
-    assert config["kick"]["record_chat"] is False
+    assert config.record_chat is True
+    assert config.kick.record_chat is False
     # only the kick channel's chat is finalized; the twitch IRC recorder keeps running
     assert recorder.chat_stop_calls == [("kick:xqc", "kick")]
 
@@ -1908,7 +1956,7 @@ def test_reply_text_kick_webhook_url_applies(tmp_path):
 def test_reply_text_kick_webhook_enable_rearms_setup_notification(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
-    config["kick"]["webhook"]["setup_notified"] = True  # already confirmed once before
+    config.kick.webhook.setup_notified = True  # already confirmed once before
     asyncio.run(ctrl.handle_reply_text("Kick webhook"))
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     asyncio.run(ctrl.handle_reply_text("https://tunnel.trycloudflare.com/kick/webhook"))
@@ -1982,8 +2030,7 @@ def test_reply_text_kick_webhook_named_token_prompt(tmp_path):
 
 def test_reply_text_kick_webhook_named_token_accepted(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     started = []
 
     async def fake_named(tok, config_path=None):
@@ -2018,8 +2065,7 @@ def test_reply_text_kick_webhook_named_token_invalid_stays(tmp_path):
 
 def test_reply_text_kick_webhook_named_hostname_invalid_stays(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     asyncio.run(ctrl.handle_reply_text("Kick webhook"))
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     asyncio.run(ctrl.handle_reply_text("Named tunnel"))
@@ -2034,8 +2080,7 @@ def test_reply_text_kick_webhook_named_hostname_invalid_stays(tmp_path):
 def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     started = []
 
     async def fake_named(tok, config_path=None):
@@ -2074,8 +2119,7 @@ def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path, monkeypatch):
 def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
 
     async def fake_named(tok, config_path=None):
         return True, None
@@ -2125,8 +2169,7 @@ class _FakeCfClient:
         self.calls.append(("get", url))
         if url == "/user/tokens/verify":
             if self.verify_status == "account-owned":
-                return _FakeCfResp(401, {"success": False,
-                                         "errors": [{"code": 1000, "message": "Invalid API Token"}]})
+                return _FakeCfResp(401, {"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]})
             return _FakeCfResp(200, {"result": {"status": self.verify_status}})
         if url.endswith("/tokens/verify"):
             return _FakeCfResp(200, {"result": {"status": "active"}})
@@ -2142,11 +2185,10 @@ class _FakeCfClient:
 
 
 def make_cf_ctrl(tmp_path, monkeypatch, client):
-    monkeypatch.setattr("src.stream_archive.telegram_control.httpx.AsyncClient", lambda *a, **k: client)
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook.httpx.AsyncClient", lambda *a, **k: client)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    config["kick"]["webhook"]["cloudflare_token"] = token
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    config.kick.webhook.cloudflare_token = token
     ctrl._cloudflare_hostname = "kick.example.com"
     return config, ctrl, token
 
@@ -2159,27 +2201,41 @@ def test_create_cloudflare_dns_creates_record(tmp_path, monkeypatch):
 
     assert ok is True
     assert "DNS record created" in message
-    assert ("post", "/zones/z1/dns_records", {
-        "type": "CNAME", "name": "kick.example.com",
-        "content": "tun-id.cfargotunnel.com", "proxied": True,
-    }) in client.calls
+    assert (
+        "post",
+        "/zones/z1/dns_records",
+        {
+            "type": "CNAME",
+            "name": "kick.example.com",
+            "content": "tun-id.cfargotunnel.com",
+            "proxied": True,
+        },
+    ) in client.calls
 
 
 def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path, monkeypatch):
-    client = _FakeCfClient(zones=[
-        {"id": "z1", "name": "example.com"},
-        {"id": "z2", "name": "sub.example.com"},
-    ])
+    client = _FakeCfClient(
+        zones=[
+            {"id": "z1", "name": "example.com"},
+            {"id": "z2", "name": "sub.example.com"},
+        ]
+    )
     config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
     ctrl._cloudflare_hostname = "kick.sub.example.com"
 
     ok, _ = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
     assert ok is True
-    assert ("post", "/zones/z2/dns_records", {
-        "type": "CNAME", "name": "kick.sub.example.com",
-        "content": "tun-id.cfargotunnel.com", "proxied": True,
-    }) in client.calls
+    assert (
+        "post",
+        "/zones/z2/dns_records",
+        {
+            "type": "CNAME",
+            "name": "kick.sub.example.com",
+            "content": "tun-id.cfargotunnel.com",
+            "proxied": True,
+        },
+    ) in client.calls
 
 
 def test_create_cloudflare_dns_existing_same_target_ok(tmp_path, monkeypatch):
@@ -2222,18 +2278,23 @@ def test_create_cloudflare_dns_no_zone_fails(tmp_path, monkeypatch):
 def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path, monkeypatch):
     # cfat_ account tokens reject /user/tokens/verify; the account-scoped
     # verify endpoint must be used instead.
-    client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}],
-                           verify_status="account-owned")
+    client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}], verify_status="account-owned")
     config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("cfat_..."))
 
     assert ok is True
     assert ("get", "/accounts/acct/tokens/verify") in client.calls
-    assert ("post", "/zones/z1/dns_records", {
-        "type": "CNAME", "name": "kick.example.com",
-        "content": "tun-id.cfargotunnel.com", "proxied": True,
-    }) in client.calls
+    assert (
+        "post",
+        "/zones/z1/dns_records",
+        {
+            "type": "CNAME",
+            "name": "kick.example.com",
+            "content": "tun-id.cfargotunnel.com",
+            "proxied": True,
+        },
+    ) in client.calls
 
 
 def test_create_cloudflare_dns_invalid_token_fails(tmp_path, monkeypatch):
@@ -2248,15 +2309,12 @@ def test_create_cloudflare_dns_invalid_token_fails(tmp_path, monkeypatch):
 
 def test_restore_named_tunnel_uses_local_config(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://kick.example.com/kick/webhook",
-        "tunnel": "cloudflare",
-        "cloudflare_managed": True,
-        "cloudflare_token": token,
-    })
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    config.kick.webhook.public_url = "https://kick.example.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.cloudflare_token = token
+    config.kick.webhook.cloudflare_managed = True
+    config.kick.webhook.enabled = True
     started = []
 
     async def fake_named(tok, config_path=None):
@@ -2273,8 +2331,7 @@ def test_restore_named_tunnel_uses_local_config(tmp_path, monkeypatch):
 
 def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps(
-        {"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
 
     async def fake_named(tok, config_path=None):
         return True, None
@@ -2351,11 +2408,9 @@ def test_reply_text_kick_webhook_tailscale_fallback_to_input(tmp_path, monkeypat
 def test_switch_tailscale_to_cloudflare_tears_down_funnel(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://box.tail1234.ts.net/kick/webhook",
-        "tunnel": "tailscale",
-    })
+    config.kick.webhook.public_url = "https://box.tail1234.ts.net/kick/webhook"
+    config.kick.webhook.tunnel = "tailscale"
+    config.kick.webhook.enabled = True
     funnel_off_calls = []
 
     async def fake_quick():
@@ -2378,13 +2433,11 @@ def test_switch_tailscale_to_cloudflare_tears_down_funnel(tmp_path, monkeypatch)
 
 def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://abc123.trycloudflare.com/kick/webhook",
-        "tunnel": "cloudflare",
-        "cloudflare_token": "",
-        "cloudflare_managed": True,
-    })
+    config.kick.webhook.public_url = "https://abc123.trycloudflare.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.cloudflare_token = ""
+    config.kick.webhook.cloudflare_managed = True
+    config.kick.webhook.enabled = True
     stopped = []
 
     async def fake_tailscale():
@@ -2404,11 +2457,9 @@ def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path, monkeypatch)
 
 def test_off_tears_down_tailscale_funnel(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://box.tail1234.ts.net/kick/webhook",
-        "tunnel": "tailscale",
-    })
+    config.kick.webhook.public_url = "https://box.tail1234.ts.net/kick/webhook"
+    config.kick.webhook.tunnel = "tailscale"
+    config.kick.webhook.enabled = True
     funnel_off_calls = []
 
     async def fake_funnel_off():
@@ -2426,12 +2477,10 @@ def test_off_tears_down_tailscale_funnel(tmp_path, monkeypatch):
 
 def test_off_tears_down_cloudflared(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://abc123.trycloudflare.com/kick/webhook",
-        "tunnel": "cloudflare",
-        "cloudflare_managed": True,
-    })
+    config.kick.webhook.public_url = "https://abc123.trycloudflare.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.cloudflare_managed = True
+    config.kick.webhook.enabled = True
     stopped = []
     ctrl._cloudflared_stop = lambda: stopped.append(1)
     asyncio.run(ctrl.handle_reply_text("Kick webhook"))
@@ -2446,13 +2495,11 @@ def test_off_tears_down_cloudflared(tmp_path, monkeypatch):
 
 def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://old.trycloudflare.com/kick/webhook",
-        "tunnel": "cloudflare",
-        "cloudflare_managed": True,
-        "setup_notified": True,  # confirmed before the restart
-    })
+    config.kick.webhook.public_url = "https://old.trycloudflare.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.cloudflare_managed = True
+    config.kick.webhook.setup_notified = True  # confirmed before the restart
+    config.kick.webhook.enabled = True
     sent = []
 
     async def fake_quick():
@@ -2475,13 +2522,11 @@ def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path, monkeypatch)
 
 def test_restore_quick_tunnel_same_url_stays_silent(tmp_path, monkeypatch):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://same.trycloudflare.com/kick/webhook",
-        "tunnel": "cloudflare",
-        "cloudflare_managed": True,
-        "setup_notified": True,
-    })
+    config.kick.webhook.public_url = "https://same.trycloudflare.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.cloudflare_managed = True
+    config.kick.webhook.setup_notified = True
+    config.kick.webhook.enabled = True
     sent = []
 
     async def fake_quick():
@@ -2494,17 +2539,15 @@ def test_restore_quick_tunnel_same_url_stays_silent(tmp_path, monkeypatch):
     ctrl._send_admin = fake_send
     before = read_file(tmp_path)
     asyncio.run(ctrl._restore_cloudflared())
-    assert config["kick"]["webhook"]["setup_notified"] is True  # live config untouched
+    assert config.kick.webhook.setup_notified is True  # live config untouched
     assert read_file(tmp_path) == before
     assert sent == []
 
 
 def test_menu_text_kick_webhook_shows_tunnel_mode(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config["kick"]["webhook"].update({
-        "enabled": True,
-        "public_url": "https://abc123.trycloudflare.com/kick/webhook",
-        "tunnel": "cloudflare",
-    })
+    config.kick.webhook.public_url = "https://abc123.trycloudflare.com/kick/webhook"
+    config.kick.webhook.tunnel = "cloudflare"
+    config.kick.webhook.enabled = True
     text = asyncio.run(ctrl.menu_text("kick_webhook"))
     assert "Kick webhook: on (cloudflare \u00b7 https://abc123.trycloudflare.com/kick/webhook)" in text

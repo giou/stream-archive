@@ -1,11 +1,12 @@
 import json
 import logging
+from typing import Any
 
 import httpx
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
-from src.stream_archive.config import channel_url, is_kick_channel
+from stream_archive.config import AppConfig, channel_url, is_kick_channel
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube"]
 _API_BASE = "https://www.googleapis.com/youtube/v3"
 
 
-def build_video_description(author, channel, game):
+def build_video_description(author: str, channel: str, game: str) -> str:
     """Description for a re-streamed broadcast; platform-aware (Twitch/Kick)."""
     platform = "Kick" if is_kick_channel(channel) else "Twitch"
     return (
@@ -25,46 +26,49 @@ def build_video_description(author, channel, game):
 
 
 class YouTubeStreamer:
-    def __init__(self, config):
+    def __init__(self, config: AppConfig):
         self._config = config
-        yt = config["youtube"]
-        self._privacy_status = yt["privacy_status"]
-        self._token_path = config["_workdir"] / "youtube_token.json"
-        self._credentials = None
+        yt = config.youtube
+        self._privacy_status = yt.privacy_status
+        self._token_path = config._workdir / "youtube_token.json"
+        self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
 
-    async def _get_credentials(self):
+    async def _get_credentials(self) -> Credentials:
         if self._credentials and self._credentials.valid:
             return self._credentials
 
         if not self._token_path.exists():
-            raise RuntimeError(
-                "YouTube token not found. Run 'python setup_youtube.py' first to authenticate."
-            )
+            raise RuntimeError("YouTube token not found. Run 'python setup_youtube.py' first to authenticate.")
 
         with open(self._token_path) as f:
             data = json.load(f)
-        self._credentials = Credentials.from_authorized_user_info(data, SCOPES)
+        creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
+        if creds is None:
+            raise RuntimeError("YouTube token could not be loaded.")
+        self._credentials = creds
 
-        if not self._credentials.valid:
-            if self._credentials.expired and self._credentials.refresh_token:
-                self._credentials.refresh(Request())
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
                 self._save_token()
             else:
                 raise RuntimeError(
-                    "YouTube token expired and cannot be refreshed. "
-                    "Run 'python setup_youtube.py' again."
+                    "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
                 )
 
         return self._credentials
 
-    def _save_token(self):
-        data = json.loads(self._credentials.to_json())
+    def _save_token(self) -> None:
+        credentials = self._credentials
+        if credentials is None:
+            return
+        data = json.loads(credentials.to_json())  # type: ignore[no-untyped-call]
         with open(self._token_path, "w") as f:
             json.dump(data, f)
         self._token_path.chmod(0o600)
 
-    async def _request(self, method, path, **kwargs):
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         creds = await self._get_credentials()
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {creds.token}"
@@ -75,7 +79,7 @@ class YouTubeStreamer:
         resp.raise_for_status()
         return resp.json()
 
-    async def create_stream(self, author, title, channel, game):
+    async def create_stream(self, author: str, title: str, channel: str, game: str) -> dict[str, Any]:
         raw_title = f"{author} - {title}"
         raw_title = raw_title.replace("<", "").replace(">", "")
         broadcast_title = raw_title[:100]
@@ -152,7 +156,7 @@ class YouTubeStreamer:
             "youtube_url": f"https://youtube.com/watch?v={broadcast_id}",
         }
 
-    async def end_stream(self, broadcast_id):
+    async def end_stream(self, broadcast_id: str) -> None:
         params = {
             "id": broadcast_id,
             "broadcastStatus": "complete",
@@ -161,5 +165,5 @@ class YouTubeStreamer:
         logger.info("[youtube] Ending broadcast: %s", broadcast_id)
         await self._request("POST", "liveBroadcasts/transition", params=params)
 
-    async def close(self):
+    async def close(self) -> None:
         await self._client.aclose()

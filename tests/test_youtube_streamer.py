@@ -1,4 +1,4 @@
-from src.stream_archive.youtube_streamer import build_video_description
+from stream_archive.youtube_streamer import build_video_description
 
 
 def test_description_twitch_channel():

@@ -7,9 +7,12 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import httpx
 from packaging.version import Version
+
+from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +26,11 @@ _MAX_CHANGELOG_CHARS = 600
 _MAX_CHANGELOG_COMMITS = 10
 
 
-def _changelog_lines(body, limit=_MAX_CHANGELOG_CHARS):
+def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> list[str]:
     """Normalize a release-notes body into a truncated list of non-empty lines."""
     lines = [ln.strip() for ln in (body or "").splitlines()]
     lines = [ln for ln in lines if ln]
-    out = []
+    out: list[str] = []
     total = 0
     for ln in lines:
         total += len(ln) + 1
@@ -39,7 +42,7 @@ def _changelog_lines(body, limit=_MAX_CHANGELOG_CHARS):
     return out
 
 
-async def _default_run_cmd(cmd, cwd):
+async def _default_run_cmd(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run a command, returning (returncode, stdout, stderr). Never raises."""
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -54,7 +57,11 @@ async def _default_run_cmd(cmd, cwd):
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
     except (TimeoutError, OSError) as e:
         return (1, "", str(e))
-    return (proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace"))
+    return (
+        proc.returncode if proc.returncode is not None else 1,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
 
 
 def _in_docker() -> bool:
@@ -71,29 +78,27 @@ class UpdateChecker:
     plugin download for the sources reported as ``"update"``.
     """
 
-    def __init__(self, config, notifier, run_cmd=None, http=None):
+    def __init__(self, config: AppConfig, notifier: Any, run_cmd: Any = None, http: Any = None):
         self._config = config
         self._notifier = notifier
-        self._workdir = Path(config["_workdir"])
+        self._workdir = config._workdir
         self._run_cmd = run_cmd or _default_run_cmd
         # GitHub release assets 302-redirect to release-assets.githubusercontent.com,
         # so redirects must be followed or the plugin download always fails.
-        self._http = http or httpx.AsyncClient(
-            timeout=httpx.Timeout(15, connect=10), follow_redirects=True
-        )
+        self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=True)
         self._lock = asyncio.Lock()
         self._state_path = self._workdir / "update_state.json"
-        self._state = {}
+        self._state: dict[str, Any] = {}
 
-    def _plugin_path(self):
-        plugin_dir = self._config["plugin_dir"]
+    def _plugin_path(self) -> Path:
+        plugin_dir = self._config.plugin_dir
         if not os.path.isabs(plugin_dir):
-            plugin_dir = self._workdir / plugin_dir
+            return self._workdir / plugin_dir / "twitch.py"
         return Path(plugin_dir) / "twitch.py"
 
     # ---- state -------------------------------------------------------------
 
-    def _load_state(self):
+    def _load_state(self) -> None:
         try:
             with open(self._state_path) as f:
                 self._state = json.load(f)
@@ -103,7 +108,7 @@ class UpdateChecker:
             logger.warning("[updater] update_state.json corrupt; starting fresh")
             self._state = {}
 
-    def _save_state(self):
+    def _save_state(self) -> None:
         tmp = Path(str(self._state_path) + ".tmp")
         with open(tmp, "w") as f:
             json.dump(self._state, f, indent=2)
@@ -111,11 +116,11 @@ class UpdateChecker:
 
     # ---- checks ------------------------------------------------------------
 
-    async def local_sha(self):
+    async def local_sha(self) -> str | None:
         rc, out, _ = await self._run_cmd(["git", "rev-parse", "HEAD"], self._workdir)
         return out.strip() if rc == 0 else None
 
-    async def _check_app(self):
+    async def _check_app(self) -> dict[str, Any]:
         local = await self.local_sha()
         rc, _, err = await self._run_cmd(["git", "fetch", "origin"], self._workdir)
         if rc != 0:
@@ -145,7 +150,7 @@ class UpdateChecker:
             "changelog": commits,
         }
 
-    def _plugin_version(self):
+    def _plugin_version(self) -> str | None:
         try:
             content = self._plugin_path().read_text(errors="replace")
         except OSError:
@@ -153,7 +158,7 @@ class UpdateChecker:
         m = _PLUGIN_VERSION_RE.search(content)
         return m.group(1) if m else None
 
-    async def _check_plugin(self):
+    async def _check_plugin(self) -> dict[str, Any]:
         current = self._plugin_version()
         try:
             resp = await self._http.get(_PLUGIN_RELEASES_URL)
@@ -184,13 +189,13 @@ class UpdateChecker:
             "changelog": data.get("body") or None,
         }
 
-    def _installed_streamlink(self):
+    def _installed_streamlink(self) -> str | None:
         try:
             return importlib.metadata.version("streamlink")
         except importlib.metadata.PackageNotFoundError:
             return None
 
-    async def _check_streamlink(self):
+    async def _check_streamlink(self) -> dict[str, Any]:
         installed = self._installed_streamlink()
         try:
             resp = await self._http.get(_PYPI_STREAMLINK_URL)
@@ -211,7 +216,7 @@ class UpdateChecker:
             changelog = await self._fetch_release_notes("streamlink/streamlink", latest)
         return {"status": status, "current": installed, "latest": latest, "changelog": changelog}
 
-    async def _fetch_release_notes(self, repo, tag):
+    async def _fetch_release_notes(self, repo: str, tag: str) -> str | None:
         """Best-effort GitHub release notes for a tag; None on any failure."""
         try:
             resp = await self._http.get(_STREAMLINK_RELEASE_NOTES_URL.format(tag=tag))
@@ -223,15 +228,15 @@ class UpdateChecker:
 
     # ---- check / notify ----------------------------------------------------
 
-    async def check(self, notify):
+    async def check(self, notify: bool) -> dict[str, Any]:
         async with self._lock:
-            uc = self._config.get("update_check") or {}
+            uc = self._config.update_check
             report = {}
-            if uc.get("check_app", True):
+            if uc.check_app:
                 report["app"] = await self._check_app()
-            if uc.get("check_streamlink", True):
+            if uc.check_streamlink:
                 report["streamlink"] = await self._check_streamlink()
-            if uc.get("check_plugin", True):
+            if uc.check_plugin:
                 report["plugin"] = await self._check_plugin()
 
             if not notify:
@@ -244,24 +249,21 @@ class UpdateChecker:
                 latest = data.get("remote") if source == "app" else data.get("latest")
                 if latest is None:
                     continue
-                if data["status"] == "update":
-                    if self._state.get(source) != latest:
-                        if source == "app":
-                            lines.append(
-                                f'• stream-archive: {data["behind"]} new commit(s) — "{data["subject"] or ""}"'
-                            )
-                            cl = data.get("changelog") or []
-                        elif source == "streamlink":
-                            lines.append(f"• streamlink: {data['current']} → {latest}")
-                            cl = _changelog_lines(data.get("changelog"))
-                        else:
-                            lines.append(f"• streamlink-ttvlol: {data['current']} → {latest}")
-                            cl = _changelog_lines(data.get("changelog"))
-                        if cl:
-                            lines.append("  Changelog:")
-                            lines.extend(f"  • {ln}" for ln in cl)
-                        self._state[source] = latest
-                        state_changed = True
+                if data["status"] == "update" and self._state.get(source) != latest:
+                    if source == "app":
+                        lines.append(f'• stream-archive: {data["behind"]} new commit(s) — "{data["subject"] or ""}"')
+                        cl = data.get("changelog") or []
+                    elif source == "streamlink":
+                        lines.append(f"• streamlink: {data['current']} → {latest}")
+                        cl = _changelog_lines(data.get("changelog"))
+                    else:
+                        lines.append(f"• streamlink-ttvlol: {data['current']} → {latest}")
+                        cl = _changelog_lines(data.get("changelog"))
+                    if cl:
+                        lines.append("  Changelog:")
+                        lines.extend(f"  • {ln}" for ln in cl)
+                    self._state[source] = latest
+                    state_changed = True
                 elif data["status"] == "up_to_date":
                     if self._state.get(source) != latest:
                         self._state[source] = latest
@@ -280,7 +282,7 @@ class UpdateChecker:
 
     # ---- apply -------------------------------------------------------------
 
-    async def apply(self, report):
+    async def apply(self, report: dict[str, Any]) -> dict[str, tuple[str, str]]:
         async with self._lock:
             results = {}
             # plugin + streamlink form a compatibility unit: apply both when both are pending
@@ -301,14 +303,14 @@ class UpdateChecker:
                     results[source] = ("failed", str(e))
             return results
 
-    async def _apply_app(self, data):
+    async def _apply_app(self, data: dict[str, Any]) -> tuple[str, str]:
         rc, _, err = await self._run_cmd(["git", "pull", "--ff-only"], self._workdir)
         if rc != 0:
             detail = err.strip().splitlines()[0] if err.strip() else "unknown error"
             return ("failed", f"git pull: {detail}")
         return ("applied", f"pulled {data.get('behind', 0)} commit(s) — {data.get('subject') or ''}")
 
-    async def _apply_plugin(self, data):
+    async def _apply_plugin(self, data: dict[str, Any]) -> tuple[str, str]:
         latest = data.get("latest")
         if not latest:
             return ("failed", "no latest release tag known")
@@ -355,7 +357,7 @@ class UpdateChecker:
             msg += "; previous version backed up to plugins/twitch.py.bak"
         return ("applied", msg)
 
-    async def _apply_streamlink(self, data):
+    async def _apply_streamlink(self, data: dict[str, Any]) -> tuple[str, str]:
         """Update uv.lock, then sync the venv — but only on host.
 
         In Docker the venv lives at /opt/venv inside the image (outside the
@@ -380,16 +382,16 @@ class UpdateChecker:
 
     # ---- loop / lifecycle --------------------------------------------------
 
-    async def run_loop(self):
+    async def run_loop(self) -> None:
         while True:
             try:
-                uc = self._config.get("update_check") or {}
-                if uc.get("enabled", True):
+                uc = self._config.update_check
+                if uc.enabled:
                     await self.check(notify=True)
             except Exception:
                 logger.exception("[updater] update check cycle failed")
-            interval = (self._config.get("update_check") or {}).get("interval_hours", 24) * 3600
+            interval = self._config.update_check.interval_hours * 3600
             await asyncio.sleep(interval)
 
-    async def close(self):
+    async def close(self) -> None:
         await self._http.aclose()

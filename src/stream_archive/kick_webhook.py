@@ -1,16 +1,18 @@
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
 import httpx
 from aiohttp import web
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from src.stream_archive.config import is_kick_channel, kick_bare_name, save_config
+from stream_archive.config import AppConfig, is_kick_channel, kick_bare_name, save_config
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ _KEY_REFETCH_INTERVAL_S = 60
 # Per-client-IP token bucket; a coarse backstop behind signature verification.
 # Behind a tunnel every request shares the tunnel's origin IP, so the budget
 # is sized for aggregate legit chat volume, not per-event precision.
-_RATE_LIMIT_PER_IP = 1200      # requests per window
+_RATE_LIMIT_PER_IP = 1200  # requests per window
 _RATE_LIMIT_WINDOW_S = 60
 _MAX_RATE_LIMIT_IPS = 10_000
 # Cap on concurrent in-flight webhook requests; flood protection.
@@ -38,7 +40,7 @@ _MAX_CONCURRENT = 16
 _SYNC_SERVER_ERROR_DELAY_S = 600
 
 
-def _is_server_error(exc):
+def _is_server_error(exc: Exception) -> bool:
     """True when Kick's API itself failed (5xx): an outage on their side.
 
     Config/auth problems (4xx), connectivity errors, and timeouts still
@@ -50,20 +52,20 @@ def _is_server_error(exc):
 class _RateLimiter:
     """Per-key token bucket (key = client IP), with a bounded bucket table."""
 
-    def __init__(self, max_requests, window_s, max_keys=_MAX_RATE_LIMIT_IPS):
+    def __init__(self, max_requests: int, window_s: int, max_keys: int = _MAX_RATE_LIMIT_IPS) -> None:
         self._max = max_requests
         self._window = window_s
         self._max_keys = max_keys
-        self._buckets = {}   # key -> [tokens, last_refill (monotonic)]
+        self._buckets: dict[str, list[float]] = {}  # key -> [tokens, last_refill (monotonic)]
 
-    def allow(self, key) -> bool:
+    def allow(self, key: str) -> bool:
         now = time.monotonic()
         buckets = self._buckets
         bucket = buckets.get(key)
         if bucket is None:
             if len(buckets) >= self._max_keys:
                 for k, (tokens, _) in list(buckets.items()):
-                    if tokens >= self._max:   # fully refilled: safe to evict
+                    if tokens >= self._max:  # fully refilled: safe to evict
                         del buckets[k]
                 if len(buckets) >= self._max_keys:
                     buckets.pop(next(iter(buckets)))
@@ -78,7 +80,7 @@ class _RateLimiter:
         return True
 
 
-def _parse_timestamp(value):
+def _parse_timestamp(value: str) -> float | None:
     """Kick sends ISO-8601; epoch seconds are accepted too. None when unparseable."""
     value = value.strip()
     try:
@@ -92,81 +94,77 @@ def _parse_timestamp(value):
 
 
 class KickWebhook:
-    EVENT_LIVE = "livestream.status.updated"   # v1
-    EVENT_CHAT = "chat.message.sent"           # v1
+    EVENT_LIVE = "livestream.status.updated"  # v1
+    EVENT_CHAT = "chat.message.sent"  # v1
 
-    def __init__(self, config, monitor, recorder, kick_api, notifier):
+    def __init__(self, config: AppConfig, monitor: Any, recorder: Any, kick_api: Any, notifier: Any):
         self._config = config
         self._monitor = monitor
         self._recorder = recorder
         self._api = kick_api
         self._notifier = notifier
-        self._runner = None
-        self._site = None
-        self._sync_task = None
+        self._runner: Any = None
+        self._site: Any = None
+        self._sync_task: asyncio.Task[Any] | None = None
         self._sync_failed_notified = False
-        self._sync_failing_since = None   # monotonic start of current failure episode
-        self._subs = {}   # bare slug -> set(subscription ids)
-        self._seen_ids = {}            # message_id -> expires (monotonic)
+        self._sync_failing_since: float | None = None  # monotonic start of current failure episode
+        self._subs: dict[str, set[str]] = {}  # bare slug -> set(subscription ids)
+        self._seen_ids: dict[str, float] = {}  # message_id -> expires (monotonic)
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
         self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
-        self._next_key_refetch = 0.0   # monotonic; gates the rotation refetch
+        self._next_key_refetch = 0.0  # monotonic; gates the rotation refetch
         self._app = web.Application()
         self._app.router.add_post("/kick/webhook", self._handle)
 
-    async def start(self):
+    async def start(self) -> None:
         """Bind the HTTP listener and start the subscription sync loop. Idempotent."""
         if self._runner is not None:
             return
-        wh = self._config["kick"]["webhook"]
+        wh = self._config.kick.webhook
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, wh["listen_host"], wh["listen_port"])
+        self._site = web.TCPSite(self._runner, wh.listen_host, wh.listen_port)
         await self._site.start()
         self._sync_task = asyncio.create_task(self._sync_loop())
         logger.info(
             "[kick_webhook] listening on http://%s:%s (public: %s)",
-            wh["listen_host"], wh["listen_port"], wh.get("public_url") or "(none)",
+            wh.listen_host,
+            wh.listen_port,
+            wh.public_url or "(none)",
         )
 
-    async def close(self):
+    async def close(self) -> None:
         """Stop the sync loop and the HTTP listener. Idempotent."""
         task = self._sync_task
         self._sync_task = None
         if task is not None:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
         site = self._site
         self._site = None
         if site is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await site.stop()
-            except Exception:
-                pass
         runner = self._runner
         self._runner = None
         if runner is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await runner.cleanup()
-            except Exception:
-                pass
 
-    async def _sync_loop(self):
+    async def _sync_loop(self) -> None:
         while self._runner is not None:
             try:
-                subscribed = await self._sync_subscriptions(self._config["channels"])
+                await self._sync_subscriptions(self._config.channels)
             except Exception as e:
                 logger.error("[kick_webhook] subscription sync failed: %s", e)
                 await self._notify_sync_failure(e)
             else:
                 self._sync_failed_notified = False
                 self._sync_failing_since = None
-            await asyncio.sleep(self._config["monitoring_interval"])
+            await asyncio.sleep(self._config.monitoring_interval)
 
-    async def _notify_sync_failure(self, e):
+    async def _notify_sync_failure(self, e: Exception) -> None:
         """Alert on a sync failure; one notification per failure episode.
 
         A Kick-side (5xx) failure only alerts once it has persisted for
@@ -186,11 +184,11 @@ class KickWebhook:
             "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
             "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
             "your app \u2192 Enable webhooks)? "
-            f"{self._config['kick']['webhook'].get('public_url', '')}\n"
+            f"{self._config.kick.webhook.public_url}\n"
             f"Error: {detail}"
         )
 
-    async def _handle(self, request):
+    async def _handle(self, request: Any) -> Any:
         client = request.remote or "unknown"
         if not self._rate_limiter.allow(client):
             return web.Response(status=429, text="too many requests")
@@ -221,7 +219,7 @@ class KickWebhook:
         finally:
             self._sem.release()
 
-    def _remember_id(self, message_id) -> bool:
+    def _remember_id(self, message_id: str | None) -> bool:
         """True when the message id is new within the freshness window; False for replays."""
         if not message_id:
             return True
@@ -239,7 +237,7 @@ class KickWebhook:
         seen[message_id] = now + _VERIFY_WINDOW_S
         return True
 
-    async def _verify(self, request, body) -> bool:
+    async def _verify(self, request: Any, body: bytes) -> bool:
         message_id = request.headers.get("Kick-Event-Message-Id")
         timestamp = request.headers.get("Kick-Event-Message-Timestamp")
         signature_b64 = request.headers.get("Kick-Event-Signature")
@@ -276,11 +274,15 @@ class KickWebhook:
         except Exception:
             return False
 
-    def _verify_signature(self, public_key_pem, message, signature):
-        key = serialization.load_pem_public_key(public_key_pem.encode() if isinstance(public_key_pem, str) else public_key_pem)
+    def _verify_signature(self, public_key_pem: Any, message: bytes, signature: bytes) -> None:
+        key = serialization.load_pem_public_key(
+            public_key_pem.encode() if isinstance(public_key_pem, str) else public_key_pem
+        )
+        if not isinstance(key, rsa.RSAPublicKey):
+            raise ValueError("webhook public key is not an RSA key")
         key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
 
-    async def _dispatch_live(self, body):
+    async def _dispatch_live(self, body: bytes) -> None:
         try:
             event = json.loads(body)
         except json.JSONDecodeError:
@@ -292,7 +294,7 @@ class KickWebhook:
             logger.warning("[kick_webhook] livestream event without channel_slug, ignoring")
             return
         channel = f"kick:{slug}"
-        if channel not in self._config["channels"]:
+        if channel not in self._config.channels:
             logger.debug("[kick_webhook] livestream event for unmonitored channel %s, ignoring", channel)
             return
         if event.get("is_live"):
@@ -302,7 +304,7 @@ class KickWebhook:
         else:
             await self._monitor.handle_offline(channel, self._config)
 
-    async def _dispatch_chat(self, body):
+    async def _dispatch_chat(self, body: bytes) -> None:
         try:
             event = json.loads(body)
         except json.JSONDecodeError:
@@ -314,29 +316,41 @@ class KickWebhook:
             return
         sender = event.get("sender") or {}
         identity = sender.get("identity") or {}
-        badges = [{"text": b.get("text"), "type": b.get("type"), "count": b.get("count")}
-                  for b in (identity.get("badges") or [])]
+        badges = [
+            {"text": b.get("text"), "type": b.get("type"), "count": b.get("count")}
+            for b in (identity.get("badges") or [])
+        ]
         payload = {
             "message_id": event.get("message_id"),
             "created_at": event.get("created_at"),
-            "broadcaster": {"user_id": broadcaster.get("user_id"),
-                            "username": broadcaster.get("username"),
-                            "profile_picture": broadcaster.get("profile_picture")},
-            "sender": {"user_id": sender.get("user_id"), "username": sender.get("username"),
-                       "is_verified": sender.get("is_verified"), "is_anonymous": sender.get("is_anonymous"),
-                       "profile_picture": sender.get("profile_picture"),
-                       "username_color": (identity or {}).get("username_color")},
+            "broadcaster": {
+                "user_id": broadcaster.get("user_id"),
+                "username": broadcaster.get("username"),
+                "profile_picture": broadcaster.get("profile_picture"),
+            },
+            "sender": {
+                "user_id": sender.get("user_id"),
+                "username": sender.get("username"),
+                "is_verified": sender.get("is_verified"),
+                "is_anonymous": sender.get("is_anonymous"),
+                "profile_picture": sender.get("profile_picture"),
+                "username_color": (identity or {}).get("username_color"),
+            },
             "content": event.get("content"),
-            "emotes": [{"emote_id": e.get("emote_id"),
-                        "positions": [{"s": p.get("s"), "e": p.get("e")} for p in (e.get("positions") or [])]}
-                       for e in (event.get("emotes") or [])],
+            "emotes": [
+                {
+                    "emote_id": e.get("emote_id"),
+                    "positions": [{"s": p.get("s"), "e": p.get("e")} for p in (e.get("positions") or [])],
+                }
+                for e in (event.get("emotes") or [])
+            ],
             "badges": badges,
         }
         await self._recorder.add_kick_chat(f"kick:{slug}", payload)
 
-    async def _sync_subscriptions(self, channels):
+    async def _sync_subscriptions(self, channels: list[str]) -> int:
         """Reconcile webhook subscriptions with the monitored kick channels."""
-        desired = {}   # bare slug -> broadcaster_user_id
+        desired = {}  # bare slug -> broadcaster_user_id
         kick_channels = [c for c in channels if is_kick_channel(c)]
         if kick_channels:
             statuses = await self._api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
@@ -351,17 +365,13 @@ class KickWebhook:
                     desired[bare] = uid
 
         existing = await self._api.list_event_subscriptions()
-        by_user = {}
+        by_user: dict[Any, list[Any]] = {}
         for sub in existing:
             by_user.setdefault(sub.get("broadcaster_user_id"), []).append(sub)
 
         # Create missing subscriptions for monitored channels.
         for bare, uid in desired.items():
-            existing_events = {
-                e.get("name")
-                for s in by_user.get(uid, [])
-                for e in (s.get("events") or [])
-            }
+            existing_events = {e.get("name") for s in by_user.get(uid, []) for e in (s.get("events") or [])}
             missing = [ev for ev in (self.EVENT_LIVE, self.EVENT_CHAT) if ev not in existing_events]
             if missing:
                 created = await self._api.create_event_subscriptions(uid, missing)
@@ -388,7 +398,7 @@ class KickWebhook:
 
         return len(desired)
 
-    async def _maybe_confirm_delivery(self):
+    async def _maybe_confirm_delivery(self) -> None:
         """Working confirmation: fires on the first verified Kick event per enable.
 
         A signature-verified POST proves Kick has the current URL saved and can
@@ -397,19 +407,17 @@ class KickWebhook:
         persists the flag so it stays silent afterwards.
         """
         try:
-            wh = self._config["kick"]["webhook"]
-            if not wh.get("enabled") or wh.get("setup_notified"):
+            wh = self._config.kick.webhook
+            if not wh.enabled or wh.setup_notified:
                 return
             if self._notifier:
-                await self._notifier.notify(
-                    "\u2705 Kick webhook is working \u2014 first event received from Kick."
-                )
-            wh["setup_notified"] = True
+                await self._notifier.notify("\u2705 Kick webhook is working \u2014 first event received from Kick.")
+            wh.setup_notified = True
             save_config(self._config)
         except Exception as e:
             logger.error("[kick_webhook] setup confirmation failed: %s", e)
 
-    async def add_channel(self, channel):
+    async def add_channel(self, channel: str) -> None:
         """Subscribe a newly added kick channel to both events; errors logged."""
         if not is_kick_channel(channel):
             return
@@ -427,7 +435,7 @@ class KickWebhook:
         except Exception as e:
             logger.error("[kick_webhook] add_channel failed for %s: %s", channel, e)
 
-    async def remove_channel(self, channel):
+    async def remove_channel(self, channel: str) -> None:
         """Delete all recorded subscriptions for a removed kick channel."""
         if not is_kick_channel(channel):
             return
@@ -440,7 +448,7 @@ class KickWebhook:
         except Exception as e:
             logger.error("[kick_webhook] remove_channel failed for %s: %s", channel, e)
 
-    async def sync_channels(self, channels):
+    async def sync_channels(self, channels: list[str]) -> None:
         """Immediate one-shot reconcile (called by /reload and after enabling)."""
         try:
             await self._sync_subscriptions(channels)

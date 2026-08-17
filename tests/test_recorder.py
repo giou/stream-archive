@@ -9,29 +9,39 @@ from datetime import datetime, timezone
 import pytest
 from streamlink.exceptions import NoStreamsError, PluginError
 
-from src.stream_archive.recorder import Recorder, _sanitize_filename
+from stream_archive.config import AppConfig
+from stream_archive.recorder import Recorder, _sanitize_filename
 
 
 @pytest.fixture(autouse=True)
 def _no_network_emote_embed(monkeypatch):
     """Keep kick chat finalize offline in recorder tests (embedding is covered in test_kick_chat)."""
+
     async def noop(root, client=None):
         return None
 
-    monkeypatch.setattr("src.stream_archive.recorder.embed_kick_emotes", noop)
+    monkeypatch.setattr("stream_archive.recorder.chat_output.embed_kick_emotes", noop)
 
 
 def make_config(tmp_path):
-    return {
-        "output_mode": "disk",
-        "recording_dir": str(tmp_path / "recordings"),
-        "record_chat": False,
+    d = {
+        "telegram_user_id": 12345,
+        "bot_telegram_api": "bot_token",
+        "twitch_client_id": "client_id",
+        "twitch_client_secret": "client_secret",
+        "channels": ["ch"],
+        "proxy_list": ["httpproxy://u:p@h:1"],
+        "monitoring_interval": 60,
         "timezone": "UTC",
         "plugin_dir": "plugins",
-        "proxy_list": ["httpproxy://u:p@h:1"],
-        "_workdir": tmp_path,
-        "channels": ["ch"],
+        "recording_dir": str(tmp_path / "recordings"),
+        "output_mode": "disk",
+        "record_chat": False,
     }
+    cfg = AppConfig.model_validate(d)
+    cfg._workdir = tmp_path
+    cfg._config_path = tmp_path / "config.json"
+    return cfg
 
 
 class FakeChatRecorder:
@@ -123,15 +133,15 @@ def test_start_success(tmp_path, monkeypatch):
 
 def test_start_uses_per_channel_override(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["channel_output_modes"] = {"ch": "youtube"}
+    config.channel_output_modes = {"twitch:ch": "youtube"}
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
 
     async def scenario():
-        assert await rec.start("ch") is True
-        assert rec._recordings["ch"]["filepath"] is None
-        await rec.stop("ch")
+        assert await rec.start("twitch:ch") is True
+        assert rec._recordings["twitch:ch"]["filepath"] is None
+        await rec.stop("twitch:ch")
 
         assert await rec.start("other") is True
         assert rec._recordings["other"]["filepath"] is not None
@@ -169,19 +179,16 @@ class FakePlugin:
 
 def _make_proxy_config(tmp_path, proxies):
     config = make_config(tmp_path)
-    config["proxy_list"] = proxies
+    config.proxy_list = proxies
     return config
 
 
 def test_resolve_stream_tries_next_proxy_on_plugin_error(tmp_path, monkeypatch):
-    rec = Recorder(_make_proxy_config(
-        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    rec = Recorder(_make_proxy_config(tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
     calls = []
     stream = FakeStream()
 
-    monkeypatch.setattr(
-        rec._session, "resolve_url",
-        lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
 
     def scripted_streams(self):
         calls.append(self.options["proxy-playlist"])
@@ -201,13 +208,10 @@ def test_resolve_stream_tries_next_proxy_on_plugin_error(tmp_path, monkeypatch):
 
 
 def test_resolve_stream_all_proxies_fail_raises_nostreams(tmp_path, monkeypatch):
-    rec = Recorder(_make_proxy_config(
-        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    rec = Recorder(_make_proxy_config(tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
     calls = []
 
-    monkeypatch.setattr(
-        rec._session, "resolve_url",
-        lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
 
     def scripted_streams(self):
         calls.append(self.options["proxy-playlist"])
@@ -225,13 +229,10 @@ def test_resolve_stream_all_proxies_fail_raises_nostreams(tmp_path, monkeypatch)
 
 
 def test_resolve_stream_nostreams_not_retried(tmp_path, monkeypatch):
-    rec = Recorder(_make_proxy_config(
-        tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
+    rec = Recorder(_make_proxy_config(tmp_path, ["httpproxy://u:p@h:1", "https://proxy2.example.com"]))
     calls = []
 
-    monkeypatch.setattr(
-        rec._session, "resolve_url",
-        lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
 
     def scripted_streams(self):
         calls.append(self.options["proxy-playlist"])
@@ -267,7 +268,7 @@ def test_start_duplicate_resolves_once(tmp_path, monkeypatch):
 
 def test_start_youtube_without_streamer_returns_false(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     rec = Recorder(config)  # youtube_streamer defaults to None
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
@@ -342,7 +343,7 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
     entry so the monitor can restart on the next poll, and transition the
     YouTube broadcast to complete instead of leaving it lingering."""
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     yt = EndingYouTubeStreamer()
     rec = Recorder(config, youtube_streamer=yt)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
@@ -371,7 +372,7 @@ def test_session_rides_through_playlist_stalls(tmp_path):
 
 def test_youtube_daily_budget_blocks_and_releases(tmp_path):
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
     # 10 creations inside the rolling 24h window: shared across channels.
     rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
@@ -393,7 +394,7 @@ def test_youtube_daily_budget_ignores_disk_mode(tmp_path):
 
 def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
@@ -416,10 +417,10 @@ def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
 
     asyncio.run(finish_with(10))
     second = rec._backoff_until["ch"]
-    assert second > first                      # exponential growth
+    assert second > first  # exponential growth
 
     asyncio.run(finish_with(300))
-    assert rec.youtube_restart_blocked_reason("ch") is None   # long recording resets
+    assert rec.youtube_restart_blocked_reason("ch") is None  # long recording resets
 
 
 def test_disk_end_no_backoff(tmp_path, monkeypatch):
@@ -445,7 +446,7 @@ def test_disk_end_no_backoff(tmp_path, monkeypatch):
 
 def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("boom")))
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
@@ -460,7 +461,7 @@ def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypat
 
 def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["output_mode"] = "youtube"
+    config.output_mode = "youtube"
     rec = Recorder(
         config,
         youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("The user has exceeded their quota")),
@@ -479,11 +480,11 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
 
 def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["record_chat"] = True
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -511,7 +512,7 @@ def test_start_chat_disabled(tmp_path, monkeypatch):
     rec = Recorder(make_config(tmp_path))  # record_chat defaults to False in make_config
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -525,11 +526,11 @@ def test_start_chat_disabled(tmp_path, monkeypatch):
 
 def test_recording_failure_stops_chat(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["record_chat"] = True
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -544,11 +545,11 @@ def test_recording_failure_stops_chat(tmp_path, monkeypatch):
 
 def test_stop_chat_stops_only_chat(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["record_chat"] = True
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -578,11 +579,11 @@ def test_stop_chat_unknown_channel_is_noop(tmp_path, monkeypatch):
 
 def test_stop_chat_platform_kick_keeps_twitch_irc(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["record_chat"] = True
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -621,11 +622,11 @@ def test_stop_chat_platform_twitch_keeps_kick_buffer(tmp_path, monkeypatch):
 
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["record_chat"] = True
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -698,7 +699,7 @@ def test_cleanup_disabled_with_zero_retention(tmp_path):
 
 def test_cleanup_resolves_relative_recording_dir(tmp_path):
     config = make_config(tmp_path)
-    config["recording_dir"] = "recordings"
+    config.recording_dir = "recordings"
     rec = Recorder(config)
     old = tmp_path / "recordings" / "ch" / "old.ts"
     seed_recording(old, time.time() - 3 * 86400)
@@ -713,16 +714,14 @@ def test_resolve_stream_preferred_quality(tmp_path, monkeypatch):
     rec = Recorder(make_config(tmp_path))
     s1, s2 = FakeStream(), FakeStream()
 
-    monkeypatch.setattr(
-        rec._session, "resolve_url",
-        lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
     monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s1, "720p": s2})
 
-    rec._config["preferred_quality"] = "720p"
+    rec._config.preferred_quality = "720p"
     best, _, _, _ = rec._resolve_stream("ch", None, None)
     assert best is s2
 
-    rec._config["preferred_quality"] = "1080p"
+    rec._config.preferred_quality = "1080p"
     best, _, _, _ = rec._resolve_stream("ch", None, None)
     assert best is s1
 
@@ -765,15 +764,16 @@ def test_recording_info_reports_duration_and_size(tmp_path):
 
 def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["disk"] = {"max_total_gb": 5, "delete_oldest": False, "check_interval_s": 0.01}
+    config.disk = {"max_total_gb": 5, "delete_oldest": False, "check_interval_s": 0.01}
     notifier = FakeNotifier()
     rec = Recorder(config, notifier=notifier)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
     async def fake_snapshot(config):
         return {"free_gb": 100.0, "dir_gb": 6.0, "file_count": 1}
 
-    monkeypatch.setattr("src.stream_archive.disk.disk_snapshot", fake_snapshot)
+    monkeypatch.setattr("stream_archive.disk.disk_snapshot", fake_snapshot)
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -787,7 +787,7 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
 
 def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     config = make_config(tmp_path)
-    config["disk"] = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
+    config.disk = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
     rec = Recorder(config)
     base = tmp_path / "recordings" / "ch"
     base.mkdir(parents=True, exist_ok=True)
@@ -808,9 +808,9 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
 
 def make_kick_config(tmp_path, record_chat=True):
     config = make_config(tmp_path)
-    config["channels"] = ["kick:xqc"]
-    config["record_chat"] = True
-    config["kick"] = {"record_chat": record_chat}
+    config.kick = {"client_id": "cid", "client_secret": "cs", "record_chat": record_chat}
+    config.channels = ["kick:xqc"]
+    config.record_chat = True
     return config
 
 
@@ -852,12 +852,12 @@ def test_resolve_stream_kick_uses_plugin_directly(tmp_path, monkeypatch):
 
 def test_start_twitch_prefixed_uses_twitch_dir(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["channels"] = ["twitch:streamer1"]
-    config["record_chat"] = True
+    config.channels = ["twitch:streamer1"]
+    config.record_chat = True
     rec = Recorder(config)
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():
@@ -878,7 +878,7 @@ def test_start_kick_uses_kick_dir_and_chat(tmp_path, monkeypatch):
     rec = Recorder(config, notifier=FakeNotifier())
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
-    monkeypatch.setattr("src.stream_archive.recorder.ChatRecorder", FakeChatRecorder)
+    monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
     FakeChatRecorder.instances.clear()
 
     async def scenario():

@@ -4,20 +4,33 @@ import json
 import httpx
 import pytest
 
-from src.stream_archive.kick_api import KickAPI
+from stream_archive.config import AppConfig
+from stream_archive.kick_api import KickAPI
 
-CONFIG = {
-    "kick": {
-        "client_id": "cid",
-        "client_secret": "csec",
-        "record_chat": True,
-        "webhook": {"enabled": False},
+
+def base_config():
+    return {
+        "telegram_user_id": 12345,
+        "bot_telegram_api": "bot_token",
+        "twitch_client_id": "client_id",
+        "twitch_client_secret": "client_secret",
+        "channels": ["ch"],
+        "proxy_list": ["httpproxy://user:pass@host:port"],
+        "monitoring_interval": 60,
+        "timezone": "UTC",
+        "plugin_dir": "plugins",
+        "recording_dir": "recordings",
+        "kick": {
+            "client_id": "cid",
+            "client_secret": "csec",
+            "record_chat": True,
+            "webhook": {"enabled": False},
+        },
     }
-}
 
 
 def make_api(handler):
-    api = KickAPI(CONFIG)
+    api = KickAPI(AppConfig.model_validate(base_config()))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return api
 
@@ -102,11 +115,21 @@ def test_get_channel_statuses_chunks_over_50_slugs():
             return token_handler(request)
         slugs = [v for k, v in request.url.params.multi_items() if k == "slug"]
         requests.append(slugs)
-        return httpx.Response(200, json={"data": [
-            {"slug": s, "stream_title": None, "category": None, "stream": {"is_live": False},
-             "broadcaster_user_id": i}
-            for i, s in enumerate(slugs)
-        ]})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "slug": s,
+                        "stream_title": None,
+                        "category": None,
+                        "stream": {"is_live": False},
+                        "broadcaster_user_id": i,
+                    }
+                    for i, s in enumerate(slugs)
+                ]
+            },
+        )
 
     api = make_api(handler)
     slugs = [f"user{i:03d}" for i in range(110)]
@@ -173,7 +196,9 @@ def test_list_event_subscriptions_without_client_id_returns_empty():
             return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
         return httpx.Response(200, json={"data": subs})
 
-    api = KickAPI({"kick": {"client_secret": "csec"}})  # no client_id
+    config = base_config()
+    del config["kick"]["client_id"]  # no client_id
+    api = KickAPI(AppConfig.model_validate(config))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     assert asyncio.run(api.list_event_subscriptions()) == []
@@ -187,10 +212,15 @@ def test_create_event_subscriptions_posts_documented_body():
             return token_handler(request)
         assert request.method == "POST"
         seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"data": [
-            {"subscription_id": "sub-1"},
-            {"subscription_id": "sub-2"},
-        ]})
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"subscription_id": "sub-1"},
+                    {"subscription_id": "sub-2"},
+                ]
+            },
+        )
 
     api = make_api(handler)
     result = asyncio.run(api.create_event_subscriptions(123, ["livestream.status.updated", "chat.message.sent"]))

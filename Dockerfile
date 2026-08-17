@@ -23,8 +23,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.5 /uv /usr/local/bin/uv
 WORKDIR /app
 
 # Dependencies first so source edits don't invalidate the layer.
-COPY pyproject.toml uv.lock ./
-COPY main.py setup_youtube.py ./
+COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 COPY plugins ./plugins
 
@@ -32,9 +31,8 @@ COPY plugins ./plugins
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev
 
-# ENTRYPOINT/CMD split: plain `docker run` starts the scheduler; overriding CMD
-# (e.g. `docker compose run stream-archive setup_youtube.py`) runs other scripts.
-ENTRYPOINT ["python"]
-CMD ["/app/main.py"]
+# Plain `docker run` starts the scheduler; overriding CMD (e.g. `docker compose
+# run --rm stream-archive stream-archive-setup-youtube`) runs other entry points.
+CMD ["stream-archive"]

@@ -3,7 +3,7 @@ import threading
 import httpx
 import pytest
 
-from setup_youtube import _CallbackHandler, extract_code
+from stream_archive.setup_youtube import _CallbackHandler, extract_code
 
 
 def _start_server():
@@ -25,10 +25,7 @@ def test_extract_code_passthrough_bare_code():
 
 
 def test_extract_code_from_full_redirect_url():
-    url = (
-        "http://localhost:53421/?code=4/0AX4XfGc"
-        "&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
-    )
+    url = "http://localhost:53421/?code=4/0AX4XfGc&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
     assert extract_code(url) == "4/0AX4XfGc"
 
 

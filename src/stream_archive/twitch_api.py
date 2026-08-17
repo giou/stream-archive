@@ -1,24 +1,24 @@
 import logging
-import re
-from pathlib import Path
+from typing import Any
 
 import httpx
-from src.stream_archive.config import get_config
+
+from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
 
 class TwitchAPI:
-    def __init__(self):
-        config = get_config()
+    def __init__(self, config: AppConfig):
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
-        self._token = None
+        self._client_id = config.twitch_client_id
+        self._client_secret = config.twitch_client_secret
+        self._token: str | None = None
         self._token_expires_at = 0
-        self._client_id = config["twitch_client_id"]
-        self._client_secret = config["twitch_client_secret"]
 
-    async def _get_token(self):
+    async def _get_token(self) -> str:
         import time
+
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
@@ -40,7 +40,7 @@ class TwitchAPI:
             logger.error("[twitch_api] Token request failed: %s", e)
             raise
 
-    async def resolve_user_ids(self, usernames):
+    async def resolve_user_ids(self, usernames: list[str]) -> dict[str, str]:
         if not usernames:
             return {}
         try:
@@ -57,7 +57,7 @@ class TwitchAPI:
             logger.error("[twitch_api] resolve_user_ids failed: %s", e)
             raise
 
-    async def get_live_streams(self, user_ids):
+    async def get_live_streams(self, user_ids: dict[str, str]) -> dict[str, Any]:
         if not user_ids:
             return {}
         try:
@@ -74,21 +74,21 @@ class TwitchAPI:
             logger.error("[twitch_api] get_live_streams failed: %s", e)
             raise
 
-    async def _eventsub_headers(self):
+    async def _eventsub_headers(self) -> dict[str, str]:
         token = await self._get_token()
         return {
             "Authorization": f"Bearer {token}",
             "Client-Id": self._client_id,
         }
 
-    async def list_conduits(self):
+    async def list_conduits(self) -> list[Any]:
         """Return existing EventSub conduits (each dict has id, shard_count)."""
         headers = await self._eventsub_headers()
         resp = await self.client.get("https://api.twitch.tv/helix/eventsub/conduits", headers=headers)
         resp.raise_for_status()
         return resp.json()["data"]
 
-    async def create_conduit(self, shard_count=1):
+    async def create_conduit(self, shard_count: int = 1) -> dict[str, Any]:
         headers = await self._eventsub_headers()
         resp = await self.client.post(
             "https://api.twitch.tv/helix/eventsub/conduits",
@@ -98,7 +98,7 @@ class TwitchAPI:
         resp.raise_for_status()
         return resp.json()["data"][0]
 
-    async def delete_conduit(self, conduit_id):
+    async def delete_conduit(self, conduit_id: str) -> None:
         """Delete a conduit (also cascades to its subscriptions). 404 is success."""
         headers = await self._eventsub_headers()
         resp = await self.client.delete(
@@ -108,7 +108,7 @@ class TwitchAPI:
             return
         resp.raise_for_status()
 
-    async def update_conduit_shards(self, conduit_id, session_id):
+    async def update_conduit_shards(self, conduit_id: str, session_id: str) -> dict[str, Any]:
         """Associate the single WebSocket shard ('0') with an EventSub session."""
         headers = await self._eventsub_headers()
         resp = await self.client.patch(
@@ -122,7 +122,7 @@ class TwitchAPI:
         resp.raise_for_status()
         return resp.json()["data"][0]
 
-    async def create_eventsub_subscription(self, payload):
+    async def create_eventsub_subscription(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Create a subscription; returns (status_code, body) without raising on 202/400/403/409."""
         headers = await self._eventsub_headers()
         resp = await self.client.post(
@@ -133,7 +133,7 @@ class TwitchAPI:
         resp.raise_for_status()
         return resp.status_code, resp.json()
 
-    async def delete_eventsub_subscription(self, sub_id):
+    async def delete_eventsub_subscription(self, sub_id: str) -> None:
         """Delete a subscription. 404 is success."""
         headers = await self._eventsub_headers()
         resp = await self.client.delete(
@@ -143,7 +143,7 @@ class TwitchAPI:
             return
         resp.raise_for_status()
 
-    async def list_eventsub_subscriptions(self):
+    async def list_eventsub_subscriptions(self) -> list[Any]:
         """All subscriptions, cursor-paginated (max 10 pages of 100)."""
         headers = await self._eventsub_headers()
         data = []
@@ -163,7 +163,7 @@ class TwitchAPI:
                 break
         return data
 
-    async def get_stream(self, user_id):
+    async def get_stream(self, user_id: str) -> Any:
         """Single stream snapshot (title/game_name); None when offline."""
         headers = await self._eventsub_headers()
         resp = await self.client.get(
@@ -173,5 +173,5 @@ class TwitchAPI:
         data = resp.json()["data"]
         return data[0] if data else None
 
-    async def close(self):
+    async def close(self) -> None:
         await self.client.aclose()

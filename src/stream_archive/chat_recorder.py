@@ -12,13 +12,14 @@ import random
 import ssl
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _TAG_ESCAPES = {"s": " ", ":": ";", "\\": "\\", "r": "\r", "n": "\n"}
 
 
-def _unescape_tag(value):
+def _unescape_tag(value: str) -> str:
     """Unescape an IRCv3 tag value (\\s \\: \\\\ \\r \\n; unknown escapes keep the char)."""
     out = []
     i = 0
@@ -34,7 +35,7 @@ def _unescape_tag(value):
     return "".join(out)
 
 
-def _parse_emotes(emotes_tag, body):
+def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split body into TwitchDownloader fragments/emoticons from an `emotes` tag value.
 
     Tag format: `25:0-4,12-16/1902:8-15`; character ranges are inclusive.
@@ -57,8 +58,8 @@ def _parse_emotes(emotes_tag, body):
             ranges.append((begin, end, emote_id))
     ranges.sort(key=lambda r: (r[0], r[1]))
 
-    fragments = []
-    emoticons = []
+    fragments: list[dict[str, Any]] = []
+    emoticons: list[dict[str, Any]] = []
     pos = 0
     for begin, end, emote_id in ranges:
         if begin >= len(body) or begin < pos:
@@ -87,8 +88,18 @@ class ChatRecorder:
     writes the file exactly once.
     """
 
-    def __init__(self, channel, chat_path, title, game, author=None, user_id=None,
-                 host="irc.chat.twitch.tv", port=6697, use_ssl=True):
+    def __init__(
+        self,
+        channel: str,
+        chat_path: str,
+        title: str,
+        game: str,
+        author: str | None = None,
+        user_id: str | int | None = None,
+        host: str = "irc.chat.twitch.tv",
+        port: int = 6697,
+        use_ssl: bool = True,
+    ):
         self.channel = channel.lower()
         self.chat_path = chat_path
         self._title = title
@@ -98,14 +109,14 @@ class ChatRecorder:
         self._host = host
         self._port = port
         self._use_ssl = use_ssl
-        self._comments = []
+        self._comments: list[dict[str, Any]] = []
         self._start_mono = time.monotonic()
         self._start_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self._task = None
+        self._task: asyncio.Task[Any] | None = None
         self._connected_once = False
         self._finalized = False
 
-    def start(self) -> asyncio.Task:
+    def start(self) -> asyncio.Task[Any]:
         self._task = asyncio.create_task(self._run())
         return self._task
 
@@ -117,7 +128,7 @@ class ChatRecorder:
         await self._finalize()
         return len(self._comments)
 
-    async def _run(self):
+    async def _run(self) -> None:
         attempts = 0
         while True:
             try:
@@ -132,7 +143,7 @@ class ChatRecorder:
                     attempts = 0
                 else:
                     attempts += 1
-            await asyncio.sleep(min(30, 2 ** attempts))
+            await asyncio.sleep(min(30, 2**attempts))
 
     async def _connect_and_read(self) -> bool:
         context = ssl.create_default_context() if self._use_ssl else None
@@ -142,8 +153,8 @@ class ChatRecorder:
             nick = "justinfan" + str(random.randint(0, 10**8 - 1)).zfill(8)
             writer.write(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
             writer.write(b"PASS oauth:anonymous\r\n")
-            writer.write(f"NICK {nick}\r\n".encode("utf-8"))
-            writer.write(f"JOIN #{self.channel}\r\n".encode("utf-8"))
+            writer.write(f"NICK {nick}\r\n".encode())
+            writer.write(f"JOIN #{self.channel}\r\n".encode())
             await writer.drain()
 
             while True:
@@ -154,7 +165,7 @@ class ChatRecorder:
                 text = line.decode("utf-8", errors="replace").rstrip("\r\n")
 
                 if text.startswith("PING :"):
-                    writer.write(f"PONG :{text[6:]}\r\n".encode("utf-8"))
+                    writer.write(f"PONG :{text[6:]}\r\n".encode())
                     await writer.drain()
                     continue
 
@@ -175,7 +186,7 @@ class ChatRecorder:
             except Exception:
                 pass
 
-    def _parse_message(self, text, kind):
+    def _parse_message(self, text: str, kind: str) -> dict[str, Any] | None:
         """Parse one tagged PRIVMSG/USERNOTICE into a TwitchDownloader comment dict."""
         if not text.startswith("@"):
             return None
@@ -250,7 +261,7 @@ class ChatRecorder:
             "message": message,
         }
 
-    async def _finalize(self):
+    async def _finalize(self) -> None:
         """Write the ChatRoot JSON atomically (tmp + same-directory rename), exactly once."""
         if self._finalized:
             return

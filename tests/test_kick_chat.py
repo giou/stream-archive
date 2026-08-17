@@ -3,7 +3,7 @@ import json
 
 import httpx
 
-from src.stream_archive.kick_chat import (
+from stream_archive.kick_chat import (
     build_chat_root,
     collect_emote_ids,
     embed_emotes,
@@ -99,8 +99,7 @@ def test_chat_root_tokens_split_without_emotes_field():
 
 def test_chat_root_bad_positions_ignored_tokens_win():
     # bogus/out-of-bounds positions in the emotes array must not break splitting
-    msg = make_msg(content="abc [emote:37226:KEKW]",
-                   emotes=[{"emote_id": "37226", "positions": [{"s": 99, "e": 120}]}])
+    msg = make_msg(content="abc [emote:37226:KEKW]", emotes=[{"emote_id": "37226", "positions": [{"s": 99, "e": 120}]}])
     root = build_chat_root("kick:xqc", "xqc", "T", START, [msg])
     assert root["comments"][0]["message"]["fragments"] == [
         {"text": "abc "},
@@ -163,10 +162,16 @@ def test_chat_root_unicode_emoji_roundtrip():
 
 
 def test_collect_emote_ids_unique_in_order():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [
-        make_msg(message_id="a", content="[emote:1:AAA]"),
-        make_msg(message_id="b", content="[emote:2:BBB] [emote:1:AAA]"),
-    ])
+    root = build_chat_root(
+        "kick:xqc",
+        "xqc",
+        "T",
+        START,
+        [
+            make_msg(message_id="a", content="[emote:1:AAA]"),
+            make_msg(message_id="b", content="[emote:2:BBB] [emote:1:AAA]"),
+        ],
+    )
     assert collect_emote_ids(root) == ["1", "2"]
 
 
@@ -182,6 +187,7 @@ def test_fetch_emote_images_with_mock_transport():
         assert images == {"37226": b"PNGDATA"}  # 404 skipped silently
 
     import asyncio
+
     asyncio.run(scenario())
 
 
@@ -190,12 +196,14 @@ def test_embed_emotes_fills_first_party_base64():
     embed_emotes(root, {"37226": b"\x89PNG-fake"})
 
     first = root["embeddedData"]["firstParty"]
-    assert first == [{
-        "id": "37226",
-        "imageScale": 2,
-        "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
-        "name": "KEKW",  # parsed from the [emote:id:NAME] token
-    }]
+    assert first == [
+        {
+            "id": "37226",
+            "imageScale": 2,
+            "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
+            "name": "KEKW",  # parsed from the [emote:id:NAME] token
+        }
+    ]
     # TwitchDownloader can deserialize it: FileInfo > 1.2.2 gates the modern shape
     json.dumps(root)
 
@@ -214,7 +222,7 @@ def test_embed_kick_emotes_orchestrates(monkeypatch):
     async def fake_fetch(ids, client=None):
         return {i: b"IMG" for i in ids}
 
-    monkeypatch.setattr("src.stream_archive.kick_chat.fetch_emote_images", fake_fetch)
+    monkeypatch.setattr("stream_archive.kick_chat.fetch_emote_images", fake_fetch)
 
     async def scenario():
         await embed_kick_emotes(root, client="unused")

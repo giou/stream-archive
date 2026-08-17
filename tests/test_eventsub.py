@@ -1,6 +1,24 @@
 import asyncio
 
-from src.stream_archive.eventsub import EventSubClient
+from stream_archive.config import AppConfig
+from stream_archive.eventsub import EventSubClient
+
+
+def make_config(**overrides):
+    data = {
+        "telegram_user_id": 12345,
+        "bot_telegram_api": "bot_token",
+        "twitch_client_id": "client_id",
+        "twitch_client_secret": "client_secret",
+        "channels": ["ch"],
+        "proxy_list": ["httpproxy://user:pass@host:port"],
+        "monitoring_interval": 60,
+        "timezone": "UTC",
+        "plugin_dir": "plugins",
+        "recording_dir": "recordings",
+    }
+    data.update(overrides)
+    return AppConfig.model_validate(data)
 
 
 class FakeTwitchAPI:
@@ -67,7 +85,7 @@ def make_client(api=None, monitor=None, config=None):
     return EventSubClient(
         api or FakeTwitchAPI(),
         monitor or StubMonitor(),
-        config or {"channels": ["ch"], "eventsub": {"enabled": True}},
+        config or make_config(),
     )
 
 
@@ -88,18 +106,18 @@ def test_online_notification_dispatches_to_monitor():
     api = FakeTwitchAPI(user_ids={"ch": "u1"}, streams={"u1": {"title": "T", "game_name": "G"}})
     mon = StubMonitor()
     client = make_client(api=api, monitor=mon)
-    client._id_to_channel = {"u1": "ch"}
+    client._id_to_channel = {"u1": "twitch:ch"}
 
     asyncio.run(handle_message(client, notification("u1", "stream.online")))
 
-    assert mon.online_calls == [("ch", "T", "G", "u1")]
+    assert mon.online_calls == [("twitch:ch", "T", "G", "u1")]
 
 
 def test_online_when_stream_already_ended():
     api = FakeTwitchAPI(user_ids={"ch": "u1"})
     mon = StubMonitor()
     client = make_client(api=api, monitor=mon)
-    client._id_to_channel = {"u1": "ch"}
+    client._id_to_channel = {"u1": "twitch:ch"}
 
     asyncio.run(handle_message(client, notification("u1", "stream.online")))
 
@@ -108,20 +126,20 @@ def test_online_when_stream_already_ended():
 
 def test_offline_notification_dispatches():
     mon = StubMonitor()
-    mon._live_channels.add("ch")
+    mon._live_channels.add("twitch:ch")
     client = make_client(monitor=mon)
-    client._id_to_channel = {"u1": "ch"}
+    client._id_to_channel = {"u1": "twitch:ch"}
 
     asyncio.run(handle_message(client, notification("u1", "stream.offline")))
 
-    assert mon.offline_calls == ["ch"]
+    assert mon.offline_calls == ["twitch:ch"]
 
 
 def test_online_event_ignored_when_already_live():
     mon = StubMonitor()
-    mon._live_channels.add("ch")
+    mon._live_channels.add("twitch:ch")
     client = make_client(monitor=mon)
-    client._id_to_channel = {"u1": "ch"}
+    client._id_to_channel = {"u1": "twitch:ch"}
 
     asyncio.run(handle_message(client, notification("u1", "stream.online")))
 
@@ -167,10 +185,10 @@ def test_activate_shard_uses_current_session():
 
 
 def test_subscribe_creates_online_and_offline_per_channel():
-    channels = [f"ch{i}" for i in range(1, 8)]
+    channels = [f"twitch:ch{i}" for i in range(1, 8)]
     user_ids = {f"ch{i}": f"u{i}" for i in range(1, 8)}
     api = FakeTwitchAPI(user_ids=user_ids)
-    client = make_client(api=api, config={"channels": channels, "eventsub": {"enabled": True}})
+    client = make_client(api=api, config=make_config(channels=channels))
     client._conduit_id = "c1"
 
     asyncio.run(client._subscribe_all())
@@ -198,7 +216,7 @@ def test_409_resolves_existing_subscription_id():
 
     asyncio.run(client._subscribe_all())
 
-    assert client._subs["ch"] == {"online": "existing-online", "offline": "existing-offline"}
+    assert client._subs["twitch:ch"] == {"online": "existing-online", "offline": "existing-offline"}
 
 
 def test_session_reconnect_message_sets_reconnect_url():
@@ -214,7 +232,7 @@ def test_session_reconnect_message_sets_reconnect_url():
 
 def test_add_channel_creates_subs_and_maps():
     api = FakeTwitchAPI()
-    client = make_client(api=api, config={"channels": ["ch"], "eventsub": {"enabled": True}})
+    client = make_client(api=api, config=make_config(channels=["ch"]))
     client._conduit_id = "c1"
     client._session_id = "s1"
 
@@ -228,12 +246,12 @@ def test_add_channel_creates_subs_and_maps():
 
 def test_remove_channel_deletes_subs():
     api = FakeTwitchAPI()
-    client = make_client(api=api, config={"channels": ["ch"], "eventsub": {"enabled": True}})
+    client = make_client(api=api, config=make_config(channels=["ch"]))
     client._conduit_id = "c1"
     client._session_id = "s1"
     client._subs = {"ch": {"online": "s1", "offline": "s2"}}
     client._user_ids = {"ch": "u1"}
-    client._id_to_channel = {"u1": "ch"}
+    client._id_to_channel = {"u1": "twitch:ch"}
 
     asyncio.run(client.remove_channel("ch"))
 
@@ -245,24 +263,19 @@ def test_remove_channel_deletes_subs():
 
 def test_subscribe_twitch_prefixed_channel_resolves_bare():
     api = FakeTwitchAPI(user_ids={"streamer1": "u1"})
-    client = make_client(
-        api=api, config={"channels": ["twitch:streamer1"], "eventsub": {"enabled": True}}
-    )
+    client = make_client(api=api, config=make_config(channels=["twitch:streamer1"]))
     client._conduit_id = "c1"
 
     asyncio.run(client._subscribe_all())
 
     assert client._user_ids == {"twitch:streamer1": "u1"}
     assert set(client._subs) == {"twitch:streamer1"}
-    assert all(
-        p["condition"]["broadcaster_user_id"] == "u1"
-        for p in api.subscription_creates
-    )
+    assert all(p["condition"]["broadcaster_user_id"] == "u1" for p in api.subscription_creates)
 
 
 def test_sync_channels_removes_stale_and_adds_new():
     api = FakeTwitchAPI()
-    client = make_client(api=api, config={"channels": ["ch1", "ch2"], "eventsub": {"enabled": True}})
+    client = make_client(api=api, config=make_config(channels=["ch1", "ch2"]))
     client._conduit_id = "c1"
     client._session_id = "s1"
     client._subs = {"ch1": {"online": "s1"}, "stale": {"online": "s2"}}

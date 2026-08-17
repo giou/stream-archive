@@ -1,8 +1,9 @@
 import asyncio
+import contextlib
 import json
 from datetime import datetime, timezone
 
-from src.stream_archive.chat_recorder import ChatRecorder
+from stream_archive.chat_recorder import ChatRecorder
 
 TS_MS = 1720000000000  # 2024-07-03T09:46:40Z
 TS2_MS = 1720000000500
@@ -69,16 +70,20 @@ class FakeIRCServer:
                 await asyncio.sleep(300)
         finally:
             writer.close()
-            try:
+            with contextlib.suppress(Exception):
                 await writer.wait_closed()
-            except Exception:
-                pass
 
 
 def make_recorder(tmp_path, server, channel="ch", **kwargs):
     return ChatRecorder(
-        channel, str(tmp_path / "chat.json"), "Title", "Game",
-        host="127.0.0.1", port=server.port, use_ssl=False, **kwargs,
+        channel,
+        str(tmp_path / "chat.json"),
+        "Title",
+        "Game",
+        host="127.0.0.1",
+        port=server.port,
+        use_ssl=False,
+        **kwargs,
     )
 
 
@@ -91,6 +96,7 @@ async def wait_for_comments(cr, n, timeout=5.0):
     async def _poll():
         while len(cr._comments) < n:
             await asyncio.sleep(0.01)
+
     await asyncio.wait_for(_poll(), timeout)
 
 
@@ -181,10 +187,10 @@ def test_offsets_monotonic(tmp_path):
 def test_user_notice_records_system_message(tmp_path):
     line = (
         "@badges=subscriber/12;color=;display-name=ViewerName;id=not-1;msg-id=resub;"
-        "room-id=123456;tmi-sent-ts={ts};user-id=987654 "
+        f"room-id=123456;tmi-sent-ts={TS_MS};user-id=987654 "
         ":viewername!viewername@viewername.tmi.twitch.tv USERNOTICE #ch :"
         "viewername subscribed at Tier 1\\s- 6 months"
-    ).format(ts=TS_MS)
+    )
 
     async def scenario():
         async with FakeIRCServer([([line], False, False)]) as server:
@@ -207,10 +213,12 @@ def test_reconnects_after_disconnect(tmp_path):
 
     async def scenario():
         # first connection closes after one message; second holds open
-        async with FakeIRCServer([
-            ([line1], False, False),
-            ([line2], True, False),
-        ]) as server:
+        async with FakeIRCServer(
+            [
+                ([line1], False, False),
+                ([line2], True, False),
+            ]
+        ) as server:
             cr = make_recorder(tmp_path, server)
             cr.start()
             await wait_for_comments(cr, 2)

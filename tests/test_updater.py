@@ -5,9 +5,9 @@ import json
 import httpx
 import pytest
 
-from src.stream_archive.config import _validate
-from src.stream_archive import updater as _updater_module
-from src.stream_archive.updater import (
+from stream_archive import updater as _updater_module
+from stream_archive.config import AppConfig
+from stream_archive.updater import (
     _PLUGIN_DOWNLOAD_URL,
     _PLUGIN_RELEASES_URL,
     _PYPI_STREAMLINK_URL,
@@ -88,14 +88,12 @@ def make_config(tmp_path):
         "plugin_dir": "plugins",
         "recording_dir": "recordings",
     }
-    _validate(config)
-    config["_workdir"] = tmp_path
-    config["_config_path"] = tmp_path / "config.json"
+    cfg = AppConfig.model_validate(config)
+    cfg._workdir = tmp_path
+    cfg._config_path = tmp_path / "config.json"
     (tmp_path / "plugins").mkdir()
-    (tmp_path / "plugins" / "twitch.py").write_text(
-        f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_CURRENT}"\n'
-    )
-    return config
+    (tmp_path / "plugins" / "twitch.py").write_text(f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_CURRENT}"\n')
+    return cfg
 
 
 def app_up_to_date_script(local=LOCAL_SHA, remote=REMOTE_SHA, count="0", subject="Latest commit", commits=""):
@@ -109,14 +107,17 @@ def app_up_to_date_script(local=LOCAL_SHA, remote=REMOTE_SHA, count="0", subject
     }
 
 
-def plugin_http(plugin_tag=PLUGIN_CURRENT, streamlink_version=STREAMLINK_CURRENT,
-                plugin_body=None, streamlink_body=None):
+def plugin_http(
+    plugin_tag=PLUGIN_CURRENT, streamlink_version=STREAMLINK_CURRENT, plugin_body=None, streamlink_body=None
+):
     routes = {
         _PLUGIN_RELEASES_URL: FakeResponse(200, {"tag_name": plugin_tag, "assets": [], "body": plugin_body}),
         _PYPI_STREAMLINK_URL: FakeResponse(200, {"info": {"version": streamlink_version}}),
     }
     if streamlink_body is not None:
-        routes[_STREAMLINK_RELEASE_NOTES_URL.format(tag=streamlink_version)] = FakeResponse(200, {"body": streamlink_body})
+        routes[_STREAMLINK_RELEASE_NOTES_URL.format(tag=streamlink_version)] = FakeResponse(
+            200, {"body": streamlink_body}
+        )
     return FakeHttp(routes)
 
 
@@ -136,16 +137,14 @@ def read_plugin(tmp_path):
 def not_docker(monkeypatch):
     """Pin updater tests to the host (non-container) path; Docker-path tests
     override _in_docker explicitly."""
-    monkeypatch.setattr("src.stream_archive.updater._in_docker", lambda: False)
+    monkeypatch.setattr("stream_archive.updater._in_docker", lambda: False)
 
 
 def test_check_all_up_to_date_no_notify_and_records_state(tmp_path, set_streamlink_version):
     set_streamlink_version(STREAMLINK_CURRENT)
     config = make_config(tmp_path)
     notifier = FakeNotifier()
-    u = UpdateChecker(
-        config, notifier, run_cmd=FakeRunCmd(app_up_to_date_script()), http=plugin_http()
-    )
+    u = UpdateChecker(config, notifier, run_cmd=FakeRunCmd(app_up_to_date_script()), http=plugin_http())
     report = asyncio.run(u.check(notify=True))
     assert report["app"]["status"] == "up_to_date"
     assert report["streamlink"]["status"] == "up_to_date"
@@ -228,7 +227,9 @@ def test_app_update_detects_behind(tmp_path, set_streamlink_version):
     config = make_config(tmp_path)
     notifier = FakeNotifier()
     script = app_up_to_date_script(
-        local=LOCAL_SHA, remote="def5678", count="3",
+        local=LOCAL_SHA,
+        remote="def5678",
+        count="3",
         subject="Add retention cleanup",
         commits="Add retention cleanup\nFix proxy retry loop",
     )
@@ -254,9 +255,7 @@ def test_app_fetch_failure_reports_unknown(tmp_path, set_streamlink_version):
         ("git", "rev-parse", "HEAD"): (0, LOCAL_SHA + "\n", ""),
         ("git", "fetch", "origin"): (1, "", "fatal: could not read Username for 'https://github.com'"),
     }
-    u = UpdateChecker(
-        config, FakeNotifier(), run_cmd=FakeRunCmd(script), http=plugin_http()
-    )
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=FakeRunCmd(script), http=plugin_http())
     report = asyncio.run(u.check(notify=False))
     assert report["app"]["status"] == "unknown"
     assert report["app"]["local"] == LOCAL_SHA
@@ -266,11 +265,9 @@ def test_app_fetch_failure_reports_unknown(tmp_path, set_streamlink_version):
 def test_check_disabled_sources_left_out(tmp_path, set_streamlink_version):
     set_streamlink_version(STREAMLINK_CURRENT)
     config = make_config(tmp_path)
-    config["update_check"]["check_app"] = False
-    config["update_check"]["check_plugin"] = False
-    u = UpdateChecker(
-        config, FakeNotifier(), run_cmd=FakeRunCmd({}), http=plugin_http()
-    )
+    config.update_check.check_app = False
+    config.update_check.check_plugin = False
+    u = UpdateChecker(config, FakeNotifier(), run_cmd=FakeRunCmd({}), http=plugin_http())
     report = asyncio.run(u.check(notify=False))
     assert "app" not in report
     assert "plugin" not in report
@@ -292,15 +289,19 @@ def update_report(plugin_digest):
 
 def apply_fakes(new_content, git_diff_rc=0, git_pull=(0, "", ""), uv_lock=(0, "", ""), uv_sync=(0, "", "")):
     digest = "sha256:" + hashlib.sha256(new_content).hexdigest()
-    run_cmd = FakeRunCmd({
-        ("git", "pull", "--ff-only"): git_pull,
-        ("git", "diff", "--quiet", "--", "plugins/twitch.py"): (git_diff_rc, "", ""),
-        ("uv", "lock", "--upgrade-package", "streamlink"): uv_lock,
-        ("uv", "sync"): uv_sync,
-    })
-    http = FakeHttp({
-        _PLUGIN_DOWNLOAD_URL.format(tag=PLUGIN_LATEST): FakeResponse(200, content=new_content),
-    })
+    run_cmd = FakeRunCmd(
+        {
+            ("git", "pull", "--ff-only"): git_pull,
+            ("git", "diff", "--quiet", "--", "plugins/twitch.py"): (git_diff_rc, "", ""),
+            ("uv", "lock", "--upgrade-package", "streamlink"): uv_lock,
+            ("uv", "sync"): uv_sync,
+        }
+    )
+    http = FakeHttp(
+        {
+            _PLUGIN_DOWNLOAD_URL.format(tag=PLUGIN_LATEST): FakeResponse(200, content=new_content),
+        }
+    )
     return run_cmd, http, digest
 
 
@@ -339,7 +340,7 @@ def test_apply_dirty_plugin_backs_up(tmp_path):
 def test_apply_sha256_mismatch_rejects_download(tmp_path):
     config = make_config(tmp_path)
     old = read_plugin(tmp_path)
-    run_cmd, http, _ = apply_fakes(b"STREAMLINK_TTVLOL_VERSION = \"9.9.9\"\n")
+    run_cmd, http, _ = apply_fakes(b'STREAMLINK_TTVLOL_VERSION = "9.9.9"\n')
     u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
     results = asyncio.run(u.apply(update_report("sha256:" + "0" * 64)))
     assert results["plugin"] == ("failed", "sha256 mismatch — download rejected")
@@ -376,7 +377,7 @@ def test_apply_plugin_invalid_utf8_rejected(tmp_path):
 def test_apply_plugin_syntax_rejected(tmp_path):
     config = make_config(tmp_path)
     old = read_plugin(tmp_path)
-    content = 'STREAMLINK_TTVLOL_VERSION = "9.9.9" ((((\n'.encode()
+    content = b'STREAMLINK_TTVLOL_VERSION = "9.9.9" ((((\n'
     run_cmd, http, digest = apply_fakes(content)
     u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
     results = asyncio.run(u.apply(update_report(digest)))
@@ -388,7 +389,7 @@ def test_apply_plugin_syntax_rejected(tmp_path):
 def test_apply_plugin_version_mismatch_rejected(tmp_path):
     config = make_config(tmp_path)
     old = read_plugin(tmp_path)
-    content = 'STREAMLINK_TTVLOL_VERSION = "9.9.9"\n'.encode()
+    content = b'STREAMLINK_TTVLOL_VERSION = "9.9.9"\n'
     run_cmd, http, digest = apply_fakes(content)
     u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
     results = asyncio.run(u.apply(update_report(digest)))
@@ -417,8 +418,8 @@ def test_apply_app_failure_continues_with_others(tmp_path):
 def test_in_docker_detection(monkeypatch):
     # not_docker (autouse) pins _in_docker to host mode; restore the real
     # function so this test exercises the detection logic itself.
-    monkeypatch.setattr("src.stream_archive.updater._in_docker", _REAL_IN_DOCKER)
-    from src.stream_archive.updater import _in_docker
+    monkeypatch.setattr("stream_archive.updater._in_docker", _REAL_IN_DOCKER)
+    from stream_archive.updater import _in_docker
 
     monkeypatch.delenv("STREAM_ARCHIVE_IN_DOCKER", raising=False)
     monkeypatch.setattr("pathlib.Path.exists", lambda self: False)
@@ -431,7 +432,7 @@ def test_in_docker_detection(monkeypatch):
 
 
 def test_apply_streamlink_docker_lock_only(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.stream_archive.updater._in_docker", lambda: True)
+    monkeypatch.setattr("stream_archive.updater._in_docker", lambda: True)
     config = make_config(tmp_path)
     new_content = f'STREAMLINK_TTVLOL_VERSION = "{PLUGIN_LATEST}"\n'.encode()
     run_cmd, http, digest = apply_fakes(new_content)
@@ -461,11 +462,14 @@ def test_apply_streamlink_sync_failure(tmp_path):
     u = UpdateChecker(config, FakeNotifier(), run_cmd=run_cmd, http=http)
     results = asyncio.run(u.apply(update_report(digest)))
     assert results["streamlink"][0] == "failed"
-    assert "uv.lock updated (8.4.0 → 8.5.0) — uv sync failed: error: failed to install streamlink" == results["streamlink"][1]
+    assert (
+        results["streamlink"][1]
+        == "uv.lock updated (8.4.0 → 8.5.0) — uv sync failed: error: failed to install streamlink"
+    )
 
 
 def test_changelog_lines_truncates_long_body():
-    from src.stream_archive.updater import _changelog_lines
+    from stream_archive.updater import _changelog_lines
 
     body = "line1\n" + "word " * 300
     lines = _changelog_lines(body)
@@ -520,7 +524,7 @@ def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch):
 
 def test_run_loop_disabled_never_checks(tmp_path, monkeypatch):
     config = make_config(tmp_path)
-    config["update_check"]["enabled"] = False
+    config.update_check.enabled = False
     u = UpdateChecker(config, FakeNotifier(), run_cmd=FakeRunCmd({}), http=FakeHttp({}))
     checks = []
     orig = u.check

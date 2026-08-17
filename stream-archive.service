@@ -8,7 +8,7 @@ WorkingDirectory=%h/stream-archive
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=%h
 Environment=PYTHONUNBUFFERED=1
-ExecStart=%h/.local/bin/uv run python main.py
+ExecStart=%h/.local/bin/uv run stream-archive
 StandardOutput=journal
 StandardError=journal
 Restart=always

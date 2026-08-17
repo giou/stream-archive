@@ -2,27 +2,30 @@ import asyncio
 import logging
 import shutil
 from pathlib import Path
+from typing import Any
+
+from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
 
-def recording_dir_path(config) -> Path:
+def recording_dir_path(config: AppConfig) -> Path:
     """Resolve recording_dir against _workdir when relative (same rule as cleanup_old_recordings)."""
-    d = Path(config["recording_dir"])
+    d = Path(config.recording_dir)
     if not d.is_absolute():
-        d = config["_workdir"] / d
+        d = config._workdir / d
     return d
 
 
-def chat_dir_path(config) -> Path:
+def chat_dir_path(config: AppConfig) -> Path:
     """Resolve chat_dir against _workdir when relative (same rule as recording_dir_path)."""
-    d = Path(config.get("chat_dir", "chat"))
+    d = Path(config.chat_dir)
     if not d.is_absolute():
-        d = config["_workdir"] / d
+        d = config._workdir / d
     return d
 
 
-async def disk_snapshot(config) -> dict:
+async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
     """Fresh fs + recordings-dir usage. Slow .ts scan runs in the default executor."""
     loop = asyncio.get_running_loop()
     base = recording_dir_path(config)
@@ -30,7 +33,8 @@ async def disk_snapshot(config) -> dict:
     usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
     dir_bytes, count = 0, 0
     if base.exists():
-        def _scan():
+
+        def _scan() -> tuple[int, int]:
             total, n = 0, 0
             for p in base.rglob("*.ts"):
                 try:
@@ -39,6 +43,7 @@ async def disk_snapshot(config) -> dict:
                 except OSError:
                     continue
             return total, n
+
         dir_bytes, count = await loop.run_in_executor(None, _scan)
     return {
         "dir": str(base),

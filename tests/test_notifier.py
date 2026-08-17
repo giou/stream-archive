@@ -1,7 +1,7 @@
 import asyncio
 
-from src.stream_archive import notifier
-from src.stream_archive.notifier import Notifier
+from stream_archive import notifier
+from stream_archive.notifier import Notifier
 
 
 class FakeBot:

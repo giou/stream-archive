@@ -92,7 +92,7 @@ flowchart TD
     Monitor["monitor"]
     Recorder["recorder"]
     Notifier["notifier"]
-    Telegram["telegram_control<br/>admin-only bot commands"]
+    Telegram["telegram<br/>admin-only bot commands"]
     EventSub["eventsub<br/>conduit WebSocket"]
     KickWebhook["kick_webhook<br/>HTTP receiver · subscription sync"]
     KickAPI["kick_api<br/>OAuth client · channel statuses · subscriptions"]
@@ -125,10 +125,10 @@ the YouTube broadcast are finalized, and the monitor restarts the recording on
 the next poll cycle (YouTube re-streams are gated by a per-channel backoff and
 a global daily broadcast budget).
 
-Control plane: `telegram_control` runs alongside the scheduler as a polling
-bot. Commands are gated to `telegram_user_id`, validated on a copy, written
-atomically to `config.json`, and applied to the running scheduler /
-recorder / monitor / webhook on the next poll cycle — see
+Control plane: the `stream_archive.telegram` package runs alongside the
+scheduler as a polling bot. Commands are gated to `telegram_user_id`, validated
+on a copy, written atomically to `config.json`, and applied to the running
+scheduler / recorder / monitor / webhook on the next poll cycle — see
 [Telegram control](#telegram-control).
 
 ## Requirements
@@ -155,7 +155,7 @@ recorder / monitor / webhook on the next poll cycle — see
 uv sync
 cp config.json.example config.json
 # fill in every key — see the configuration reference below
-uv run python main.py
+uv run stream-archive
 ```
 
 The config file is looked up in the current directory and then in the
@@ -172,12 +172,12 @@ Only needed when `output_mode` is `youtube` or `both`:
    **Google Cloud Console → APIs & Services → OAuth consent screen → Audience
    tab → Publishing status → Publish app** (set to *In production*). While
    the app is *Testing*, refresh tokens expire after **7 days** (you would
-   have to re-run `setup_youtube.py` weekly) and only test users can
+   have to re-run `stream-archive-setup-youtube` weekly) and only test users can
    authorize.
 3. Run the one-time authorization flow:
 
    ```sh
-   uv run python setup_youtube.py
+   uv run stream-archive-setup-youtube
    ```
 
    It opens the authorization page in your browser and completes
@@ -186,11 +186,17 @@ Only needed when `output_mode` is `youtube` or `both`:
    (chmod 600). If the redirect page cannot load — SSH session, Docker,
    headless box — copy the **full URL** from the address bar and paste it
    when prompted. The token is refreshed automatically while it is still
-   refreshable; if it expires irrecoverably, run `setup_youtube.py` again.
+   refreshable; if it expires irrecoverably, run `stream-archive-setup-youtube` again.
 
 ## Configuration reference
 
 All keys from `config.json.example`:
+
+Secrets can be injected from the environment: any string value may be written
+as `${ENV_VAR}` (e.g. `"bot_telegram_api": "${TELEGRAM_BOT_TOKEN}"`), resolved
+from the environment at load time. Saved placeholder text is preserved, so the
+resolved secret is never written back into `config.json` — making a
+placeholder-based `config.json` safe to commit/share.
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -375,7 +381,7 @@ Notes:
 ### Foreground
 
 ```sh
-uv run python main.py
+uv run stream-archive
 ```
 
 ### As a systemd user unit
@@ -424,7 +430,7 @@ docker compose stop                  # graceful shutdown: recordings stopped, br
   image is the source of truth for the venv (`/opt/venv`), so `/update` only
   rewrites `uv.lock` and the reply tells you to run `docker compose up -d
   --build` — the running streamlink is unchanged until you rebuild.
-- One-time YouTube OAuth: `docker compose run --rm stream-archive setup_youtube.py`
+- One-time YouTube OAuth: `docker compose run --rm stream-archive stream-archive-setup-youtube`
   (the browser opens on your host; the localhost redirect can't reach the
   container, so paste the full address-bar URL when prompted)
 
@@ -463,36 +469,42 @@ in `src/stream_archive/monitor.py`).
 
 ```
 config.json.example      # template for runtime config (config.json is gitignored)
-main.py                  # entrypoint: logging setup + asyncio.run(scheduler)
-setup_youtube.py         # one-time YouTube OAuth flow (auto-captures the code, or paste the redirect URL)
 stream-archive.service   # systemd user unit
 pyproject.toml
+.pre-commit-config.yaml  # ruff + ruff-format + mypy hooks
 src/stream_archive/
-  scheduler.py           # poll loop, signal handling, daily retention cleanup
+  scheduler.py           # entry point (stream-archive): logging, poll loop, signal handling
+  setup_youtube.py       # one-time YouTube OAuth flow (entry point: stream-archive-setup-youtube)
   monitor.py             # start/stop/restart decisions, failure alerts (Twitch + Kick)
   eventsub.py            # Twitch EventSub conduit client (stream.online/offline fast-path)
   kick_webhook.py        # Kick webhook receiver (/kick/webhook), signature verification, subscription sync
   kick_api.py            # Kick OAuth client (token, channel statuses, webhook subscriptions, public key)
   kick_chat.py           # Kick chat -> TwitchDownloader ChatRoot conversion + emote embedding
-  recorder.py            # streamlink capture, ffmpeg pipe, task tracking, chat finalization
+  recorder/              # streamlink capture, ffmpeg pipe, task tracking, chat finalization (core + mixins)
   chat_recorder.py       # Twitch IRC chat capture (TwitchDownloader-compatible JSON)
   youtube_streamer.py    # YouTube Live API (broadcast/stream/bind/end)
   twitch_api.py          # Twitch Helix client (token, users, streams)
   notifier.py            # Telegram messages
-  telegram_control.py    # admin-only Telegram bot commands (/add /remove /mode …) + settings menus
-  config.py              # config loading + validation
+  telegram/              # admin-only Telegram bot commands (/add /remove /mode …) + settings menus
+  config.py              # typed config (Pydantic) + ${ENV_VAR} interpolation
   updater.py             # periodic update checks (app / streamlink / plugin)
   disk.py                # disk-size watchdog (max_total_gb)
 plugins/twitch.py        # vendored streamlink-ttvlol plugin
-tests/                   # pytest suite (config, recorder, monitor, eventsub, kick api/webhook/chat, telegram_control, …)
+tests/                   # pytest suite (config, recorder, monitor, eventsub, kick api/webhook/chat, telegram, …)
 ```
 
 ## Development
 
 ```sh
-uv sync        # installs dev group (pytest)
+uv sync        # installs dev group (pytest, ruff, mypy, pre-commit)
 uv run pytest
+uv run ruff check && uv run ruff format --check
+uv run mypy
+uv run pre-commit run --all-files
 ```
+
+`plugins/twitch.py` (vendored streamlink plugin) is excluded from ruff and
+mypy — it is replaced wholesale by `/update`.
 
 ## License
 

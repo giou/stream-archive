@@ -1,8 +1,26 @@
 import asyncio
-import time
 
-from src.stream_archive import monitor as monitor_module
-from src.stream_archive.monitor import Monitor
+from stream_archive import monitor as monitor_module
+from stream_archive.config import AppConfig
+from stream_archive.monitor import Monitor
+
+
+def make_config(**overrides):
+    data = {
+        "telegram_user_id": 12345,
+        "bot_telegram_api": "bot_token",
+        "twitch_client_id": "client_id",
+        "twitch_client_secret": "client_secret",
+        "channels": ["ch"],
+        "proxy_list": ["httpproxy://user:pass@host:port"],
+        "monitoring_interval": 60,
+        "timezone": "UTC",
+        "plugin_dir": "plugins",
+        "recording_dir": "recordings",
+        "kick": {"client_id": "cid", "client_secret": "cs"},
+    }
+    data.update(overrides)
+    return AppConfig.model_validate(data)
 
 
 class FakeTwitchAPI:
@@ -53,9 +71,7 @@ class FakeRecorder:
 
     async def start(self, channel, title=None, game=None, user_id=None):
         self.started.append(channel)
-        self.started_kwargs.append(
-            {"channel": channel, "title": title, "game": game, "user_id": user_id}
-        )
+        self.started_kwargs.append({"channel": channel, "title": title, "game": game, "user_id": user_id})
         return self.ok
 
     async def stop(self, channel):
@@ -106,12 +122,12 @@ def test_live_channel_started_once():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
     assert rec.stopped == []
 
 
@@ -119,14 +135,14 @@ def test_offline_transition_stops():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     api.streams = {}
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch"]
-    assert rec.stopped == ["ch"]
+    assert rec.started == ["twitch:ch"]
+    assert rec.stopped == ["twitch:ch"]
 
 
 def test_failed_start_is_retried_and_alert_rate_limited():
@@ -134,14 +150,14 @@ def test_failed_start_is_retried_and_alert_rate_limited():
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch", "ch"]
+    assert rec.started == ["twitch:ch", "twitch:ch"]
     assert len(notifier.messages) == 1
-    assert "Failed to start recording for ch" in notifier.messages[0]
+    assert "Failed to start recording for twitch:ch" in notifier.messages[0]
 
 
 def test_failure_alert_not_rate_limited_when_interval_zero(monkeypatch):
@@ -150,12 +166,12 @@ def test_failure_alert_not_rate_limited_when_interval_zero(monkeypatch):
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch", "ch"]
+    assert rec.started == ["twitch:ch", "twitch:ch"]
     assert len(notifier.messages) == 2
 
 
@@ -163,15 +179,15 @@ def test_recording_death_triggers_restart():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
 
     rec._recording = False
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch", "ch"]
+    assert rec.started == ["twitch:ch", "twitch:ch"]
     assert rec.stopped == []
 
 
@@ -179,7 +195,7 @@ def test_unknown_user_stream_is_skipped():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u999": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
@@ -190,7 +206,7 @@ def test_transient_api_error_does_not_raise_or_act():
     rec = FakeRecorder()
     api = FakeTwitchAPI(error=RuntimeError("boom"), user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
@@ -203,12 +219,12 @@ def test_delete_oldest_and_starts_when_over_cap():
     rec.snapshot["dir_gb"] = 25.0
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "delete_oldest": True}}
+    config = make_config(channels=["ch"], disk={"max_total_gb": 20, "delete_oldest": True})
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
     assert rec.delete_oldest_calls == [1]
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
 
 
 def test_block_when_cap_reached_and_nothing_to_delete():
@@ -217,7 +233,7 @@ def test_block_when_cap_reached_and_nothing_to_delete():
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"], "disk": {"max_total_gb": 20, "delete_oldest": True}}
+    config = make_config(channels=["ch"], disk={"max_total_gb": 20, "delete_oldest": True})
 
     async def keep_full():
         rec.delete_oldest_calls.append(1)
@@ -239,11 +255,11 @@ def test_concurrency_limit_records_first_n():
         user_ids={"ch_a": "u1", "ch_b": "u2"},
     )
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch_a", "ch_b"], "max_concurrent_recordings": 1}
+    config = make_config(channels=["ch_a", "ch_b"], max_concurrent_recordings=1)
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch_a"]
+    assert rec.started == ["twitch:ch_a"]
     assert any("concurrent recording limit reached" in m for m in notifier.messages)
 
 
@@ -256,55 +272,55 @@ def test_youtube_limit_blocks_restreams():
         user_ids={"ch_a": "u1", "ch_b": "u2"},
     )
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch_a", "ch_b"], "output_mode": "youtube", "max_concurrent_youtube_streams": 1}
+    config = make_config(channels=["ch_a", "ch_b"], output_mode="youtube", max_concurrent_youtube_streams=1)
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
-    assert rec.started == ["ch_a"]
+    assert rec.started == ["twitch:ch_a"]
     assert any("YouTube re-stream limit reached" in m for m in notifier.messages)
 
 
 def test_handle_online_starts_recording():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
 
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
     assert rec.stopped == []
 
 
 def test_handle_online_twice_is_noop():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
 
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
 
 
 def test_handle_online_restarts_dead_recording():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
     rec._recording = False
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
 
-    assert rec.started == ["ch", "ch"]
+    assert rec.started == ["twitch:ch", "twitch:ch"]
     assert rec.stopped == []
 
 
 def test_handle_online_ignores_unknown_channel():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["other"]}
+    config = make_config(channels=["other"])
 
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
 
     assert rec.started == []
 
@@ -317,10 +333,10 @@ def test_recorder_backoff_blocks_restart():
     rec = BackoffRecorder()
     notifier = FakeNotifier()
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     async def scenario():
-        await mon.handle_online("ch", "T", "G", "u1", config)
+        await mon.handle_online("twitch:ch", "T", "G", "u1", config)
         assert rec.started == []
         assert any("restarting in" in m for m in notifier.messages)
 
@@ -331,12 +347,12 @@ def test_handle_offline_stops_and_notifies():
     rec = FakeRecorder()
     notifier = FakeNotifier()
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
-    asyncio.run(mon.handle_online("ch", "T", "G", "u1", config))
-    asyncio.run(mon.handle_offline("ch", config))
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_offline("twitch:ch", config))
 
-    assert rec.stopped == ["ch"]
+    assert rec.stopped == ["twitch:ch"]
     assert len(notifier.offline) == 1
 
 
@@ -344,9 +360,9 @@ def test_handle_offline_ignores_when_not_live():
     rec = FakeRecorder()
     notifier = FakeNotifier()
     mon = make_monitor(recorder=rec, notifier=notifier)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
-    asyncio.run(mon.handle_offline("ch", config))
+    asyncio.run(mon.handle_offline("twitch:ch", config))
 
     assert rec.stopped == []
     assert notifier.offline == []
@@ -356,17 +372,17 @@ def test_poll_and_event_lock_same_channel():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch"]}
+    config = make_config()
 
     async def concurrent():
         await asyncio.gather(
             mon.check_channels(api, FakeKickAPI(), config),
-            mon.handle_online("ch", "T", "G", "u1", config),
+            mon.handle_online("twitch:ch", "T", "G", "u1", config),
         )
 
     asyncio.run(concurrent())
 
-    assert rec.started == ["ch"]
+    assert rec.started == ["twitch:ch"]
     assert rec.stopped == []
 
 
@@ -383,20 +399,25 @@ KICK_STATUS_LIVE = {
 def test_kick_live_starts_with_title_game_and_no_user_id():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:xqc"]}
+    config = make_config(channels=["kick:xqc"])
 
     asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(statuses=KICK_STATUS_LIVE), config))
 
     assert rec.started == ["kick:xqc"]
-    assert rec.started_kwargs == [{
-        "channel": "kick:xqc", "title": "Kick title", "game": "Kick game", "user_id": None,
-    }]
+    assert rec.started_kwargs == [
+        {
+            "channel": "kick:xqc",
+            "title": "Kick title",
+            "game": "Kick game",
+            "user_id": None,
+        }
+    ]
 
 
 def test_kick_live_to_offline_stops():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:xqc"]}
+    config = make_config(channels=["kick:xqc"])
     kick = FakeKickAPI(statuses=KICK_STATUS_LIVE)
 
     asyncio.run(mon.check_channels(FakeTwitchAPI(), kick, config))
@@ -410,11 +431,9 @@ def test_kick_live_to_offline_stops():
 def test_kick_api_error_no_start_stop_or_raise():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:xqc"]}
+    config = make_config(channels=["kick:xqc"])
 
-    asyncio.run(mon.check_channels(
-        FakeTwitchAPI(), FakeKickAPI(error=RuntimeError("boom")), config
-    ))
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(error=RuntimeError("boom")), config))
 
     assert rec.started == []
     assert rec.stopped == []
@@ -423,9 +442,9 @@ def test_kick_api_error_no_start_stop_or_raise():
 def test_unknown_kick_slug_warned_once_no_start(caplog):
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:ghost"]}
+    config = make_config(channels=["kick:ghost"])
 
-    with caplog.at_level("WARNING", logger="src.stream_archive.monitor"):
+    with caplog.at_level("WARNING", logger="stream_archive.monitor"):
         asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(), config))
         asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(), config))
 
@@ -438,10 +457,12 @@ def test_unknown_kick_slug_warned_once_no_start(caplog):
 def test_unknown_kick_slug_stops_if_live():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:ghost"]}
-    kick = FakeKickAPI(statuses={
-        "ghost": {"title": "T", "game": "G", "is_live": True, "broadcaster_user_id": 1},
-    })
+    config = make_config(channels=["kick:ghost"])
+    kick = FakeKickAPI(
+        statuses={
+            "ghost": {"title": "T", "game": "G", "is_live": True, "broadcaster_user_id": 1},
+        }
+    )
 
     asyncio.run(mon.check_channels(FakeTwitchAPI(), kick, config))
     kick.statuses = {}
@@ -458,19 +479,19 @@ def test_mixed_channels_resolve_twitch_ids_for_twitch_only():
         user_ids={"ch": "u1"},
     )
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["ch", "kick:xqc"]}
+    config = make_config(channels=["ch", "kick:xqc"])
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(statuses=KICK_STATUS_LIVE), config))
 
     assert api.resolve_calls == [["ch"]]
-    assert rec.started == ["ch", "kick:xqc"]
+    assert rec.started == ["twitch:ch", "kick:xqc"]
 
 
 def test_twitch_prefixed_channel_resolves_bare_and_starts():
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"streamer1": "u1"})
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["twitch:streamer1"]}
+    config = make_config(channels=["twitch:streamer1"])
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
@@ -483,7 +504,7 @@ def test_kick_only_config_skips_twitch_api():
     rec = FakeRecorder()
     api = FakeTwitchAPI(error=RuntimeError("twitch should not be called"))
     mon = make_monitor(recorder=rec)
-    config = {"channels": ["kick:xqc"]}
+    config = make_config(channels=["kick:xqc"])
 
     asyncio.run(mon.check_channels(api, FakeKickAPI(statuses=KICK_STATUS_LIVE), config))
 

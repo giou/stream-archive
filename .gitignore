@@ -2,6 +2,10 @@ config.json
 youtube_token.json
 __pycache__/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+*.egg-info/
 *.pyc
 *.pyo
 *.pyd

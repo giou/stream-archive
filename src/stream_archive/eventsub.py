@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import json
 import logging
+from typing import Any
 
 import websockets
 
-from src.stream_archive.config import bare_name, is_kick_channel
+from stream_archive.config import AppConfig, bare_name, is_kick_channel
 
 logger = logging.getLogger(__name__)
 
@@ -19,57 +21,53 @@ class EventSubClient:
     in scheduler.py remains the reconciliation/fallback path.
     """
 
-    def __init__(self, twitch_api, monitor, config):
+    def __init__(self, twitch_api: Any, monitor: Any, config: AppConfig):
         self._api = twitch_api
         self._monitor = monitor
         self._config = config
-        self._conduit_id = None
-        self._session_id = None
-        self._subs = {}            # channel -> {"online": sub_id, "offline": sub_id}
-        self._user_ids = {}        # channel -> helix user id
-        self._id_to_channel = {}   # helix user id -> channel
-        self._reconnect_url = None
+        self._conduit_id: str | None = None
+        self._session_id: str | None = None
+        self._subs: dict[str, dict[str, str]] = {}  # channel -> {"online": sub_id, "offline": sub_id}
+        self._user_ids: dict[str, str] = {}  # channel -> helix user id
+        self._id_to_channel: dict[str, str] = {}  # helix user id -> channel
+        self._reconnect_url: str | None = None
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
-        self._status_error = None
+        self._status_error: str | None = None
         self._subscribed = False
-        self._ws = None
-        self._task = None
+        self._ws: Any = None
+        self._task: asyncio.Task[Any] | None = None
 
-    async def start(self):
-        if not self._config.get("eventsub", {}).get("enabled", True):
+    async def start(self) -> None:
+        if not self._config.eventsub.enabled:
             logger.info("[eventsub] disabled, polling only")
             self._ready.set()
             return
         self._task = asyncio.create_task(self._run())
 
-    async def wait_ready(self, timeout=15.0):
+    async def wait_ready(self, timeout: float = 15.0) -> bool:
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
             return False
 
-    async def close(self):
+    async def close(self) -> None:
         self._stop.set()
         task = self._task
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
         ws = self._ws
         self._ws = None
         if ws is not None:
-            try:
+            with contextlib.suppress(Exception):
                 await ws.close()
-            except Exception:
-                pass
 
-    def status(self):
-        if not self._config.get("eventsub", {}).get("enabled", True):
+    def status(self) -> str:
+        if not self._config.eventsub.enabled:
             return "EventSub: disabled (polling only)"
         if self._status_error:
             return f"EventSub: unavailable ({self._status_error}) \u2014 polling only"
@@ -77,7 +75,7 @@ class EventSubClient:
             return "EventSub: connecting\u2026"
         return f"EventSub: connected via conduit ({len(self._subs)} channels subscribed)"
 
-    async def add_channel(self, channel):
+    async def add_channel(self, channel: str) -> None:
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not subscribing %s", channel)
             return
@@ -95,7 +93,7 @@ class EventSubClient:
         self._id_to_channel[uid] = channel
         await self._create_channel_subs(channel, uid)
 
-    async def remove_channel(self, channel):
+    async def remove_channel(self, channel: str) -> None:
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not unsubscribing %s", channel)
             return
@@ -108,7 +106,7 @@ class EventSubClient:
         if uid is not None:
             self._id_to_channel.pop(uid, None)
 
-    async def sync_channels(self, channels):
+    async def sync_channels(self, channels: list[str]) -> None:
         channels = [c for c in channels if not is_kick_channel(c)]
         for ch in list(self._subs):
             if ch not in channels:
@@ -117,7 +115,7 @@ class EventSubClient:
             if ch not in self._subs:
                 await self.add_channel(ch)
 
-    async def _run(self):
+    async def _run(self) -> None:
         backoff = 5.0
         while not self._stop.is_set():
             try:
@@ -129,17 +127,14 @@ class EventSubClient:
             await self._sleep_or_stop(backoff)
             backoff = min(backoff * 2, 60.0)
 
-    async def _sleep_or_stop(self, seconds):
-        try:
+    async def _sleep_or_stop(self, seconds: float) -> None:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            pass
 
-    async def _connect_and_listen(self):
+    async def _connect_and_listen(self) -> None:
         try:
-            if self._conduit_id is None:
-                if not await self._ensure_conduit():
-                    return
+            if self._conduit_id is None and not await self._ensure_conduit():
+                return
             url = self._reconnect_url or BASE_WS_URL
             self._reconnect_url = None
             self._ws = await websockets.connect(url)
@@ -149,7 +144,9 @@ class EventSubClient:
                 logger.error("[eventsub] timed out waiting for session_welcome, reconnecting")
                 return
             if welcome.get("metadata", {}).get("message_type") != "session_welcome":
-                logger.error("[eventsub] expected session_welcome, got %s", welcome.get("metadata", {}).get("message_type"))
+                logger.error(
+                    "[eventsub] expected session_welcome, got %s", welcome.get("metadata", {}).get("message_type")
+                )
                 return
             session = welcome["payload"]["session"]
             self._session_id = session["id"]
@@ -159,7 +156,7 @@ class EventSubClient:
                 await self._subscribe_all()
                 self._subscribed = True
                 self._ready.set()
-                twitch_count = len([c for c in self._config["channels"] if not is_kick_channel(c)])
+                twitch_count = len([c for c in self._config.channels if not is_kick_channel(c)])
                 logger.info(
                     "[eventsub] session connected, subscribed %d/%d channels",
                     len(self._subs),
@@ -179,12 +176,10 @@ class EventSubClient:
             ws = self._ws
             self._ws = None
             if ws is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await ws.close()
-                except Exception:
-                    pass
 
-    async def _ensure_conduit(self):
+    async def _ensure_conduit(self) -> bool:
         """Delete existing conduits (cascade removes their subscriptions) and create one."""
         try:
             for conduit in await self._api.list_conduits():
@@ -200,24 +195,20 @@ class EventSubClient:
             self._ready.set()
             return False
 
-    async def _activate_shard(self):
+    async def _activate_shard(self) -> None:
         result = await self._api.update_conduit_shards(self._conduit_id, self._session_id)
         if result.get("status") != "enabled":
             logger.warning("[eventsub] shard status: %s", result.get("status"))
 
-    async def _subscribe_all(self):
-        channels = [c for c in self._config["channels"] if not is_kick_channel(c)]
+    async def _subscribe_all(self) -> None:
+        channels = [c for c in self._config.channels if not is_kick_channel(c)]
         try:
             resolved = await self._api.resolve_user_ids([bare_name(c) for c in channels])
         except Exception as e:
             logger.error("[eventsub] resolve_user_ids failed: %s", e)
             resolved = {}
         identity_by_bare = {bare_name(c): c for c in channels}
-        user_ids = {
-            identity_by_bare[bare]: uid
-            for bare, uid in resolved.items()
-            if bare in identity_by_bare
-        }
+        user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
         self._user_ids = user_ids
         self._id_to_channel = {uid: ch for ch, uid in user_ids.items()}
         for channel in channels:
@@ -230,8 +221,8 @@ class EventSubClient:
             poll_only = [ch for ch in channels if ch not in self._subs]
             logger.info("[eventsub] polling only for: %s", ", ".join(poll_only))
 
-    async def _create_channel_subs(self, channel, uid):
-        def payload(sub_type):
+    async def _create_channel_subs(self, channel: str, uid: str) -> None:
+        def payload(sub_type: str) -> dict[str, Any]:
             return {
                 "type": sub_type,
                 "version": "1",
@@ -243,10 +234,10 @@ class EventSubClient:
             self._api.create_eventsub_subscription(payload("stream.online")),
             self._api.create_eventsub_subscription(payload("stream.offline")),
         )
-        for kind, (status, body) in zip(("online", "offline"), results):
+        for kind, (status, body) in zip(("online", "offline"), results, strict=True):
             await self._handle_subscribe_response(channel, kind, status, body)
 
-    async def _handle_subscribe_response(self, channel, kind, status, body):
+    async def _handle_subscribe_response(self, channel: str, kind: str, status: int, body: dict[str, Any]) -> None:
         sub_type = f"stream.{kind}"
         if status == 202:
             self._subs.setdefault(channel, {})[kind] = body["data"][0]["id"]
@@ -268,7 +259,7 @@ class EventSubClient:
         else:
             logger.error("[eventsub] unexpected status %s creating %s for %s", status, sub_type, channel)
 
-    async def _handle_message(self, msg):
+    async def _handle_message(self, msg: dict[str, Any]) -> bool:
         """Dispatch one WebSocket message. Returns True when the socket must reconnect."""
         mtype = msg.get("metadata", {}).get("message_type")
         if mtype == "notification":
@@ -282,7 +273,7 @@ class EventSubClient:
             await self._handle_revocation(msg)
         return False
 
-    async def _handle_revocation(self, msg):
+    async def _handle_revocation(self, msg: dict[str, Any]) -> None:
         sub = msg.get("payload", {}).get("subscription", {})
         sub_id = sub.get("id")
         logger.warning("[eventsub] subscription revoked: %s (%s)", sub.get("type"), sub_id)
@@ -291,13 +282,13 @@ class EventSubClient:
                 if sid == sub_id:
                     del self._subs[channel][kind]
 
-    async def _dispatch(self, msg):
+    async def _dispatch(self, msg: dict[str, Any]) -> None:
         try:
             sub_type = msg.get("metadata", {}).get("subscription_type")
             event = msg.get("payload", {}).get("event", {})
             user_id = event.get("broadcaster_user_id")
             channel = self._id_to_channel.get(user_id)
-            if channel is None or channel not in self._config["channels"]:
+            if channel is None or channel not in self._config.channels:
                 logger.debug("[eventsub] event for unknown channel %s, ignoring", user_id)
                 return
             if sub_type == "stream.online":

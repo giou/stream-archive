@@ -9,8 +9,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from src.stream_archive.kick_api import KickAPI
-from src.stream_archive.kick_webhook import KickWebhook, _RateLimiter
+from stream_archive.config import AppConfig
+from stream_archive.kick_api import KickAPI
+from stream_archive.kick_webhook import KickWebhook, _RateLimiter
 
 
 def _fresh_ts():
@@ -20,8 +21,16 @@ def _fresh_ts():
 
 def base_config():
     return {
+        "telegram_user_id": 12345,
+        "bot_telegram_api": "bot_token",
+        "twitch_client_id": "client_id",
+        "twitch_client_secret": "client_secret",
         "channels": ["kick:xqc"],
+        "proxy_list": ["httpproxy://user:pass@host:port"],
         "monitoring_interval": 60,
+        "timezone": "UTC",
+        "plugin_dir": "plugins",
+        "recording_dir": "recordings",
         "kick": {
             "client_id": "cid",
             "client_secret": "csec",
@@ -86,7 +95,20 @@ class FakeKickAPI:
 
 
 def make_webhook(config=None, monitor=None, recorder=None, api=None, notifier=None):
-    config = config or base_config()
+    raw = config or base_config()
+    # base_config uses listen_port 0 (ephemeral) so bind tests never collide;
+    # the model only allows 1-65535, so validate with a placeholder port and
+    # re-apply the ephemeral port afterwards.
+    if isinstance(raw, AppConfig):
+        ephemeral = raw.kick.webhook.listen_port == 0
+        config = raw
+    else:
+        ephemeral = raw.get("kick", {}).get("webhook", {}).get("listen_port") == 0
+        if ephemeral:
+            raw["kick"]["webhook"]["listen_port"] = 8787
+        config = AppConfig.model_validate(raw)
+    if ephemeral:
+        object.__setattr__(config.kick.webhook, "listen_port", 0)
     return KickWebhook(
         config,
         monitor or FakeMonitor(),
@@ -103,46 +125,57 @@ def sign(private_key, message_id, timestamp, body):
 
 
 def live_event(slug="xqc", is_live=True):
-    return json.dumps({
-        "is_live": is_live,
-        "broadcaster": {"channel_slug": slug, "channel_id": 123},
-    }).encode()
+    return json.dumps(
+        {
+            "is_live": is_live,
+            "broadcaster": {"channel_slug": slug, "channel_id": 123},
+        }
+    ).encode()
 
 
 def chat_event(slug="xqc"):
-    return json.dumps({
-        "message_id": "msg-123",
-        "created_at": "2026-08-13T10:00:00Z",
-        "broadcaster": {
-            "channel_slug": slug, "channel_id": 123, "user_id": 123,
-            "username": "xqc", "profile_picture": "https://example.com/bc.png",
-        },
-        "sender": {
-            "user_id": 999,
-            "username": "viewer1",
-            "is_verified": False,
-            "is_anonymous": False,
-            "profile_picture": "https://example.com/av.png",
-            "identity": {
-                "username_color": "#FF5733",
-                "badges": [{"text": "sub", "type": "sub", "count": 1}],
+    return json.dumps(
+        {
+            "message_id": "msg-123",
+            "created_at": "2026-08-13T10:00:00Z",
+            "broadcaster": {
+                "channel_slug": slug,
+                "channel_id": 123,
+                "user_id": 123,
+                "username": "xqc",
+                "profile_picture": "https://example.com/bc.png",
             },
-        },
-        "content": "hello kick \U0001f600 [emote:37226:KEKW]",
-        "emotes": [
-            {"emote_id": "emote-1", "positions": [{"s": 0, "e": 6}]},
-            {"emote_id": "37226", "positions": [{"s": 13, "e": 30}]},
-        ],
-    }).encode()
+            "sender": {
+                "user_id": 999,
+                "username": "viewer1",
+                "is_verified": False,
+                "is_anonymous": False,
+                "profile_picture": "https://example.com/av.png",
+                "identity": {
+                    "username_color": "#FF5733",
+                    "badges": [{"text": "sub", "type": "sub", "count": 1}],
+                },
+            },
+            "content": "hello kick \U0001f600 [emote:37226:KEKW]",
+            "emotes": [
+                {"emote_id": "emote-1", "positions": [{"s": 0, "e": 6}]},
+                {"emote_id": "37226", "positions": [{"s": 13, "e": 30}]},
+            ],
+        }
+    ).encode()
 
 
 @pytest.fixture
 def keypair():
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_pem = private_key.public_key().public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
     return private_key, public_pem
 
 
@@ -214,7 +247,7 @@ def test_live_event_dispatches_online(keypair):
     channel, title, game, user_id, cfg = monitor.online[0]
     assert channel == "kick:xqc"
     assert (title, game, user_id) == (None, None, None)
-    assert cfg is config
+    assert cfg is wh._config
 
 
 def test_live_event_dispatches_offline(keypair):
@@ -261,8 +294,12 @@ def test_chat_event_dispatches_normalized_payload(keypair):
         "created_at": "2026-08-13T10:00:00Z",
         "broadcaster": {"user_id": 123, "username": "xqc", "profile_picture": "https://example.com/bc.png"},
         "sender": {
-            "user_id": 999, "username": "viewer1", "is_verified": False, "is_anonymous": False,
-            "profile_picture": "https://example.com/av.png", "username_color": "#FF5733",
+            "user_id": 999,
+            "username": "viewer1",
+            "is_verified": False,
+            "is_anonymous": False,
+            "profile_picture": "https://example.com/av.png",
+            "username_color": "#FF5733",
         },
         "content": "hello kick \U0001f600 [emote:37226:KEKW]",
         "emotes": [
@@ -342,7 +379,9 @@ def test_live_event_unmonitored_channel_ignored(keypair):
 
 
 def make_mock_api(handler):
-    api = KickAPI(base_config())
+    config = base_config()
+    config["kick"]["webhook"]["listen_port"] = 8787  # KickAPI never binds; model needs 1-65535
+    api = KickAPI(AppConfig.model_validate(config))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return api
 
@@ -380,10 +419,10 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
     }
     config["_workdir"] = tmp_path
     cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps(
-        {k: v for k, v in config.items() if not k.startswith("_")}, indent=4
-    ))
-    config["_config_path"] = cfg_file
+    cfg_file.write_text(json.dumps({k: v for k, v in config.items() if not k.startswith("_")}, indent=4))
+    config = AppConfig.model_validate(config)
+    config._workdir = tmp_path
+    config._config_path = cfg_file
 
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=notifier)
@@ -394,12 +433,14 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
         async with TestClient(TestServer(wh._app)) as client:
             body = live_event()
             await client.post(
-                "/kick/webhook", data=body,
+                "/kick/webhook",
+                data=body,
                 headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
             )
             # A second event must stay silent.
             await client.post(
-                "/kick/webhook", data=body,
+                "/kick/webhook",
+                data=body,
                 headers=_signed_headers(private_key, "m2", _fresh_ts(), body, wh.EVENT_LIVE),
             )
 
@@ -448,9 +489,15 @@ def test_reconcile_creates_missing_subscriptions():
                 return httpx.Response(200, json={"data": []})
             if request.method == "POST":
                 seen["posts"].append(json.loads(request.content))
-                return httpx.Response(200, json={"data": [
-                    {"subscription_id": "sub-1"}, {"subscription_id": "sub-2"},
-                ]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"subscription_id": "sub-1"},
+                            {"subscription_id": "sub-2"},
+                        ]
+                    },
+                )
         pytest.fail(f"unexpected request: {request.method} {request.url}")
 
     api = make_mock_api(handler)
@@ -461,14 +508,16 @@ def test_reconcile_creates_missing_subscriptions():
 
     asyncio.run(scenario())
 
-    assert seen["posts"] == [{
-        "broadcaster_user_id": 123,
-        "events": [
-            {"name": "livestream.status.updated", "version": 1},
-            {"name": "chat.message.sent", "version": 1},
-        ],
-        "method": "webhook",
-    }]
+    assert seen["posts"] == [
+        {
+            "broadcaster_user_id": 123,
+            "events": [
+                {"name": "livestream.status.updated", "version": 1},
+                {"name": "chat.message.sent", "version": 1},
+            ],
+            "method": "webhook",
+        }
+    ]
     assert wh._subs == {"xqc": {"sub-1", "sub-2"}}
 
 
@@ -482,12 +531,25 @@ def test_reconcile_deletes_stale_subscriptions():
             return httpx.Response(200, json={"data": []})
         if request.url.path == "/public/v1/events/subscriptions":
             if request.method == "GET":
-                return httpx.Response(200, json={"data": [
-                    {"id": "stale-1", "app_id": "cid", "broadcaster_user_id": 999,
-                     "events": [{"name": "livestream.status.updated"}]},
-                    {"id": "stale-2", "app_id": "cid", "broadcaster_user_id": 999,
-                     "events": [{"name": "chat.message.sent"}]},
-                ]})
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "stale-1",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 999,
+                                "events": [{"name": "livestream.status.updated"}],
+                            },
+                            {
+                                "id": "stale-2",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 999,
+                                "events": [{"name": "chat.message.sent"}],
+                            },
+                        ]
+                    },
+                )
             if request.method == "DELETE":
                 deletes.append([v for k, v in request.url.params.multi_items() if k == "id"])
                 return httpx.Response(200, json={"data": []})
@@ -540,9 +602,7 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
 def _server_error_500():
     request = httpx.Request("GET", "https://api.kick.com/public/v1/events/subscriptions")
     response = httpx.Response(500, request=request)
-    return httpx.HTTPStatusError(
-        "Server error '500 Internal Server Error'", request=request, response=response
-    )
+    return httpx.HTTPStatusError("Server error '500 Internal Server Error'", request=request, response=response)
 
 
 class ScriptedAPI:
@@ -564,7 +624,7 @@ class ScriptedAPI:
 
 def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
     # A Kick-side 500 must not notify while it is shorter than the delay.
-    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 3600)
+    monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 3600)
     config = base_config()
     config["monitoring_interval"] = 0.01
     notifier = FakeNotifier()
@@ -582,7 +642,7 @@ def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
 
 
 def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch):
-    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.02)
+    monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.02)
     config = base_config()
     config["monitoring_interval"] = 0.01
     notifier = FakeNotifier()
@@ -603,7 +663,7 @@ def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch)
 def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
     # Recovery resets the episode timer: brief blips shorter than the delay
     # (even several in a row, each separated by a success) stay silent.
-    monkeypatch.setattr("src.stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
+    monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
     config = base_config()
     config["monitoring_interval"] = 0.01
     notifier = FakeNotifier()
@@ -627,12 +687,13 @@ def test_stale_timestamp_rejected_401(keypair):
     monitor = FakeMonitor()
     wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
     body = live_event(is_live=True)
-    stale = str(int(time.time()) - 600)   # outside the 5-minute window
+    stale = str(int(time.time()) - 600)  # outside the 5-minute window
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             resp = await client.post(
-                "/kick/webhook", data=body,
+                "/kick/webhook",
+                data=body,
                 headers=_signed_headers(private_key, "m1", stale, body, wh.EVENT_LIVE),
             )
             assert resp.status == 401
@@ -651,7 +712,8 @@ def test_future_timestamp_rejected_401(keypair):
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             resp = await client.post(
-                "/kick/webhook", data=body,
+                "/kick/webhook",
+                data=body,
                 headers=_signed_headers(private_key, "m1", future, body, wh.EVENT_LIVE),
             )
             assert resp.status == 401
@@ -668,7 +730,8 @@ def test_unparseable_timestamp_rejected_401(keypair):
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             resp = await client.post(
-                "/kick/webhook", data=body,
+                "/kick/webhook",
+                data=body,
                 headers=_signed_headers(private_key, "m1", "not-a-date", body, wh.EVENT_LIVE),
             )
             assert resp.status == 401
