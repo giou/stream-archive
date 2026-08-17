@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Runtime deps. Chromium is NOT needed: the recorder plays live streams through
 # the ttvlol playlist proxies (config proxy_list -> plugin option proxy-playlist),
@@ -19,8 +19,8 @@ RUN apt-get update \
  && chmod +x /usr/local/bin/cloudflared \
  && rm -rf /var/lib/apt/lists/*
 
-# Pinned to the same uv version the project was developed with (host: 0.11.5).
-COPY --from=ghcr.io/astral-sh/uv:0.11.5 /uv /usr/local/bin/uv
+# Pinned uv version used to build the image; bump deliberately with releases.
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
