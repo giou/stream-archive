@@ -35,7 +35,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-extend-exclude = ["plugins"]   # dev-only plugin dir, downloaded manually (see README Development)
+extend-exclude = ["plugins"]   # dev-only plugin dir, not shipped in this repo
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

@@ -435,22 +435,6 @@ docker compose logs -f
 YouTube broadcasts are transitioned to `complete`, and the scheduler exits
 with `[scheduler] Shutdown complete`.
 
-## Migrating from a git-checkout install
-
-The old deployment ran the checkout directly (systemd unit, `uv run`). To
-move to the standalone Docker app:
-
-1. Create the data dir (e.g. `~/stream-archive/` — see
-   [Quick start](#quick-start)) and put `docker-compose.yml` + `config.json`
-   in it.
-2. Copy from the old checkout: `config.json`, `recordings/`, `chat/`,
-   `youtube_token.json`, `client_secret.json`, `cloudflared/`.
-3. In the copied `config.json`, set `plugin_dir` to `"/app/plugins"` (the
-   plugin is baked into the image; a leftover `plugins/` dir in the data dir
-   is ignored and can be deleted).
-4. Delete the old checkout — nothing runs from it anymore.
-5. New update habit: `docker compose pull && docker compose up -d`.
-
 ## Failure handling & recovery
 
 | Failure | Behavior |
@@ -512,33 +496,6 @@ uv run ruff check && uv run ruff format --check
 uv run mypy
 uv run pre-commit run --all-files
 ```
-
-### Plugin maintenance
-
-The `twitch.py` plugin (2bc4/streamlink-ttvlol) is not in this repo — the
-Dockerfile fetches it at image build from upstream releases, pinned by the
-`TTVLOL_PLUGIN_VERSION` / `TTVLOL_PLUGIN_SHA256` ARGs, and verifies its sha256
-digest, so the plugin ships in the image and updates only when you pull a new
-one.
-
-Refresh procedure — when the bot reports
-"streamlink-ttvlol: X → Y (ships in a future image)":
-
-1. Get the new tag + sha256 digest from
-   `https://api.github.com/repos/2bc4/streamlink-ttvlol/releases/latest`
-   (asset `twitch.py` → `digest` field).
-2. Bump both ARGs in the Dockerfile.
-3. Bump `pyproject.toml`'s `version`, tag `v<version>` — the CI publish
-   workflow asserts they match, then builds and pushes the image.
-
-Dev runs on the host (recordings tests need a local plugin):
-
-```sh
-curl -fsSL -o plugins/twitch.py https://github.com/2bc4/streamlink-ttvlol/releases/download/<tag>/twitch.py
-```
-
-`plugins/twitch.py` is excluded from ruff and mypy — it is a third-party file
-never edited in this repo.
 
 ## License
 
