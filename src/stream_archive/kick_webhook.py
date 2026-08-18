@@ -108,6 +108,7 @@ class KickWebhook:
         self._sync_task: asyncio.Task[Any] | None = None
         self._sync_failed_notified = False
         self._sync_failing_since: float | None = None  # monotonic start of current failure episode
+        self._sync_error_logged = False
         self._subs: dict[str, set[str]] = {}  # bare slug -> set(subscription ids)
         self._seen_ids: dict[str, float] = {}  # message_id -> expires (monotonic)
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
@@ -157,11 +158,18 @@ class KickWebhook:
             try:
                 await self._sync_subscriptions(self._config.channels)
             except Exception as e:
-                logger.error("[kick_webhook] subscription sync failed: %s", e)
+                # Log once per failure episode; the loop retries every
+                # interval anyway, so per-cycle error lines are just spam.
+                if not self._sync_error_logged:
+                    self._sync_error_logged = True
+                    logger.error("[kick_webhook] subscription sync failed: %s", e)
+                else:
+                    logger.debug("[kick_webhook] subscription sync still failing: %s", e)
                 await self._notify_sync_failure(e)
             else:
                 self._sync_failed_notified = False
                 self._sync_failing_since = None
+                self._sync_error_logged = False
             await asyncio.sleep(self._config.monitoring_interval)
 
     async def _notify_sync_failure(self, e: Exception) -> None:

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any
@@ -7,6 +8,20 @@ import httpx
 from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+# Kick's edge intermittently rejects otherwise-valid app-token requests
+# (observed as 400/403 waves that self-recover). Sending a descriptive
+# User-Agent instead of the default python-httpx one is the standard
+# mitigation for that (Cloudflare-fronted APIs commonly 403 the SDK default);
+# retries below ride out the residual blips. Deliberately versionless: the
+# string must stay stable across releases.
+_USER_AGENT = "stream-archive"
+
+# Transient statuses to retry with short backoff: edge/WAF hiccups (429/5xx)
+# and rate limiting. Auth/param errors (401/400/403) stay immediate.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_ATTEMPTS = 3
+_RETRY_DELAYS = (1.0, 3.0)
 
 
 class KickAPI:
@@ -18,12 +33,34 @@ class KickAPI:
 
     def __init__(self, config: AppConfig):
         kick = config.kick
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10, connect=5),
+            headers={"User-Agent": _USER_AGENT},
+        )
         self._client_id = kick.client_id
         self._client_secret = kick.client_secret
         self._token: str | None = None
         self._token_expires_at = 0
         self._public_key: str | None = None
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        """Send a request, retrying transient failures with short backoff.
+
+        Retries only the statuses in ``_RETRY_STATUSES`` plus transport-level
+        errors; auth/param problems (401/400/403) fail immediately so the
+        caller's error path (and any alert) fires without added latency.
+        """
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                resp = await self.client.request(method, url, **kwargs)
+            except httpx.TransportError:
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise
+                resp = None
+            if resp is not None and (resp.status_code not in _RETRY_STATUSES or attempt == _MAX_ATTEMPTS - 1):
+                return resp
+            await asyncio.sleep(_RETRY_DELAYS[attempt])
+        raise RuntimeError("unreachable")
 
     async def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self._get_token()}"}
@@ -33,7 +70,8 @@ class KickAPI:
         if self._token and now < self._token_expires_at - 60:
             return self._token
         try:
-            resp = await self.client.post(
+            resp = await self._request(
+                "POST",
                 self.TOKEN_URL,
                 data={
                     "grant_type": "client_credentials",
@@ -58,7 +96,8 @@ class KickAPI:
         out = {}
         for i in range(0, len(slugs), self.MAX_SLUGS_PER_REQUEST):
             chunk = slugs[i : i + self.MAX_SLUGS_PER_REQUEST]
-            resp = await self.client.get(
+            resp = await self._request(
+                "GET",
                 self.CHANNELS_URL,
                 headers=headers,
                 params=[("slug", s) for s in chunk],
@@ -82,7 +121,7 @@ class KickAPI:
         """
         if self._public_key and not force:
             return self._public_key
-        resp = await self.client.get(self.PUBLIC_KEY_URL)
+        resp = await self._request("GET", self.PUBLIC_KEY_URL)
         resp.raise_for_status()
         data = resp.json().get("data")
         if isinstance(data, dict):  # live API nests the PEM: {"data": {"public_key": "..."}}
@@ -101,7 +140,7 @@ class KickAPI:
         broadcasters, so a wrong filter would destroy another app's
         subscriptions. Without a client_id configured, nothing is managed.
         """
-        resp = await self.client.get(self.EVENTS_SUBS_URL, headers=await self._headers())
+        resp = await self._request("GET", self.EVENTS_SUBS_URL, headers=await self._headers())
         resp.raise_for_status()
         data = resp.json()["data"]
         if not self._client_id:
@@ -110,7 +149,8 @@ class KickAPI:
 
     async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]:
         """Create webhook subscriptions; returns created items (each has subscription_id)."""
-        resp = await self.client.post(
+        resp = await self._request(
+            "POST",
             self.EVENTS_SUBS_URL,
             headers=await self._headers(),
             json={
@@ -125,7 +165,8 @@ class KickAPI:
     async def delete_event_subscriptions(self, ids: list[str]) -> None:
         if not ids:
             return
-        resp = await self.client.delete(
+        resp = await self._request(
+            "DELETE",
             self.EVENTS_SUBS_URL,
             headers=await self._headers(),
             params=[("id", i) for i in ids],

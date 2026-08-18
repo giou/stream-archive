@@ -340,8 +340,9 @@ class EndingYouTubeStreamer(FakeYouTubeStreamer):
 
 def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
     """A stream that ends cleanly (feed stall -> streamlink EOF) must release the
-    entry so the monitor can restart on the next poll, and transition the
-    YouTube broadcast to complete instead of leaving it lingering."""
+    entry, flag the end as clean (so the monitor skips restart attempts until
+    the offline event arrives), and transition the YouTube broadcast to
+    complete instead of leaving it lingering."""
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     yt = EndingYouTubeStreamer()
@@ -360,7 +361,50 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
         await task
         await asyncio.sleep(0.05)  # let the fire-and-forget finalizers run
         assert "ch" not in rec._recordings
+        assert rec.ended_clean("ch")
         assert yt.ended == ["b1"]
+
+    asyncio.run(scenario())
+
+
+def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
+    """A task that ends with an exception must not look like a clean stream end:
+    the monitor has to restart it."""
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        async def boom():
+            raise RuntimeError("stream interrupted")
+
+        task = asyncio.create_task(boom())
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": None,
+            "kick_chat": None,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        assert "ch" not in rec._recordings
+        assert not rec.ended_clean("ch")
+
+    asyncio.run(scenario())
+
+
+def test_clean_end_flag_cleared_on_restart(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "disk"
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        rec._ended_clean.add("ch")
+        assert await rec.start("ch") is True
+        assert not rec.ended_clean("ch")
+        await rec.stop("ch")
 
     asyncio.run(scenario())
 

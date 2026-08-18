@@ -65,6 +65,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._quick_ends = {}  # channel -> consecutive short YouTube recordings
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
         self._youtube_starts = []
+        self._ended_clean: set[str] = set()  # channels whose last task ended cleanly (stream over)
 
     async def start(
         self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
@@ -213,6 +214,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if disk_cfg.max_total_gb > 0:
             entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
+        self._ended_clean.discard(channel)
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
         return True
 
@@ -302,6 +304,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         entry["tasks"].remove(task)
         if exc is not None:
             logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
+            entry["failed"] = True
         else:
             # A clean stream end (e.g. the HLS feed stalls and streamlink closes
             # it) must also release the entry once all tasks are done: otherwise
@@ -319,7 +322,16 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             asyncio.create_task(self._end_broadcast(channel, youtube_info["broadcast_id"]))
         if entry.get("mode") in ("youtube", "both"):
             self._note_youtube_end(channel, entry)
+        # Remember that the stream ended on its own (as opposed to a task
+        # failure) so the monitor can skip restart attempts until the offline
+        # event catches up — a dead stream just resolves to a 404 otherwise.
+        if not entry.get("failed"):
+            self._ended_clean.add(channel)
         del self._recordings[channel]
+
+    def ended_clean(self, channel: str) -> bool:
+        """True when the channel's last recording ended cleanly (stream over)."""
+        return channel in self._ended_clean
 
     async def _abort(self, channel: str, reason: str) -> None:
         logger.warning("[recorder] [%s] Stopping recording: %s", channel, reason)

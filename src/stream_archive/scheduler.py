@@ -143,6 +143,9 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
+    # Webhook heartbeats would otherwise log one line per POST.
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp.server").setLevel(logging.WARNING)
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run_scheduler())

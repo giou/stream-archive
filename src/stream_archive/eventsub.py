@@ -170,7 +170,16 @@ class EventSubClient:
             logger.error("[eventsub] keepalive timeout, reconnecting")
             return
         except websockets.ConnectionClosed as e:
-            logger.error("[eventsub] connection closed (code=%s), reconnecting", e.code)
+            if e.code == 4007:
+                # 4007 is Twitch's normal server-initiated reconnect (the
+                # session_reconnect message precedes it); not a fault.
+                logger.info("[eventsub] reconnect requested by Twitch (code=4007)")
+            elif e.code == 1006:
+                # Abnormal closure; happens during Twitch deploys. The
+                # reconnect/backoff loop recovers on its own.
+                logger.warning("[eventsub] connection closed abnormally (code=1006), reconnecting")
+            else:
+                logger.error("[eventsub] connection closed (code=%s), reconnecting", e.code)
             return
         finally:
             ws = self._ws

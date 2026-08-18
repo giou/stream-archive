@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from stream_archive.config import AppConfig
-from stream_archive.kick_api import KickAPI
+from stream_archive.kick_api import _USER_AGENT, KickAPI
 
 
 def base_config():
@@ -31,7 +31,7 @@ def base_config():
 
 def make_api(handler):
     api = KickAPI(AppConfig.model_validate(base_config()))
-    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"User-Agent": _USER_AGENT})
     return api
 
 
@@ -257,7 +257,9 @@ def test_delete_event_subscriptions_empty_is_noop():
     asyncio.run(api.delete_event_subscriptions([]))
 
 
-def test_http_errors_propagate():
+def test_http_errors_propagate(monkeypatch):
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
+
     def handler(request):
         if request.url.path == "/oauth/token":
             return token_handler(request)
@@ -266,6 +268,86 @@ def test_http_errors_propagate():
     api = make_api(handler)
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(api.get_channel_statuses(["xqc"]))
+
+
+def test_channels_request_sends_user_agent():
+    seen = {}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        seen["ua"] = request.headers.get("User-Agent")
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+    asyncio.run(api.get_channel_statuses(["xqc"]))
+
+    assert seen["ua"] == "stream-archive"
+
+
+def test_transient_status_retried_then_succeeds(monkeypatch):
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_channel_statuses(["xqc"])) == {}
+    assert calls["n"] == 2
+
+
+def test_transport_error_retried_then_succeeds(monkeypatch):
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("boom")
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_channel_statuses(["xqc"])) == {}
+    assert calls["n"] == 2
+
+
+def test_retries_exhausted_raises(monkeypatch):
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        calls["n"] += 1
+        return httpx.Response(503, request=request)
+
+    api = make_api(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(api.get_channel_statuses(["xqc"]))
+    assert calls["n"] == 3
+
+
+def test_client_error_not_retried():
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        calls["n"] += 1
+        return httpx.Response(400, request=request)
+
+    api = make_api(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(api.get_channel_statuses(["xqc"]))
+    assert calls["n"] == 1
 
 
 def test_token_error_propagates():

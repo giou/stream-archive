@@ -58,6 +58,7 @@ class FakeRecorder:
         self.started_kwargs = []
         self.stopped = []
         self._recording = True
+        self._ended_clean = set()
         self.snapshot = {
             "free_gb": 100.0,
             "total_fs_gb": 500.0,
@@ -80,6 +81,9 @@ class FakeRecorder:
 
     def is_recording(self, channel):
         return self._recording
+
+    def ended_clean(self, channel):
+        return channel in self._ended_clean
 
     def active_channels(self):
         return list(self.started)
@@ -189,6 +193,29 @@ def test_recording_death_triggers_restart():
 
     assert rec.started == ["twitch:ch", "twitch:ch"]
     assert rec.stopped == []
+
+
+def test_clean_end_skips_restart_until_offline(caplog):
+    rec = FakeRecorder()
+    rec._recording = False
+    rec._ended_clean.add("kick:xqc")
+    mon = make_monitor(recorder=rec)
+    config = make_config(channels=["kick:xqc"])
+    kick = FakeKickAPI(statuses={"xqc": {"title": "T", "game": "G", "is_live": True, "broadcaster_user_id": 1}})
+    mon._live_channels.add("kick:xqc")
+
+    with caplog.at_level("DEBUG", logger="stream_archive.monitor"):
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), kick, config))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), kick, config))
+
+    assert rec.started == []  # no restart while the API still reports live
+    assert "ended cleanly, awaiting offline event" in caplog.text
+
+    # The offline event clears the live flag; a later online event starts fresh.
+    asyncio.run(mon.handle_offline("kick:xqc", config))
+    assert rec.stopped == ["kick:xqc"]
+    asyncio.run(mon.handle_online("kick:xqc", "T", "G", None, config))
+    assert rec.started == ["kick:xqc"]
 
 
 def test_unknown_user_stream_is_skipped():
@@ -426,6 +453,24 @@ def test_kick_live_to_offline_stops():
 
     assert rec.started == ["kick:xqc"]
     assert rec.stopped == ["kick:xqc"]
+
+
+def test_kick_api_failure_logged_once_per_episode(caplog):
+    mon = make_monitor()
+    config = make_config(channels=["kick:xqc"])
+    failing = FakeKickAPI(error=RuntimeError("boom"))
+    ok = FakeKickAPI()
+
+    with caplog.at_level("DEBUG", logger="stream_archive.monitor"):
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), failing, config))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), failing, config))
+        assert len([r for r in caplog.records if "kick get_channel_statuses failed" in r.getMessage()]) == 1
+        assert len([r for r in caplog.records if "still failing" in r.getMessage()]) == 1
+
+        # Recovery resets the episode: the next failure logs at error again.
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), ok, config))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), failing, config))
+        assert len([r for r in caplog.records if "kick get_channel_statuses failed" in r.getMessage()]) == 2
 
 
 def test_kick_api_error_no_start_stop_or_raise():

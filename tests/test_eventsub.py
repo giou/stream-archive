@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 
 from stream_archive.config import AppConfig
 from stream_archive.eventsub import EventSubClient
@@ -217,6 +219,86 @@ def test_409_resolves_existing_subscription_id():
     asyncio.run(client._subscribe_all())
 
     assert client._subs["twitch:ch"] == {"online": "existing-online", "offline": "existing-offline"}
+
+
+class _FakeClosed(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def _make_closing_ws(code):
+    """Fake websocket: delivers a welcome, then closes with ``code``."""
+
+    class FakeWS:
+        def __init__(self):
+            self.n = 0
+
+        async def recv(self):
+            self.n += 1
+            if self.n == 1:
+                return json.dumps(
+                    {
+                        "metadata": {"message_type": "session_welcome"},
+                        "payload": {"session": {"id": "s1", "keepalive_timeout_seconds": 60}},
+                    }
+                )
+            raise _FakeClosed(code)
+
+        async def close(self):
+            pass
+
+    class FakeWebsockets:
+        ConnectionClosed = _FakeClosed
+
+        async def connect(self, url):
+            return FakeWS()
+
+    return FakeWebsockets()
+
+
+def _run_close_code(client, code):
+    return asyncio.run(client._connect_and_listen())
+
+
+def test_close_code_4007_logged_as_info(caplog, monkeypatch):
+    # 4007 is Twitch's normal server-initiated reconnect; not an error.
+    client = make_client()
+    client._conduit_id = "c1"
+    client._subscribed = True
+    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(4007))
+
+    with caplog.at_level("INFO", logger="stream_archive.eventsub"):
+        _run_close_code(client, 4007)
+
+    assert any("reconnect requested by Twitch" in r.getMessage() for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_close_code_1006_logged_as_warning(caplog, monkeypatch):
+    client = make_client()
+    client._conduit_id = "c1"
+    client._subscribed = True
+    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1006))
+
+    with caplog.at_level("WARNING", logger="stream_archive.eventsub"):
+        _run_close_code(client, 1006)
+
+    assert any("abnormally" in r.getMessage() for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_close_code_other_logged_as_error(caplog, monkeypatch):
+    client = make_client()
+    client._conduit_id = "c1"
+    client._subscribed = True
+    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1011))
+
+    with caplog.at_level("ERROR", logger="stream_archive.eventsub"):
+        _run_close_code(client, 1011)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "code=1011" in errors[0].getMessage()
 
 
 def test_session_reconnect_message_sets_reconnect_url():

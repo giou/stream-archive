@@ -20,6 +20,7 @@ class Monitor:
         self._last_disk_notify = 0.0
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
+        self._kick_api_error_logged = False
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
         if channel not in self._locks:
@@ -74,8 +75,15 @@ class Monitor:
             try:
                 statuses = await kick_api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
             except Exception as e:
-                logger.error("[monitor] kick get_channel_statuses failed: %s", e)
+                # Log once per failure episode; the poll retries every
+                # interval anyway, so per-cycle error lines are just spam.
+                if not self._kick_api_error_logged:
+                    self._kick_api_error_logged = True
+                    logger.error("[monitor] kick get_channel_statuses failed: %s", e)
+                else:
+                    logger.debug("[monitor] kick get_channel_statuses still failing: %s", e)
             else:
+                self._kick_api_error_logged = False
                 if snapshot is None:
                     snapshot = await self._snapshot_if_needed(config)
                 for ch in kick_channels:
@@ -121,6 +129,12 @@ class Monitor:
         async with self._lock_for(channel):
             if channel in self._live_channels:
                 if self.recorder.is_recording(channel):
+                    return snapshot
+                if self.recorder.ended_clean(channel):
+                    # The stream ended on its own; the offline webhook/API
+                    # poll hasn't caught up yet. Restarting now would resolve
+                    # a dead stream URL every poll cycle until it does.
+                    logger.debug("[monitor] %s ended cleanly, awaiting offline event", channel)
                     return snapshot
                 logger.warning("[monitor] %s recording stopped unexpectedly, restarting", channel)
                 ok, snapshot = await self._start_or_block(

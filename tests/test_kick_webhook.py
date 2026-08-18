@@ -599,6 +599,34 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
     assert wh._sync_failed_notified is False  # flag cleared after the last success
 
 
+def test_sync_failure_logged_once_per_episode(caplog):
+    config = base_config()
+    config["monitoring_interval"] = 0.01
+    notifier = FakeNotifier()
+
+    class AlwaysFails:
+        async def get_channel_statuses(self, slugs):
+            raise httpx.ConnectError("boom")
+
+        async def list_event_subscriptions(self):
+            return []
+
+    wh = make_webhook(config=config, api=AlwaysFails(), notifier=notifier)
+
+    async def scenario():
+        await wh.start()
+        await asyncio.sleep(0.05)
+        await wh.close()
+
+    with caplog.at_level("DEBUG", logger="stream_archive.kick_webhook"):
+        asyncio.run(scenario())
+
+    errors = [r for r in caplog.records if "subscription sync failed" in r.getMessage()]
+    debugs = [r for r in caplog.records if "subscription sync still failing" in r.getMessage()]
+    assert len(errors) == 1
+    assert len(debugs) >= 1
+
+
 def _server_error_500():
     request = httpx.Request("GET", "https://api.kick.com/public/v1/events/subscriptions")
     response = httpx.Response(500, request=request)
