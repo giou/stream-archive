@@ -81,7 +81,12 @@ recording processes that die mid-stream.
 - **Retention cleanup** — optional automatic deletion of recordings older
   than `retention_days`, run at startup and then daily; optional
   `disk.max_total_gb` cap that deletes oldest recordings or stops new ones.
-- **YouTube Live integration** — private/unlisted/public broadcasts, DVR
+  enabled, automatic start/stop, and clean broadcast ending on shutdown. An
+  optional hold delay (`youtube.hold_seconds`, or per channel) keeps the
+  broadcast open after the source drops and reuses the same broadcast when
+  the streamer returns within the delay — no new broadcast creation, no
+  quota cost; a bundled "Reconnecting..." clip keeps the broadcast fed
+  during the wait.
   enabled, automatic start/stop, and clean broadcast ending on shutdown.
 
 ## Architecture
@@ -255,8 +260,8 @@ placeholder-based `config.json` safe to commit/share.
 | `update_check.check_app` | no | `true` | Check GitHub releases for a newer stream-archive release |
 | `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
 | `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`; plugin updates ship in a future image |
-| `youtube.privacy_status` | no | `unlisted` | `public`, `unlisted`, or `private` |
-| `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client secrets JSON |
+| `youtube.hold_seconds` | no | `0` | Keep the YouTube broadcast open this many seconds after the source stops, waiting for the streamer to return; `0` = end immediately (default). A return within the delay reuses the same broadcast instead of creating a new one (saves the daily broadcast quota); a bundled pre-encoded "Reconnecting..." clip keeps the broadcast fed during the wait |
+| `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`: `{"channel": 60}`; a channel set to `0` is explicitly off; absent = global value. Managed from the Telegram channel submenu |
 
 ¹ Required when the channel list contains a `kick:` entry. ² Required when
 the webhook is enabled.
@@ -343,7 +348,8 @@ bot; anyone else gets no reply at all. The bot registers a command menu (type
 `/`) for the admin and a `/settings` reply keyboard (buttons above the input
 bar) that covers every setting in submenus — channels, chat recording
 (Twitch/Kick), output mode, quality, retention, recording limits, disk
-limits, and the Kick webhook setup wizard; inline buttons are used only for
+limits, the per-channel YouTube hold delay, and the Kick webhook setup
+wizard; inline buttons are used only for
 destructive confirmations (removing a channel, enabling delete-oldest).
 The bot re-sends the settings menu after every restart, so the reply keyboard
 keeps working across code updates and reboots without re-typing `/settings`.
@@ -355,7 +361,7 @@ a failed command leaves both memory and disk untouched.
 | --- | --- |
 | `/help` | List the available commands |
 | `/start` | Show the available commands and open the settings menu |
-| `/settings` | Open the settings menu (reply keyboard buttons): channels, chat recording, output mode, quality, retention, recording limits, disk limits, Kick webhook |
+| `/settings` | Open the settings menu (reply keyboard buttons): channels, chat recording, output mode, quality, retention, recording limits, disk limits, YouTube hold delay, Kick webhook |
 | `/status` | Monitored channels, output mode, retention, chat-recording state, quality, concurrency limits, disk usage/limits, update-check state, Kick webhook state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
 | `/add <channel\|url>` | Start monitoring a channel: `twitch:<name>`, `kick:<name>`, or a `twitch.tv`/`kick.com` profile URL (stored canonically; Kick webhook/EventSub subscriptions are created immediately) |
@@ -378,6 +384,12 @@ Notes:
   mode it started with. A per-channel override (`/mode <channel> <mode>`) wins
   over the global `output_mode`; `/status` lists active overrides, and
   `/remove <channel>` clears the channel's override.
+- The per-channel YouTube hold delay is set from
+  `/settings → Channels → <channel> → Hold delay` (presets, `0` = off, or a
+  custom value in seconds; `Default` clears the override back to the global
+  `youtube.hold_seconds`). The value is read when a recording stops, so it
+  applies to the next stop immediately; the global default lives in
+  `config.json`.
 - `/chat off` applies immediately: in-flight chat capture is stopped and
   finalized (the video recordings continue), and new recordings start without
   chat until `/chat on`; `/chat on` affects new recordings only.
@@ -447,6 +459,7 @@ with `[scheduler] Shutdown complete`.
 | Other YouTube broadcast-creation error | Task fails loudly; channel restarted next cycle |
 | Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, feed stall) | Entry removed (chat + broadcast finalized), monitor restarts on the next poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
 | YouTube re-stream keeps ending shortly after start (flaky feed) | Restarts back off per channel (120s doubling, 30 min cap); a rolling 24h budget of 10 broadcast creations shared across all channels blocks further restarts (one alert with the next-slot time) until a slot frees — guards YouTube's per-channel daily broadcast cap (`userBroadcastsExceedLimit`) |
+| Source drops briefly with a hold delay configured | The broadcast stays open (`youtube.hold_seconds`, or the per-channel override), fed by a bundled pre-encoded "Reconnecting..." clip; a return within the delay reuses the same broadcast — no new broadcast creation, no quota cost. On expiry the broadcast ends as usual |
 | Transient Twitch API error (token/request) | Logged, nothing acted on, retried next cycle |
 | Transient Kick API error (token/request) | Logged, nothing acted on, retried next cycle |
 | Kick channel slug not found | Warned once per channel, treated as offline; never crashes the poll |
