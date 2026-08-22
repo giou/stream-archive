@@ -41,6 +41,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
+    _held: dict[str, dict[str, Any]]
     _finalize_chat: Any
     _finalize_kick_chat: Any
     _end_broadcast: Any
@@ -65,6 +66,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._quick_ends = {}  # channel -> consecutive short YouTube recordings
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
         self._youtube_starts = []
+        self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
         self._ended_clean: set[str] = set()  # channels whose last task ended cleanly (stream over)
 
     async def start(
@@ -246,7 +248,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         youtube_info = entry.get("youtube_info")
 
         if youtube_info:
-            await self._end_broadcast(channel, youtube_info["broadcast_id"])
+            await self._release_broadcast(channel, youtube_info, entry)
 
         filepath = entry.get("filepath")
         file_info = None
@@ -288,6 +290,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
     async def close(self) -> None:
         await self.stop_all()
+        for ch, held in list(self._held.items()):
+            held["end_task"].cancel()
+            await self._stop_keepalive(held.get("keepalive"))
+            self._held.pop(ch, None)
+            await self._end_broadcast(ch, held["youtube_info"]["broadcast_id"])
 
     def _track(self, channel: str, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -319,7 +326,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         asyncio.create_task(self._finalize_kick_chat(entry))
         youtube_info = entry.get("youtube_info")
         if youtube_info:
-            asyncio.create_task(self._end_broadcast(channel, youtube_info["broadcast_id"]))
+            asyncio.create_task(self._release_broadcast(channel, youtube_info, entry))
         if entry.get("mode") in ("youtube", "both"):
             self._note_youtube_end(channel, entry)
         # Remember that the stream ended on its own (as opposed to a task
@@ -353,7 +360,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         await self._finalize_kick_chat(entry)
 
         if entry.get("youtube_info"):
-            await self._end_broadcast(channel, entry["youtube_info"]["broadcast_id"])
+            await self._release_broadcast(channel, entry["youtube_info"], entry)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings

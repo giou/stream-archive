@@ -333,6 +333,11 @@ class EndingYouTubeStreamer(FakeYouTubeStreamer):
     def __init__(self):
         super().__init__()
         self.ended = []
+        self.create_count = 0
+
+    async def create_stream(self, author, title, channel, game):
+        self.create_count += 1
+        return await super().create_stream(author, title, channel, game)
 
     async def end_stream(self, broadcast_id):
         self.ended.append(broadcast_id)
@@ -1174,5 +1179,341 @@ def test_stop_chat_finalizes_kick_chat_midstream(tmp_path, monkeypatch):
             comments = json.load(f)["comments"]
         assert [c["message"]["body"] for c in comments] == ["saved"]
         await rec.stop("kick:xqc")
+
+    asyncio.run(scenario())
+
+
+class FakeKeepaliveProc:
+    """Keep-alive process stand-in: wait() blocks until terminated (or exits
+    immediately when exit_immediately is set, for the early-death path)."""
+
+    def __init__(self, exit_immediately=False):
+        self._rc = 1 if exit_immediately else None
+        self.terminated = False
+        self.killed = False
+
+    @property
+    def returncode(self):
+        return self._rc
+
+    def terminate(self):
+        self.terminated = True
+        self._rc = 1
+
+    def kill(self):
+        self.killed = True
+        self._rc = 1
+
+    async def wait(self):
+        while self._rc is None:
+            await asyncio.sleep(0.01)
+        return self._rc
+
+
+def test_hold_delays_end_and_reuses_broadcast(tmp_path, monkeypatch):
+    """A clean source end defers the broadcast end; a return within the delay
+    reuses the same broadcast (no second create_stream)."""
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 60
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def no_keepalive(rtmp_url):
+        return None
+
+    monkeypatch.setattr(rec, "_start_keepalive", no_keepalive)
+
+    async def scenario():
+        # Feed ends cleanly on its own -> broadcast held, not ended
+        assert await rec.start("ch") is True
+        for _ in range(200):  # real ffmpeg spawn/EOF takes a few ticks
+            if "ch" in rec._held:
+                break
+            await asyncio.sleep(0.01)
+        assert yt.ended == []
+        assert "ch" in rec._held
+        assert rec._held["ch"]["youtube_info"]["broadcast_id"] == "b1"
+        assert rec.ended_clean("ch")
+        assert yt.create_count == 1  # the fresh create above
+
+        # Streamer returns within the hold -> same broadcast, no new create
+        monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert yt.create_count == 1  # no new create: held broadcast reused
+        assert rec._recordings["ch"]["youtube_info"]["broadcast_id"] == "b1"
+        assert rec._held == {}  # hold consumed by the reuse
+
+        # Stop path also holds instead of ending
+        await rec.stop("ch")
+        assert yt.ended == []
+        assert "ch" in rec._held
+        await rec.close()  # flush the hold
+
+    asyncio.run(scenario())
+    assert yt.ended == ["b1"]
+    assert rec._held == {}
+
+
+def test_hold_expiry_ends_broadcast(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 0.05
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+
+    async def no_keepalive(rtmp_url):
+        return None
+
+    monkeypatch.setattr(rec, "_start_keepalive", no_keepalive)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
+            "kick_chat": None,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+        await asyncio.sleep(0.15)  # beyond the 0.05s hold
+        assert yt.ended == ["b1"]
+        assert rec._held == {}
+
+    asyncio.run(scenario())
+
+
+def test_stop_schedules_hold(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 60
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def no_keepalive(rtmp_url):
+        return None
+
+    monkeypatch.setattr(rec, "_start_keepalive", no_keepalive)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        await rec.stop("ch")
+        assert yt.ended == []  # deferred
+        assert "ch" in rec._held
+        await rec.close()  # clean shutdown flushes the hold
+
+    asyncio.run(scenario())
+    assert yt.ended == ["b1"]
+    assert rec._held == {}
+
+
+def test_failed_reused_task_ends_immediately(tmp_path, monkeypatch):
+    """A reuse whose feed dies again is a dead broadcast: end now, no hold loop."""
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 60
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def no_keepalive(rtmp_url):
+        return None
+
+    monkeypatch.setattr(rec, "_start_keepalive", no_keepalive)
+
+    async def scenario():
+        async def boom():
+            raise RuntimeError("stream interrupted")
+
+        task = asyncio.create_task(boom())
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1"},
+            "kick_chat": None,
+            "mode": "youtube",
+            "started_at": time.monotonic() - 300,  # avoid quick-end backoff noise
+            "reused": True,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        assert yt.ended == ["b1"]
+        assert rec._held == {}
+
+    asyncio.run(scenario())
+
+
+def test_hold_bypasses_restart_gates(tmp_path, monkeypatch):
+    """A pending hold is free to reuse: no new broadcast, so no backoff/budget gate."""
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+
+    async def scenario():
+        rec._held["ch"] = {
+            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
+            "end_task": asyncio.create_task(asyncio.sleep(60)),
+            "keepalive": None,
+        }
+        rec._backoff_until["ch"] = time.monotonic() + 999
+        rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+        assert rec.youtube_restart_blocked_reason("ch") is None
+
+    asyncio.run(scenario())
+
+
+def test_per_channel_hold_override(tmp_path):
+    config = make_config(tmp_path)
+    rec = Recorder(config)
+    config.channel_youtube_hold_seconds = {"twitch:ch": 60}  # keys normalize on assignment
+    assert rec._hold_seconds("twitch:ch") == 60
+    assert rec._hold_seconds("kick:a") == 0  # no override: global default 0
+    config.youtube.hold_seconds = 120
+    config.channel_youtube_hold_seconds["twitch:ch"] = 0  # explicit off beats global
+    assert rec._hold_seconds("twitch:ch") == 0
+
+
+def test_bundled_reconnect_clip_present():
+    from stream_archive.recorder.youtube_output import _RECONNECT_CLIP
+
+    assert _RECONNECT_CLIP.is_file()
+    assert _RECONNECT_CLIP.stat().st_size > 0
+
+
+def test_start_keepalive_uses_bundled_clip(tmp_path, monkeypatch):
+    from stream_archive.recorder.youtube_output import _RECONNECT_CLIP
+
+    rec = Recorder(make_config(tmp_path))
+    recorded = []
+    fake_proc = object()
+
+    async def fake_exec(*args, **kwargs):
+        recorded.append(args)
+        return fake_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    result = asyncio.run(rec._start_keepalive("rtmp://x"))
+    assert result is fake_proc
+    assert recorded[0] == (
+        "ffmpeg",
+        "-loglevel",
+        "warning",
+        "-re",
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(_RECONNECT_CLIP),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-f",
+        "flv",
+        "-flvflags",
+        "no_duration_filesize",
+        "rtmp://x",
+    )
+
+    async def failing_exec(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg missing")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_exec)
+    assert asyncio.run(rec._start_keepalive("rtmp://x")) is None  # spawn failure -> None, no exception
+
+
+def test_hold_spawns_keepalive_and_stops_on_expiry(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 0.05
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    proc = FakeKeepaliveProc()
+
+    async def fake_start(rtmp_url):
+        return proc
+
+    monkeypatch.setattr(rec, "_start_keepalive", fake_start)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
+            "kick_chat": None,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+        await asyncio.sleep(0.15)
+        assert yt.ended == ["b1"]
+        assert rec._held == {}
+        assert proc.terminated
+
+    asyncio.run(scenario())
+
+
+def test_reuse_stops_keepalive(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 60
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        proc = FakeKeepaliveProc()
+        rec._held["ch"] = {
+            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
+            "end_task": asyncio.create_task(asyncio.sleep(60)),
+            "keepalive": proc,
+        }
+        monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+        assert await rec.start("ch") is True
+        await asyncio.sleep(0.05)
+        assert yt.create_count == 0  # reuse: no new broadcast created
+        assert proc.terminated
+        assert rec._recordings["ch"]["youtube_info"]["broadcast_id"] == "b1"
+        assert rec._recordings["ch"]["reused"] is True
+        await rec.stop("ch")
+        await rec.close()
+
+    asyncio.run(scenario())
+
+
+def test_keepalive_early_death_ends_broadcast(tmp_path, monkeypatch):
+    """If the keep-alive feed dies (e.g. broadcast rejected), end now instead of
+    waiting out the full delay."""
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.youtube.hold_seconds = 60
+    yt = EndingYouTubeStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+
+    async def dying_keepalive(rtmp_url):
+        return FakeKeepaliveProc(exit_immediately=True)
+
+    monkeypatch.setattr(rec, "_start_keepalive", dying_keepalive)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        rec._recordings["ch"] = {
+            "tasks": [task],
+            "process": None,
+            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
+            "kick_chat": None,
+        }
+        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        await task
+        await asyncio.sleep(0.1)
+        assert yt.ended == ["b1"]
+        assert rec._held == {}
 
     asyncio.run(scenario())

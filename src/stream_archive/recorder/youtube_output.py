@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,9 +23,15 @@ _BACKOFF_BASE_S = 120
 
 _BACKOFF_MAX_S = 1800
 
+# Pre-encoded 1920x1080@60 "Reconnecting..." interstitial (animated dots,
+# 3s loop) fed into a held broadcast with `-c copy` — no runtime encoding.
 _YOUTUBE_DAILY_BUDGET = 10
 
 _YOUTUBE_BUDGET_WINDOW_S = 86400
+
+# Pre-encoded 1920x1080@60 "Reconnecting..." interstitial (animated dots,
+# 3s loop) fed into a held broadcast with `-c copy` — no runtime encoding.
+_RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect_clip.mp4"
 
 
 class YoutubeOutputMixin:
@@ -32,6 +39,7 @@ class YoutubeOutputMixin:
     _youtube: Any
     _notifier: Any
     _recordings: dict[str, dict[str, Any]]
+    _held: dict[str, dict[str, Any]]
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
@@ -69,6 +77,8 @@ class YoutubeOutputMixin:
         mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
         if mode not in ("youtube", "both"):
             return None
+        if self._held.get(channel):
+            return None  # held broadcast is free to reuse: no new broadcast, no quota cost
         now = time.monotonic()
         backoff = self._backoff_until.get(channel, 0.0)
         if backoff > now:
@@ -95,6 +105,125 @@ class YoutubeOutputMixin:
         except Exception as e:
             logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
+    def _hold_seconds(self, channel: str) -> float:
+        """Delay (s) the broadcast stays open after the source stops; 0 = end now."""
+        return self._config.channel_youtube_hold_seconds.get(channel, self._config.youtube.hold_seconds)
+
+    async def _start_keepalive(self, rtmp_url: str) -> asyncio.subprocess.Process | None:
+        """Loop the bundled reconnect clip into the RTMP URL with `-c copy`.
+
+        Keeps the broadcast fed for the whole hold (YouTube otherwise auto-ends
+        a broadcast ~90s after the encoder goes silent). Returns None when the
+        keep-alive cannot be spawned (hold proceeds without it, safely).
+        """
+        cmd = [
+            "ffmpeg",
+            "-loglevel",
+            "warning",
+            "-re",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(_RECONNECT_CLIP),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-f",
+            "flv",
+            "-flvflags",
+            "no_duration_filesize",
+            rtmp_url,
+        ]
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return proc
+        except asyncio.CancelledError:
+            if proc is not None:
+                proc.terminate()
+            raise
+        except Exception as e:
+            logger.warning("[recorder] [youtube] keep-alive spawn failed (hold without keep-alive): %s", e)
+            return None
+
+    async def _stop_keepalive(self, proc: asyncio.subprocess.Process | None) -> None:
+        """Stop the keep-alive feed; idempotent."""
+        if proc is None or proc.returncode is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+
+    async def _release_broadcast(
+        self, channel: str, youtube_info: dict[str, Any] | None, entry: dict[str, Any]
+    ) -> None:
+        """End a broadcast now, or hold it open for the configured delay."""
+        if youtube_info is None:
+            return
+        delay = self._hold_seconds(channel)
+        if delay <= 0 or (entry.get("reused") and entry.get("failed")):
+            # default behavior (feature off) — and a reuse that died is a dead
+            # broadcast: holding it would loop
+            await self._end_broadcast(channel, youtube_info["broadcast_id"])
+            return
+        old = self._held.get(channel)
+        if old:
+            old["end_task"].cancel()
+        hold: dict[str, Any] = {"youtube_info": youtube_info, "end_task": None, "keepalive": None}
+        self._held[channel] = hold
+        hold["end_task"] = asyncio.create_task(self._hold_then_end(channel, delay, hold))
+        logger.info(
+            "[recorder] [youtube] %s broadcast %s held for %.0fs (streamer may return)",
+            channel,
+            youtube_info["broadcast_id"],
+            delay,
+        )
+
+    async def _hold_then_end(self, channel: str, delay: float, hold: dict[str, Any]) -> None:
+        """Feed the held broadcast until the delay elapses (or the feed dies), then end."""
+        keepalive = await self._start_keepalive(hold["youtube_info"]["rtmp_url"])
+        hold["keepalive"] = keepalive
+        sleep_task = asyncio.create_task(asyncio.sleep(delay))
+        ka_task = asyncio.create_task(keepalive.wait()) if keepalive is not None else None
+        try:
+            done, _ = await asyncio.wait(
+                [t for t in (sleep_task, ka_task) if t is not None],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if ka_task is not None and ka_task in done:
+                # keep-alive feed died early: broadcast unreachable/ended -> end now
+                if self._held.get(channel) is hold:
+                    self._held.pop(channel, None)
+                await self._stop_keepalive(keepalive)
+                logger.warning("[recorder] [youtube] %s keep-alive feed stopped early, ending broadcast", channel)
+                await self._end_broadcast(channel, hold["youtube_info"]["broadcast_id"])
+                return
+            if ka_task is not None:
+                ka_task.cancel()
+            if self._held.get(channel) is not hold:
+                await self._stop_keepalive(keepalive)
+                return  # hold consumed by a reuse while we slept
+            self._held.pop(channel, None)
+            await self._stop_keepalive(keepalive)
+            await self._end_broadcast(channel, hold["youtube_info"]["broadcast_id"])
+        except asyncio.CancelledError:
+            for t in (sleep_task, ka_task):
+                if t is not None:
+                    t.cancel()
+            await self._stop_keepalive(keepalive)
+            raise
+
     async def _stream_youtube(
         self,
         channel: str,
@@ -106,41 +235,51 @@ class YoutubeOutputMixin:
         notify: bool = True,
         youtube_notify: bool = True,
     ) -> None:
-        logger.info("[recorder] [youtube] %s resolving...", channel)
-        try:
-            youtube_info = await self._youtube.create_stream(author, title, channel, game)
-            self._record_youtube_start()
-        except Exception as e:
-            logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
-            if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():
-                msg = (
-                    f"\u26a0\ufe0f YouTube rate limit reached!\n"
-                    f"Channel: {channel}\n"
-                    f"Stream: {title or 'Unknown'}\n"
-                    f"Stream link: {channel_url(channel)}"
-                )
-                if self._notifier:
-                    await self._notifier.notify(msg)
-                entry = self._recordings.get(channel)
-                if entry is not None:
-                    recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
-                    os.makedirs(recording_dir, exist_ok=True)
-                    now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
-                    safe_title = _sanitize_filename(f"{author} - {title}")
-                    filepath = os.path.join(recording_dir, f"{safe_title}-{now}.ts")
-                    entry["filepath"] = filepath
-                    logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)
-                    disk_task = self._track(channel, self._record_disk(channel, filepath, stream))
-                    entry["tasks"].append(disk_task)
-                    if self._notifier and notify:
-                        await self._notifier.notify_live(channel, title, game, channel_url(channel))
-                return
-            raise
-
         entry = self._recordings.get(channel)
         if entry is None:
             return
-        entry["youtube_info"] = youtube_info
+        held = self._held.pop(channel, None)
+        if held is not None:
+            held["end_task"].cancel()
+            await self._stop_keepalive(held.get("keepalive"))
+            youtube_info = held["youtube_info"]
+            entry["youtube_info"] = youtube_info
+            entry["reused"] = True
+            logger.info("[recorder] [youtube] %s reusing held broadcast %s", channel, youtube_info["broadcast_id"])
+        else:
+            try:
+                youtube_info = await self._youtube.create_stream(author, title, channel, game)
+                self._record_youtube_start()  # quota accounting ONLY on fresh creates
+            except Exception as e:
+                logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
+                if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():
+                    msg = (
+                        f"\u26a0\ufe0f YouTube rate limit reached!\n"
+                        f"Channel: {channel}\n"
+                        f"Stream: {title or 'Unknown'}\n"
+                        f"Stream link: {channel_url(channel)}"
+                    )
+                    if self._notifier:
+                        await self._notifier.notify(msg)
+                    entry = self._recordings.get(channel)
+                    if entry is not None:
+                        recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
+                        os.makedirs(recording_dir, exist_ok=True)
+                        now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
+                        safe_title = _sanitize_filename(f"{author} - {title}")
+                        filepath = os.path.join(recording_dir, f"{safe_title}-{now}.ts")
+                        entry["filepath"] = filepath
+                        logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)
+                        disk_task = self._track(channel, self._record_disk(channel, filepath, stream))
+                        entry["tasks"].append(disk_task)
+                        if self._notifier and notify:
+                            await self._notifier.notify_live(channel, title, game, channel_url(channel))
+                    return
+                raise
+            entry = self._recordings.get(channel)
+            if entry is None:
+                return
+            entry["youtube_info"] = youtube_info
 
         if self._notifier and youtube_notify:
             await self._notifier.notify_live(channel, title, game, channel_url(channel), youtube_info["youtube_url"])

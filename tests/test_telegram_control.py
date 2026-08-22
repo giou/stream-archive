@@ -980,6 +980,7 @@ def test_reply_keyboard_channel_layout(tmp_path):
         [{"text": "Delete channel"}],
         [{"text": "Mode: disk"}, {"text": "Mode: youtube"}],
         [{"text": "Mode: both"}, {"text": "Mode: default"}],
+        [{"text": "Hold delay"}],
         [{"text": "Back"}],
     ]
 
@@ -2674,3 +2675,79 @@ def test_menu_text_kick_webhook_shows_tunnel_mode(tmp_path):
     config.kick.webhook.enabled = True
     text = asyncio.run(ctrl.menu_text("kick_webhook"))
     assert "Kick webhook: on (cloudflare \u00b7 https://abc123.trycloudflare.com/kick/webhook)" in text
+
+def test_reply_text_channel_hold_menu(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Hold delay"))
+    assert "YouTube hold delay for twitch:channel1" in text
+    assert "Global default: 0s" in text
+    assert kb_labels(markup) == ["0 (off)", "30s", "60s", "120s", "300s", "600s", "Default", "Custom", "Back"]
+    assert ctrl._menu == "channel_hold"
+
+
+def test_reply_text_channel_hold_set_preset(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"
+    asyncio.run(ctrl.handle_reply_text("Hold delay"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("60s"))
+    assert "Hold delay for twitch:channel1 set to 60s" in text
+    assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {"twitch:channel1": 60}
+    assert config.channel_youtube_hold_seconds == {"twitch:channel1": 60.0}
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+
+
+def test_reply_text_channel_hold_default_resets(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.channel_youtube_hold_seconds = {"twitch:channel1": 60}
+    ctrl._menu, ctrl._menu_channel = "channel_hold", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Default"))
+    assert "reset to global" in text
+    assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {}
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+
+
+def test_reply_text_channel_hold_custom(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"
+    asyncio.run(ctrl.handle_reply_text("Hold delay"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Custom"))
+    assert "Hold delay for twitch:channel1" in text
+    assert ctrl._menu == "custom"
+    assert ctrl._custom_setting == "channel_hold"
+    assert ctrl._menu_channel == "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("90"))
+    assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {"twitch:channel1": 90}
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert ctrl._menu == "channels"
+
+
+def test_back_from_channel_hold_to_channel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._menu, ctrl._menu_channel = "channel_hold", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+    assert "Output mode" in text
+
+
+def test_handle_channel_hold_invalid(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    for args in (["twitch:channel1", "-5"], ["twitch:channel1", "abc"]):
+        text = ctrl.handle_channel_hold(args)
+        assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_remove_clears_hold_override(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1", "twitch:ch"])
+    ctrl.handle_channel_hold(["twitch:channel1", "60"])
+    assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {"twitch:channel1": 60}
+    asyncio.run(ctrl.handle_remove(["twitch:channel1"]))
+    assert read_file(tmp_path).get("channel_youtube_hold_seconds", {}) == {}
+    assert "twitch:channel1" not in read_file(tmp_path)["channels"]

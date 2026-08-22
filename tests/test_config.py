@@ -31,6 +31,8 @@ def test_valid_config_passes_and_sets_defaults():
     assert config.output_mode == "disk"
     assert config.youtube.privacy_status == "unlisted"
     assert config.youtube.client_secrets_file == "client_secret.json"
+    assert config.youtube.hold_seconds == 0
+    assert config.channel_youtube_hold_seconds == {}
     assert config.retention_days == 0
     assert config.update_check.enabled is True
     assert config.update_check.interval_hours == 24
@@ -445,3 +447,28 @@ def test_env_interpolation_missing_var_raises(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(data))
     with pytest.raises(ValueError, match="TEST_BOT_TOKEN"):
         get_config(tmp_path / "config.json")
+
+def test_channel_hold_override_normalized():
+    config = build(channel_youtube_hold_seconds={"channel1": 60})
+    assert config.channel_youtube_hold_seconds == {"twitch:channel1": 60}
+
+
+def test_invalid_channel_hold_key_raises():
+    config = valid_config()
+    config["channel_youtube_hold_seconds"] = {"bad name!": 60}
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(config)
+
+
+def test_negative_channel_hold_raises():
+    config = valid_config()
+    config["channel_youtube_hold_seconds"] = {"channel1": -1}
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(config)
+
+
+def test_negative_global_hold_raises():
+    config = valid_config()
+    config["youtube"] = {"hold_seconds": -1}
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(config)

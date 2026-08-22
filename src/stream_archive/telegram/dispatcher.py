@@ -248,7 +248,15 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         elif menu == "channels":
             rows = [["Add channel"], *([f"\u2022 {ch}"] for ch in self._config.channels), ["Back"]]
         elif menu == "channel":
-            rows = [["Delete channel"], ["Mode: disk", "Mode: youtube"], ["Mode: both", "Mode: default"], ["Back"]]
+            rows = [
+                ["Delete channel"],
+                ["Mode: disk", "Mode: youtube"],
+                ["Mode: both", "Mode: default"],
+                ["Hold delay"],
+                ["Back"],
+            ]
+        elif menu == "channel_hold":
+            rows = [["0 (off)", "30s", "60s", "120s"], ["300s", "600s", "Default"], ["Custom", "Back"]]
         elif menu == "chat":
             rows = [["Twitch", "Kick"], ["Back"]]
         elif menu in ("chat_twitch", "chat_kick"):
@@ -331,7 +339,25 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             ch = channel or ""
             override = c.channel_output_modes.get(ch)
             mode = override or f"default (global: {c.output_mode})"
-            return f"Channel: {ch}\nOutput mode: {mode}\n\nTap Delete to remove it, or set its output mode."
+            hold_override = c.channel_youtube_hold_seconds.get(ch)
+            hold_text = (
+                f"{hold_override:g}s" if hold_override is not None else f"default (global: {c.youtube.hold_seconds:g}s)"
+            )
+            return (
+                f"Channel: {ch}\nOutput mode: {mode}\nHold delay: {hold_text}\n\n"
+                "Tap Delete to remove it, or set its output mode or hold delay."
+            )
+        if menu == "channel_hold":
+            ch = channel or ""
+            hold_override = c.channel_youtube_hold_seconds.get(ch)
+            eff = c.youtube.hold_seconds if hold_override is None else hold_override
+            return (
+                f"YouTube hold delay for {ch}: {eff:g}s (0 = end immediately)\n"
+                f"Global default: {c.youtube.hold_seconds:g}s\n\n"
+                "When the source stream stops, the broadcast stays open this long, waiting for the "
+                "streamer to return \u2014 a return within the delay reuses the same broadcast instead "
+                "of creating a new one."
+            )
         if menu == "chat":
             kick_chat = c.kick.record_chat
             return (
@@ -363,11 +389,15 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 "(or recording stops). Choose:"
             )
         if menu == "custom":
+            ch = self._menu_channel or ""
+            hold_override = c.channel_youtube_hold_seconds.get(ch)
+            eff = c.youtube.hold_seconds if hold_override is None else hold_override
             labels = {
                 "retention": (f"Retention: {c.retention_days} day(s) (0 = disabled)", " in days"),
                 "maxrec": (f"Max recordings: {c.max_concurrent_recordings} (0 = unlimited)", ""),
                 "maxyt": (f"Max YouTube re-streams: {c.max_concurrent_youtube_streams} (0 = unlimited)", ""),
                 "disk_maxsize": (f"Max total: {d.max_total_gb:g} GB (0 = disabled)", " in GB"),
+                "channel_hold": (f"Hold delay for {ch}: {eff:g}s (0 = end immediately)", " in seconds"),
             }
             label, units = labels[self._custom_setting or ""]
             return f"{label}. Send the new value{units}:"
@@ -382,12 +412,17 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         if text == "Back":
             parent: str | None
             if self._menu == "custom":
-                parent = "root" if self._custom_setting in ("retention", "maxrec", "maxyt") else "disk"
+                parent = (
+                    "channel"
+                    if self._custom_setting == "channel_hold"
+                    else ("root" if self._custom_setting in ("retention", "maxrec", "maxyt") else "disk")
+                )
             else:
                 parent = {
                     "channels": "root",
                     "add_channel": "channels",
                     "channel": "channels",
+                    "channel_hold": "channel",
                     "chat": "root",
                     "chat_twitch": "chat",
                     "chat_kick": "chat",
@@ -408,6 +443,9 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 return None
             if self._menu in ("kick_cloudflare_hostname", "kick_cloudflare_dns"):
                 self._cloudflare_hostname = None
+            if parent == "channel":
+                self._menu = "channel"
+                return await self.menu_text("channel", self._menu_channel), self.reply_keyboard("channel")
             self._menu, self._menu_channel = parent or "", None
             return await self.menu_text(parent), self.reply_keyboard(parent)
         if self._menu == "add_channel":  # any text is a candidate channel name
@@ -424,11 +462,17 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 result = self.handle_maxrecordings([text])
             elif setting == "maxyt":
                 result = self.handle_maxyoutube([text])
+            elif setting == "channel_hold":
+                result = self.handle_channel_hold([self._menu_channel or "", text])
             else:
                 result = self.handle_disk(["maxsize", text])
             if result.startswith("\u274c") or result.startswith("Usage"):
                 return result, self.reply_keyboard("custom")
-            parent = "root" if setting in ("retention", "maxrec", "maxyt") else "disk"
+            parent = (
+                "channel"
+                if setting == "channel_hold"
+                else ("root" if setting in ("retention", "maxrec", "maxyt") else "disk")
+            )
             self._menu = parent
             return result, self.reply_keyboard(parent)
         if self._menu == "kick_cloudflare_token":  # any text is a token candidate
@@ -494,6 +538,9 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                     f"and removes its output-mode override.",
                     self._confirm_keyboard("confirm_remove", ch),
                 )
+            if text == "Hold delay":
+                self._menu = "channel_hold"
+                return await self.menu_text("channel_hold", ch), self.reply_keyboard("channel_hold")
             values = {
                 "Mode: disk": "disk",
                 "Mode: youtube": "youtube",
@@ -503,6 +550,27 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             if text in values:
                 result = self.handle_mode([ch, values[text]])
                 return result, self.reply_keyboard("channel")
+            return None
+        if menu == "channel_hold":
+            ch = self._menu_channel
+            if ch is None:
+                return None
+            values = {
+                "0 (off)": "0",
+                "30s": "30",
+                "60s": "60",
+                "120s": "120",
+                "300s": "300",
+                "600s": "600",
+                "Default": "default",
+            }
+            if text in values:
+                result = self.handle_channel_hold([ch, values[text]])
+                self._menu = "channel"
+                return result, self.reply_keyboard("channel")
+            if text == "Custom":
+                self._custom_setting, self._menu = "channel_hold", "custom"
+                return await self.menu_text("custom"), self.reply_keyboard("custom")
             return None
         if menu == "chat":
             if text in ("Twitch", "Kick"):

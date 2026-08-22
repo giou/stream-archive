@@ -60,6 +60,31 @@ class SettingsCommands:
 
         return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
 
+    def handle_channel_hold(self, args: list[str]) -> str:
+        if len(args) != 2:
+            return "Usage: /channelhold <channel> <seconds|default>"
+        ch = normalize_channel_name(args[0])
+        if ch is None:
+            return f"\u274c Invalid channel name: {ch!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+        if args[1] == "default":
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.channel_youtube_hold_seconds.pop(ch, None)
+
+            return self._apply(mutate, lambda c: f"Hold delay for {ch} reset to global ({c.youtube.hold_seconds:g}s)")
+
+        try:
+            n = int(args[1])
+        except ValueError:
+            return "\u274c hold delay must be a non-negative integer (seconds) or 'default'"
+        if n < 0:
+            return "\u274c hold delay must be a non-negative integer (seconds) or 'default'"
+
+        def set_hold(candidate: AppConfig) -> None:
+            candidate.channel_youtube_hold_seconds[ch] = n
+
+        return self._apply(set_hold, lambda c: f"Hold delay for {ch} set to {n}s (0 = end immediately)")
+
     def handle_quality(self, args: list[str]) -> str:
         if not args:
             return f"Quality: {self._config.preferred_quality}"

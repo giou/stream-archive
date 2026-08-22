@@ -90,6 +90,7 @@ class YouTubeConfig(BaseModel):
 
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
+    hold_seconds: float = Field(0, ge=0)
 
 
 class UpdateCheckConfig(BaseModel):
@@ -212,6 +213,7 @@ class AppConfig(BaseModel):
     retention_days: float = Field(0, ge=0)
     output_mode: OutputMode = "disk"
     channel_output_modes: dict[str, OutputMode] = {}
+    channel_youtube_hold_seconds: dict[str, float] = {}
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
@@ -255,6 +257,19 @@ class AppConfig(BaseModel):
             if norm is None:
                 raise ValueError(f"Invalid channel name in channel_output_modes: {ch!r}")
             normalized[norm] = mode
+        return normalized
+
+    @field_validator("channel_youtube_hold_seconds")
+    @classmethod
+    def _normalize_hold_keys(cls, v: dict[str, float]) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for ch, seconds in v.items():
+            norm = normalize_channel_name(ch)
+            if norm is None:
+                raise ValueError(f"Invalid channel name in channel_youtube_hold_seconds: {ch!r}")
+            if seconds < 0:
+                raise ValueError(f"channel_youtube_hold_seconds.{ch} must be >= 0")
+            normalized[norm] = seconds
         return normalized
 
     @field_validator("timezone")
