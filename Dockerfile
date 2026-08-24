@@ -37,15 +37,18 @@ RUN mkdir -p /app/plugins \
  && echo "${TTVLOL_PLUGIN_SHA256}  /tmp/twitch.py" | sha256sum -c - \
  && mv /tmp/twitch.py /app/plugins/twitch.py
 
-# Dependencies first so source edits don't invalidate the layer.
+# Two-stage dependency install so source edits don't invalidate the dep layer:
+# stage 1 resolves+installs third-party deps only (cached until uv.lock or
+# project metadata changes); stage 2 adds the project itself from src/.
 COPY pyproject.toml uv.lock README.md ./
-COPY src ./src
 
 # Venv lives OUTSIDE /app so the read-only rootfs never blocks it.
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
+RUN uv sync --frozen --no-dev --no-install-project
+COPY src ./src
 RUN uv sync --frozen --no-dev
 
 # HOME must be writable by the (non-root) runtime user: streamlink's plugin
@@ -67,3 +70,8 @@ ENTRYPOINT ["stream-archive-entrypoint"]
 # Plain `docker run` starts the scheduler; overriding CMD (e.g. `docker compose
 # run --rm stream-archive stream-archive-setup-youtube`) runs other entry points.
 CMD ["stream-archive"]
+
+# Liveness for the hung-process case: the scheduler serves /healthz on the
+# loopback interface (scheduler.py _start_health_server). Compose inherits
+# this automatically; do not duplicate it in docker-compose.yml.
+HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4)"]

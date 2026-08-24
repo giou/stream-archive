@@ -1879,7 +1879,7 @@ wheels = [
 
 [[package]]
 name = "stream-archive"
-version = "1.0.5"
+version = "1.0.7"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

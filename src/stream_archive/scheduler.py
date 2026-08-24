@@ -5,6 +5,8 @@ import signal
 import time
 from typing import Any
 
+from aiohttp import web
+
 from stream_archive.config import get_config
 from stream_archive.eventsub import EventSubClient
 from stream_archive.kick_api import KickAPI
@@ -21,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 _shutdown_event: asyncio.Event | None = None
 
+_HEALTH_HOST = "127.0.0.1"
+_HEALTH_PORT = 9100
+
 
 def _setup_signal_handlers() -> None:
     global _shutdown_event
@@ -34,9 +39,34 @@ def _setup_signal_handlers() -> None:
     signal.signal(signal.SIGINT, handle_signal)
 
 
+async def _healthz(request: web.Request) -> web.Response:
+    return web.Response(status=200, text="ok")
+
+
+async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_PORT) -> web.AppRunner | None:
+    """Loopback-only liveness endpoint for the container HEALTHCHECK.
+
+    Binding failure is non-fatal: an absent /healthz just means no
+    healthcheck, never a broken app.
+    """
+    app = web.Application()
+    app.router.add_get("/healthz", _healthz)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+    except OSError as e:
+        await runner.cleanup()
+        logger.warning("[scheduler] health endpoint unavailable on %s:%s: %s", host, port, e)
+        return None
+    return runner
+
+
 async def run_scheduler() -> None:
     global _shutdown_event
     _setup_signal_handlers()
+
     assert _shutdown_event is not None
 
     config = get_config()
@@ -54,6 +84,7 @@ async def run_scheduler() -> None:
 
     twitch_api = TwitchAPI(config)
     notifier = Notifier(config.bot_telegram_api, config.telegram_user_id)
+    health_runner = await _start_health_server()
 
     # Constructed unconditionally so a live /mode youtube|both always has a
     # streamer available; it only stores paths and creates an httpx client.
@@ -122,6 +153,8 @@ async def run_scheduler() -> None:
         await asyncio.gather(updater_task, return_exceptions=True)
         await updater.close()
         await telegram.stop()
+        if health_runner is not None:
+            await health_runner.cleanup()
         await notifier.close()
         await eventsub.close()
         if kick_webhook:

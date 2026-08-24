@@ -28,6 +28,12 @@ from stream_archive.recorder.youtube_output import YoutubeOutputMixin
 
 logger = logging.getLogger(__name__)
 
+# How long a clean feed end suppresses monitor restarts while waiting for the
+# offline webhook/API event to catch up. Load-bearing: 10 min covers encoder
+# restarts and HLS playlist END stalls; short enough that a still-live feed
+# resumes recording quickly instead of staying dark until an offline arrives.
+_ENDED_CLEAN_GRACE_S = 600.0
+
 
 class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputMixin):
     _config: AppConfig
@@ -42,6 +48,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
     _held: dict[str, dict[str, Any]]
+    _reserve_lock: asyncio.Lock
+    _reserved_channels: dict[str, str]
     _finalize_chat: Any
     _finalize_kick_chat: Any
     _end_broadcast: Any
@@ -67,13 +75,43 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
         self._youtube_starts = []
         self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
-        self._ended_clean: set[str] = set()  # channels whose last task ended cleanly (stream over)
+        self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
+        self._reserve_lock = asyncio.Lock()
+        self._reserved_channels = {}  # channel -> output mode, reserved but not yet started
 
     async def start(
         self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
     ) -> bool:
         async with self._lock_for(channel):
             return await self._start_unlocked(channel, title=title, game=game, user_id=user_id)
+
+    async def reserve_start(self, channel: str) -> str | None:
+        """Atomically reserve recording/YT capacity; returns block reason or None.
+
+        Closes the check-then-act gap between the monitor's limit counters and
+        the (seconds-later) registration in _recordings: two simultaneous
+        go-lives can no longer both slip past max_concurrent_recordings /
+        max_concurrent_youtube_streams. The monitor releases the reservation
+        in a finally block once start() has registered (or failed).
+        """
+        async with self._reserve_lock:
+            mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
+            max_rec = self._config.max_concurrent_recordings
+            if max_rec > 0 and len(self._recordings) + len(self._reserved_channels) >= max_rec:
+                return f"concurrent recording limit reached ({max_rec}/{max_rec})"
+            max_yt = self._config.max_concurrent_youtube_streams
+            if max_yt > 0 and mode in ("youtube", "both"):
+                yt_busy = self.youtube_active_count() + sum(
+                    1 for m in self._reserved_channels.values() if m in ("youtube", "both")
+                )
+                if yt_busy >= max_yt:
+                    return f"YouTube re-stream limit reached ({max_yt}/{max_yt})"
+            self._reserved_channels[channel] = mode
+            return None
+
+    def release_start(self, channel: str) -> None:
+        """Drop a reservation made by reserve_start (idempotent)."""
+        self._reserved_channels.pop(channel, None)
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
         if channel not in self._locks:
@@ -216,7 +254,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if disk_cfg.max_total_gb > 0:
             entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
-        self._ended_clean.discard(channel)
+        self._ended_clean.pop(channel, None)
         logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
         return True
 
@@ -333,14 +371,27 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # failure) so the monitor can skip restart attempts until the offline
         # event catches up — a dead stream just resolves to a 404 otherwise.
         if not entry.get("failed"):
-            self._ended_clean.add(channel)
+            self._ended_clean[channel] = time.monotonic()
         del self._recordings[channel]
 
     def ended_clean(self, channel: str) -> bool:
-        """True when the channel's last recording ended cleanly (stream over)."""
-        return channel in self._ended_clean
+        """True when the channel's last recording ended cleanly and recently."""
+        ts = self._ended_clean.get(channel)
+        if ts is None:
+            return False
+        if time.monotonic() - ts >= _ENDED_CLEAN_GRACE_S:
+            self._ended_clean.pop(channel, None)
+            return False
+        return True
 
     async def _abort(self, channel: str, reason: str) -> None:
+        # The disk-cap watchdog calls this from outside any per-channel lock;
+        # taking the lock here keeps the _recordings mutation serialized with
+        # stop()/start() for the same channel.
+        async with self._lock_for(channel):
+            await self._abort_unlocked(channel, reason)
+
+    async def _abort_unlocked(self, channel: str, reason: str) -> None:
         logger.warning("[recorder] [%s] Stopping recording: %s", channel, reason)
         if self._notifier:
             await self._notifier.notify(f"\u26d4 Stopped recording {channel}: {reason}")

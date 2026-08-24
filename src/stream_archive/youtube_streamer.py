@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Any
@@ -33,31 +34,37 @@ class YouTubeStreamer:
         self._token_path = config._workdir / "youtube_token.json"
         self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
+        self._refresh_lock = asyncio.Lock()
 
     async def _get_credentials(self) -> Credentials:
-        if self._credentials and self._credentials.valid:
+        # Single-flight: hold the lock across load+refresh so concurrent starts
+        # don't double-refresh the same expired token. to_thread keeps the
+        # synchronous HTTPS refresh off the event loop that feeds the ffmpeg
+        # pipes.
+        async with self._refresh_lock:
+            if self._credentials and self._credentials.valid:
+                return self._credentials
+
+            if not self._token_path.exists():
+                raise RuntimeError("YouTube token not found. Run 'python setup_youtube.py' first to authenticate.")
+
+            with open(self._token_path) as f:
+                data = json.load(f)
+            creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
+            if creds is None:
+                raise RuntimeError("YouTube token could not be loaded.")
+            self._credentials = creds
+
+            if not creds.valid:
+                if creds.expired and creds.refresh_token:
+                    await asyncio.to_thread(creds.refresh, Request())
+                    self._save_token()
+                else:
+                    raise RuntimeError(
+                        "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
+                    )
+
             return self._credentials
-
-        if not self._token_path.exists():
-            raise RuntimeError("YouTube token not found. Run 'python setup_youtube.py' first to authenticate.")
-
-        with open(self._token_path) as f:
-            data = json.load(f)
-        creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
-        if creds is None:
-            raise RuntimeError("YouTube token could not be loaded.")
-        self._credentials = creds
-
-        if not creds.valid:
-            if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                self._save_token()
-            else:
-                raise RuntimeError(
-                    "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
-                )
-
-        return self._credentials
 
     def _save_token(self) -> None:
         credentials = self._credentials

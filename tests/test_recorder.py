@@ -406,10 +406,36 @@ def test_clean_end_flag_cleared_on_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
 
     async def scenario():
-        rec._ended_clean.add("ch")
+        rec._ended_clean["ch"] = time.monotonic()
         assert await rec.start("ch") is True
         assert not rec.ended_clean("ch")
         await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_clean_end_latch_expires_after_grace(tmp_path):
+    rec = Recorder(make_config(tmp_path))
+    rec._ended_clean["ch"] = time.monotonic() - 601
+    assert not rec.ended_clean("ch")  # expired -> monitor restarts instead of suppressing
+    assert "ch" not in rec._ended_clean  # expired entries are lazily popped
+
+
+def test_reserve_start_blocks_when_capacity_taken(tmp_path):
+    """reserve_start atomically holds a slot so two simultaneous go-lives
+    cannot both pass max_concurrent_recordings."""
+    config = make_config(tmp_path)
+    config.max_concurrent_recordings = 1
+    rec = Recorder(config)
+    reason = (
+        f"concurrent recording limit reached ({config.max_concurrent_recordings}/{config.max_concurrent_recordings})"
+    )
+
+    async def scenario():
+        assert await rec.reserve_start("ch") is None
+        assert await rec.reserve_start("other") == reason
+        rec.release_start("ch")
+        assert await rec.reserve_start("other") is None
 
     asyncio.run(scenario())
 
@@ -932,6 +958,32 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     assert any("archive at 5 GB cap" in m for m in notifier.messages)
 
 
+def test_abort_serializes_with_stop(tmp_path):
+    """Watchdog _abort racing monitor stop() on the same channel must tear
+    down the recording exactly once, never double-pop the entry."""
+    rec = Recorder(make_config(tmp_path))
+
+    async def scenario():
+        released = asyncio.Event()
+
+        async def feed():
+            await released.wait()  # recording task runs until torn down
+
+        task = asyncio.create_task(feed())
+        rec._recordings["ch"] = {"tasks": [task], "process": None, "youtube_info": None, "kick_chat": None}
+
+        results = await asyncio.gather(rec._abort("ch", "cap"), rec.stop("ch"))
+        released.set()
+
+        assert "ch" not in rec._recordings  # removed exactly once
+        assert task.cancelled()  # whichever path won the lock tore it down
+        # The loser sees no entry: stop() yields None (abort won) or a result
+        # with no file info (stop won); either way no RuntimeError surfaced.
+        assert results[1] is None or results[1] == {"file_info": None, "youtube_info": None}
+
+    asyncio.run(scenario())
+
+
 def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     config = make_config(tmp_path)
     config.disk = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
@@ -950,6 +1002,29 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     assert freed == 1024
     assert not (base / "old.ts").exists()
     assert (base / "mid.ts").exists()
+    assert (base / "new.ts").exists()
+
+
+def test_delete_oldest_spares_active_recording(tmp_path):
+    """Cap deletion must skip the file currently being written and fall
+    through to the next-oldest candidate."""
+    config = make_config(tmp_path)
+    config.disk = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
+    rec = Recorder(config)
+    base = tmp_path / "recordings" / "ch"
+    base.mkdir(parents=True, exist_ok=True)
+    t0 = time.time() - 100
+    for i, name in enumerate(["old.ts", "mid.ts", "new.ts"]):
+        p = base / name
+        p.write_bytes(b"x" * 1024)
+        os.utime(p, (t0 + i, t0 + i))
+    rec._recordings["ch"] = {"filepath": str(base / "old.ts")}
+
+    removed, freed = asyncio.run(rec.delete_oldest_to_cap())
+
+    assert (removed, freed) == (1, 1024)
+    assert (base / "old.ts").exists()  # active recording is never a deletion candidate
+    assert not (base / "mid.ts").exists()  # next-oldest takes the hit instead
     assert (base / "new.ts").exists()
 
 

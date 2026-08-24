@@ -212,17 +212,25 @@ class KickWebhook:
                 known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
                 logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
                 return web.Response(status=401, text="unauthorized")
-            if not self._remember_id(request.headers.get("Kick-Event-Message-Id")):
+            msg_id = request.headers.get("Kick-Event-Message-Id")
+            if not self._remember_id(msg_id):
                 logger.debug("[kick_webhook] duplicate event, ignoring")
                 return web.Response(status=200, text="ok")
             await self._maybe_confirm_delivery()
-            if event_type == self.EVENT_LIVE:
-                await self._dispatch_live(body)
-            elif event_type == self.EVENT_CHAT:
-                await self._dispatch_chat(body)
-            else:
-                logger.debug("[kick_webhook] unknown event type %r", event_type)
-                return web.Response(status=204)
+            try:
+                if event_type == self.EVENT_LIVE:
+                    await self._dispatch_live(body)
+                elif event_type == self.EVENT_CHAT:
+                    await self._dispatch_chat(body)
+                else:
+                    logger.debug("[kick_webhook] unknown event type %r", event_type)
+                    return web.Response(status=204)
+            except Exception:
+                # Roll back the dedup mark so Kick's retry is processed instead
+                # of answered 200 as a replay (aiohttp answers the raise 500).
+                if msg_id:
+                    self._seen_ids.pop(msg_id, None)
+                raise
             return web.Response(status=200, text="ok")
         finally:
             self._sem.release()

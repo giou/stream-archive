@@ -271,6 +271,37 @@ def test_live_event_dispatches_offline(keypair):
     assert monitor.offline[0][0] == "kick:xqc"
 
 
+def test_failed_dispatch_not_marked_seen(keypair):
+    """A crashing handler must answer 500 and unmark the message id, so the
+    Kick retry is dispatched instead of swallowed as a duplicate."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    wh = make_webhook(config=base_config(), monitor=monitor, api=FakeKickAPI(public_pem))
+    calls = {"n": 0}
+    original_online = monitor.handle_online
+
+    async def flaky_online(channel, title, game, user_id, config):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient handler boom")
+        await original_online(channel, title, game, user_id, config)
+
+    monitor.handle_online = flaky_online
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            body = live_event(is_live=True)
+            headers = _signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE)
+            first = await client.post("/kick/webhook", data=body, headers=headers)
+            assert first.status == 500
+            second = await client.post("/kick/webhook", data=body, headers=headers)  # Kick's retry
+            assert second.status == 200
+
+    asyncio.run(scenario())
+    assert calls["n"] == 2
+    assert len(monitor.online) == 1
+
+
 def test_chat_event_dispatches_normalized_payload(keypair):
     private_key, public_pem = keypair
     recorder = FakeRecorder()

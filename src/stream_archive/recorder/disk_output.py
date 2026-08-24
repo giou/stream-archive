@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -91,18 +92,31 @@ class DiskOutputMixin:
             return (0, 0)
         loop = asyncio.get_running_loop()
 
+        # Never unlink a file that is being written right now: deleting the
+        # active target loses the live recording even though ffmpeg keeps its
+        # fd open and the space is only reclaimed after teardown.
+        active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
+
         def _delete_oldest() -> tuple[int, int]:
             base = disk.recording_dir_path(self._config)
             if not base.exists():
                 return (0, 0)
-            files = sorted((p for p in base.rglob("*.ts")), key=lambda p: p.stat().st_mtime)
-            total = sum(p.stat().st_size for p in files)
+            stats = []
+            for p in base.rglob("*.ts"):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue  # retention cleanup may have raced us mid-scan
+                stats.append((st.st_mtime, st.st_size, p))
+            stats.sort(key=lambda t: t[0])
+            total = sum(size for _, size, _ in stats)
             cap_bytes = int(cap * 1024**3)
             removed = freed = 0
-            for p in files:
+            for _, size, p in stats:
                 if total < cap_bytes:
                     break
-                size = p.stat().st_size
+                if os.path.realpath(p) in active:
+                    continue
                 p.unlink(missing_ok=True)
                 total -= size
                 removed += 1

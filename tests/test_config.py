@@ -441,12 +441,58 @@ def test_env_interpolation_and_placeholder_preservation(monkeypatch, tmp_path):
     assert "s3cr3t" not in raw
 
 
+def test_save_persists_bot_written_literal_over_placeholder(monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_TOK", "abc")
+    data = valid_config()
+    data["bot_telegram_api"] = "${MY_TOK}"
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    cfg = get_config(tmp_path / "config.json")
+
+    cfg.bot_telegram_api = "literal"  # bot persisted an explicit value
+    save_config(cfg)
+
+    raw = (tmp_path / "config.json").read_text()
+    assert '"literal"' in raw
+    assert "${MY_TOK}" not in raw
+    save_config(cfg)  # a second save keeps the literal (placeholder dropped)
+    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == "literal"
+
+
+def test_untouched_placeholder_still_round_trips_masked(monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_TOK", "abc")
+    data = valid_config()
+    data["bot_telegram_api"] = "${MY_TOK}"
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    cfg = get_config(tmp_path / "config.json")
+
+    save_config(cfg)
+
+    raw = (tmp_path / "config.json").read_text()
+    assert "${MY_TOK}" in raw
+    assert "abc" not in raw
+
+
+def test_missing_env_var_at_save_restores_placeholder(monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_TOK", "abc")
+    data = valid_config()
+    data["bot_telegram_api"] = "${MY_TOK}"
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    cfg = get_config(tmp_path / "config.json")
+
+    monkeypatch.delenv("MY_TOK")  # env vanished before the next save
+    save_config(cfg)
+
+    raw = (tmp_path / "config.json").read_text()
+    assert "${MY_TOK}" in raw
+
+
 def test_env_interpolation_missing_var_raises(tmp_path):
     data = valid_config()
     data["bot_telegram_api"] = "${TEST_BOT_TOKEN}"
     (tmp_path / "config.json").write_text(json.dumps(data))
     with pytest.raises(ValueError, match="TEST_BOT_TOKEN"):
         get_config(tmp_path / "config.json")
+
 
 def test_channel_hold_override_normalized():
     config = build(channel_youtube_hold_seconds={"channel1": 60})

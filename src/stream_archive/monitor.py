@@ -41,34 +41,38 @@ class Monitor:
             else:
                 identity_by_bare = {bare_name(c): c for c in twitch_channels}
                 user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
+                # A failed Helix fetch must not read as "everyone offline":
+                # the sweep below stops every live recording on an API
+                # outage. Leave streams unset and skip both loops instead.
+                streams: dict[str, Any] | None = None
                 try:
                     streams = await twitch_api.get_live_streams(user_ids)
                 except Exception as e:
                     logger.error("[monitor] get_live_streams failed: %s", e)
-                    streams = {}
 
-                user_to_channel = {v: k for k, v in user_ids.items()}
+                if streams is not None:
+                    user_to_channel = {v: k for k, v in user_ids.items()}
 
-                snapshot = await self._snapshot_if_needed(config)
+                    snapshot = await self._snapshot_if_needed(config)
 
-                for user_id, stream in sorted(streams.items(), key=lambda kv: user_to_channel.get(kv[0], "")):
-                    channel = user_to_channel.get(user_id)
-                    if channel is None:
-                        logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
-                        continue
-                    snapshot = await self._ensure_recording(
-                        channel,
-                        stream.get("title"),
-                        stream.get("game_name"),
-                        user_id,
-                        config,
-                        snapshot,
-                    )
+                    for user_id, stream in sorted(streams.items(), key=lambda kv: user_to_channel.get(kv[0], "")):
+                        channel = user_to_channel.get(user_id)
+                        if channel is None:
+                            logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
+                            continue
+                        snapshot = await self._ensure_recording(
+                            channel,
+                            stream.get("title"),
+                            stream.get("game_name"),
+                            user_id,
+                            config,
+                            snapshot,
+                        )
 
-                for channel in twitch_channels:
-                    user_id = user_ids.get(channel)
-                    if channel in self._live_channels and user_id not in streams:
-                        await self._ensure_stopped(channel, config)
+                    for channel in twitch_channels:
+                        uid = user_ids.get(channel)
+                        if channel in self._live_channels and uid not in streams:
+                            await self._ensure_stopped(channel, config)
 
         kick_channels = [c for c in config.channels if is_kick_channel(c)]
         if kick_channels:
@@ -197,7 +201,15 @@ class Monitor:
             logger.warning("[monitor] %s not started: %s", channel, reason)
             await self._notify_blocked(channel, reason)
             return False, snapshot
-        ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
+        reserve_reason = await self.recorder.reserve_start(channel)
+        if reserve_reason:
+            logger.warning("[monitor] %s not started: %s", channel, reserve_reason)
+            await self._notify_blocked(channel, reserve_reason)
+            return False, snapshot
+        try:
+            ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
+        finally:
+            self.recorder.release_start(channel)
         return ok, snapshot
 
     async def _start_blocked_reason(self, channel: str, config: AppConfig, snapshot: Any) -> tuple[str | None, Any]:
@@ -216,14 +228,6 @@ class Monitor:
                         return (f"recording archive at {cap:g} GB cap (nothing to delete)", snapshot)
                 else:
                     return (f"recording archive at {cap:g} GB cap", snapshot)
-            max_rec = config.max_concurrent_recordings
-            if max_rec > 0 and len(self.recorder.active_channels()) >= max_rec:
-                return (f"concurrent recording limit reached ({max_rec}/{max_rec})", snapshot)
-            max_yt = config.max_concurrent_youtube_streams
-            if max_yt > 0:
-                mode = config.channel_output_modes.get(channel, config.output_mode)
-                if mode in ("youtube", "both") and self.recorder.youtube_active_count() >= max_yt:
-                    return (f"YouTube re-stream limit reached ({max_yt}/{max_yt})", snapshot)
             return (None, snapshot)
         except Exception as e:
             logger.error("[monitor] disk gate failed, proceeding: %s", e)

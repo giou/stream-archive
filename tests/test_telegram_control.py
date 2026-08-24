@@ -2676,6 +2676,7 @@ def test_menu_text_kick_webhook_shows_tunnel_mode(tmp_path):
     text = asyncio.run(ctrl.menu_text("kick_webhook"))
     assert "Kick webhook: on (cloudflare \u00b7 https://abc123.trycloudflare.com/kick/webhook)" in text
 
+
 def test_reply_text_channel_hold_menu(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"

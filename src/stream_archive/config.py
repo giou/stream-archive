@@ -341,6 +341,13 @@ def _set_at(data: Any, path: tuple[Any, ...], value: str) -> None:
     node[path[-1]] = value
 
 
+def _get_at(data: Any, path: tuple[Any, ...]) -> Any:
+    node = data
+    for key in path[:-1]:
+        node = node[key]
+    return node[path[-1]]
+
+
 def get_config(path: Path | None = None) -> AppConfig:
     config_path = path or _find_config()
     try:
@@ -368,8 +375,22 @@ def save_config(config: AppConfig) -> None:
     """Validate and atomically write config to the file it was loaded from."""
     validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
     data = validated.model_dump()
-    for key_path, raw in config._env_placeholders.items():
-        _set_at(data, key_path, raw)
+    for key_path, raw in list(config._env_placeholders.items()):
+        # Restore the ${VAR} placeholder only while the live value still equals
+        # its env interpolation (untouched secret -> stays masked on disk).
+        # Anything else is a deliberate bot-persisted literal: write it and
+        # stop masking, so saves no longer silently revert edits to ${VAR}.
+        try:
+            resolved = _ENV_RE.sub(lambda m: os.environ[m.group(1)], raw)
+        except Exception:
+            resolved = None  # env var vanished since load: keep masking, don't persist a guess
+        if resolved is None or _get_at(data, key_path) == resolved:
+            # Untouched value (still equal to its interpolation), or the env
+            # var vanished since load: keep masking either way.
+            _set_at(data, key_path, raw)
+        else:
+            # Deliberate bot-persisted literal: write it and stop masking.
+            del config._env_placeholders[key_path]
     config_path = config._config_path
     tmp = Path(str(config_path) + ".tmp")
     with open(tmp, "w") as f:
