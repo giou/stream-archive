@@ -49,7 +49,7 @@ class EventSubClient:
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     async def close(self) -> None:
@@ -140,7 +140,7 @@ class EventSubClient:
             self._ws = await websockets.connect(url)
             try:
                 welcome = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=WELCOME_TIMEOUT))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error("[eventsub] timed out waiting for session_welcome, reconnecting")
                 return
             if welcome.get("metadata", {}).get("message_type") != "session_welcome":
@@ -166,7 +166,7 @@ class EventSubClient:
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=keepalive + 30))
                 if await self._handle_message(msg):
                     return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("[eventsub] keepalive timeout, reconnecting")
             return
         except websockets.ConnectionClosed as e:
@@ -261,7 +261,7 @@ class EventSubClient:
                     and s["condition"].get("broadcaster_user_id") == self._user_ids.get(channel)
                 )
                 self._subs.setdefault(channel, {})[kind] = existing["id"]
-            except (StopIteration, KeyError):
+            except StopIteration, KeyError:
                 logger.error("[eventsub] could not resolve existing subscription id for %s", channel)
         elif status in (400, 403):
             logger.error("[eventsub] subscription rejected for %s (%s); channel relies on polling", channel, status)

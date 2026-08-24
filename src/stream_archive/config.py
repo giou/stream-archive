@@ -165,7 +165,7 @@ class KickWebhookConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _require_public_url_when_enabled(self) -> "KickWebhookConfig":
+    def _require_public_url_when_enabled(self) -> KickWebhookConfig:
         if self.enabled and not (self.public_url.startswith("http://") or self.public_url.startswith("https://")):
             raise ValueError("kick.webhook.public_url is required when kick.webhook.enabled is true")
         return self
@@ -277,7 +277,7 @@ class AppConfig(BaseModel):
     def _valid_timezone(cls, v: str) -> str:
         try:
             ZoneInfo(v)
-        except (ZoneInfoNotFoundError, KeyError):
+        except ZoneInfoNotFoundError, KeyError:
             raise ValueError(f"Invalid timezone: {v!r}") from None
         return v
 
@@ -289,7 +289,7 @@ class AppConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _require_kick_creds(self) -> "AppConfig":
+    def _require_kick_creds(self) -> AppConfig:
         if any(is_kick_channel(c) for c in self.channels):
             if not self.kick.client_id:
                 raise ValueError("kick.client_id is required when kick channels are configured")

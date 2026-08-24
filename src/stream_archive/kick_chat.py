@@ -21,7 +21,7 @@ import asyncio
 import base64
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -39,7 +39,7 @@ def _parse_time(value: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         return None
 
 
@@ -92,7 +92,7 @@ def build_chat_root(
     """
     start = _parse_time(started_wall)
     video_id = f"kick-{slug}-{int(start.timestamp()) if start else 0}"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
 
     streamer_id = None
     broadcaster_username = slug

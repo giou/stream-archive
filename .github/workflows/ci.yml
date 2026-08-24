@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.10"
+          python-version: "3.14"
       - name: Install ffmpeg (runtime dep; hold/reuse tests spawn it)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: uv sync --frozen

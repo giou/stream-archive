@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Coroutine
 from contextlib import nullcontext, suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -293,7 +293,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if filepath and os.path.exists(filepath):
             st = os.stat(filepath)
             size_mb = st.st_size / (1024 * 1024)
-            mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+            mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
             file_info = {
                 "name": os.path.basename(filepath),
                 "size_mb": round(size_mb, 2),

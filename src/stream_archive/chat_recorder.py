@@ -11,7 +11,7 @@ import os
 import random
 import ssl
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class ChatRecorder:
         self._use_ssl = use_ssl
         self._comments: list[dict[str, Any]] = []
         self._start_mono = time.monotonic()
-        self._start_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._start_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._task: asyncio.Task[Any] | None = None
         self._connected_once = False
         self._finalized = False
@@ -218,9 +218,9 @@ class ChatRecorder:
         except ValueError:
             ts = 0
         if ts:
-            created_at = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            created_at = datetime.fromtimestamp(ts / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         else:
-            created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         try:
             bits = int(tags.get("bits", 0))
@@ -267,10 +267,10 @@ class ChatRecorder:
             return
         self._finalized = True
 
-        now_z = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             streamer_id = int(self._user_id) if self._user_id else 0
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             streamer_id = 0
         # TDL convention (ChatDownloader.cs): live chat gets length/end from the
         # last comment's offset; chatrender derives the render duration from

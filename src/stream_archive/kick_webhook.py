@@ -202,7 +202,7 @@ class KickWebhook:
             return web.Response(status=429, text="too many requests")
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=0.1)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return web.Response(status=503, text="busy")
         try:
             body = await request.read()

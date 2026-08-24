@@ -111,7 +111,7 @@ class WebhookCommands:
                 "Install it on the host: curl -fsSL https://tailscale.com/install.sh | sh\n"
                 "then log in: tailscale up"
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._kill_proc(proc)
             return None, "tailscale status timed out \u2014 is the tailscale daemon running on the host?"
         if proc.returncode != 0:
@@ -143,7 +143,7 @@ class WebhookCommands:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_FUNNEL_TIMEOUT)
         except FileNotFoundError:
             return None, "Tailscale is not installed in this container."
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._kill_proc(proc)
             return None, (
                 "tailscale funnel timed out (first enable provisions HTTPS certificates and can take "
@@ -170,7 +170,7 @@ class WebhookCommands:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_STATUS_TIMEOUT)
-        except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        except TimeoutError, FileNotFoundError, OSError:
             return False
         if proc.returncode != 0:
             return False
@@ -221,7 +221,7 @@ class WebhookCommands:
             )
         try:
             url, tail = await asyncio.wait_for(self._wait_cloudflared_url(proc), timeout=_CLOUDFLARED_QUICK_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._kill_proc(proc)
             return None, (
                 "cloudflared did not publish a trycloudflare URL within "
@@ -261,7 +261,7 @@ class WebhookCommands:
             registered, tail = await asyncio.wait_for(
                 self._wait_cloudflared_registered(proc), timeout=_CLOUDFLARED_RUN_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if proc.returncode is None:  # still running: connection registered
                 self._cloudflared = proc
                 self._cloudflared_drain = asyncio.create_task(self._drain_cloudflared(proc))
@@ -554,7 +554,7 @@ class WebhookCommands:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=_TAILSCALE_STATUS_TIMEOUT)
-        except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        except TimeoutError, FileNotFoundError, OSError:
             return False
         return proc.returncode == 0
 

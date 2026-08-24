@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import UTC
 from typing import Any
 
 import httpx
@@ -93,9 +94,9 @@ class YouTubeStreamer:
         if raw_title != broadcast_title:
             logger.info("[youtube] Title truncated to 100 chars: %r", broadcast_title)
         description = build_video_description(author, channel, game)
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        scheduled_start = datetime.now(timezone.utc).isoformat()
+        scheduled_start = datetime.now(UTC).isoformat()
 
         broadcast_body = {
             "snippet": {

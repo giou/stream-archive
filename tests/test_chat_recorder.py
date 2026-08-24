@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from stream_archive.chat_recorder import ChatRecorder
 
@@ -64,7 +64,7 @@ class FakeIRCServer:
                     reply = await asyncio.wait_for(reader.readline(), timeout=2)
                     if reply:
                         self.received.append(reply.decode(errors="replace").strip())
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
             if hold:
                 await asyncio.sleep(300)
@@ -115,7 +115,7 @@ def test_privmsg_with_emotes_badges_color(tmp_path):
         comment = data["comments"][0]
         expected = {
             "_id": "abc-123",
-            "created_at": datetime.fromtimestamp(TS_MS / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "created_at": datetime.fromtimestamp(TS_MS / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "channel_id": "123456",
             "content_type": "video",
             "content_id": "ch",

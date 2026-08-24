@@ -4,7 +4,7 @@ import json
 import os
 import time
 import types
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from streamlink.exceptions import NoStreamsError, PluginError
@@ -731,7 +731,7 @@ def test_stop_returns_file_info(tmp_path):
     assert file_info["name"] == "rec.ts"
     assert file_info["size_mb"] == 1.0
     mtime = os.stat(filepath).st_mtime
-    expected = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%d-%m-%Y %H:%M")
+    expected = datetime.fromtimestamp(mtime, tz=UTC).strftime("%d-%m-%Y %H:%M")
     assert file_info["date"] == expected
 
 
