@@ -1,177 +1,101 @@
 # StreamArchive
 
-Monitors Twitch **and** Kick channels and records every live stream via
-[streamlink](https://streamlink.github.io/), with near-instant live/offline
-signals on both platforms:
+Monitors Twitch and Kick channels and records every live stream with
+[streamlink](https://streamlink.github.io/). Live/offline signals arrive
+within seconds on both platforms. A poll at `monitoring_interval` stays as
+the fallback. The poll catches missed events, starts channels that are
+already live at boot, and restarts recordings that died mid-stream.
 
-- **Twitch** — EventSub `stream.online` / `stream.offline` delivered over a
-  conduit WebSocket shard (authenticated with the existing app credentials,
-  covers ALL configured channels). Twitch streams are recorded through
-  ad-block playlist proxies (vendored `streamlink-ttvlol` plugin) so streams
-  playable only via an ad-block workaround still record.
-- **Kick** — signature-verified webhooks (`livestream.status.updated` and
-  `chat.message.sent`) via the Kick Developer API. Kick streams are recorded
-  with streamlink's built-in Kick plugin, which talks to Kick's API directly —
-  no proxy loop needed.
+Signals take two fast paths:
 
-On both platforms a poll at `monitoring_interval` stays as the
-reconciliation/fallback: it catches events the fast paths missed (neither has
-replay), picks up channels already live at boot, and restarts recordings that
-died mid-stream. Optionally re-streams recordings to
-[YouTube Live](https://www.youtube.com/live) and sends Telegram alerts on
-live/offline events and start failures. The admin can also manage the
-recorder over Telegram — add/remove monitored channels, set retention and
-output mode, toggle chat recording (per platform), set up the Kick webhook
-tunnel, view status, reload, or restart — with no other user able to issue
-commands.
+- **Twitch**: EventSub `stream.online` / `stream.offline` events over one
+  conduit WebSocket shard, authenticated with the existing app credentials.
+  Recordings run through ad-block playlist proxies (vendored
+  `streamlink-ttvlol` plugin), so streams that need an ad-block workaround
+  still record.
+- **Kick**: signature-verified `livestream.status.updated` and
+  `chat.message.sent` webhooks from the Kick Developer API. Recordings use
+  the built-in streamlink Kick plugin, which talks to the Kick API directly.
 
-The system is designed to be set-and-forget: failures are logged, alerted
-(rate-limited), and retried automatically on the next poll cycle — including
-recording processes that die mid-stream.
+Failures are logged, alerted (rate-limited), and retried on the next poll
+cycle. The app can also re-stream recordings to
+[YouTube Live](https://www.youtube.com/live) and send alerts and admin
+commands over a Telegram bot.
 
 ## Features
 
-- **Multi-platform monitoring** — one config, both platforms; channels are
-  identified as `twitch:<name>` or `kick:<slug>`. Twitch EventSub and Kick
-  webhooks start/stop recordings within seconds; the poll reconciles state,
-  covers outages, boot-time already-live channels, and recordings that died
-  mid-stream.
-- **Kick webhooks** — `livestream.status.updated` (live/offline) and
-  `chat.message.sent` (chat) v1 events, verified against Kick's published
-  signing key (RSA PKCS1v15/SHA-256 over `message_id.timestamp.body`, with a
-  key-rotation refetch) and protected against replay by a signed-timestamp
-  window. Subscriptions are auto-created for monitored Kick
-  channels and reconciled every poll cycle; the bot also drives the whole
-  setup — tunnel included — from `/settings` (see
-  [Kick webhook setup](#kick-webhook-setup)).
-- **Ad-block proxy support (Twitch)** — playlist URLs from the vendored
-  `streamlink-ttvlol` plugin, with `httpproxy://user:pass@host:port` entries
-  for upstream proxies. Kick recordings use streamlink's built-in Kick plugin
-  instead (it solves Kick's anti-bot challenge automatically when a browser
-  is installed on the host).
-- **Three output modes**:
-  - `disk` — record `.ts` files into `recording_dir/<channel>/`
-  - `youtube` — pipe the stream through `ffmpeg` to a YouTube Live broadcast
-  - `both` — disk recording and YouTube re-stream simultaneously
-- **Telegram alerts** — live (with title/game/URL), offline (with file size
-  and YouTube link), start-failure (rate-limited to once per 30 minutes per
-  channel), Kick anti-bot blocks, webhook problems, and service lifecycle
-  messages (startup with the monitored channels and app version, and
-  shutdown/restart).
-- **Telegram control** — the admin (`telegram_user_id`) can manage the
-  recorder over the bot: add/remove monitored channels (both platforms), set
-  retention and output mode, toggle chat recording per platform, set up the
-  Kick webhook, view status, reload `config.json`, or restart the service.
-  Every change is validated and persisted atomically, then applied live on
-  the next poll cycle; non-admin senders get no reply.
-- **Self-healing**:
-  - Recording tasks that die mid-stream (ffmpeg crash, disk error, proxy
-    death, or a feed that simply stops delivering segments) are detected and
-    restarted on the next poll cycle.
-  - YouTube re-stream restarts back off exponentially after short recordings,
-    and a rolling 24h budget of 10 broadcast creations (shared across all
-    channels) protects YouTube's per-channel daily limit.
-  - YouTube rate-limit / `403` / quota errors fall back to disk recording.
-  - Transient Twitch/Kick API errors are logged and retried next cycle;
-    unknown ids in a response are skipped instead of crashing the poll.
-- **Live chat recording** — Twitch IRC chat and Kick webhook chat are both
-  captured while a stream is being recorded and written as
-  TwitchDownloader-compatible chat JSON into `chat_dir/<platform>/<channel>/`
-  (usable directly with `TwitchDownloaderCLI chatupdate` / `chatrender`).
-- **Retention cleanup** — optional automatic deletion of recordings older
-  than `retention_days`, run at startup and then daily; optional
-  `disk.max_total_gb` cap that deletes oldest recordings or stops new ones.
-  enabled, automatic start/stop, and clean broadcast ending on shutdown. An
-  optional hold delay (`youtube.hold_seconds`, or per channel) keeps the
-  broadcast open after the source drops and reuses the same broadcast when
-  the streamer returns within the delay — no new broadcast creation, no
-  quota cost; a bundled "Reconnecting..." clip keeps the broadcast fed
-  during the wait.
-  enabled, automatic start/stop, and clean broadcast ending on shutdown.
+- One config for both platforms. Channels are identified as `twitch:<name>`
+  or `kick:<slug>`.
+- Three output modes. `disk` writes `.ts` files to `recording_dir/<channel>/`.
+  `youtube` pipes the stream through ffmpeg to a YouTube broadcast. `both`
+  runs disk and youtube together.
+- Live chat recording. The app saves Twitch IRC chat and Kick webhook chat as
+  TwitchDownloader-compatible JSON in `chat_dir/<platform>/<channel>/`.
+- Retention cleanup. The app deletes recordings older than `retention_days`
+  at startup and then daily. An optional `disk.max_total_gb` cap deletes the
+  oldest recordings or stops new ones.
+- Self-healing. Recording tasks that die mid-stream restart on the next poll.
+  YouTube re-streams restart with growing delays. A rolling 24-hour budget of
+  10 broadcast creations guards the YouTube daily limit. YouTube quota errors
+  fall back to disk recording.
+- Telegram alerts. Live (title, game, URL), offline (file size, YouTube
+  link), start failures, Kick anti-bot blocks, webhook problems, and service
+  lifecycle messages. Repeated failure alerts are limited to one per
+  30 minutes per channel.
+- Telegram control. The admin manages the recorder over the bot. Commands
+  cover channels, retention, output mode, quality, chat recording, limits,
+  the Kick webhook, status, reload, and restart. Other users get no reply.
+  Every change is validated and written atomically to `config.json`, and
+  applies on the next poll cycle.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    Scheduler["scheduler<br/>poll loop · signal handling · retention cleanup"]
-    Monitor["monitor"]
-    Recorder["recorder"]
-    Notifier["notifier"]
-    Telegram["telegram<br/>admin-only bot commands"]
-    EventSub["eventsub<br/>conduit WebSocket"]
-    KickWebhook["kick_webhook<br/>HTTP receiver · subscription sync"]
-    KickAPI["kick_api<br/>OAuth client · channel statuses · subscriptions"]
+The scheduler runs the poll loop, signal handling, and retention cleanup.
+Each cycle the monitor compares the configured channels against the Twitch
+Helix API and the Kick API, then starts, stops, or restarts recording tasks.
+The recorder captures with streamlink, writes `.ts` files or pipes through
+ffmpeg to YouTube, and finalizes chat files and broadcasts when a task ends.
+The notifier sends Telegram messages.
 
-    Scheduler -->|"every monitoring_interval"| Monitor
-    Scheduler -->|starts| EventSub
-    EventSub -->|"stream.online / stream.offline"| Monitor
-    KickWebhook -->|"livestream.status.updated"| Monitor
-    KickWebhook -->|"chat.message.sent"| Recorder
-    Monitor -->|"resolve user ids + live streams"| Twitch["Twitch Helix API"]
-    Monitor -->|"channel statuses"| KickAPI
-    KickWebhook -->|"create / list / delete subscriptions"| KickAPI
-    Monitor -->|"start / stop / restart"| Recorder
-    Recorder -->|"proxied playlist → stream"| Streamlink["streamlink"]
-    Recorder -->|"kick.com URL → stream"| Streamlink
-    Recorder -->|disk| Disk[".ts files"]
-    Recorder -->|youtube| Ffmpeg["ffmpeg<br/>pipe → RTMP"]
-    Ffmpeg -->|"re-stream"| YouTube["YouTube Live API"]
-    Recorder -->|"live / offline / failures"| Notifier
-    Scheduler -->|starts| Telegram
-    Telegram -->|"persists atomically"| Config["config.json"]
-    Telegram -->|"/add /remove /mode /reload /restart"| Recorder
-    Telegram -->|"/remove"| Monitor
-    Telegram -->|"webhook setup · tunnel mgmt"| KickWebhook
-```
-
-Recording tasks are tracked; when a task ends — cleanly (the feed stopped
-delivering segments) or with an error — its channel entry is removed, chat and
-the YouTube broadcast are finalized, and the monitor restarts the recording on
-the next poll cycle (YouTube re-streams are gated by a per-channel backoff and
-a global daily broadcast budget).
-
-Control plane: the `stream_archive.telegram` package runs alongside the
-scheduler as a polling bot. Commands are gated to `telegram_user_id`, validated
-on a copy, written atomically to `config.json`, and applied to the running
-scheduler / recorder / monitor / webhook on the next poll cycle — see
-[Telegram control](#telegram-control).
+Two extra services feed the monitor directly. The EventSub client holds one
+authenticated WebSocket for Twitch events. The Kick webhook receiver
+verifies and deduplicates incoming HTTP events and keeps subscriptions in
+sync. The Telegram package runs alongside as an admin-only polling bot. It
+validates changes on a copy, writes `config.json` atomically, and applies
+them on the next cycle. See [Project layout](#project-layout) for the module
+map.
 
 ## Requirements
 
-- Docker with the compose plugin (Docker Engine 20.10+ or Docker Desktop)
-- **Twitch** app credentials — register at
-  <https://dev.twitch.tv/console> (client id + client secret)
-- **Kick** app credentials — only when `kick:` channels are configured;
-  create an app in Kick's Developer portal (client id + client secret)
-- **Telegram** bot token — create one with
-  [BotFather](https://t.me/BotFather) and note your user/chat id
-- **Google Cloud OAuth client** (`client_secret.json`) — only for
-  `output_mode: youtube` or `both`; see
-  [YouTube setup](#youtube-setup)
-- **cloudflared** and/or **Tailscale** — only for the Kick webhook tunnel;
-  the bot runs whichever you choose from `/settings`. Both ship in the image;
-  Tailscale only needs to be installed on the host when you use the funnel
-  option (the tailscaled socket is mounted into the container)
+- Docker with the compose plugin (Docker Engine 20.10+ or Docker Desktop).
+- Twitch app credentials. Register at <https://dev.twitch.tv/console>.
+- Kick app credentials. Only needed for `kick:` channels. Create an app in
+  the Kick Developer portal (client id + client secret).
+- A Telegram bot token from [BotFather](https://t.me/BotFather). Note your
+  user/chat id.
+- A Google Cloud OAuth client (`client_secret.json`). Only for
+  `output_mode: youtube` or `both` (see [YouTube setup](#youtube-setup)).
+- `cloudflared` and/or Tailscale. Only for the Kick webhook tunnel. Both
+  ship in the image. The Tailscale funnel option also needs tailscale on the
+  host (the tailscaled socket is mounted into the container).
 
 ## Quick start
 
-One folder holds everything — the compose file, the config, and all data:
-
 ```sh
-mkdir ~/stream-archive && cd ~/stream-archive
+mkdir ~/stream-archive-data && cd ~/stream-archive-data
 curl -LO https://github.com/giou/stream-archive/releases/latest/download/docker-compose.yml
 curl -LO https://github.com/giou/stream-archive/releases/latest/download/config.json.example
 cp config.json.example config.json
-# fill in every key — see the configuration reference below
+# fill in every key, see the config reference below
 docker compose up -d
 docker compose logs -f   # follow startup
 ```
 
-`STREAM_ARCHIVE_DATA` (via `.env` in that folder) moves the data directory —
-recordings, chat, tokens, state — to another disk:
+`STREAM_ARCHIVE_DATA` moves the data dir (recordings, chat, tokens,
+state) to another disk. Put the variable in `.env` in that folder:
 
 ```sh
-# ~/stream-archive/.env
+# ~/stream-archive-data/.env
 STREAM_ARCHIVE_DATA=/mnt/bigdisk/stream-archive-data
 ```
 
@@ -185,145 +109,142 @@ docker compose pull && docker compose up -d
 
 Only needed when `output_mode` is `youtube` or `both`:
 
-1. Create a Google Cloud project, enable the **YouTube Data API v3**, and
-   download an OAuth desktop client as `client_secret.json` (see
-   [Google's guide](https://developers.google.com/youtube/registering_an_application)).
-2. Publish the OAuth consent screen so the token does not expire:
-   **Google Cloud Console → APIs & Services → OAuth consent screen → Audience
-   tab → Publishing status → Publish app** (set to *In production*). While
-   the app is *Testing*, refresh tokens expire after **7 days** (you would
-   have to re-run `stream-archive-setup-youtube` weekly) and only test users can
-   authorize.
-3. Run the one-time authorization flow:
+1. Create a Google Cloud project and enable the **YouTube Data API v3**.
+2. Download an OAuth desktop client as `client_secret.json` (see
+   [the guide from Google](https://developers.google.com/youtube/registering_an_application)).
+3. Publish the OAuth consent screen: **Google Cloud Console → APIs &
+   Services → OAuth consent screen → Audience tab → Publishing status →
+   Publish app**. While the app is in *Testing*, refresh tokens expire after
+   **7 days** and only test users can authorize. Publishing keeps the token
+   valid.
+4. Run the one-time authorization flow:
 
    ```sh
    docker compose run --rm stream-archive stream-archive-setup-youtube
    ```
 
-   It opens the authorization page in your browser and completes
-   automatically: after you authorize, the redirect page shows
-   "Authorization successful!" and the token is saved to `youtube_token.json`
-   (chmod 600). If the redirect page cannot load — SSH session, Docker,
-   headless box — copy the **full URL** from the address bar and paste it
-   when prompted (under Docker the localhost redirect cannot reach the
-   container, so paste the full address-bar URL). The token is refreshed
-   automatically while it is still refreshable; if it expires irrecoverably,
-   run the command again.
+   The command opens the authorization page in your browser and completes
+   automatically. After you authorize, the redirect page shows
+   "Authorization successful!" and the command saves the token to
+   `youtube_token.json`. If the redirect page cannot load (SSH session,
+   Docker, headless host), copy the **full URL** from the address bar.
+   Paste the URL at the prompt. Under Docker the localhost redirect cannot
+   reach the container, so always paste the full URL. The token refreshes
+   automatically while it is refreshable. If it expires irrecoverably, run
+   the command again.
 
-## Configuration reference
+## Config reference
 
 All keys from `config.json.example`:
 
-Secrets can be injected from the environment: any string value may be written
-as `${ENV_VAR}` (e.g. `"bot_telegram_api": "${TELEGRAM_BOT_TOKEN}"`), resolved
-from the environment at load time. Saved placeholder text is preserved, so the
-resolved secret is never written back into `config.json` — making a
-placeholder-based `config.json` safe to commit/share.
+Secrets can come from the environment. You can write a secret as
+`${ENV_VAR}`, for example `"bot_telegram_api": "${TELEGRAM_BOT_TOKEN}"`.
+The placeholder text stays in `config.json`, so the resolved secret is
+never written back. A config with placeholders is safe to commit or share.
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
-| `telegram_user_id` | yes | — | Numeric Telegram user/chat id for alerts; sole authorized user of the bot's control commands |
+| `telegram_user_id` | yes | — | Numeric Telegram user/chat id for alerts and bot control |
 | `bot_telegram_api` | yes | — | Telegram bot token from BotFather |
 | `twitch_client_id` | yes | — | Twitch app client id |
 | `twitch_client_secret` | yes | — | Twitch app client secret |
-| `channels` | yes | — | Non-empty list of channel identities: `twitch:<name>` or `kick:<slug>` (bare names are normalized to `twitch:` on load) |
-| `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies: `httpproxy://…` entries are ttvlol v2 proxies (optionally `httpproxy://user:pass@host:port`), `https://…` entries are v1; Twitch recordings only |
-| `monitoring_interval` | yes | — | Poll interval in seconds; must be > 0 |
-| `timezone` | yes | — | IANA timezone (e.g. `America/New_York`) used for filenames and timestamps |
-| `plugin_dir` | yes | — | Directory containing the streamlink-ttvlol plugin: `/app/plugins` in Docker (baked into the image, read-only), relative `plugins` for dev runs |
-| `recording_dir` | yes | — | Directory where `.ts` recordings are stored |
-| `record_chat` | no | `true` | Record Twitch IRC chat alongside the video; `false` disables it (Kick chat has its own flag) |
-| `chat_dir` | no | `chat` | Directory where chat JSON files are stored (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`) |
+| `channels` | yes | — | Non-empty list of channels: `twitch:<name>` or `kick:<slug>`. Bare names become `twitch:` on load |
+| `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies (Twitch recordings only). `httpproxy://…` entries are ttvlol v2 proxies (optional `httpproxy://user:pass@host:port`). `https://…` entries are v1 |
+| `monitoring_interval` | yes | — | Poll interval in seconds, more than 0 |
+| `timezone` | yes | — | IANA timezone (for example `America/New_York`) used for filenames and timestamps |
+| `plugin_dir` | yes | — | Directory with the streamlink-ttvlol plugin. `/app/plugins` in Docker (baked into the image, read-only). Relative `plugins` for dev runs |
+| `recording_dir` | yes | — | Directory for `.ts` recordings |
+| `record_chat` | no | `true` | Record Twitch IRC chat alongside the video. Kick chat has its own flag |
+| `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`) |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
-| `channel_output_modes` | no | `{}` | Per-channel override: `{"channel": "disk" \| "youtube" \| "both"}`; falls back to `output_mode` when absent |
-| `eventsub.enabled` | no | `true` | Twitch EventSub fast-path via conduit (uses the existing app credentials; no extra setup); `false` = Twitch polling only |
-| `kick.client_id` | yes¹ | — | Kick app client id — **required when any `kick:` channel is configured** |
-| `kick.client_secret` | yes¹ | — | Kick app client secret — same requirement |
-| `kick.record_chat` | no | `true` | Record Kick chat (delivered via webhook) alongside the video; requires `kick.webhook.enabled` |
-| `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live/offline + chat) and keep subscriptions in sync; `false` = Kick polling only (no chat) |
-| `kick.webhook.listen_host` | no | `127.0.0.1` | Address the receiver binds (`0.0.0.0` under Docker so the host's tunnel can reach it) |
-| `kick.webhook.listen_port` | no | `8787` | Port the receiver binds; the bot's tunnels forward to it |
-| `kick.webhook.public_url` | yes² | `""` | Public URL Kick POSTs to (a host-root URL gets `/kick/webhook` appended) — **required when `kick.webhook.enabled` is true** |
-| `kick.webhook.tunnel` | no | `""` | `cloudflare` or `tailscale` when the bot manages the tunnel; set by the bot, not by hand |
-| `kick.webhook.cloudflare_token` | no | `""` | cloudflared tunnel token when the bot runs a managed Cloudflare tunnel |
-| `kick.webhook.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself (restored on boot) |
-| `kick.webhook.setup_notified` | no | `false` | Internal: whether the "webhook is working" confirmation has been sent for the current enable |
-| `retention_days` | no | `0` | Delete recordings older than this many days; `0` disables cleanup |
-| `preferred_quality` | no | `best` | Stream quality to request from streamlink (`best`, `1080p`, `720p`, …); falls back to `best` |
-| `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings; `0` = unlimited |
-| `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams; `0` = unlimited |
-| `disk.max_total_gb` | no | `0` | Delete oldest recordings when the archive exceeds this (GB); `0` = disabled |
-| `disk.check_interval_s` | no | `60` | How often the disk watchdog re-checks the archive size |
-| `disk.delete_oldest` | no | `true` | Delete oldest recordings when `disk.max_total_gb` is exceeded; `false` stops new recordings instead |
-| `update_check.enabled` | no | `true` | Periodically check the app, streamlink, and the vendored plugin for updates and send a Telegram notification when one is available |
-| `update_check.interval_hours` | no | `24` | How often to run the update check (hours) |
-| `update_check.check_app` | no | `true` | Check GitHub releases for a newer stream-archive release |
+| `channel_output_modes` | no | `{}` | Per-channel override, for example `{"channel": "disk" \| "youtube" \| "both"}`. Channels without an entry use `output_mode` |
+| `eventsub.enabled` | no | `true` | Twitch EventSub fast path via conduit. Uses the existing app credentials (no extra setup). `false` = Twitch polling only |
+| `kick.client_id` | yes¹ | — | Kick app client id. Required when a `kick:` channel is configured |
+| `kick.client_secret` | yes¹ | — | Kick app client secret. Same requirement |
+| `kick.record_chat` | no | `true` | Record Kick chat (delivered by the webhook). Requires `kick.webhook.enabled` |
+| `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live/offline + chat) and keep subscriptions in sync. `false` = Kick polling only (no chat) |
+| `kick.webhook.listen_host` | no | `127.0.0.1` | Bind address of the receiver. Set to `0.0.0.0` under Docker so the host tunnel reaches it |
+| `kick.webhook.listen_port` | no | `8787` | Port of the receiver. The tunnels forward to it |
+| `kick.webhook.public_url` | yes² | `""` | Public URL that Kick POSTs to (a host-root URL gets `/kick/webhook` appended). Required when `kick.webhook.enabled` is true |
+| `kick.webhook.tunnel` | no | `""` | `cloudflare` or `tailscale` when the bot manages the tunnel. The bot sets this key |
+| `kick.webhook.cloudflare_token` | no | `""` | cloudflared tunnel token for a managed Cloudflare tunnel |
+| `kick.webhook.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. Restored on boot |
+| `kick.webhook.setup_notified` | no | `false` | Internal: tracks the "webhook is working" confirmation for the current enable |
+| `retention_days` | no | `0` | Delete recordings older than this many days. `0` disables cleanup |
+| `preferred_quality` | no | `best` | Stream quality requested from streamlink (`best`, `1080p`, `720p`, …) |
+| `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` = unlimited |
+| `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams. `0` = unlimited |
+| `disk.max_total_gb` | no | `0` | Delete oldest recordings when the archive exceeds this size in GB. `0` disables the cap |
+| `disk.check_interval_s` | no | `60` | Seconds between disk watchdog checks |
+| `disk.delete_oldest` | no | `true` | On breach, delete the oldest recordings. `false` stops new recordings instead |
+| `update_check.enabled` | no | `true` | Periodic checks for app, streamlink, and plugin updates, with a Telegram notification when one is available |
+| `update_check.interval_hours` | no | `24` | Hours between update checks |
+| `update_check.check_app` | no | `true` | Check GitHub releases for a newer release of this app |
 | `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
-| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`; plugin updates ship in a future image |
-| `youtube.hold_seconds` | no | `0` | Keep the YouTube broadcast open this many seconds after the source stops, waiting for the streamer to return; `0` = end immediately (default). A return within the delay reuses the same broadcast instead of creating a new one (saves the daily broadcast quota); a bundled pre-encoded "Reconnecting..." clip keeps the broadcast fed during the wait |
-| `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`: `{"channel": 60}`; a channel set to `0` is explicitly off; absent = global value. Managed from the Telegram channel submenu |
+| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`. Plugin updates ship in a future image |
+| `youtube.hold_seconds` | no | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast (no quota cost). A bundled "Reconnecting..." clip feeds the broadcast during the wait. `0` ends the broadcast immediately |
+| `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"channel": 60}`. A channel set to `0` is off. Absent = global value. Managed from the Telegram channel submenu |
 
-¹ Required when the channel list contains a `kick:` entry. ² Required when
-the webhook is enabled.
+¹ Required when the channel list contains a `kick:` entry.
+² Required when the webhook is enabled.
 
 `output_mode: youtube` additionally requires `youtube_token.json` (see
 [YouTube setup](#youtube-setup)).
 
 ## Kick webhook setup
 
-The webhook gives near-instant live/offline signals **and** Kick chat — the
-poll alone cannot deliver chat (Kick has no chat replay). Setup is driven
-from Telegram: `/settings → Kick webhook`, then choose:
+The webhook gives near-instant live/offline signals and Kick chat. The poll
+alone cannot deliver chat (Kick has no chat replay). Open `/settings` in
+Telegram and choose **Kick webhook**, then choose a tunnel option:
 
-- **Cloudflare tunnel** — *Quick tunnel* (no account, temporary URL) or
+- **Cloudflare tunnel**: a *Quick tunnel* (no account, temporary URL) or a
   *Named tunnel* (paste the `cloudflared service install <TOKEN>` command or
-  token, pick a hostname; the bot writes the ingress config, creates the DNS
-  record if you give it a Cloudflare API token, and runs cloudflared).
-- **Tailscale funnel** — the bot runs `tailscale funnel <port>` (the host
-  must run tailscale; under Docker the tailscaled socket is mounted into the
-  container).
-- **Your own tunnel** — paste the public URL of a tunnel you already run.
+  token, pick a hostname). The bot writes the ingress config for a named
+  tunnel. It creates the DNS record if you provide a Cloudflare API token,
+  and runs cloudflared.
+- **Tailscale funnel**: the bot runs `tailscale funnel <port>`. The host
+  must run tailscale (under Docker the tailscaled socket is mounted into
+  the container).
+- **Your own tunnel**: paste the public URL of a tunnel you already run.
 
-The bot probes the URL for reachability, persists the state to `config.json`,
-and then you register it in the Kick app: **Kick → Settings → Developer →
-your app → Enable webhooks** and paste the URL there. The first
-signature-verified event from Kick sends a "Kick webhook is working"
-confirmation. App-managed tunnels are torn down when the webhook is disabled
-or switched to another provider, and a managed Cloudflare tunnel is restored
-automatically on service restart (its trycloudflare URL may have changed —
-you get a new notification if so).
+The bot probes the URL for reachability and persists its state to
+`config.json`. Then register the URL in the Kick app: **Kick → Settings →
+Developer → your app → Enable webhooks**, and paste the URL there. The
+first verified event from Kick triggers a "Kick webhook is working"
+confirmation. The bot tears down its tunnels when you disable the webhook
+or switch to another provider. A managed Cloudflare tunnel comes back
+automatically on service restart. Its trycloudflare URL can change, and you
+get a new notification when it does.
 
 Internals: the receiver is `POST /kick/webhook` on
 `kick.webhook.listen_host:listen_port`. Every request is verified against
-Kick's published signing key (the `Kick-Event-Signature` header, over
-`Kick-Event-Message-Id.Kick-Event-Message-Timestamp.<body>`) and rejected
-unless the signed timestamp is within a 5-minute freshness window — so a
-captured request cannot be replayed to kill recordings or forge chat lines.
-Verified events are deduplicated by message id within that window, the
-public-key rotation refetch is rate-limited, and per-client-IP rate limiting
-plus a concurrency cap bound floods; failures get `401` and are logged. The
-subscription sync loop reconciles
+the published signing key of Kick. Requests with a timestamp outside a
+5-minute freshness window get rejected. A captured request cannot be
+replayed. Verified events are deduplicated by message id within that
+window. Key rotation refetches are rate-limited, and per-client-IP rate
+limiting plus a concurrency cap bound floods. Failed requests get `401` and
+a log entry. The subscription sync loop reconciles
 `livestream.status.updated` + `chat.message.sent` subscriptions against the
-monitored Kick channels every poll cycle (and immediately on `/add`,
-`/remove`, `/reload`, or enabling). If sync fails — usually the URL is not
-registered in the Kick app — one Telegram alert is sent until it recovers.
-Webhook delivery is best-effort: missed events are covered by the polling
-cycle (live/offline) and chat gaps are simply absent from the chat file.
+monitored Kick channels every poll cycle, and immediately on `/add`,
+`/remove`, `/reload`, or enabling. If sync fails (usually the URL is not
+registered in the Kick app), one Telegram alert is sent until it recovers.
+Webhook delivery is best-effort: the poll covers missed live/offline
+events, and chat gaps stay absent from the chat file.
 
 ## Live chat recording
 
-When enabled (Twitch: `record_chat`, default on; Kick: `kick.record_chat`,
-default on, requires the webhook), every recording — in any output mode
-(`disk`, `youtube`, or `both`) — also captures chat and writes a chat JSON in
-the `TwitchDownloader` `ChatRoot` format to
+When enabled, every recording also captures chat, in every output mode.
+Files are written in the `TwitchDownloader` `ChatRoot` format to
 `chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`:
 
-- **Twitch** — an IRC connection to the channel's chat (`chat/twitch/<name>/`).
-- **Kick** — `chat.message.sent` webhook events buffered during the stream
-  (`chat/kick/<slug>/`); emote images are downloaded and embedded into the
-  file as base64 `embeddedData.firstParty` so the result is self-contained.
+- **Twitch**: an IRC connection to the channel chat (`record_chat`, default
+  on). Use `chatupdate -E` to embed emotes/badges/avatars into a copy for a
+  fully self-contained file.
+- **Kick**: buffered `chat.message.sent` webhook events (`kick.record_chat`,
+  default on, requires the webhook). Emote images are downloaded and
+  embedded as base64, so the file is self-contained.
 
-It is the format `TwitchDownloaderCLI` consumes directly:
+`TwitchDownloaderCLI` consumes these files directly:
 
 ```sh
 # enrich the file (embed emotes/badges/avatars) and/or render it:
@@ -331,113 +252,107 @@ TwitchDownloaderCLI chatupdate -i chat/<platform>/<channel>/<title>-<ts>.chat.js
 TwitchDownloaderCLI chatrender -i out.chat.json -o chat.mp4
 ```
 
-StreamArchive only **saves the JSON** — it performs no rendering (no ffmpeg,
-no HTML/MP4 generation). Emotes and badges are parsed into the file's
-`fragments`/`emoticons`/`user_badges` fields; use `chatupdate -E` to embed the
-artwork into a copy for Twitch chat if you want a fully self-contained file.
-Chat is held in memory for the stream and written atomically on stop (every
-termination path — stream going offline, disk watchdog abort, recording-task
-failure, restart, `SIGTERM`/`SIGINT` — finalizes the file), so a crash can
-never corrupt an existing `.chat.json`. `retention_days` cleanup also removes
-old `*.chat.json` files alongside the `.ts` recordings.
+StreamArchive only writes the JSON. It does no rendering (no ffmpeg, no
+HTML/MP4 generation). Chat is held in memory during the stream and written
+atomically on stop. Every termination path (stream offline, disk watchdog
+abort, task failure, restart, `SIGTERM`/`SIGINT`) finalizes the file, so a
+crash cannot corrupt an existing `.chat.json`. `retention_days` cleanup
+also removes old `*.chat.json` files together with the recordings.
 
 ## Telegram control
 
-The admin user (`telegram_user_id`) can manage the recorder by messaging the
-bot; anyone else gets no reply at all. The bot registers a command menu (type
-`/`) for the admin and a `/settings` reply keyboard (buttons above the input
-bar) that covers every setting in submenus — channels, chat recording
-(Twitch/Kick), output mode, quality, retention, recording limits, disk
-limits, the per-channel YouTube hold delay, and the Kick webhook setup
-wizard; inline buttons are used only for
-destructive confirmations (removing a channel, enabling delete-oldest).
-The bot re-sends the settings menu after every restart, so the reply keyboard
-keeps working across code updates and reboots without re-typing `/settings`.
-Every change is validated before being
-written atomically to `config.json` and takes effect on the next poll cycle —
-a failed command leaves both memory and disk untouched.
+Only the admin user (`telegram_user_id`) gets replies from the bot. The bot
+registers a command menu (type `/`). It also offers a `/settings` reply
+keyboard. The submenus cover channels, chat recording, output mode,
+quality, retention, recording and disk limits, the YouTube hold delay, and
+the Kick webhook. Destructive actions (remove
+a channel, enable delete-oldest) use inline confirmation buttons. The bot
+re-sends the settings menu after every restart, so the reply keyboard
+survives updates and reboots. Every change is validated, written atomically
+to `config.json`, and applies on the next poll cycle. A failed command
+leaves memory and disk untouched.
 
 | Command | Action |
 | --- | --- |
 | `/help` | List the available commands |
 | `/start` | Show the available commands and open the settings menu |
-| `/settings` | Open the settings menu (reply keyboard buttons): channels, chat recording, output mode, quality, retention, recording limits, disk limits, YouTube hold delay, Kick webhook |
+| `/settings` | Open the settings menu (reply keyboard buttons) |
 | `/status` | Monitored channels, output mode, retention, chat-recording state, quality, concurrency limits, disk usage/limits, update-check state, Kick webhook state, and channels currently recording |
 | `/channels` | Numbered list of monitored channels |
-| `/add <channel\|url>` | Start monitoring a channel: `twitch:<name>`, `kick:<name>`, or a `twitch.tv`/`kick.com` profile URL (stored canonically; Kick webhook/EventSub subscriptions are created immediately) |
-| `/remove <channel>` | Stop monitoring a channel; if it is live, stops the recording (sending the offline notification) and deletes its webhook/EventSub subscriptions |
-| `/retention <days>` | Set `retention_days`; `0` disables cleanup |
-| `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode` (no channel) or a per-channel override; `default` clears the override; applies to new recordings |
-| `/reload` | Re-read `config.json` from disk (re-syncs webhook/EventSub subscriptions) |
+| `/add <channel\|url>` | Start monitoring a channel: `twitch:<name>`, `kick:<name>`, or a `twitch.tv`/`kick.com` profile URL. Subscriptions are created immediately |
+| `/remove <channel>` | Stop monitoring a channel. A live recording is stopped (offline notification sent) and its webhook/EventSub subscriptions are deleted |
+| `/retention <days>` | Set `retention_days`. `0` disables cleanup |
+| `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode`, or a per-channel override. `default` clears the override. Applies to new recordings |
+| `/reload` | Re-read `config.json` from disk and re-sync webhook/EventSub subscriptions |
 | `/restart` | Gracefully restart the service |
-| `/update` | Check for updates now (app, streamlink, plugin); check-only — nothing is downloaded or applied. An app update is applied with `docker compose pull && docker compose up -d`; plugin/streamlink updates ship in a future image |
+| `/update` | Check for updates now (app, streamlink, plugin). Check-only: nothing is downloaded or applied. Apply an app update with `docker compose pull && docker compose up -d` |
 | `/quality [value]` | Show the preferred quality, or set it (`best`, `1080p`, `720p`, …) |
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
 | `/disk` | Show disk limits |
-| `/disk <maxsize\|delete_oldest> <value>` | Set a disk limit (`maxsize` takes GB, `delete_oldest` takes `on`/`off`) |
-| `/chat [on\|off] [twitch\|kick]` | Show whether chat recording is enabled, or enable/disable it (per platform with `twitch` or `kick`); `off` also stops and finalizes in-flight chat capture (the video recordings continue) |
+| `/disk <maxsize\|delete_oldest> <value>` | Set a disk limit. `maxsize` takes GB. `delete_oldest` takes `on`/`off` |
+| `/chat [on\|off] [twitch\|kick]` | Show whether chat recording is enabled, or enable/disable it (globally, or per platform with `twitch`/`kick`). `off` stops and finalizes in-flight chat capture (video recordings continue) |
 
 Notes:
 
-- `/mode` applies to new recordings; an in-flight recording finishes in the
-  mode it started with. A per-channel override (`/mode <channel> <mode>`) wins
-  over the global `output_mode`; `/status` lists active overrides, and
-  `/remove <channel>` clears the channel's override.
-- The per-channel YouTube hold delay is set from
+- `/mode` applies to new recordings. An in-flight recording finishes in the
+  mode it started with. A per-channel override wins over the global
+  `output_mode`. `/status` lists active overrides, and `/remove` clears the
+  override of that channel.
+- The per-channel YouTube hold delay lives under
   `/settings → Channels → <channel> → Hold delay` (presets, `0` = off, or a
-  custom value in seconds; `Default` clears the override back to the global
-  `youtube.hold_seconds`). The value is read when a recording stops, so it
-  applies to the next stop immediately; the global default lives in
-  `config.json`.
-- `/chat off` applies immediately: in-flight chat capture is stopped and
-  finalized (the video recordings continue), and new recordings start without
-  chat until `/chat on`; `/chat on` affects new recordings only.
-- `/chat off twitch` / `/chat off kick` (and the `on` variants) toggle only
-  that platform: Twitch IRC chat (`record_chat`) or Kick webhook chat
-  (`kick.record_chat`). The other platform's in-flight capture keeps running.
-- `/retention` and `/reload` apply immediately — the cleanup loop and the
+  custom value in seconds). `Default` clears the override back to the global
+  `youtube.hold_seconds`. The value is read when a recording stops, so it
+  applies to the next stop immediately.
+- `/chat off` applies immediately. In-flight capture is stopped and
+  finalized, and new recordings start without chat until `/chat on`.
+  `/chat on` affects new recordings only. A platform toggle
+  (`/chat off twitch`) affects only that platform, and the other platform
+  keeps running.
+- `/retention` and `/reload` apply immediately. The cleanup loop and the
   monitor read the live config every cycle.
-- `/restart` replies first, then triggers the scheduler shutdown; the compose
-  `restart: unless-stopped` policy relaunches the container.
+- `/restart` replies first, then triggers the scheduler shutdown. The
+  compose policy `restart: unless-stopped` relaunches the container.
 - Secrets (bot token, Twitch credentials, proxy credentials, Kick
   credentials, tunnel tokens) are never printed by `/status` and cannot be
   changed over Telegram.
 
 ## Running
 
-The image owns all code; your data dir owns all state. The container runs
-with a read-only rootfs — only the mounted data dir and `/tmp` (tmpfs) are
+The image owns all code. Your data dir owns all state. The container root
+filesystem is read-only. Only the mounted data dir and `/tmp` (tmpfs) are
 writable.
 
 ```sh
-docker compose up -d   # start
-docker compose logs -f # follow logs
-docker compose stop    # graceful shutdown: recordings stopped, broadcasts ended
+docker compose up -d    # start
+docker compose logs -f  # follow logs
+docker compose stop     # graceful shutdown: recordings stopped, broadcasts ended
 ```
 
-- The data dir (default: the folder containing `docker-compose.yml`, i.e.
-  `~/stream-archive/`) holds `config.json`, `recordings/`, `chat/`,
+- The data dir (default: the folder containing `docker-compose.yml`, for
+  example `~/stream-archive-data/`) holds `config.json`, `recordings/`, `chat/`,
   `youtube_token.json`, `client_secret.json`, `cloudflared/`, and
-  `update_state.json` — browse and edit it like any folder on the host;
-  backup = copy the folder. Override the location with
-  `STREAM_ARCHIVE_DATA` in `.env` (see [Quick start](#quick-start)).
-- The container runs as the owner of the data dir, so recorded files stay
-  manageable on the host no matter what your uid/gid is — no configuration
-  needed. To force a specific identity, set `USER_UID`/`USER_GID` in `.env`
-  (if the data dir is root-owned — e.g. Docker auto-created it — fix it once
-  with `sudo chown -R "$(id -u):$(id -g)" <data-dir>`).
-- Log timestamps follow the container timezone (`UTC` by default); set
-  `TZ=America/New_York` in the same `.env` to match `config.json`'s `timezone`.
-- Logs are rotated by compose (10 MB × 3 files).
-- Kick webhook under Docker: the host's tailscale funnel forwards to the
-  host loopback, and the compose file publishes the receiver on
-  `127.0.0.1:8787` — set `kick.webhook.listen_host` to `"0.0.0.0"` in
-  `config.json`. The image ships `cloudflared` and the tailscale CLI; the
+  `update_state.json`. Treat it like a normal folder on the host.
+  Back up the folder by copying it. Move it with `STREAM_ARCHIVE_DATA` in
+  `.env` (see [Quick start](#quick-start)).
+- The container runs as the owner of the data dir. Recorded files stay
+  manageable on the host. Set `USER_UID` /
+  `USER_GID` in `.env` to force a specific identity. If Docker auto-created
+  the data dir as root, fix the ownership once with
+  `sudo chown -R "$(id -u):$(id -g)" <data-dir>`.
+- Log timestamps follow the container timezone (`UTC` by default). Set
+  `TZ=America/New_York` in the same `.env` to match the `timezone` in
+  config.
+- Compose rotates logs (10 MB × 3 files).
+- Kick webhook under Docker: a host tailscale funnel forwards to the host
+  loopback, and the compose file publishes the receiver on
+  `127.0.0.1:8787`. Set `kick.webhook.listen_host` to `"0.0.0.0"` in
+  config. The image ships `cloudflared` and the tailscale CLI, and the
   tailscaled socket is mounted from the host.
-- One-time YouTube OAuth: `docker compose run --rm stream-archive stream-archive-setup-youtube`
-  (the browser opens on your host; the localhost redirect can't reach the
-  container, so paste the full address-bar URL when prompted)
+- One-time YouTube OAuth:
+  `docker compose run --rm stream-archive stream-archive-setup-youtube`.
+  The browser opens on your host. Paste the full address-bar URL at the
+  prompt (the localhost redirect cannot reach the container).
 
 ### Logs
 
@@ -445,31 +360,30 @@ docker compose stop    # graceful shutdown: recordings stopped, broadcasts ended
 docker compose logs -f
 ```
 
-`SIGTERM`/`SIGINT` trigger a graceful shutdown: all recordings stop, active
-YouTube broadcasts are transitioned to `complete`, and the scheduler exits
-with `[scheduler] Shutdown complete`.
+`SIGTERM`/`SIGINT` trigger a graceful shutdown. All recordings stop, active
+YouTube broadcasts transition to `complete`, and the scheduler exits with
+`[scheduler] Shutdown complete`.
 
-## Failure handling & recovery
+## Failure handling
 
 | Failure | Behavior |
 | --- | --- |
-| All ad-block proxies fail for a live Twitch channel | Channel skipped, one Telegram alert (rate-limited to 30 min/channel), retried next cycle |
-| Kick blocks recording requests (anti-bot challenge / `403`) | Channel skipped, one Telegram alert (rate-limited to 30 min/channel) with a hint to install a browser on the host, retried next cycle |
-| YouTube rate limit / `403` / quota error at broadcast creation | Automatic fallback to disk recording; live alert still sent |
-| Other YouTube broadcast-creation error | Task fails loudly; channel restarted next cycle |
-| Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, feed stall) | Entry removed (chat + broadcast finalized), monitor restarts on the next poll cycle; no alert if recovery succeeds, alert (rate-limited) only if the restart also fails |
-| YouTube re-stream keeps ending shortly after start (flaky feed) | Restarts back off per channel (120s doubling, 30 min cap); a rolling 24h budget of 10 broadcast creations shared across all channels blocks further restarts (one alert with the next-slot time) until a slot frees — guards YouTube's per-channel daily broadcast cap (`userBroadcastsExceedLimit`) |
-| Source drops briefly with a hold delay configured | The broadcast stays open (`youtube.hold_seconds`, or the per-channel override), fed by a bundled pre-encoded "Reconnecting..." clip; a return within the delay reuses the same broadcast — no new broadcast creation, no quota cost. On expiry the broadcast ends as usual |
-| Transient Twitch API error (token/request) | Logged, nothing acted on, retried next cycle |
-| Transient Kick API error (token/request) | Logged, nothing acted on, retried next cycle |
-| Kick channel slug not found | Warned once per channel, treated as offline; never crashes the poll |
-| EventSub connection lost / conduit shard disabled | Auto-reconnect with backoff; shard re-associated with the new WebSocket session; missed events covered by the polling cycle |
-| Kick webhook signature verification failed | Request answered `401`, logged; valid requests keep flowing |
-| Kick webhook subscription sync fails (e.g. URL not registered in the Kick app) | One Telegram alert until the sync recovers; polling still covers live/offline |
-| Stream reported for an unknown user id | Skipped with a warning; the poll cycle never crashes |
+| All ad-block proxies fail for a live Twitch channel | Channel skipped. One alert (rate-limited to 30 min/channel). Retry on the next cycle |
+| Kick blocks recording requests (anti-bot challenge / `403`) | Channel skipped. One alert (rate-limited) with a hint to install a browser on the host. Retry on the next cycle |
+| YouTube rate limit / `403` / quota error at broadcast creation | Automatic fallback to disk recording. The live alert still goes out |
+| Other YouTube broadcast-creation error | The task fails with an error. Restart on the next cycle |
+| Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, stalled feed) | Entry removed (chat + broadcast finalized). Restart on the next cycle. No alert if recovery succeeds, rate-limited alert only if the restart also fails |
+| YouTube re-stream keeps ending shortly after start (flaky feed) | Restart delays grow per channel. They double from 120 s to a cap of 30 min. A rolling 24 h budget of 10 broadcast creations across all channels blocks further restarts until a slot frees (one alert with the next-slot time). Guards the daily broadcast limit of YouTube (`userBroadcastsExceedLimit`) |
+| Source drops briefly with a hold delay configured | The broadcast stays open, fed by a bundled pre-encoded "Reconnecting..." clip. A return within the delay reuses the same broadcast (no new creation, no quota cost). On expiry the broadcast ends as usual |
+| Transient Twitch/Kick API error (token/request) | Logged. Nothing acted on. Retry on the next cycle |
+| Kick channel slug not found | Warned once per channel. Treated as offline. Never crashes the poll |
+| EventSub connection lost / conduit shard disabled | Auto-reconnect with backoff. The shard re-associates with the new session. Missed events covered by the poll |
+| Kick webhook signature verification failed | Request answered `401` and logged. Valid requests keep flowing |
+| Kick webhook subscription sync fails (URL not registered in the Kick app) | One alert until the sync recovers. Polling still covers live/offline |
+| Stream reported for an unknown user id | Skipped with a warning. The poll never crashes |
 
-Alerts are sent at most once per 30 minutes per channel (`FAILURE_NOTIFY_INTERVAL`
-in `src/stream_archive/monitor.py`).
+Alerts are sent at most once per 30 minutes per channel
+(`FAILURE_NOTIFY_INTERVAL` in `src/stream_archive/monitor.py`).
 
 ## Project layout
 
@@ -499,7 +413,7 @@ plugins/twitch.py        # dev-only: fetched from streamlink-ttvlol releases (ba
 tests/                   # pytest suite (config, recorder, monitor, eventsub, kick api/webhook/chat, telegram, …)
 ```
 
-At runtime all state lives in the data dir (see [Running](#running)); the
+At runtime all state lives in the data dir (see [Running](#running)). The
 repository itself is only needed for development.
 
 ## Development
@@ -514,6 +428,6 @@ uv run pre-commit run --all-files
 
 ## License
 
-[MIT](LICENSE). The image contains the third-party `twitch.py`
-(streamlink-ttvlol), fetched at build from upstream releases, retaining its
-upstream license.
+[MIT](LICENSE). The image contains the third-party `twitch.py` plugin
+(streamlink-ttvlol). The plugin is fetched at build from upstream releases
+and keeps its upstream license.
