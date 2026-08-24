@@ -149,7 +149,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             msg = str(e)
             if is_kick_channel(channel) and ("403" in msg or "blocked by security policy" in msg):
                 now_ts = time.monotonic()
-                if now_ts - self._last_kick_block_notify.get(channel, 0.0) >= 1800:
+                if now_ts - self._last_kick_block_notify.get(channel, -1800.0) >= 1800:
                     self._last_kick_block_notify[channel] = now_ts
                     if self._notifier:
                         await self._notifier.notify(

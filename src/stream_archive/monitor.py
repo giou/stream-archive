@@ -17,7 +17,7 @@ class Monitor:
         self.notifier = notifier
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
-        self._last_disk_notify = 0.0
+        self._last_disk_notify = -float(DISK_NOTIFY_INTERVAL)
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
         self._kick_api_error_logged = False
@@ -242,7 +242,7 @@ class Monitor:
 
     async def _handle_start_failure(self, channel: str) -> None:
         now = time.monotonic()
-        if now - self._last_failure_notify.get(channel, 0.0) < FAILURE_NOTIFY_INTERVAL:
+        if now - self._last_failure_notify.get(channel, -FAILURE_NOTIFY_INTERVAL) < FAILURE_NOTIFY_INTERVAL:
             return
         self._last_failure_notify[channel] = now
         await self.notifier.notify(
