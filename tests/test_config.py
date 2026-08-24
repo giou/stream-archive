@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -518,3 +519,11 @@ def test_negative_global_hold_raises():
     config["youtube"] = {"hold_seconds": -1}
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
+
+
+def test_config_example_is_valid_json_and_appconfig():
+    data = json.loads((Path(__file__).resolve().parent.parent / "config.json.example").read_text())
+    data["telegram_user_id"] = 12345  # placeholder string fails StrictInt by design
+    config = AppConfig.model_validate(data)
+    assert config.youtube.hold_seconds == 0
+    assert config.output_mode == "disk"

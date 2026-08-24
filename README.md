@@ -182,6 +182,8 @@ never written back. A config with placeholders is safe to commit or share.
 | `update_check.check_app` | no | `true` | Check GitHub releases for a newer release of this app |
 | `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
 | `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`. Plugin updates ship in a future image |
+| `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client file. Only the YouTube authorization flow uses this file |
+| `youtube.privacy_status` | no | `unlisted` | Privacy of created YouTube broadcasts: `public`, `unlisted`, or `private` |
 | `youtube.hold_seconds` | no | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast (no quota cost). A bundled "Reconnecting..." clip feeds the broadcast during the wait. `0` ends the broadcast immediately |
 | `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"channel": 60}`. A channel set to `0` is off. Absent = global value. Managed from the Telegram channel submenu |
 

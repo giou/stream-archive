@@ -17,6 +17,8 @@
     "recording_dir": "recordings",
     "record_chat": true,
     "chat_dir": "chat",
+    "output_mode": "disk",
+    "channel_output_modes": {},
     "channel_youtube_hold_seconds": {},
     "eventsub": {
         "enabled": true
@@ -52,9 +54,9 @@
         "check_streamlink": true,
         "check_plugin": true
     },
+    "youtube": {
+        "privacy_status": "unlisted",
         "client_secrets_file": "client_secret.json",
         "hold_seconds": 0
-    }
-        "client_secrets_file": "client_secret.json"
     }
 }
