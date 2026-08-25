@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ def chat_dir_path(config: AppConfig) -> Path:
     return d
 
 
-def iter_recordings(base: Path):
+def iter_recordings(base: Path) -> Iterator[Path]:
     """Yield every recording under base: legacy .ts plus audio-only .m4a."""
     yield from base.rglob("*.ts")
     yield from base.rglob("*.m4a")

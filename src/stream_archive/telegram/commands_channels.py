@@ -58,6 +58,7 @@ class ChannelsCommands:
         if not result.startswith("\u274c") and self._recorder.is_recording(ch):
             await self._recorder.stop(ch)
             self._monitor.remove_channel(ch)
+            result += "\nRecording stopped."
         if not result.startswith("\u274c"):
             if is_kick_channel(ch):
                 if self._kick_webhook:

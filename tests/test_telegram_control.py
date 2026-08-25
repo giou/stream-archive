@@ -248,9 +248,38 @@ def test_remove_stops_live_recording(tmp_path):
     assert text.startswith("Removed")
     assert "twitch:ch" in text
     assert recorder.stop_calls == ["twitch:ch"]
+    assert "Recording stopped." in text
     assert monitor.remove_calls == ["twitch:ch"]
     assert "twitch:ch" not in read_file(tmp_path)["channels"]
     assert "twitch:ch" not in config.channels
+
+
+def test_remove_recording_channel_sends_no_apply_warning(tmp_path):
+    # Regression: removing a live channel whose per-channel override differs
+    # from the global default used to stash a bogus "recording in progress"
+    # apply warning. The remove path stops the recording itself, so there is
+    # nothing to apply or keep.
+    config, ctrl, recorder, monitor, eventsub = make_controller(
+        tmp_path, channels=["twitch:channel1", "twitch:ch"], recording=["twitch:ch"]
+    )
+    # A real settings change first: it legitimately warns while the channel
+    # records. The admin declines, so the prompt stays pending.
+    ctrl.handle_mode(["twitch:ch", "youtube"])
+    assert len(ctrl._pending_apply) == 1
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+
+    text = asyncio.run(ctrl.handle_remove(["twitch:ch"]))
+    assert text.startswith("Removed twitch:ch")
+    assert "Recording stopped." in text
+    assert recorder.stop_calls == ["twitch:ch"]
+    assert recorder.restart_calls == []
+
+    # The removal must not stash a second warning for the removed channel,
+    # and the send pass drops the leftover prompt: its recording has ended.
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 0
+    assert ctrl._pending_apply == {}
 
 
 def test_remove_not_recording_does_not_stop(tmp_path):
@@ -414,6 +443,7 @@ def test_deferred_affected_same_value_noop(tmp_path):
 
 def test_deferred_affected_quality_change(tmp_path):
     cfg = _load_config(tmp_path)
+    cfg.channels = ["twitch:ch", "twitch:channel1"]
     cfg.preferred_quality = "720p"
     rec = _recordings(["twitch:ch", "twitch:channel1"])
     assert _deferred_affected_channels(cfg, rec) == ["twitch:ch", "twitch:channel1"]
@@ -421,6 +451,7 @@ def test_deferred_affected_quality_change(tmp_path):
 
 def test_deferred_affected_per_channel_quality_override(tmp_path):
     cfg = _load_config(tmp_path)
+    cfg.channels = ["twitch:ch", "twitch:channel1"]
     cfg.channel_preferred_qualities = {"twitch:ch": "1080p"}
     rec = _recordings(["twitch:ch", "twitch:channel1"])  # both snapshots report quality best
     assert _deferred_affected_channels(cfg, rec) == ["twitch:ch"]
@@ -435,6 +466,7 @@ def test_deferred_affected_chat_twitch_enable(tmp_path):
 
 def test_deferred_affected_chat_kick_enable(tmp_path):
     cfg = _load_config(tmp_path)
+    cfg.channels = ["twitch:channel1", "kick:xqc"]
     cfg.kick.record_chat = True
     rec = _recordings(["twitch:channel1", "kick:xqc"], chat=True, kick_chat=False)
     assert _deferred_affected_channels(cfg, rec) == ["kick:xqc"]
@@ -451,6 +483,17 @@ def test_deferred_affected_no_active_recordings(tmp_path):
     cfg = _load_config(tmp_path)
     cfg.output_mode = "youtube"
     assert _deferred_affected_channels(cfg, {}) == []
+
+
+def test_deferred_affected_ignores_removed_channel(tmp_path):
+    # Removing a channel stops its recording right away. Its snapshot may
+    # differ from the global fallback settings, but that never warrants a
+    # deferred-apply warning.
+    cfg = _load_config(tmp_path)
+    cfg.output_mode = "youtube"
+    cfg.channels = ["twitch:channel1"]  # twitch:gone was just removed
+    rec = _recordings(["twitch:channel1", "twitch:gone"])
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:channel1"]
 
 
 def test_mode_change_sets_pending_apply(tmp_path):
@@ -502,6 +545,20 @@ def test_apply_warning_round_trip_restarts(tmp_path):
     assert "twitch:channel1: restarted with the new settings" in text
     assert recorder.restart_calls == ["twitch:channel1"]
     assert ctrl._pending_apply == {}
+
+
+def test_apply_warning_dropped_when_recording_ends(tmp_path):
+    # A pending prompt whose recording ended before the admin answered is
+    # dropped: there is no running recording left to apply settings to.
+    config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
+    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    asyncio.run(recorder.stop("twitch:channel1"))
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 0
+    assert ctrl._pending_apply == {}
+    assert ctrl._apply_warnings_sent == set()
 
 
 def test_apply_now_callback_restarts(tmp_path):

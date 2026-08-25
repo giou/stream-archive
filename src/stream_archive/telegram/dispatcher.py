@@ -46,10 +46,14 @@ def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, 
     recording keeps the old settings, so the same change must warn again.
     Deferred effects: output mode (global or per-channel override),
     preferred quality, and chat capture enabled (disabling chat stops an
-    in-flight capture immediately and never warns).
+    in-flight capture immediately and never warns). A channel that the
+    change removes from monitoring is never listed. The remove path stops
+    its recording at once, so no deferred choice exists for it.
     """
     affected: set[str] = set()
     for ch, rec in recordings.items():
+        if ch not in new.channels:
+            continue
         if (
             rec.get("output_mode") != new.channel_output_modes.get(ch, new.output_mode)
             or rec.get("preferred_quality") != effective_quality(new, ch)
@@ -214,12 +218,21 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         admin answers. The nonce in the message callback data must still
         resolve when the admin taps a button. ``_apply_warnings_sent``
         records which nonces the bot already messaged, so a later trigger
-        does not resend.
+        does not resend. A prompt whose affected recordings have all ended
+        (removed channel or finished stream) is dropped, not sent.
         """
         for nonce in list(self._pending_apply):
+            summary, channels = self._pending_apply[nonce]
+            channels = [ch for ch in channels if self._recorder.is_recording(ch)]
+            if not channels:
+                # Every affected recording already ended (the channel was
+                # removed or the stream finished). Nothing can be applied
+                # to a running recording, so drop the stale prompt.
+                self._pending_apply.pop(nonce, None)
+                self._apply_warnings_sent.discard(nonce)
+                continue
             if nonce in self._apply_warnings_sent:
                 continue
-            summary, channels = self._pending_apply[nonce]
             text = (
                 f"\u26a0\ufe0f {summary}, but recording in progress for: {', '.join(channels)}\n"
                 "The running recording keeps the previous settings until it ends.\n"
