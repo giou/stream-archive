@@ -33,6 +33,7 @@ class DiskOutputMixin:
     async def _record_disk(self, channel: str, filepath: str, stream: Any) -> None:
         logger.info("[recorder] [disk] %s -> %s", channel, filepath)
         loop = asyncio.get_running_loop()
+        fd: Any = None
         try:
             fd = await loop.run_in_executor(None, stream.open)
             with open(filepath, "wb") as f:
@@ -136,11 +137,17 @@ class DiskOutputMixin:
             return 0
         cutoff = time.time() - retention_days * 86400
         loop = asyncio.get_running_loop()
+        # Never unlink the in-flight recording: a feed stalled longer than
+        # retention_days keeps its fd open while mtime ages out, and removing
+        # the file drops the live capture mid-write.
+        active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
 
         def _scan() -> list[Path]:
             found: list[Path] = []
             if base.exists():
                 for path in base.rglob("*.ts"):
+                    if os.path.realpath(path) in active:
+                        continue
                     try:
                         if path.stat().st_mtime < cutoff:
                             found.append(path)

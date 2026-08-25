@@ -1592,3 +1592,50 @@ def test_keepalive_early_death_ends_broadcast(tmp_path, monkeypatch):
         assert rec._held == {}
 
     asyncio.run(scenario())
+
+
+def test_start_setup_failure_cleans_registered_entry(tmp_path, monkeypatch):
+    """An OSError after registration (makedirs denied) must not strand a taskless
+    zombie entry: start returns False, nothing stays registered, and a retry
+    once the cause is gone succeeds."""
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    real_makedirs = os.makedirs
+    denied = {"on": True}
+
+    def flaky_makedirs(path, *a, **k):
+        if denied["on"]:
+            raise PermissionError(f"denied: {path}")
+        return real_makedirs(path, *a, **k)
+
+    monkeypatch.setattr(os, "makedirs", flaky_makedirs)
+
+    async def scenario():
+        assert await rec.start("ch") is False
+        assert "ch" not in rec._recordings
+
+        denied["on"] = False  # cause removed: the next cycle retries successfully
+        assert await rec.start("ch") is True
+        assert "ch" in rec._recordings
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_spares_active_recording(tmp_path):
+    """Retention cleanup must not unlink the in-flight .ts even when its mtime
+    aged past retention_days (a stalled feed keeps writing via its open fd)."""
+    rec = Recorder(make_config(tmp_path))
+    old_active = tmp_path / "recordings" / "ch" / "active.ts"
+    old_idle = tmp_path / "recordings" / "ch" / "idle.ts"
+    t = time.time() - 30 * 86400
+    seed_recording(old_active, t)
+    seed_recording(old_idle, t)
+    rec._recordings["ch"] = {"tasks": [], "process": None, "youtube_info": None, "filepath": str(old_active)}
+
+    removed = asyncio.run(rec.cleanup_old_recordings(7))
+
+    assert removed == 1
+    assert old_active.exists()
+    assert not old_idle.exists()

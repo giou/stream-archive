@@ -357,3 +357,46 @@ def test_token_error_propagates():
     api = make_api(handler)
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(api.get_channel_statuses(["xqc"]))
+
+
+def test_concurrent_token_refresh_is_single_flight():
+    """A burst of callers (webhook verifications run concurrently) must produce
+    exactly one client_credentials POST."""
+    calls = {"tokens": 0}
+
+    def handler(request):
+        calls["tokens"] += 1
+        return token_handler(request)
+
+    api = make_api(handler)
+
+    async def scenario():
+        return await asyncio.gather(*[api._get_token() for _ in range(5)])
+
+    assert asyncio.run(scenario()) == ["tok-1"] * 5
+    assert calls["tokens"] == 1
+
+
+def test_get_public_key_keeps_cache_on_malformed_response():
+    calls = {"n": 0}
+    pem = "-----BEGIN PUBLIC KEY-----\nAAA\n-----END PUBLIC KEY-----\n"
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_handler(request)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json={"data": {"public_key": pem}})
+        return httpx.Response(200, json={})  # malformed 200: no data at all
+
+    api = make_api(handler)
+
+    async def scenario():
+        first = await api.get_public_key(force=True)
+        second = await api.get_public_key(force=True)  # rotation refetch hits the malformed body
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert calls["n"] == 2
+    assert first == pem
+    assert second == pem  # known-good PEM survives a malformed response

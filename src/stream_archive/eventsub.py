@@ -37,6 +37,9 @@ class EventSubClient:
         self._subscribed = False
         self._ws: Any = None
         self._task: asyncio.Task[Any] | None = None
+        # Strong refs to in-flight dispatch tasks; CPython GCs unreferenced
+        # tasks, which would silently drop a live/offline event mid-flight.
+        self._dispatch_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
         if not self._config.eventsub.enabled:
@@ -272,7 +275,9 @@ class EventSubClient:
         """Dispatch one WebSocket message. Returns True when the socket must reconnect."""
         mtype = msg.get("metadata", {}).get("message_type")
         if mtype == "notification":
-            asyncio.create_task(self._dispatch(msg))
+            t = asyncio.create_task(self._dispatch(msg))
+            self._dispatch_tasks.add(t)
+            t.add_done_callback(self._dispatch_tasks.discard)
         elif mtype == "session_keepalive":
             pass
         elif mtype == "session_reconnect":

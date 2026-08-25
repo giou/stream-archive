@@ -2752,3 +2752,32 @@ def test_remove_clears_hold_override(tmp_path):
     asyncio.run(ctrl.handle_remove(["twitch:channel1"]))
     assert read_file(tmp_path).get("channel_youtube_hold_seconds", {}) == {}
     assert "twitch:channel1" not in read_file(tmp_path)["channels"]
+
+
+def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkeypatch):
+    """A proxy 502 HTML page on token-verify must come back as (False, message)
+    ('not valid'), never escape as a JSONDecodeError mid-setup-flow."""
+
+    class _HtmlVerifyResp:
+        status_code = 200
+        text = "<html><body>502 Bad Gateway</body></html>"
+
+        def json(self):
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+    class _HtmlCfClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            return _HtmlVerifyResp()
+
+    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, _HtmlCfClient())
+
+    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
+
+    assert ok is False
+    assert "not valid" in message

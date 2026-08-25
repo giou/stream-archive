@@ -376,6 +376,14 @@ def save_config(config: AppConfig) -> None:
     validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
     data = validated.model_dump()
     for key_path, raw in list(config._env_placeholders.items()):
+        try:
+            current = _get_at(data, key_path)
+        except KeyError, IndexError, TypeError:
+            # Placeholder recorded under a key pydantic dropped (extra='ignore'):
+            # nothing left in the output to mask — drop the tracker instead of
+            # aborting this and every future save.
+            del config._env_placeholders[key_path]
+            continue
         # Restore the ${VAR} placeholder only while the live value still equals
         # its env interpolation (untouched secret -> stays masked on disk).
         # Anything else is a deliberate bot-persisted literal: write it and
@@ -384,7 +392,7 @@ def save_config(config: AppConfig) -> None:
             resolved = _ENV_RE.sub(lambda m: os.environ[m.group(1)], raw)
         except Exception:
             resolved = None  # env var vanished since load: keep masking, don't persist a guess
-        if resolved is None or _get_at(data, key_path) == resolved:
+        if resolved is None or current == resolved:
             # Untouched value (still equal to its interpolation), or the env
             # var vanished since load: keep masking either way.
             _set_at(data, key_path, raw)
@@ -393,22 +401,28 @@ def save_config(config: AppConfig) -> None:
             del config._env_placeholders[key_path]
     config_path = config._config_path
     tmp = Path(str(config_path) + ".tmp")
+    try:
+        existing_mode = config_path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        existing_mode = None  # new file: keep the umask default
     with open(tmp, "w") as f:
         json.dump(data, f, indent=4)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if existing_mode is not None:
+        os.chmod(tmp, existing_mode)
     os.replace(tmp, config_path)
 
 
 def reload_config(config: AppConfig) -> None:
     """Re-read config.json from disk into the live instance; raises ValueError on any failure."""
     try:
-        with open(config._config_path) as f:
-            json.load(f)
+        _replace_in_place(config, get_config(config._config_path))
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse config.json: {e}") from e
     except FileNotFoundError:
         raise ValueError("config.json not found") from None
-    _replace_in_place(config, get_config(config._config_path))
 
 
 def _replace_in_place(target: AppConfig, source: AppConfig) -> None:

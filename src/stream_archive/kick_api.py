@@ -42,6 +42,7 @@ class KickAPI:
         self._token: str | None = None
         self._token_expires_at = 0
         self._public_key: str | None = None
+        self._token_lock = asyncio.Lock()
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Send a request, retrying transient failures with short backoff.
@@ -69,24 +70,30 @@ class KickAPI:
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
-        try:
-            resp = await self._request(
-                "POST",
-                self.TOKEN_URL,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token = data["access_token"]
-            self._token_expires_at = now + data.get("expires_in", 3600)
-            return self._token
-        except httpx.HTTPStatusError as e:
-            logger.error("[kick_api] Token request failed: %s", e)
-            raise
+        # Single-flight: concurrent callers (webhook verifications run in
+        # parallel) must not each POST client_credentials. Double-check the
+        # cache inside the lock — the winner of the race already refreshed.
+        async with self._token_lock:
+            if self._token and time.time() < self._token_expires_at - 60:
+                return self._token
+            try:
+                resp = await self._request(
+                    "POST",
+                    self.TOKEN_URL,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._token = data["access_token"]
+                self._token_expires_at = time.time() + data.get("expires_in", 3600)
+                return self._token
+            except httpx.HTTPStatusError as e:
+                logger.error("[kick_api] Token request failed: %s", e)
+                raise
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]:
         """Map slug -> {title, game, is_live, broadcaster_user_id}; unknown slugs absent."""
@@ -126,7 +133,8 @@ class KickAPI:
         data = resp.json().get("data")
         if isinstance(data, dict):  # live API nests the PEM: {"data": {"public_key": "..."}}
             data = data.get("public_key")
-        self._public_key = data
+        if data:  # a 200 without a key must not wipe the known-good PEM
+            self._public_key = data
         return self._public_key
 
     def clear_public_key_cache(self) -> None:

@@ -415,7 +415,15 @@ class WebhookCommands:
                 verify = await client.get("/user/tokens/verify", headers=headers)
                 if verify.status_code != 200 and account_id:
                     verify = await client.get(f"/accounts/{account_id}/tokens/verify", headers=headers)
-                if verify.status_code != 200 or (verify.json().get("result") or {}).get("status") != "active":
+                try:
+                    verify_active = (
+                        verify.status_code == 200 and (verify.json().get("result") or {}).get("status") == "active"
+                    )
+                except ValueError:
+                    # Non-JSON body (proxy 502 HTML pages): treat like an
+                    # unusable token instead of escaping mid-flow.
+                    verify_active = False
+                if not verify_active:
                     return False, "\u274c That Cloudflare API token is not valid."
                 zones_resp = await client.get("/zones?per_page=50", headers=headers)
                 if zones_resp.status_code != 200:
@@ -452,7 +460,9 @@ class WebhookCommands:
                 if created.status_code not in (200, 201):
                     err = (created.json().get("errors") or [{}])[0].get("message", created.text)
                     return False, f"\u274c Could not create the DNS record: {err}"
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ValueError) as e:
+            # ValueError: .json() on a non-JSON body (proxy 502 HTML pages) —
+            # this handler must never escape with an exception mid-flow.
             return False, f"\u274c Cloudflare API request failed: {e}"
         return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
 

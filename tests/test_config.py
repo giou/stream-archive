@@ -527,3 +527,33 @@ def test_config_example_is_valid_json_and_appconfig():
     config = AppConfig.model_validate(data)
     assert config.youtube.hold_seconds == 0
     assert config.output_mode == "disk"
+
+
+def test_save_preserves_file_mode(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(valid_config()))
+    path.chmod(0o600)
+    cfg = get_config(path)
+
+    save_config(cfg)
+
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
+    monkeypatch.delenv("DEFINITELY_UNSET_VAR_12345", raising=False)
+    data = valid_config()
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    cfg = get_config(tmp_path / "config.json")
+    # A ${VAR} recorded under a key pydantic dropped (extra='ignore'):
+    # nothing in the output matches it anymore.
+    cfg._env_placeholders[("bogus",)] = "${DEFINITELY_UNSET_VAR_12345}"
+
+    save_config(cfg)  # must not raise
+
+    rewritten = json.loads((tmp_path / "config.json").read_text())
+    assert rewritten["bot_telegram_api"] == data["bot_telegram_api"]
+    assert "bogus" not in rewritten
+    assert ("bogus",) not in cfg._env_placeholders
+    save_config(cfg)  # later saves keep working
+    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == data["bot_telegram_api"]

@@ -163,100 +163,117 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             logger.error("[recorder] Unexpected error resolving %s: %s", channel, e)
             return False
 
-        entry: dict[str, Any] = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
-        entry["started_at"] = time.monotonic()
-        entry["mode"] = mode
-        self._recordings[channel] = entry
-        entry["title"] = title
-        entry["game"] = game
-        entry["user_id"] = user_id
-        entry["quality"] = self._config.preferred_quality
-        tasks = []
-        live_url = channel_url(channel)
+        try:
+            entry: dict[str, Any] = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
+            entry["started_at"] = time.monotonic()
+            entry["mode"] = mode
+            self._recordings[channel] = entry
+            entry["title"] = title
+            entry["game"] = game
+            entry["user_id"] = user_id
+            entry["quality"] = self._config.preferred_quality
+            tasks = []
+            live_url = channel_url(channel)
 
-        now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
-        safe_title = _sanitize_filename(stream_title)
+            now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
+            safe_title = _sanitize_filename(stream_title)
 
-        if mode in ("disk", "both"):
-            recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
-            os.makedirs(recording_dir, exist_ok=True)
-            filename = f"{safe_title}-{now}.ts"
-            filepath = os.path.join(recording_dir, filename)
-            entry["filepath"] = filepath
+            if mode in ("disk", "both"):
+                recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
+                os.makedirs(recording_dir, exist_ok=True)
+                filename = f"{safe_title}-{now}.ts"
+                filepath = os.path.join(recording_dir, filename)
+                entry["filepath"] = filepath
 
-        if mode == "disk":
-            disk_task = self._track(channel, self._record_disk(channel, entry["filepath"], best))
-            tasks.append(disk_task)
-            if self._notifier and notify:
-                await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
-        elif mode == "youtube":
-            if self._youtube is not None:
-                yt_task = self._track(
-                    channel,
-                    self._stream_youtube(
+            if mode == "disk":
+                disk_task = self._track(channel, self._record_disk(channel, entry["filepath"], best))
+                tasks.append(disk_task)
+                if self._notifier and notify:
+                    await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
+            elif mode == "youtube":
+                if self._youtube is not None:
+                    yt_task = self._track(
                         channel,
-                        author,
-                        stream_title,
-                        stream_game,
-                        best,
-                        None,
-                        notify=notify,
-                        youtube_notify=youtube_notify,
-                    ),
-                )
-                tasks.append(yt_task)
-        elif mode == "both":
-            if self._youtube is not None:
-                yt_task = self._track(
-                    channel,
-                    self._stream_youtube(
+                        self._stream_youtube(
+                            channel,
+                            author,
+                            stream_title,
+                            stream_game,
+                            best,
+                            None,
+                            notify=notify,
+                            youtube_notify=youtube_notify,
+                        ),
+                    )
+                    tasks.append(yt_task)
+            elif mode == "both":
+                if self._youtube is not None:
+                    yt_task = self._track(
                         channel,
-                        author,
-                        stream_title,
-                        stream_game,
-                        best,
-                        entry["filepath"],
-                        notify=notify,
-                        youtube_notify=youtube_notify,
-                    ),
-                )
-                tasks.append(yt_task)
+                        self._stream_youtube(
+                            channel,
+                            author,
+                            stream_title,
+                            stream_game,
+                            best,
+                            entry["filepath"],
+                            notify=notify,
+                            youtube_notify=youtube_notify,
+                        ),
+                    )
+                    tasks.append(yt_task)
 
-        if not tasks:
-            del self._recordings[channel]
+            if not tasks:
+                del self._recordings[channel]
+                return False
+
+            if self._config.record_chat and not is_kick_channel(channel):
+                chat_dir = disk.chat_dir_path(self._config)
+                chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
+                os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+                chat_recorder = ChatRecorder(
+                    bare_name(channel), chat_path, stream_title, stream_game, author=author, user_id=user_id
+                )
+                entry["chat_recorder"] = chat_recorder
+                entry["chat_task"] = chat_recorder.start()
+
+            if is_kick_channel(channel) and self._config.kick.record_chat:
+                chat_dir = disk.chat_dir_path(self._config)
+                chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
+                os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+                entry["kick_chat"] = {
+                    "path": chat_path,
+                    "messages": [],
+                    "title": stream_title,
+                    "channel": channel,
+                    "started_wall": datetime.now(ZoneInfo(self._config.timezone)).isoformat(),
+                }
+
+            entry["tasks"] = tasks
+
+            disk_cfg = self._config.disk
+            if disk_cfg.max_total_gb > 0:
+                entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
+
+            self._ended_clean.pop(channel, None)
+            logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
+            return True
+        except Exception as e:
+            # The entry is already registered: without this cleanup any OSError
+            # below (makedirs, task creation) leaves a taskless entry behind and
+            # every later start short-circuits on it — the monitor then reports
+            # the channel as LIVE forever. Route into _handle_start_failure
+            # instead (rate-limited alert + next-cycle retry).
+            to_cancel: list[asyncio.Task[Any]] = list(tasks)
+            chat_task = entry.get("chat_task")
+            if chat_task is not None:
+                to_cancel.append(chat_task)
+            for t in to_cancel:
+                t.cancel()
+            await asyncio.gather(*to_cancel, return_exceptions=True)
+            self._recordings.pop(channel, None)
+            logger.error("[recorder] [%s] Failed to start recording: %s", channel, e)
             return False
-
-        if self._config.record_chat and not is_kick_channel(channel):
-            chat_dir = disk.chat_dir_path(self._config)
-            chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
-            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
-            chat_recorder = ChatRecorder(
-                bare_name(channel), chat_path, stream_title, stream_game, author=author, user_id=user_id
-            )
-            entry["chat_recorder"] = chat_recorder
-            entry["chat_task"] = chat_recorder.start()
-
-        if is_kick_channel(channel) and self._config.kick.record_chat:
-            chat_dir = disk.chat_dir_path(self._config)
-            chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
-            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
-            entry["kick_chat"] = {
-                "path": chat_path,
-                "messages": [],
-                "title": stream_title,
-                "channel": channel,
-                "started_wall": datetime.now(ZoneInfo(self._config.timezone)).isoformat(),
-            }
-
-        entry["tasks"] = tasks
-
-        disk_cfg = self._config.disk
-        if disk_cfg.max_total_gb > 0:
-            entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
-
-        self._ended_clean.pop(channel, None)
-        logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
-        return True
 
     async def stop(self, channel: str) -> dict[str, Any] | None:
         async with self._lock_for(channel):
@@ -398,9 +415,20 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         entry = self._recordings.pop(channel, None)
         if entry is None:
             return
+        wd = entry.pop("watchdog", None)
+        if wd:
+            wd.cancel()
         for task in entry.get("tasks", []):
             task.cancel()
-        await asyncio.gather(*entry.get("tasks", []), return_exceptions=True)
+        # The watchdog calls _abort from inside its own task; gathering that
+        # task after self-cancelling it makes Task.cancel recurse through a
+        # Task<->GatheringFuture cycle (RecursionError). Await everything else.
+        me = asyncio.current_task()
+        gathered = list(entry.get("tasks", []))
+        if wd is not None and wd is not me:
+            gathered.append(wd)
+        if gathered:
+            await asyncio.gather(*gathered, return_exceptions=True)
 
         chat_recorder = entry.pop("chat_recorder", None)
         if chat_recorder:

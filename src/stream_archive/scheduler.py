@@ -148,7 +148,7 @@ async def run_scheduler() -> None:
     finally:
         logger.info("[scheduler] Shutting down, stopping all recordings...")
         await notifier.notify_shutdown()
-        await recorder.stop_all()
+        await recorder.close()
         updater_task.cancel()
         await asyncio.gather(updater_task, return_exceptions=True)
         await updater.close()

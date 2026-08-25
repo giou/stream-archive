@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import UTC
 from typing import Any
 
@@ -72,9 +73,8 @@ class YouTubeStreamer:
         if credentials is None:
             return
         data = json.loads(credentials.to_json())  # type: ignore[no-untyped-call]
-        with open(self._token_path, "w") as f:
+        with os.fdopen(os.open(self._token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             json.dump(data, f)
-        self._token_path.chmod(0o600)
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         creds = await self._get_credentials()
@@ -142,7 +142,7 @@ class YouTubeStreamer:
             ingestion = live_stream["cdn"]["ingestionInfo"]
             ingestion_address = ingestion["ingestionAddress"]
             stream_name = ingestion["streamName"]
-            logger.info("[youtube] Stream created: %s -> %s/%s", stream_id, ingestion_address, stream_name)
+            logger.info("[youtube] Stream created: %s -> %s", stream_id, ingestion_address)
 
             params = {"id": broadcast_id, "streamId": stream_id, "part": "id,snippet,status"}
             logger.info("[youtube] Binding broadcast %s to stream %s", broadcast_id, stream_id)

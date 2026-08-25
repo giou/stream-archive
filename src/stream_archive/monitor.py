@@ -71,7 +71,7 @@ class Monitor:
 
                     for channel in twitch_channels:
                         uid = user_ids.get(channel)
-                        if channel in self._live_channels and uid not in streams:
+                        if uid and channel in self._live_channels and uid not in streams:
                             await self._ensure_stopped(channel, config)
 
         kick_channels = [c for c in config.channels if is_kick_channel(c)]

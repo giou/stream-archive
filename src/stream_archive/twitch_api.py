@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Any
 
@@ -15,6 +16,7 @@ class TwitchAPI:
         self._client_secret = config.twitch_client_secret
         self._token: str | None = None
         self._token_expires_at = 0
+        self._token_lock = asyncio.Lock()
 
     async def _get_token(self) -> str:
         import time
@@ -22,23 +24,29 @@ class TwitchAPI:
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
-        try:
-            resp = await self.client.post(
-                "https://id.twitch.tv/oauth2/token",
-                data={
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "grant_type": "client_credentials",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token = data["access_token"]
-            self._token_expires_at = now + data.get("expires_in", 3600)
-            return self._token
-        except httpx.HTTPStatusError as e:
-            logger.error("[twitch_api] Token request failed: %s", e)
-            raise
+        # Single-flight: concurrent callers must not each POST
+        # client_credentials. Double-check the cache inside the lock — the
+        # winner of the race already refreshed.
+        async with self._token_lock:
+            if self._token and time.time() < self._token_expires_at - 60:
+                return self._token
+            try:
+                resp = await self.client.post(
+                    "https://id.twitch.tv/oauth2/token",
+                    data={
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                        "grant_type": "client_credentials",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._token = data["access_token"]
+                self._token_expires_at = time.time() + data.get("expires_in", 3600)
+                return self._token
+            except httpx.HTTPStatusError as e:
+                logger.error("[twitch_api] Token request failed: %s", e)
+                raise
 
     async def resolve_user_ids(self, usernames: list[str]) -> dict[str, str]:
         if not usernames:

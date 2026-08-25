@@ -619,3 +619,17 @@ def test_kick_only_config_skips_twitch_api():
 
     assert api.resolve_calls == []
     assert rec.started == ["kick:xqc"]
+
+
+def test_partial_resolve_keeps_unresolved_live_channel():
+    """A Helix resolve returning a subset must not read unresolved-but-live
+    channels as offline: the sweep stops only channels it actually resolved."""
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch1": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = make_config(channels=["ch1", "ch2"])
+    mon._live_channels.update(["twitch:ch1", "twitch:ch2"])
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.stopped == []

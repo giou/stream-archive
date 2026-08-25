@@ -328,7 +328,7 @@ class YoutubeOutputMixin:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await pipe_task
             logger.info("[recorder] [youtube] %s cancelled", channel)
-            return
+            raise
         finally:
             if process.returncode is None:
                 try:

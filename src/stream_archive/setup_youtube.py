@@ -1,5 +1,6 @@
 import contextlib
 import json
+import os
 import sys
 import threading
 import webbrowser
@@ -115,9 +116,8 @@ def main() -> None:
 
     token_path = config._workdir / "youtube_token.json"
     data = json.loads(flow.credentials.to_json())
-    with open(token_path, "w") as f:
+    with os.fdopen(os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(data, f)
-    token_path.chmod(0o600)
 
     print()
     print(f"Token saved to {token_path}")
