@@ -25,8 +25,8 @@ class TwitchAPI:
         if self._token and now < self._token_expires_at - 60:
             return self._token
         # Single-flight: concurrent callers must not each POST
-        # client_credentials. Double-check the cache inside the lock — the
-        # winner of the race already refreshed.
+        # client_credentials. Double-check the cache inside the lock
+        # because the winner of the race already refreshed it.
         async with self._token_lock:
             if self._token and time.time() < self._token_expires_at - 60:
                 return self._token
@@ -90,7 +90,7 @@ class TwitchAPI:
         }
 
     async def list_conduits(self) -> list[Any]:
-        """Return existing EventSub conduits (each dict has id, shard_count)."""
+        """Return existing EventSub conduits. Each dict has id and shard_count."""
         headers = await self._eventsub_headers()
         resp = await self.client.get("https://api.twitch.tv/helix/eventsub/conduits", headers=headers)
         resp.raise_for_status()
@@ -107,7 +107,7 @@ class TwitchAPI:
         return resp.json()["data"][0]
 
     async def delete_conduit(self, conduit_id: str) -> None:
-        """Delete a conduit (also cascades to its subscriptions). 404 is success."""
+        """Delete a conduit. Deletion cascades to its subscriptions. Treats 404 as success."""
         headers = await self._eventsub_headers()
         resp = await self.client.delete(
             "https://api.twitch.tv/helix/eventsub/conduits", headers=headers, params={"id": conduit_id}
@@ -131,7 +131,11 @@ class TwitchAPI:
         return resp.json()["data"][0]
 
     async def create_eventsub_subscription(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        """Create a subscription; returns (status_code, body) without raising on 202/400/403/409."""
+        """Create a subscription and return (status_code, body).
+
+        The method does not raise for status on 202/400/403/409. Callers
+        handle those statuses.
+        """
         headers = await self._eventsub_headers()
         resp = await self.client.post(
             "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, json=payload
@@ -152,7 +156,7 @@ class TwitchAPI:
         resp.raise_for_status()
 
     async def list_eventsub_subscriptions(self) -> list[Any]:
-        """All subscriptions, cursor-paginated (max 10 pages of 100)."""
+        """List all subscriptions with cursor pagination (max 10 pages of 100)."""
         headers = await self._eventsub_headers()
         data = []
         cursor = None
@@ -172,7 +176,7 @@ class TwitchAPI:
         return data
 
     async def get_stream(self, user_id: str) -> Any:
-        """Single stream snapshot (title/game_name); None when offline."""
+        """Return a single stream snapshot (title/game_name), or None when offline."""
         headers = await self._eventsub_headers()
         resp = await self.client.get(
             "https://api.twitch.tv/helix/streams", headers=headers, params={"user_id": user_id}

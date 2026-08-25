@@ -41,9 +41,9 @@ class Monitor:
             else:
                 identity_by_bare = {bare_name(c): c for c in twitch_channels}
                 user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
-                # A failed Helix fetch must not read as "everyone offline":
-                # the sweep below stops every live recording on an API
-                # outage. Leave streams unset and skip both loops instead.
+                # If get_live_streams fails, treat the result as unknown, not
+                # empty. Otherwise the sweep below stops every live recording
+                # during an API outage. Leave streams unset and skip both loops.
                 streams: dict[str, Any] | None = None
                 try:
                     streams = await twitch_api.get_live_streams(user_ids)
@@ -79,8 +79,8 @@ class Monitor:
             try:
                 statuses = await kick_api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
             except Exception as e:
-                # Log once per failure episode; the poll retries every
-                # interval anyway, so per-cycle error lines are just spam.
+                # Log one error per failure episode. The loop retries every
+                # interval, so an error per cycle is only noise.
                 if not self._kick_api_error_logged:
                     self._kick_api_error_logged = True
                     logger.error("[monitor] kick get_channel_statuses failed: %s", e)
@@ -129,15 +129,15 @@ class Monitor:
     async def _ensure_recording(
         self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig, snapshot: Any
     ) -> Any:
-        """Start (or restart) the recording for a channel that is live. Returns the snapshot."""
+        """Start or restart the recording for a live channel. Returns the snapshot."""
         async with self._lock_for(channel):
             if channel in self._live_channels:
                 if self.recorder.is_recording(channel):
                     return snapshot
                 if self.recorder.ended_clean(channel):
-                    # The stream ended on its own; the offline webhook/API
-                    # poll hasn't caught up yet. Restarting now would resolve
-                    # a dead stream URL every poll cycle until it does.
+                    # The stream ended on its own, and the offline webhook or
+                    # API poll has not caught up yet. Restarting now resolves
+                    # a dead stream URL every poll cycle until then.
                     logger.debug("[monitor] %s ended cleanly, awaiting offline event", channel)
                     return snapshot
                 logger.warning("[monitor] %s recording stopped unexpectedly, restarting", channel)
@@ -213,7 +213,11 @@ class Monitor:
         return ok, snapshot
 
     async def _start_blocked_reason(self, channel: str, config: AppConfig, snapshot: Any) -> tuple[str | None, Any]:
-        """Return (reason_or_None, snapshot). Raises nothing: snapshot failures fail open."""
+        """Return (reason_or_None, snapshot).
+
+        This method raises nothing. A snapshot failure fails open and does
+        not block the start.
+        """
         reason = self.recorder.youtube_restart_blocked_reason(channel)
         if reason:
             return (reason, snapshot)

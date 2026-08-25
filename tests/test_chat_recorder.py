@@ -16,9 +16,11 @@ PRIVMSG_TEMPLATE = (
 
 
 class FakeIRCServer:
-    """Scripted IRC server. spec per accepted connection: (lines, hold_open, expect_reply).
+    """Scripted IRC server.
 
-    lines may contain floats: sleep that many seconds before continuing.
+    Each accepted connection consumes one spec: (lines, hold_open,
+    expect_reply). A float entry in lines makes the handler sleep that many
+    seconds before it writes the next line.
     """
 
     def __init__(self, specs):
@@ -141,11 +143,13 @@ def test_privmsg_with_emotes_badges_color(tmp_path):
         assert comment == expected
         assert isinstance(offset, float) and offset >= 0
         assert round(offset, 3) == offset
-        # render duration: TDL chatrender uses video.end - video.start
+        # TDL chatrender derives the render duration from video.end minus
+        # video.start, so both fields equal the final comment offset.
         assert data["video"]["end"] == offset
         assert data["video"]["length"] == offset
-        # sentinel "0" (not ""/null): GUI chat-update preview takes the VOD
-        # branch and degrades gracefully instead of FormatException/NRE
+        # The sentinel "0" (not "" or null) makes the GUI chat-update preview
+        # take the VOD branch. It then degrades gracefully instead of raising
+        # FormatException or a null reference error.
         assert data["video"]["id"] == "0"
 
     asyncio.run(scenario())
@@ -212,7 +216,7 @@ def test_reconnects_after_disconnect(tmp_path):
     line2 = PRIVMSG_TEMPLATE.format(msg_id="m2", ts=TS2_MS, body="second")
 
     async def scenario():
-        # first connection closes after one message; second holds open
+        # The first connection closes after one message. The second holds open.
         async with FakeIRCServer(
             [
                 ([line1], False, False),
@@ -244,7 +248,8 @@ def test_empty_chat_writes_valid_json(tmp_path):
         assert data["FileInfo"]["Version"] == {"Major": 1, "Minor": 4, "Patch": 0}
         assert data["streamer"]["login"] == "ch"
         assert data["video"]["title"] == "Title"
-        # no comments: end/length fall back to the capture wall-clock duration
+        # With no comments, end and length fall back to the capture
+        # wall-clock duration.
         assert data["video"]["end"] > 0
         assert data["video"]["length"] == data["video"]["end"]
 
@@ -275,7 +280,7 @@ def test_cancel_mid_stream_writes_complete_json(tmp_path):
     line2 = PRIVMSG_TEMPLATE.format(msg_id="m2", ts=TS2_MS, body="second")
 
     async def scenario():
-        # server holds the connection open mid-stream
+        # The server holds the connection open mid-stream.
         async with FakeIRCServer([([line1, line2], True, False)]) as server:
             cr = make_recorder(tmp_path, server)
             cr.start()
@@ -284,7 +289,8 @@ def test_cancel_mid_stream_writes_complete_json(tmp_path):
             await cr.stop()
 
         text = (tmp_path / "chat.json").read_text()
-        # whole file parses => the comments array is closed and complete
+        # A successful parse proves that the comments array is closed and
+        # complete.
         data = json.loads(text)
         assert [c["_id"] for c in data["comments"]] == ["m1", "m2"]
 

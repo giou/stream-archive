@@ -39,7 +39,7 @@ def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> lis
 
 
 def _installed_app_version() -> str | None:
-    """Installed package version; None when the distribution is missing."""
+    """Installed package version, or None when the distribution is missing."""
     try:
         return importlib.metadata.version("stream-archive")
     except importlib.metadata.PackageNotFoundError:
@@ -49,16 +49,17 @@ def _installed_app_version() -> str | None:
 class UpdateChecker:
     """Periodic informational update checks (app, streamlink, vendored plugin) and /update.
 
-    Checks are read-only and never raise; nothing is downloaded or applied at
-    runtime — updates ship in new images.
+    Checks are read-only and never raise. The runtime downloads nothing and
+    applies nothing. Updates ship in new images.
     """
 
     def __init__(self, config: AppConfig, notifier: Any, http: Any = None):
         self._config = config
         self._notifier = notifier
         self._workdir = config._workdir
-        # GitHub release assets 302-redirect to release-assets.githubusercontent.com,
-        # so redirects must be followed.
+        # GitHub serves release assets from a 302 redirect to
+        # release-assets.githubusercontent.com, so the client must follow
+        # redirects.
         self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=True)
         self._lock = asyncio.Lock()
         self._state_path = self._workdir / "update_state.json"

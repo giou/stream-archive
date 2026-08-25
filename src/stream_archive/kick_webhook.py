@@ -16,41 +16,44 @@ from stream_archive.config import AppConfig, is_kick_channel, kick_bare_name, sa
 
 logger = logging.getLogger(__name__)
 
-# Signed events are accepted only within this freshness window. The header
-# timestamp is covered by Kick's signature, so an attacker cannot move it —
-# this is what stops replay of captured events (recording kill / forged chat).
+# Signed events are accepted only within this freshness window. The signature
+# covers the header timestamp, so an attacker cannot move it. This is what
+# stops replay of captured events (a recording kill or a forged chat).
 _VERIFY_WINDOW_S = 300
-# message_id dedup store: one entry per unique signed event, kept for the
-# freshness window. Bounded so a flood cannot grow memory.
+# This store holds one dedup entry per unique signed event, for the
+# freshness window. Its bound stops a flood from growing memory.
 _MAX_SEEN_IDS = 50_000
-# A failed signature triggers a public-key refetch (key-rotation retry). This
-# negative cache bounds that refetch so unauthenticated floods cannot force an
-# outbound Kick API call per request (rate-limit self-DoS).
+# A failed signature triggers a public-key refetch (key-rotation retry).
+# This negative cache bounds that refetch. Without it, an unauthenticated
+# flood forces one outbound Kick API call per request and exhausts the Kick
+# rate limit (self-DoS).
 _KEY_REFETCH_INTERVAL_S = 60
-# Per-client-IP token bucket; a coarse backstop behind signature verification.
-# Behind a tunnel every request shares the tunnel's origin IP, so the budget
-# is sized for aggregate legit chat volume, not per-event precision.
+# Token bucket keyed by client IP. It adds coarse backstop protection behind
+# signature verification. Behind a tunnel, every request shares the tunnel's
+# origin IP, so the budget covers aggregate legit chat volume, not per-event
+# precision.
 _RATE_LIMIT_PER_IP = 1200  # requests per window
 _RATE_LIMIT_WINDOW_S = 60
 _MAX_RATE_LIMIT_IPS = 10_000
-# Cap on concurrent in-flight webhook requests; flood protection.
+# Cap on concurrent in-flight webhook requests. This blunts request floods.
 _MAX_CONCURRENT = 16
-# Kick-side sync failures (5xx) alert only after persisting this long, so a
-# transient API outage doesn't page the admin. Other failures notify at once.
+# Kick-side sync failures (5xx) alert only after they persist this long, so
+# a transient API outage does not page the admin. Other failures notify at
+# once.
 _SYNC_SERVER_ERROR_DELAY_S = 600
 
 
 def _is_server_error(exc: Exception) -> bool:
     """True when Kick's API itself failed (5xx): an outage on their side.
 
-    Config/auth problems (4xx), connectivity errors, and timeouts still
-    notify immediately — they may need action on our side.
+    Config or auth problems (4xx), connectivity errors, and timeouts still
+    notify immediately. Those failures can require action on our side.
     """
     return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
 
 
 class _RateLimiter:
-    """Per-key token bucket (key = client IP), with a bounded bucket table."""
+    """Token bucket keyed by client IP, with a bounded bucket table."""
 
     def __init__(self, max_requests: int, window_s: int, max_keys: int = _MAX_RATE_LIMIT_IPS) -> None:
         self._max = max_requests
@@ -65,7 +68,7 @@ class _RateLimiter:
         if bucket is None:
             if len(buckets) >= self._max_keys:
                 for k, (tokens, _) in list(buckets.items()):
-                    if tokens >= self._max:  # fully refilled: safe to evict
+                    if tokens >= self._max:  # fully refilled, so eviction loses nothing
                         del buckets[k]
                 if len(buckets) >= self._max_keys:
                     buckets.pop(next(iter(buckets)))
@@ -81,7 +84,7 @@ class _RateLimiter:
 
 
 def _parse_timestamp(value: str) -> float | None:
-    """Kick sends ISO-8601; epoch seconds are accepted too. None when unparseable."""
+    """Kick sends ISO-8601. Epoch seconds are accepted too. None when unparseable."""
     value = value.strip()
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
@@ -113,7 +116,7 @@ class KickWebhook:
         self._seen_ids: dict[str, float] = {}  # message_id -> expires (monotonic)
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
         self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
-        self._next_key_refetch = 0.0  # monotonic; gates the rotation refetch
+        self._next_key_refetch = 0.0  # monotonic time. Gates the rotation refetch.
         self._app = web.Application()
         self._app.router.add_post("/kick/webhook", self._handle)
 
@@ -158,8 +161,8 @@ class KickWebhook:
             try:
                 await self._sync_subscriptions(self._config.channels)
             except Exception as e:
-                # Log once per failure episode; the loop retries every
-                # interval anyway, so per-cycle error lines are just spam.
+                # Log one error per failure episode. The loop retries every
+                # interval, so an error per cycle is only noise.
                 if not self._sync_error_logged:
                     self._sync_error_logged = True
                     logger.error("[kick_webhook] subscription sync failed: %s", e)
@@ -173,9 +176,9 @@ class KickWebhook:
             await asyncio.sleep(self._config.monitoring_interval)
 
     async def _notify_sync_failure(self, e: Exception) -> None:
-        """Alert on a sync failure; one notification per failure episode.
+        """Alert on a sync failure. Send one notification per failure episode.
 
-        A Kick-side (5xx) failure only alerts once it has persisted for
+        A Kick-side (5xx) failure alerts only after it persists for
         ``_SYNC_SERVER_ERROR_DELAY_S``, so a transient API blip stays quiet.
         """
         if not self._notifier or self._sync_failed_notified:
@@ -208,7 +211,7 @@ class KickWebhook:
             body = await request.read()
             event_type = request.headers.get("Kick-Event-Type", "")
             if not await self._verify(request, body):
-                # event_type is attacker-controlled: only log known values.
+                # Attackers control event_type, so log only known values.
                 known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
                 logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
                 return web.Response(status=401, text="unauthorized")
@@ -226,8 +229,9 @@ class KickWebhook:
                     logger.debug("[kick_webhook] unknown event type %r", event_type)
                     return web.Response(status=204)
             except Exception:
-                # Roll back the dedup mark so Kick's retry is processed instead
-                # of answered 200 as a replay (aiohttp answers the raise 500).
+                # Roll back the dedup mark, so the code processes Kick's
+                # retry instead of answering 200 as if it were a replay.
+                # Aiohttp answers the raised exception with 500.
                 if msg_id:
                     self._seen_ids.pop(msg_id, None)
                 raise
@@ -236,7 +240,10 @@ class KickWebhook:
             self._sem.release()
 
     def _remember_id(self, message_id: str | None) -> bool:
-        """True when the message id is new within the freshness window; False for replays."""
+        """True when the message id is new within the freshness window.
+
+        False for replays.
+        """
         if not message_id:
             return True
         now = time.monotonic()
@@ -274,11 +281,11 @@ class KickWebhook:
             return True
         except Exception:
             pass
-        # The key may have rotated: refetch (rate-limited) and retry once.
-        # The refetch bypasses the cache (force), so rotation is actually
-        # detected; a flood of bad signatures keeps verifying against the
-        # cached key with no outbound calls, and only one refetch per
-        # interval is ever attempted.
+        # The failure can mean that Kick rotated the key. Refetch
+        # (rate-limited) and retry once. The refetch bypasses the cache
+        # (force), so the code detects rotation reliably. Meanwhile, a flood
+        # of bad signatures keeps verifying against the cached key with no
+        # outbound calls. The code attempts only one refetch per interval.
         now = time.monotonic()
         if now < self._next_key_refetch:
             return False
@@ -415,12 +422,12 @@ class KickWebhook:
         return len(desired)
 
     async def _maybe_confirm_delivery(self) -> None:
-        """Working confirmation: fires on the first verified Kick event per enable.
+        """Confirm the setup works on the first verified Kick event after enable.
 
-        A signature-verified POST proves Kick has the current URL saved and can
-        reach it \u2014 the only real signal that the setup is complete. Fires
-        once per enable (``setup_notified`` is re-armed by enabling), then
-        persists the flag so it stays silent afterwards.
+        A signature-verified POST proves that Kick saved the current URL and
+        can reach it. That is the only real signal that the setup is complete.
+        This notifies once per enable (enabling re-arms ``setup_notified``)
+        and then persists the flag, so it stays silent afterwards.
         """
         try:
             wh = self._config.kick.webhook
@@ -434,7 +441,7 @@ class KickWebhook:
             logger.error("[kick_webhook] setup confirmation failed: %s", e)
 
     async def add_channel(self, channel: str) -> None:
-        """Subscribe a newly added kick channel to both events; errors logged."""
+        """Subscribe a newly added kick channel to both events. This logs errors."""
         if not is_kick_channel(channel):
             return
         bare = kick_bare_name(channel)
@@ -465,7 +472,7 @@ class KickWebhook:
             logger.error("[kick_webhook] remove_channel failed for %s: %s", channel, e)
 
     async def sync_channels(self, channels: list[str]) -> None:
-        """Immediate one-shot reconcile (called by /reload and after enabling)."""
+        """Run one reconcile now. /reload and the post-enable path call this."""
         try:
             await self._sync_subscriptions(channels)
         except Exception as e:

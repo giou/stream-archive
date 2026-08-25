@@ -102,7 +102,7 @@ def plugin_http(
 
 @pytest.fixture
 def set_installed_versions(monkeypatch):
-    """Pin importlib.metadata.version per distribution name; other names hit the real metadata."""
+    """Pin importlib.metadata.version for the given names. Others hit real metadata."""
     real = importlib.metadata.version
     overrides: dict[str, str] = {}
 
@@ -303,8 +303,8 @@ def test_changelog_lines_truncates_long_body():
 
 
 def test_default_client_follows_redirects(tmp_path):
-    # GitHub release assets 302-redirect to release-assets.githubusercontent.com,
-    # so redirects must be followed.
+    # GitHub serves release assets from release-assets.githubusercontent.com
+    # via a 302 redirect, so the default client must follow redirects.
     config = make_config(tmp_path)
     u = UpdateChecker(config, FakeNotifier())
     assert u._http.follow_redirects is True

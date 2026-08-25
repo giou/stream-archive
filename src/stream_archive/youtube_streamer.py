@@ -18,7 +18,7 @@ _API_BASE = "https://www.googleapis.com/youtube/v3"
 
 
 def build_video_description(author: str, channel: str, game: str) -> str:
-    """Description for a re-streamed broadcast; platform-aware (Twitch/Kick)."""
+    """Build the description text for a re-streamed Twitch or Kick broadcast."""
     platform = "Kick" if is_kick_channel(channel) else "Twitch"
     return (
         f"{platform} stream by {author}\n"
@@ -40,7 +40,7 @@ class YouTubeStreamer:
 
     async def _get_credentials(self) -> Credentials:
         # Single-flight: hold the lock across load+refresh so concurrent starts
-        # don't double-refresh the same expired token. to_thread keeps the
+        # do not double-refresh the same expired token. to_thread keeps the
         # synchronous HTTPS refresh off the event loop that feeds the ffmpeg
         # pipes.
         async with self._refresh_lock:

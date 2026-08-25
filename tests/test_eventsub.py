@@ -261,7 +261,7 @@ def _run_close_code(client, code):
 
 
 def test_close_code_4007_logged_as_info(caplog, monkeypatch):
-    # 4007 is Twitch's normal server-initiated reconnect; not an error.
+    # 4007 is Twitch's normal server-initiated reconnect, not an error.
     client = make_client()
     client._conduit_id = "c1"
     client._subscribed = True

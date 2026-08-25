@@ -2,19 +2,19 @@
 
 TwitchDownloader renders chat emoticons from ``message.fragments[].emoticon``
 and resolves their artwork from ``embeddedData.firstParty`` (base64 image
-bytes keyed by emote id) before falling back to Twitch's CDN. We therefore:
+bytes keyed by emote id) before it falls back to Twitch's CDN. This module:
 
-- map every kick message to a ChatRoot comment (sender, badges, colors,
+- maps every kick message to a ChatRoot comment (sender, badges, colors,
   timestamps, reply offsets),
-- split the body into fragments so each ``[emote:<id>:<name>]`` token becomes
-  an emoticon reference,
-- download the kick emote images (files.kick.com/emotes/<id>/fullsize) and
-  embed them as base64 so TwitchDownloader renders them offline, without
-  ever contacting Twitch's CDN.
+- splits the body into fragments so each ``[emote:<id>:<name>]`` token
+  becomes an emoticon reference,
+- downloads the kick emote images (files.kick.com/emotes/<id>/fullsize) and
+  embeds them as base64, so TwitchDownloader renders them offline without
+  contacting Twitch's CDN.
 
-Unicode emojis are literal characters in the body and survive untouched.
-Any emote whose image cannot be downloaded is left as its text token, which
-TwitchDownloader renders as plain text (never a broken image).
+Unicode emojis are literal characters in the body and survive untouched. If
+the app cannot download an image for an emote, it leaves the text token in
+place. TwitchDownloader then renders plain text there, never a broken image.
 """
 
 import asyncio
@@ -39,18 +39,18 @@ def _parse_time(value: Any) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError, AttributeError:
+    except (ValueError, AttributeError):
         return None
 
 
 def _fragments(content: str) -> list[dict[str, Any]]:
-    """Split body into ChatRoot fragments; emotes become emoticon references.
+    """Split body into ChatRoot fragments. Each emote becomes an emoticon reference.
 
-    Emote tokens are self-describing ("[emote:<id>:<name>]"), so fragments are
-    derived by scanning the body itself. Kick's webhook "emotes" positions are
-    NOT used for splitting: live data shows they are frequently absent or
-    inconsistent with the actual body (offsets past the string length), while
-    the token text is always exact.
+    Emote tokens are self-describing ("[emote:<id>:<name>]"), so the parser
+    derives fragments by scanning the body itself. Kick's webhook "emotes"
+    positions are not used for splitting. Live data shows that these positions
+    are frequently absent or inconsistent with the actual body (offsets past
+    the string length), while the token text is always exact.
     """
     if not content:
         return [{"text": ""}]
@@ -88,7 +88,7 @@ def build_chat_root(
 ) -> dict[str, Any]:
     """Build a TwitchDownloader ChatRoot dict from normalized kick messages.
 
-    Emote images are NOT included; call embed_kick_emotes() afterwards.
+    Emote images are not included here. Call embed_kick_emotes() afterwards.
     """
     start = _parse_time(started_wall)
     video_id = f"kick-{slug}-{int(start.timestamp()) if start else 0}"
@@ -142,8 +142,9 @@ def build_chat_root(
                 "_id": str(sender.get("user_id")) if sender.get("user_id") is not None else "",
                 "name": sender.get("username") or "anonymous",
                 "bio": "",
-                # created_at/updated_at intentionally omitted: TD maps them to
-                # non-nullable DateTime, and an empty string fails deserialization.
+                # created_at/updated_at are intentionally omitted. TD maps
+                # these fields to non-nullable DateTime values, and an empty
+                # string fails deserialization.
                 "logo": sender.get("profile_picture") or "",
             },
             "message": {
@@ -199,7 +200,10 @@ def collect_emote_ids(root: dict[str, Any]) -> list[str]:
 
 
 async def fetch_emote_images(ids: list[str], client: httpx.AsyncClient | None = None) -> dict[str, bytes]:
-    """Download kick emote images; failures are skipped (returned dict is partial)."""
+    """Download kick emote images.
+
+    A failed download is skipped, so the returned dict can be partial.
+    """
     out: dict[str, bytes] = {}
     if not ids:
         return out

@@ -9,16 +9,18 @@ from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
-# Kick's edge intermittently rejects otherwise-valid app-token requests
-# (observed as 400/403 waves that self-recover). Sending a descriptive
-# User-Agent instead of the default python-httpx one is the standard
-# mitigation for that (Cloudflare-fronted APIs commonly 403 the SDK default);
-# retries below ride out the residual blips. Deliberately versionless: the
-# string must stay stable across releases.
+# The Kick edge intermittently rejects otherwise-valid app-token requests.
+# These failures appear as 400/403 waves that recover on their own. A
+# descriptive User-Agent instead of the default python-httpx one is the
+# standard mitigation for this. Cloudflare-fronted APIs commonly reject
+# the SDK default with 403. The retries below ride out remaining blips.
+# This string is deliberately versionless: it must stay stable across
+# releases.
 _USER_AGENT = "stream-archive"
 
-# Transient statuses to retry with short backoff: edge/WAF hiccups (429/5xx)
-# and rate limiting. Auth/param errors (401/400/403) stay immediate.
+# Transient statuses to retry with short backoff: edge and WAF hiccups
+# (429/5xx) and rate limiting. Auth and parameter errors (401/400/403)
+# stay immediate.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_ATTEMPTS = 3
 _RETRY_DELAYS = (1.0, 3.0)
@@ -47,9 +49,9 @@ class KickAPI:
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Send a request, retrying transient failures with short backoff.
 
-        Retries only the statuses in ``_RETRY_STATUSES`` plus transport-level
-        errors; auth/param problems (401/400/403) fail immediately so the
-        caller's error path (and any alert) fires without added latency.
+        Retries only transient statuses (429/5xx, see ``_RETRY_STATUSES``)
+        and transport errors. Auth and parameter errors fail immediately,
+        so caller error paths fire without delay.
         """
         for attempt in range(_MAX_ATTEMPTS):
             try:
@@ -70,9 +72,9 @@ class KickAPI:
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
-        # Single-flight: concurrent callers (webhook verifications run in
-        # parallel) must not each POST client_credentials. Double-check the
-        # cache inside the lock — the winner of the race already refreshed.
+        # Single-flight: concurrent callers must not each POST
+        # client_credentials. Double-check the cache inside the lock
+        # because the winner of the race already refreshed it.
         async with self._token_lock:
             if self._token and time.time() < self._token_expires_at - 60:
                 return self._token
@@ -96,7 +98,10 @@ class KickAPI:
                 raise
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]:
-        """Map slug -> {title, game, is_live, broadcaster_user_id}; unknown slugs absent."""
+        """Map slug to {title, game, is_live, broadcaster_user_id}.
+
+        Unknown slugs are absent.
+        """
         if not slugs:
             return {}
         headers = await self._headers()
@@ -120,18 +125,19 @@ class KickAPI:
         return out
 
     async def get_public_key(self, force: bool = False) -> str | None:
-        """PEM string used to verify webhook signatures; cached in memory.
+        """Return the PEM string used to verify webhook signatures.
 
-        ``force`` bypasses the cache (key-rotation refetch on signature
-        failure). On fetch failure the previous key is kept, so verification
-        still runs against the last known-good key.
+        The value is cached in memory. ``force`` bypasses the cache for a
+        key-rotation refetch after a signature failure. If a fetch fails,
+        the method keeps the previous key, so verification still runs
+        against the last known-good key.
         """
         if self._public_key and not force:
             return self._public_key
         resp = await self._request("GET", self.PUBLIC_KEY_URL)
         resp.raise_for_status()
         data = resp.json().get("data")
-        if isinstance(data, dict):  # live API nests the PEM: {"data": {"public_key": "..."}}
+        if isinstance(data, dict):  # live API nests the PEM under data.public_key
             data = data.get("public_key")
         if data:  # a 200 without a key must not wipe the known-good PEM
             self._public_key = data
@@ -141,12 +147,13 @@ class KickAPI:
         self._public_key = None
 
     async def list_event_subscriptions(self) -> list[dict[str, Any]]:
-        """All webhook subscriptions for this app (fail-closed app_id filter).
+        """List all webhook subscriptions for this app with a fail-closed app_id filter.
 
-        Subscriptions we cannot prove belong to this app are never returned:
-        the webhook reconcile deletes subscriptions for unmonitored
-        broadcasters, so a wrong filter would destroy another app's
-        subscriptions. Without a client_id configured, nothing is managed.
+        The method returns only subscriptions whose app_id matches this
+        client_id. The webhook reconcile deletes subscriptions for
+        unmonitored broadcasters, so a wrong filter would destroy another
+        app's subscriptions. Without a configured client_id, nothing is
+        managed.
         """
         resp = await self._request("GET", self.EVENTS_SUBS_URL, headers=await self._headers())
         resp.raise_for_status()
@@ -156,7 +163,7 @@ class KickAPI:
         return [s for s in data if s.get("app_id") == self._client_id]
 
     async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]:
-        """Create webhook subscriptions; returns created items (each has subscription_id)."""
+        """Create webhook subscriptions. Returns created items with subscription_id."""
         resp = await self._request(
             "POST",
             self.EVENTS_SUBS_URL,

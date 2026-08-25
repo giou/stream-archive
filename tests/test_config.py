@@ -545,8 +545,8 @@ def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
     data = valid_config()
     (tmp_path / "config.json").write_text(json.dumps(data))
     cfg = get_config(tmp_path / "config.json")
-    # A ${VAR} recorded under a key pydantic dropped (extra='ignore'):
-    # nothing in the output matches it anymore.
+    # A ${VAR} can survive in _env_placeholders under a key that pydantic
+    # dropped (extra='ignore'). Then nothing in the saved output matches it.
     cfg._env_placeholders[("bogus",)] = "${DEFINITELY_UNSET_VAR_12345}"
 
     save_config(cfg)  # must not raise

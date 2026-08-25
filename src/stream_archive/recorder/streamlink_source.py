@@ -32,9 +32,9 @@ class StreamlinkMixin:
 
     def _resolve_stream(self, channel: str, title: str | None, game: str | None) -> tuple[Any, str, str, str]:
         if is_kick_channel(channel):
-            # No proxy loop / ad-block workarounds: streamlink's built-in kick
-            # plugin talks to kick's API itself (and solves the JS challenge
-            # via a browser when one is installed).
+            # No proxy loop or ad-block workarounds. The built-in kick plugin
+            # talks to the kick API itself and solves the JS challenge through
+            # a browser when one is installed.
             plugin_name, plugin_class, resolved_url = self._session.resolve_url(channel_url(channel))
             plugin = plugin_class(self._session, resolved_url, options={})
             streams = plugin.streams()
@@ -55,10 +55,10 @@ class StreamlinkMixin:
                     streams = plugin.streams()
                     break
                 except NoStreamsError:
-                    raise  # channel offline, or all proxies exhausted — never retried
+                    raise  # offline or proxies exhausted, never retried
                 except (PluginError, OSError) as err:
-                    # Mirrors the plugin's proxy loop: skip the failing proxy and try
-                    # the next; after the last proxy, match the plugin's NoStreamsError.
+                    # Mirror the plugin's own proxy loop. Skip the failing
+                    # proxy, and raise NoStreamsError after the last one.
                     if len(proxies) <= 1:
                         raise NoStreamsError from None
                     logger.warning(

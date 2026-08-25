@@ -28,10 +28,9 @@ from stream_archive.recorder.youtube_output import YoutubeOutputMixin
 
 logger = logging.getLogger(__name__)
 
-# How long a clean feed end suppresses monitor restarts while waiting for the
-# offline webhook/API event to catch up. Load-bearing: 10 min covers encoder
-# restarts and HLS playlist END stalls; short enough that a still-live feed
-# resumes recording quickly instead of staying dark until an offline arrives.
+# A clean feed end suppresses monitor restarts until the offline webhook or API
+# event catches up. The 10 min covers encoder restarts and HLS playlist END
+# stalls. The value stays short so a still-live feed resumes recording quickly.
 _ENDED_CLEAN_GRACE_S = 600.0
 
 
@@ -63,11 +62,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._locks = {}
         self._session = Streamlink()
         self._session.set_option("http-timeout", 30)
-        # Ride through short HLS playlist stalls: with the default queue-deadline
+        # Ride through short HLS playlist stalls. With the default queue-deadline
         # factor (3) and Kick's ~2s target duration, streamlink aborts after ~6s
-        # without new segments — which fresh Kick streams routinely hit right
-        # after go-live. Factor 10 raises the tolerance to ~20s; a genuinely dead
-        # feed is still detected (and the poll cycle covers the rest).
+        # without new segments. Fresh Kick streams often hit that right after
+        # go-live. Factor 10 raises the tolerance to ~20s. A genuinely dead feed
+        # is still detected, and the poll cycle covers the rest.
         self._session.set_option("stream-segmented-queue-deadline", 10)
         self._plugin_loaded = False
         self._last_kick_block_notify = {}
@@ -86,13 +85,13 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             return await self._start_unlocked(channel, title=title, game=game, user_id=user_id)
 
     async def reserve_start(self, channel: str) -> str | None:
-        """Atomically reserve recording/YT capacity; returns block reason or None.
+        """Reserve recording/YT capacity atomically. Returns a block reason or None.
 
-        Closes the check-then-act gap between the monitor's limit counters and
-        the (seconds-later) registration in _recordings: two simultaneous
+        This closes the check-then-act gap between the monitor's limit counters
+        and the registration in _recordings seconds later. Two simultaneous
         go-lives can no longer both slip past max_concurrent_recordings /
-        max_concurrent_youtube_streams. The monitor releases the reservation
-        in a finally block once start() has registered (or failed).
+        max_concurrent_youtube_streams. The monitor releases the reservation in
+        a finally block once start() has registered or failed.
         """
         async with self._reserve_lock:
             mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
@@ -259,11 +258,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
             return True
         except Exception as e:
-            # The entry is already registered: without this cleanup any OSError
-            # below (makedirs, task creation) leaves a taskless entry behind and
-            # every later start short-circuits on it — the monitor then reports
-            # the channel as LIVE forever. Route into _handle_start_failure
-            # instead (rate-limited alert + next-cycle retry).
+            # The entry is already registered here. Without this cleanup, any
+            # OSError below (makedirs, task creation) leaves a taskless entry
+            # behind. Every later start short-circuits on that entry, and the
+            # monitor reports the channel as LIVE forever. Returning False
+            # routes the failure into _handle_start_failure (rate-limited alert
+            # plus next-cycle retry).
             to_cancel: list[asyncio.Task[Any]] = list(tasks)
             chat_task = entry.get("chat_task")
             if chat_task is not None:
@@ -322,12 +322,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     async def restart(self, channel: str) -> bool:
         """Stop and immediately restart a recording with the current config.
 
-        Bypasses monitor start gates (disk cap, max recordings, YouTube budget)
-        intentionally: this is an admin-forced action. Suppresses the disk-mode
-        live notification (the Telegram apply-result message is the feedback);
-        a youtube-mode restart still sends the live notification once the new
-        broadcast is created, because the apply-now restart ended the old
-        broadcast and the link changed.
+        Restart bypasses the monitor start gates (disk cap, max recordings,
+        YouTube budget) intentionally because this is an admin-forced action.
+        Disk mode suppresses the live notification: the Telegram apply-result
+        message gives the feedback. A youtube-mode restart still sends the live
+        notification once the new broadcast is created, because the apply-now
+        restart ended the old broadcast and changed the link.
         """
         async with self._lock_for(channel):
             entry = self._recordings.get(channel)
@@ -368,13 +368,13 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
             entry["failed"] = True
         else:
-            # A clean stream end (e.g. the HLS feed stalls and streamlink closes
-            # it) must also release the entry once all tasks are done: otherwise
-            # the monitor sees the channel as recording and never restarts, and
-            # the YouTube broadcast lingers until YouTube auto-ends it.
+            # A clean stream end (for example, the HLS feed stalls and streamlink
+            # closes it) must also release the entry once all tasks finish.
+            # Otherwise the monitor sees the channel as recording and never
+            # restarts, and the broadcast lingers until YouTube auto-ends it.
             logger.info("[recorder] [%s] Recording task ended", channel)
         if entry["tasks"]:
-            return  # other recording tasks (e.g. the disk fallback) still running
+            return  # other recording tasks (for example the disk fallback) still running
         chat_recorder = entry.pop("chat_recorder", None)
         if chat_recorder:
             asyncio.create_task(self._finalize_chat(channel, chat_recorder))
@@ -384,9 +384,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             asyncio.create_task(self._release_broadcast(channel, youtube_info, entry))
         if entry.get("mode") in ("youtube", "both"):
             self._note_youtube_end(channel, entry)
-        # Remember that the stream ended on its own (as opposed to a task
-        # failure) so the monitor can skip restart attempts until the offline
-        # event catches up — a dead stream just resolves to a 404 otherwise.
+        # Remember that the stream ended on its own, not through a task failure.
+        # The monitor then skips restart attempts until the offline event catches
+        # up. Otherwise a dead stream just resolves to a 404.
         if not entry.get("failed"):
             self._ended_clean[channel] = time.monotonic()
         del self._recordings[channel]
@@ -402,8 +402,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         return True
 
     async def _abort(self, channel: str, reason: str) -> None:
-        # The disk-cap watchdog calls this from outside any per-channel lock;
-        # taking the lock here keeps the _recordings mutation serialized with
+        # The disk-cap watchdog calls this from outside any per-channel lock.
+        # Taking the lock here serializes the _recordings mutation with
         # stop()/start() for the same channel.
         async with self._lock_for(channel):
             await self._abort_unlocked(channel, reason)
@@ -420,7 +420,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             wd.cancel()
         for task in entry.get("tasks", []):
             task.cancel()
-        # The watchdog calls _abort from inside its own task; gathering that
+        # The watchdog calls _abort from inside its own task. Gathering that
         # task after self-cancelling it makes Task.cancel recurse through a
         # Task<->GatheringFuture cycle (RecursionError). Await everything else.
         me = asyncio.current_task()
@@ -449,11 +449,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         return sorted(self._recordings)
 
     def recording_settings(self) -> dict[str, dict[str, Any]]:
-        """Per active channel: settings the in-flight recording actually uses.
+        """Per active channel: settings that the in-flight recording uses.
 
-        Output mode and preferred quality are snapshotted at recording start;
-        chat capture is the live state (chat disable stops in-flight capture
-        immediately, so only chat-enable is a deferred effect).
+        Output mode and preferred quality come from snapshots taken at
+        recording start. Chat capture reflects the live state: chat disable
+        stops in-flight capture immediately, so only chat enable takes effect
+        on later recordings.
         """
         out = {}
         for ch, e in self._recordings.items():

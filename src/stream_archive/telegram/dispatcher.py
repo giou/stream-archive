@@ -37,15 +37,15 @@ logger = logging.getLogger(__name__)
 
 
 def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, Any]]) -> list[str]:
-    """Active channels whose in-flight recording is affected by a config change.
+    """Active channels whose in-flight recording a config change affects.
 
-    Compared against the settings each recording actually uses (snapshotted at
-    recording start), not the previous config: after a declined change the
-    config already holds the new value while the recording keeps the old
-    settings, so the same change must warn again. Deferred effects: output
-    mode (global or per-channel override), preferred quality, chat capture
-    enabled (chat disable stops in-flight capture immediately and never
-    warns).
+    The check compares against the settings each recording actually uses,
+    snapshotted at recording start, not against the previous config. After
+    a declined change the config already holds the new value while the
+    recording keeps the old settings, so the same change must warn again.
+    Deferred effects: output mode (global or per-channel override),
+    preferred quality, and chat capture enabled (disabling chat stops an
+    in-flight capture immediately and never warns).
     """
     affected: set[str] = set()
     for ch, rec in recordings.items():
@@ -109,7 +109,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         self._cloudflared_drain = None
 
     def command_list(self) -> list[BotCommand]:
-        """BotCommand entries for the Telegram /-menu, shown only to the admin."""
+        """BotCommand entries for the Telegram /-menu that only the admin sees."""
         return [
             BotCommand("start", "Show available commands and open settings"),
             BotCommand("help", "Show available commands"),
@@ -166,9 +166,10 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             raise RuntimeError("telegram updater not available")
         await updater.start_polling(allowed_updates=["message", "callback_query"])
         logger.info("[telegram] Bot polling started (admin id=%s)", self._admin_id)
-        # Re-arm the /settings reply keyboard after a restart: keyboard buttons
-        # are plain text routed by in-memory menu state, which resets on boot,
-        # so a stale on-screen keyboard would be dead until /settings is typed.
+        # Re-arm the /settings reply keyboard after a restart. Keyboard
+        # buttons are plain text routed by in-memory menu state, and that
+        # state resets on boot. A stale on-screen keyboard stays dead until
+        # the admin types /settings.
         try:
             await self._app.bot.send_message(
                 chat_id=self._admin_id,
@@ -203,13 +204,14 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         return ok_text(candidate)
 
     async def _maybe_send_apply_warnings(self) -> None:
-        """Send apply-now warnings stashed by _apply (deferred-effect settings
-        changed while channels are recording).
+        """Send apply-now warnings stashed by _apply.
 
-        Entries stay in ``_pending_apply`` until answered: the nonce in the
-        message's callback data must still resolve when the admin taps a
-        button. ``_apply_warnings_sent`` tracks which nonces were already
-        messaged so a later trigger does not resend.
+        _apply stores warnings when deferred-effect settings changed while
+        channels recorded. Entries stay in ``_pending_apply`` until the
+        admin answers. The nonce in the message callback data must still
+        resolve when the admin taps a button. ``_apply_warnings_sent``
+        records which nonces the bot already messaged, so a later trigger
+        does not resend.
         """
         for nonce in list(self._pending_apply):
             if nonce in self._apply_warnings_sent:
@@ -235,7 +237,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 logger.warning("[telegram] Failed to send apply-now warning", exc_info=True)
 
     def reply_keyboard(self, menu: str = "root", channel: str | None = None) -> ReplyKeyboardMarkup:
-        """Reply-keyboard rows for ``menu``; button labels are the routing literals."""
+        """Reply-keyboard rows for ``menu``. Button labels are the routing literals."""
         if menu == "root":
             rows = [
                 ["Channels", "Status"],
@@ -290,7 +292,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         )
 
     async def menu_text(self, menu: str = "root", channel: str | None = None) -> str:
-        """Status/instruction body shown above the reply keyboard for ``menu``."""
+        """Return the status or instruction body shown above the reply keyboard for ``menu``."""
         c = self._config
         if menu == "root":
             return await self.handle_status()
@@ -406,8 +408,8 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
     async def handle_reply_text(self, text: str) -> tuple[str, ReplyKeyboardMarkup | InlineKeyboardMarkup] | None:
         """Route one reply-keyboard press or typed value.
 
-        Returns ``(reply_text, reply_markup)`` for ``reply_text(..., reply_markup=)``
-        (both markup kinds are valid there), or ``None`` to ignore the message.
+        Return ``(reply_text, reply_markup)`` for ``reply_text(..., reply_markup=)``.
+        Both markup kinds are valid there. Return ``None`` to ignore the message.
         """
         if text == "Back":
             parent: str | None
@@ -692,8 +694,8 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         return None
 
     def _confirm_keyboard(self, action: str, value: str) -> InlineKeyboardMarkup:
-        # Nonce makes the callback data unique per confirm message, so the
-        # double-tap guard never swallows a later confirm/cancel on a new message.
+        # The nonce makes the callback data unique per confirm message, so the
+        # double-tap guard never drops a later confirm or cancel on a new message.
         nonce = secrets.token_hex(4)
         return InlineKeyboardMarkup(
             [
@@ -705,12 +707,14 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         )
 
     async def handle_callback(self, data: str) -> tuple[str, Any] | None:
-        """Apply one confirmation-button press; returns (reply_text, markup) or None.
+        """Apply one confirmation-button press.
 
-        Wire format (from ``_confirm_keyboard``): ``confirm_<action>:<value>:<nonce>``
-        and ``cancel:<nonce>``; apply-now warnings use ``apply_now:<nonce>``. The
-        nonce makes every confirm message's buttons unique, so the double-tap
-        guard only ever guards the same message.
+        Return ``(reply_text, markup)`` on success or ``None`` for an unknown
+        or already handled press. Wire format (from ``_confirm_keyboard``):
+        ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Apply-now
+        warnings use ``apply_now:<nonce>``. The nonce makes every confirm
+        message's buttons unique, so the double-tap guard covers only the
+        same message.
         """
         parts = data.split(":")
         action = parts[0]
@@ -722,8 +726,8 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         if action == "confirm_remove" and len(parts) >= 3:
             if data in self._confirm_done:  # double-tap on the same message
                 return None
-            # The channel sits between the action and the nonce; it may itself
-            # contain ':' (kick:<slug>), so rejoin the middle parts.
+            # The channel sits between the action and the nonce. The channel
+            # name can itself contain ':' (kick:<slug>), so rejoin the middle parts.
             value = ":".join(parts[1:-1])
             if value not in self._config.channels:
                 return f"{value} is no longer monitored", None  # stale confirm message

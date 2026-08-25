@@ -73,8 +73,11 @@ class FakeStream:
 
 
 class SustainedStream:
-    """Stream that keeps returning data until closed, so recording tasks stay
-    alive until cancelled (FakeStream ends instantly with a clean EOF)."""
+    """Feed that keeps returning data until closed.
+
+    FakeStream ends instantly with a clean EOF. Tests use this stream so
+    recording tasks stay alive until cancellation.
+    """
 
     def __init__(self, chunk=b"\x00" * 1024):
         self._chunk = chunk
@@ -344,10 +347,13 @@ class EndingYouTubeStreamer(FakeYouTubeStreamer):
 
 
 def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
-    """A stream that ends cleanly (feed stall -> streamlink EOF) must release the
-    entry, flag the end as clean (so the monitor skips restart attempts until
-    the offline event arrives), and transition the YouTube broadcast to
-    complete instead of leaving it lingering."""
+    """A clean stream end releases the entry and completes the broadcast.
+
+    When a feed stall ends in a streamlink EOF, the recorder releases the
+    entry and flags the end as clean. The monitor then skips restart attempts
+    until the offline event arrives. The YouTube broadcast transitions to
+    complete instead of lingering.
+    """
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     yt = EndingYouTubeStreamer()
@@ -373,8 +379,10 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
 
 
 def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
-    """A task that ends with an exception must not look like a clean stream end:
-    the monitor has to restart it."""
+    """A task that ends with an exception must not look like a clean end.
+
+    The monitor has to restart the channel after such a task death.
+    """
     rec = Recorder(make_config(tmp_path))
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
@@ -422,8 +430,10 @@ def test_clean_end_latch_expires_after_grace(tmp_path):
 
 
 def test_reserve_start_blocks_when_capacity_taken(tmp_path):
-    """reserve_start atomically holds a slot so two simultaneous go-lives
-    cannot both pass max_concurrent_recordings."""
+    """reserve_start holds a capacity slot atomically.
+
+    Two simultaneous go-lives cannot both pass max_concurrent_recordings.
+    """
     config = make_config(tmp_path)
     config.max_concurrent_recordings = 1
     rec = Recorder(config)
@@ -977,8 +987,9 @@ def test_abort_serializes_with_stop(tmp_path):
 
         assert "ch" not in rec._recordings  # removed exactly once
         assert task.cancelled()  # whichever path won the lock tore it down
-        # The loser sees no entry: stop() yields None (abort won) or a result
-        # with no file info (stop won); either way no RuntimeError surfaced.
+        # The loser sees no entry. stop() returns None when abort wins, or a
+        # result with no file info when stop wins. Either way no RuntimeError
+        # surfaces.
         assert results[1] is None or results[1] == {"file_info": None, "youtube_info": None}
 
     asyncio.run(scenario())
@@ -1006,8 +1017,10 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
 
 
 def test_delete_oldest_spares_active_recording(tmp_path):
-    """Cap deletion must skip the file currently being written and fall
-    through to the next-oldest candidate."""
+    """Cap deletion must skip the file currently being written.
+
+    Deletion falls through to the next-oldest candidate instead.
+    """
     config = make_config(tmp_path)
     config.disk = {"max_total_gb": 2.5e-6}  # ~2.6 KB cap
     rec = Recorder(config)
@@ -1066,7 +1079,7 @@ def test_resolve_stream_kick_uses_plugin_directly(tmp_path, monkeypatch):
     assert title == "Title"
     assert game == "Game"
 
-    # without plugin metadata, the bare slug is the author fallback
+    # Without plugin metadata, the bare slug is the author fallback.
     CapturingFakePlugin.author = None
     best, author, title, game = rec._resolve_stream("kick:xqc", None, None)
     assert author == "xqc"
@@ -1259,8 +1272,11 @@ def test_stop_chat_finalizes_kick_chat_midstream(tmp_path, monkeypatch):
 
 
 class FakeKeepaliveProc:
-    """Keep-alive process stand-in: wait() blocks until terminated (or exits
-    immediately when exit_immediately is set, for the early-death path)."""
+    """Keep-alive process stand-in.
+
+    wait() blocks until terminated. If exit_immediately is set, the process
+    exits immediately to cover the early-death path.
+    """
 
     def __init__(self, exit_immediately=False):
         self._rc = 1 if exit_immediately else None
@@ -1286,8 +1302,11 @@ class FakeKeepaliveProc:
 
 
 def test_hold_delays_end_and_reuses_broadcast(tmp_path, monkeypatch):
-    """A clean source end defers the broadcast end; a return within the delay
-    reuses the same broadcast (no second create_stream)."""
+    """A clean source end defers the broadcast end.
+
+    A return within the hold delay reuses the same broadcast without a
+    second create_stream call.
+    """
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     config.youtube.hold_seconds = 60
@@ -1564,8 +1583,10 @@ def test_reuse_stops_keepalive(tmp_path, monkeypatch):
 
 
 def test_keepalive_early_death_ends_broadcast(tmp_path, monkeypatch):
-    """If the keep-alive feed dies (e.g. broadcast rejected), end now instead of
-    waiting out the full delay."""
+    """If the keep-alive feed dies early, end now.
+
+    An example is a rejected broadcast. Do not wait out the full delay.
+    """
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     config.youtube.hold_seconds = 60
@@ -1595,9 +1616,11 @@ def test_keepalive_early_death_ends_broadcast(tmp_path, monkeypatch):
 
 
 def test_start_setup_failure_cleans_registered_entry(tmp_path, monkeypatch):
-    """An OSError after registration (makedirs denied) must not strand a taskless
-    zombie entry: start returns False, nothing stays registered, and a retry
-    once the cause is gone succeeds."""
+    """An OSError after registration must not strand a taskless zombie entry.
+
+    If the OS denies makedirs after registration, start returns False and
+    nothing stays registered. A retry succeeds once the cause is gone.
+    """
     rec = Recorder(make_config(tmp_path))
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
@@ -1624,8 +1647,11 @@ def test_start_setup_failure_cleans_registered_entry(tmp_path, monkeypatch):
 
 
 def test_cleanup_spares_active_recording(tmp_path):
-    """Retention cleanup must not unlink the in-flight .ts even when its mtime
-    aged past retention_days (a stalled feed keeps writing via its open fd)."""
+    """Retention cleanup must not unlink an in-flight .ts file.
+
+    Even when its mtime aged past retention_days, a stalled feed keeps
+    writing through its open fd.
+    """
     rec = Recorder(make_config(tmp_path))
     old_active = tmp_path / "recordings" / "ch" / "active.ts"
     old_idle = tmp_path / "recordings" / "ch" / "idle.ts"

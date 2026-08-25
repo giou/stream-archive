@@ -37,7 +37,7 @@ _HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?
 
 
 def _decode_cloudflared_token(token: str) -> dict[str, Any] | None:
-    """Decode a cloudflared install token to its JSON payload (or None)."""
+    """Decode a cloudflared install token into its JSON payload, or return None."""
     padded = token + "=" * (-len(token) % 4)
     for decoder in (base64.b64decode, base64.urlsafe_b64decode):
         try:
@@ -48,7 +48,11 @@ def _decode_cloudflared_token(token: str) -> dict[str, Any] | None:
 
 
 def _valid_cloudflare_token(token: str) -> bool:
-    """True when the token is cloudflared install credentials {a: account, t: tunnel, s: secret}."""
+    """Return True when the token holds cloudflared install credentials.
+
+    The decoded JSON payload must contain non-empty strings under the keys
+    {a: account, t: tunnel, s: secret}.
+    """
     data = _decode_cloudflared_token(token)
     return bool(isinstance(data, dict) and all(isinstance(data.get(k), str) and data[k] for k in ("a", "t", "s")))
 
@@ -61,7 +65,7 @@ def _normalize_webhook_url(url: str) -> str:
 
 
 def _parse_public_hostname(text: str) -> str | None:
-    """Extract a bare hostname (at least one dot) from user input; None when invalid."""
+    """Extract a bare hostname with at least one dot from user input, or return None."""
     text = text.strip()
     host = urlsplit(text).hostname if re.match(r"^https?://", text) else text
     if not host:
@@ -128,9 +132,9 @@ class WebhookCommands:
             return None, "tailscale status shows no machine DNS name \u2014 is this machine in a tailnet?"
         proc = None
         try:
-            # --bg: register the funnel with the daemon and exit (the plain form
-            # serves in the foreground and never returns); --yes: no interactive
-            # prompts (which would hang a piped subprocess).
+            # --bg registers the funnel with the daemon and exits. The plain
+            # form serves in the foreground and never returns. --yes skips
+            # the interactive prompts that hang a piped subprocess.
             proc = await asyncio.create_subprocess_exec(
                 "tailscale",
                 "funnel",
@@ -151,15 +155,16 @@ class WebhookCommands:
             )
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
-            # Already enabled (e.g. a previous attempt finished after its timeout,
-            # or the user re-clicks the menu): verify the funnel really serves
-            # our port before reporting success.
+            # The funnel can already exist: a previous attempt finished
+            # after its timeout, or the user re-clicked the menu. Verify
+            # that the funnel really serves our port before reporting
+            # success.
             if "listener already exists" not in stderr_text or not await self._funnel_serving(port):
                 return None, (f"tailscale funnel {port} failed: " + (stderr_text or f"exit {proc.returncode}"))
         return f"https://{dns_name}/kick/webhook", None
 
     async def _funnel_serving(self, port: int) -> bool:
-        """True when a foreground tailscale funnel config proxies / to 127.0.0.1:<port>."""
+        """True when a foreground tailscale funnel proxies / to 127.0.0.1:<port>."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "tailscale",
@@ -196,16 +201,16 @@ class WebhookCommands:
             pass
 
     async def _cloudflared_quick_start(self) -> tuple[str | None, str | None]:
-        """Run a cloudflared quick tunnel; return (url, None) or (None, hint).
+        """Run a cloudflared quick tunnel and return (url, None) or (None, hint).
 
-        The spawned process is kept as the managed tunnel; callers enable the
+        Keep the spawned process as the managed tunnel. Callers enable the
         webhook with the published trycloudflare URL.
         """
         self._cloudflared_stop()
         port = self._config.kick.webhook.listen_port
         try:
             proc = await asyncio.create_subprocess_exec(
-                # --no-autoupdate is a root flag: it must precede the subcommand.
+                # --no-autoupdate is a root flag. It must precede the subcommand.
                 "cloudflared",
                 "--no-autoupdate",
                 "tunnel",
@@ -235,11 +240,12 @@ class WebhookCommands:
         return _normalize_webhook_url(url), None
 
     async def _cloudflared_named_start(self, token: str, config_path: Path | None = None) -> tuple[bool, str | None]:
-        """Run ``cloudflared tunnel run --token``; return (True, None) or (False, hint).
+        """Start a named tunnel with ``cloudflared tunnel run --token``.
 
-        With ``config_path`` the local ingress file is used (no dashboard
-        configuration needed). Flag order matters: ``--no-autoupdate`` and
-        ``--config`` are ``tunnel``-command options and must precede ``run``.
+        Return (True, None) or (False, hint). With ``config_path``, use the
+        local ingress file so no dashboard configuration is needed. Flag
+        order matters: ``--no-autoupdate`` and ``--config`` are
+        ``tunnel``-command options and must precede ``run``.
         """
         self._cloudflared_stop()
         cmd = ["cloudflared", "tunnel", "--no-autoupdate"]
@@ -262,7 +268,7 @@ class WebhookCommands:
                 self._wait_cloudflared_registered(proc), timeout=_CLOUDFLARED_RUN_TIMEOUT
             )
         except TimeoutError:
-            if proc.returncode is None:  # still running: connection registered
+            if proc.returncode is None:  # still running: the tunnel registered
                 self._cloudflared = proc
                 self._cloudflared_drain = asyncio.create_task(self._drain_cloudflared(proc))
                 return True, None
@@ -276,7 +282,10 @@ class WebhookCommands:
         return True, None
 
     async def _wait_cloudflared_url(self, proc: Any) -> tuple[str | None, list[str]]:
-        """Read cloudflared output until the trycloudflare URL or EOF; (url, tail_lines)."""
+        """Read cloudflared output until the trycloudflare URL appears or EOF.
+
+        Return (url, tail_lines).
+        """
         tail: list[str] = []
         while True:
             line = await proc.stdout.readline()
@@ -289,7 +298,10 @@ class WebhookCommands:
                 return m.group(0), tail
 
     async def _wait_cloudflared_registered(self, proc: Any) -> tuple[bool, list[str]]:
-        """Read cloudflared output until the named tunnel registers or EOF; (ok, tail_lines)."""
+        """Read cloudflared output until the named tunnel registers or EOF.
+
+        Return (ok, tail_lines).
+        """
         tail: list[str] = []
         while True:
             line = await proc.stdout.readline()
@@ -356,7 +368,7 @@ class WebhookCommands:
     async def _handle_cloudflare_token(self, text: str) -> tuple[bool, str]:
         """Validate a pasted cloudflared token/command and persist it.
 
-        Returns (True, message) with the next-step prompt, or (False, error).
+        Return (True, message) with the next-step prompt, or (False, error).
         """
         text = text.strip()
         m = _CLOUDFLARED_INSTALL_RE.match(text)
@@ -380,7 +392,7 @@ class WebhookCommands:
         )
 
     async def _write_cloudflared_config(self, host: str) -> Path:
-        """Write the local ingress config for the named tunnel; returns its path."""
+        """Write the local ingress config for the named tunnel and return its path."""
         wh = self._config.kick.webhook
         port = wh.listen_port
         data = _decode_cloudflared_token(wh.cloudflare_token)
@@ -396,8 +408,8 @@ class WebhookCommands:
     async def _create_cloudflare_dns(self, api_token: str) -> tuple[bool, str]:
         """Create the CNAME for the named tunnel's hostname via the Cloudflare API.
 
-        Returns (True, message) on success (or when the record already points
-        at the tunnel), (False, error) otherwise. Never raises.
+        Return (True, message) on success, including when the record already
+        points at the tunnel, or (False, error) otherwise. Never raises.
         """
         host = self._cloudflare_hostname or ""
         wh = self._config.kick.webhook
@@ -411,7 +423,7 @@ class WebhookCommands:
         try:
             async with httpx.AsyncClient(timeout=15, base_url=_CLOUDFLARE_API) as client:
                 # Account-owned tokens (cfat_ prefix) reject the user-scoped
-                # verify endpoint, so fall back to the account-scoped one.
+                # verify endpoint. Fall back to the account-scoped endpoint.
                 verify = await client.get("/user/tokens/verify", headers=headers)
                 if verify.status_code != 200 and account_id:
                     verify = await client.get(f"/accounts/{account_id}/tokens/verify", headers=headers)
@@ -420,8 +432,9 @@ class WebhookCommands:
                         verify.status_code == 200 and (verify.json().get("result") or {}).get("status") == "active"
                     )
                 except ValueError:
-                    # Non-JSON body (proxy 502 HTML pages): treat like an
-                    # unusable token instead of escaping mid-flow.
+                    # json() fails on a non-JSON body (proxy 502 HTML
+                    # pages). Treat the token as unusable instead of
+                    # escaping mid-flow.
                     verify_active = False
                 if not verify_active:
                     return False, "\u274c That Cloudflare API token is not valid."
@@ -461,8 +474,9 @@ class WebhookCommands:
                     err = (created.json().get("errors") or [{}])[0].get("message", created.text)
                     return False, f"\u274c Could not create the DNS record: {err}"
         except (httpx.HTTPError, ValueError) as e:
-            # ValueError: .json() on a non-JSON body (proxy 502 HTML pages) —
-            # this handler must never escape with an exception mid-flow.
+            # .json() raises ValueError on a non-JSON body (proxy 502 HTML
+            # pages). This handler must never escape with an exception
+            # mid-flow.
             return False, f"\u274c Cloudflare API request failed: {e}"
         return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
 
@@ -470,7 +484,7 @@ class WebhookCommands:
         """Wire up the named tunnel: local ingress config, run, enable the webhook.
 
         ``dns_note`` is the DNS success message, or None when the user chose
-        'skip' (then the manual CNAME instructions are included instead).
+        'skip'. Then include the manual CNAME instructions instead.
         """
         host = self._cloudflare_hostname or ""
         self._cloudflare_hostname = None
@@ -509,7 +523,7 @@ class WebhookCommands:
     async def _apply_cloudflare_url(self, text: str) -> tuple[str, Any]:
         """Enable the webhook with a pasted URL of the user's own (external) tunnel.
 
-        The tunnel is not app-managed: it is never restarted on boot.
+        The app does not manage this tunnel and never restarts it on boot.
         """
         url = _normalize_webhook_url(text.strip())
         result = await self._apply_webhook_state(True, url, "cloudflare")
@@ -520,10 +534,10 @@ class WebhookCommands:
         return (f"{result}\n\n```\n{url}\n```\n" + _KICK_DASHBOARD_HINT + note, self.reply_keyboard("kick_webhook"))
 
     async def _probe_webhook_url(self, url: str) -> bool:
-        """True when the public URL answers an HTTP request (tunnel + DNS work).
+        """True when the public URL answers an HTTP request (tunnel and DNS work).
 
-        Any response counts \u2014 including 4xx from the receiver \u2014 because the
-        point is that the request reached the app through the tunnel.
+        Any response counts, including a 4xx from the receiver. The point
+        is that the request reached the app through the tunnel.
         """
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -535,9 +549,9 @@ class WebhookCommands:
     async def _reachability_note(self, url: str, tunnel: str = "") -> str:
         """Probe the public URL and return a user-facing status line.
 
-        Tailscale funnels are exempt: the funnel was just verified against the
-        host's tailscaled, and containers cannot reach the host's tailnet IP
-        (Docker hairpin), so a probe would always fail there.
+        Tailscale funnels need no probe. The funnel check just verified the
+        host's tailscaled. Containers cannot reach the host's tailnet IP
+        (Docker hairpin), so a probe always fails there.
         """
         if tunnel == "tailscale":
             return ""
@@ -551,8 +565,9 @@ class WebhookCommands:
     async def _tailscale_funnel_off(self) -> bool:
         """Turn off the app-managed tailscale funnel for the webhook port (best effort).
 
-        Newer tailscale CLIs reject ``--bg <port> off``; the documented form is
-        ``tailscale funnel --https=443 off`` (funnels only ever listen on 443).
+        Newer tailscale CLIs reject ``--bg <port> off``. The documented form
+        is ``tailscale funnel --https=443 off``, because funnels only ever
+        listen on 443.
         """
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -573,12 +588,13 @@ class WebhookCommands:
     ) -> str:
         """Persist kick.webhook.{enabled,public_url,tunnel,...} and reconcile live state.
 
-        Kick has a single webhook URL, so only one tunnel may expose the
-        receiver: enabling a different provider \u2014 or disabling \u2014 tears down the
-        previously app-managed tunnel (the tailscale funnel for the webhook
-        port, or the cloudflared subprocess). ``cloudflare_managed`` marks a
-        cloudflare tunnel the app started itself (restored on boot); a pasted
-        URL with no token is the user's own tunnel and is never restarted.
+        Kick accepts a single webhook URL, so only one tunnel can expose
+        the receiver. Enabling a different provider, or disabling the
+        webhook, tears down the previously managed tunnel: the tailscale
+        funnel for the webhook port, or the cloudflared subprocess.
+        ``cloudflare_managed`` marks a cloudflare tunnel that the app
+        started itself and restores on boot. A pasted URL with no token is
+        the user's own tunnel, and the app never restarts it.
         """
         wh = self._config.kick.webhook
         old_tunnel = wh.tunnel
@@ -587,15 +603,15 @@ class WebhookCommands:
         def mutate(candidate: AppConfig) -> None:
             cw = candidate.kick.webhook
             if enabled:
-                # public_url first: the model requires an http(s) URL the
-                # moment enabled flips to True.
+                # Set public_url first: the model requires an http(s)
+                # URL the moment enabled flips to True.
                 cw.public_url = url
                 cw.tunnel = cast(Any, tunnel)
                 cw.cloudflare_token = cloudflare_token
                 cw.cloudflare_managed = cloudflare_managed
-                # Re-arm the "webhook is working" confirmation: it fires on
-                # the first verified Kick event, so a re-enable (new
-                # tunnel/URL) confirms again.
+                # Re-arm the "webhook is working" confirmation. It fires on
+                # the first verified Kick event, so a re-enable with a new
+                # tunnel or URL confirms again.
                 cw.setup_notified = False
                 cw.enabled = True
             else:

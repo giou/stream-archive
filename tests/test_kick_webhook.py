@@ -15,7 +15,7 @@ from stream_archive.kick_webhook import KickWebhook, _RateLimiter
 
 
 def _fresh_ts():
-    """Current epoch-second timestamp string; webhook events must be fresh."""
+    """Current epoch-second timestamp string. Webhook events must be fresh."""
     return str(int(time.time()))
 
 
@@ -96,9 +96,9 @@ class FakeKickAPI:
 
 def make_webhook(config=None, monitor=None, recorder=None, api=None, notifier=None):
     raw = config or base_config()
-    # base_config uses listen_port 0 (ephemeral) so bind tests never collide;
-    # the model only allows 1-65535, so validate with a placeholder port and
-    # re-apply the ephemeral port afterwards.
+    # base_config uses listen_port 0 for an ephemeral port so bind tests never
+    # collide. The config model allows only ports 1-65535, so make_webhook
+    # validates with a placeholder port and re-applies 0 afterwards.
     if isinstance(raw, AppConfig):
         ephemeral = raw.kick.webhook.listen_port == 0
         config = raw
@@ -272,8 +272,9 @@ def test_live_event_dispatches_offline(keypair):
 
 
 def test_failed_dispatch_not_marked_seen(keypair):
-    """A crashing handler must answer 500 and unmark the message id, so the
-    Kick retry is dispatched instead of swallowed as a duplicate."""
+    """A crashing handler must answer 500 and unmark the message id. Kick then
+    retries the event, and the retry dispatches instead of counting as a
+    duplicate."""
     private_key, public_pem = keypair
     monitor = FakeMonitor()
     wh = make_webhook(config=base_config(), monitor=monitor, api=FakeKickAPI(public_pem))
@@ -411,7 +412,8 @@ def test_live_event_unmonitored_channel_ignored(keypair):
 
 def make_mock_api(handler):
     config = base_config()
-    config["kick"]["webhook"]["listen_port"] = 8787  # KickAPI never binds; model needs 1-65535
+    # The config model needs a real port, although KickAPI itself never binds.
+    config["kick"]["webhook"]["listen_port"] = 8787
     api = KickAPI(AppConfig.model_validate(config))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return api
@@ -425,7 +427,7 @@ def token_response(request):
 def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
     private_key, public_pem = keypair
     config = {
-        # save_config validates the whole config, so provide a valid one
+        # save_config validates the whole config, so provide a valid one.
         "telegram_user_id": 12345,
         "bot_telegram_api": "bot_token",
         "twitch_client_id": "client_id",
@@ -458,8 +460,8 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=notifier)
 
-    # A signature-verified POST proves Kick saved the URL and can reach it:
-    # confirm exactly once, then persist the flag.
+    # A signature-verified POST proves that Kick saved the URL and can reach
+    # it. The webhook confirms setup exactly once and then persists the flag.
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             body = live_event()
@@ -625,7 +627,7 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
     asyncio.run(scenario())
 
     assert calls["n"] >= 4
-    assert len(notifier.messages) == 1  # only the out-of-sync warning; sync never confirms
+    assert len(notifier.messages) == 1  # sync failure notified once, no setup confirm
     assert "Kick webhook subscriptions out of sync" in notifier.messages[0]
     assert wh._sync_failed_notified is False  # flag cleared after the last success
 
@@ -705,7 +707,8 @@ def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch)
     config = base_config()
     config["monitoring_interval"] = 0.01
     notifier = FakeNotifier()
-    # Two episodes of >delay 500s with a recovery in between: one alert each.
+    # Two 500-error episodes, separated by one recovery, each exceed the
+    # delay and notify once.
     wh = make_webhook(config=config, api=ScriptedAPI([True] * 6 + [False] + [True] * 6), notifier=notifier)
 
     async def scenario():
@@ -720,8 +723,8 @@ def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch)
 
 
 def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
-    # Recovery resets the episode timer: brief blips shorter than the delay
-    # (even several in a row, each separated by a success) stay silent.
+    # Recovery resets the episode timer. Brief blips stay silent when each
+    # failing run is shorter than the delay, even across several episodes.
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
     config = base_config()
     config["monitoring_interval"] = 0.01
@@ -810,7 +813,7 @@ def test_duplicate_message_id_dropped(keypair):
             first = await client.post("/kick/webhook", data=body, headers=headers)
             replay = await client.post("/kick/webhook", data=body, headers=headers)
             assert first.status == 200
-            assert replay.status == 200  # replayed: acknowledged, not dispatched
+            assert replay.status == 200  # replayed event is acknowledged, not dispatched
 
     asyncio.run(scenario())
     assert len(monitor.online) == 1
@@ -845,8 +848,8 @@ def test_bad_signature_key_refetch_rate_limited(keypair):
             for _ in range(5):
                 resp = await client.post("/kick/webhook", data=body, headers=headers)
                 assert resp.status == 401
-            # 1 initial fetch + 1 refetch for the first request; the 60s
-            # negative cache keeps the other 4 requests purely local.
+            # The first request fetches the key once and refetches once.
+            # The 60s negative cache keeps the other 4 requests purely local.
             assert api.fetch_count == 2
             # After the refetch window elapses, one more refetch is allowed.
             wh._next_key_refetch = 0.0
@@ -868,8 +871,8 @@ def test_rate_limit_returns_429(keypair):
             for _ in range(4):
                 resp = await client.post("/kick/webhook", data=b"{}")
                 statuses.append(resp.status)
-            # The bucket starts full: max=2 admits a burst of 2, refill drift
-            # lets the 3rd through, and the 4th is blocked.
+            # The bucket starts full, so max=2 admits a burst of 2. Refill
+            # drift lets the 3rd request through, and the 4th is blocked.
             assert statuses == [401, 401, 401, 429]
 
     asyncio.run(scenario())

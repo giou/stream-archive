@@ -23,7 +23,7 @@ class DiskOutputMixin:
     _abort: Any
 
     def _channel_dir(self, channel: str) -> str:
-        """Recording subdirectory: kick/<slug>, twitch/<name>, legacy bare -> bare."""
+        """Return the recording subdirectory (kick/<slug>, twitch/<name>, else bare)."""
         if is_kick_channel(channel):
             return f"kick/{kick_bare_name(channel)}"
         if channel.startswith("twitch:"):
@@ -87,15 +87,18 @@ class DiskOutputMixin:
             logger.error("[recorder] [%s] watchdog error: %s", channel, e)
 
     async def delete_oldest_to_cap(self) -> tuple[int, int]:
-        """Delete oldest .ts files until under disk.max_total_gb; returns (files_removed, freed_gb)."""
+        """Delete the oldest .ts files until under disk.max_total_gb.
+
+        Returns (files_removed, freed_gb).
+        """
         cap = self._config.disk.max_total_gb
         if cap <= 0:
             return (0, 0)
         loop = asyncio.get_running_loop()
 
-        # Never unlink a file that is being written right now: deleting the
-        # active target loses the live recording even though ffmpeg keeps its
-        # fd open and the space is only reclaimed after teardown.
+        # Never unlink a recording that ffmpeg is still writing. The space
+        # behind its open fd is reclaimed only at teardown, so deletion here
+        # cannot touch the live capture.
         active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
 
         def _delete_oldest() -> tuple[int, int]:
@@ -107,7 +110,7 @@ class DiskOutputMixin:
                 try:
                     st = p.stat()
                 except OSError:
-                    continue  # retention cleanup may have raced us mid-scan
+                    continue  # retention cleanup can race us mid-scan
                 stats.append((st.st_mtime, st.st_size, p))
             stats.sort(key=lambda t: t[0])
             total = sum(size for _, size, _ in stats)
@@ -128,7 +131,10 @@ class DiskOutputMixin:
         return await loop.run_in_executor(None, _delete_oldest)
 
     async def cleanup_old_recordings(self, retention_days: float) -> int:
-        """Delete .ts and .chat.json files older than retention_days days; returns count removed."""
+        """Delete .ts and .chat.json files older than retention_days days.
+
+        Returns the number of files removed.
+        """
         if retention_days <= 0:
             return 0
         base = disk.recording_dir_path(self._config)
@@ -137,9 +143,9 @@ class DiskOutputMixin:
             return 0
         cutoff = time.time() - retention_days * 86400
         loop = asyncio.get_running_loop()
-        # Never unlink the in-flight recording: a feed stalled longer than
-        # retention_days keeps its fd open while mtime ages out, and removing
-        # the file drops the live capture mid-write.
+        # A stalled feed can sit past retention_days while still writing.
+        # Never unlink that in-flight file. Its fd stays open, and removal
+        # would cut off the live capture mid-write.
         active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
 
         def _scan() -> list[Path]:

@@ -10,7 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 def recording_dir_path(config: AppConfig) -> Path:
-    """Resolve recording_dir against _workdir when relative (same rule as cleanup_old_recordings)."""
+    """Resolve recording_dir against _workdir when it is relative.
+
+    Applies the same rule as cleanup_old_recordings.
+    """
     d = Path(config.recording_dir)
     if not d.is_absolute():
         d = config._workdir / d
@@ -18,7 +21,7 @@ def recording_dir_path(config: AppConfig) -> Path:
 
 
 def chat_dir_path(config: AppConfig) -> Path:
-    """Resolve chat_dir against _workdir when relative (same rule as recording_dir_path)."""
+    """Resolve chat_dir against _workdir when relative, like recording_dir_path."""
     d = Path(config.chat_dir)
     if not d.is_absolute():
         d = config._workdir / d
@@ -26,7 +29,10 @@ def chat_dir_path(config: AppConfig) -> Path:
 
 
 async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
-    """Fresh fs + recordings-dir usage. Slow .ts scan runs in the default executor."""
+    """Collect filesystem usage and recordings directory totals.
+
+    The slow .ts scan runs in the default executor.
+    """
     loop = asyncio.get_running_loop()
     base = recording_dir_path(config)
     fs_dir = base if base.exists() else base.parent  # missing dir: report parent fs
@@ -67,6 +73,6 @@ def format_bytes(n: int) -> str:
 
 
 def format_duration(seconds: float) -> str:
-    """H:MM:SS, zero-padded, e.g. '01:23:45'."""
+    """Format seconds as zero-padded H:MM:SS, for example '01:23:45'."""
     s = int(seconds)
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"

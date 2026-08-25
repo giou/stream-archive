@@ -150,7 +150,7 @@ def base_config(tmp_path):
 
 
 def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart=None):
-    """Mirror get_config(): write a valid config file, then load it typed."""
+    """Write a valid config file, then load it typed, mirroring get_config()."""
     config = base_config(tmp_path)
     if channels is not None:
         config["channels"] = channels
@@ -176,7 +176,7 @@ def read_file(tmp_path):
 
 
 def probe_ok(ctrl):
-    """Fake the reachability probe so enable flows don't hit the network."""
+    """Fake the reachability probe so enable flows do not hit the network."""
 
     async def probe(url):
         return True
@@ -398,8 +398,8 @@ def test_deferred_affected_per_channel_override_change(tmp_path):
 
 
 def test_deferred_affected_repeat_change_after_decline(tmp_path):
-    # Config already holds the change (the first prompt was declined); the
-    # recording still runs the old mode, so the same change must warn again.
+    # Config already holds the change because the first prompt was declined.
+    # The recording still runs the old mode, so the same change must warn again.
     cfg = _load_config(tmp_path)
     cfg.channel_output_modes = {"twitch:channel1": "disk"}
     rec = _recordings(["twitch:channel1"], mode="youtube")
@@ -469,16 +469,16 @@ def test_apply_warning_sent_with_inline_keyboard(tmp_path):
     buttons = kwargs["reply_markup"].to_dict()["inline_keyboard"][0]
     assert buttons[0]["callback_data"] == "apply_now:abcd"
     assert buttons[1]["callback_data"] == "cancel:abcd"
-    # the entry stays pending so the button's nonce still resolves on tap
+    # The entry stays pending so the button's nonce still resolves on tap.
     assert ctrl._pending_apply == {"abcd": ("Output mode set to youtube", ["twitch:channel1"])}
     assert ctrl._apply_warnings_sent == {"abcd"}
-    # a second trigger does not resend the same warning
+    # A second trigger does not resend the same warning.
     asyncio.run(ctrl._maybe_send_apply_warnings())
     assert bot.send_message.await_count == 1
 
 
 def test_apply_warning_round_trip_restarts(tmp_path):
-    """Full flow: change -> warning sent -> Apply now tap restarts the recording."""
+    """A change sends a warning, and an Apply now tap restarts the recording."""
     config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
@@ -508,14 +508,14 @@ def test_apply_now_callback_restarts(tmp_path):
     assert recorder.restart_calls == ["twitch:channel1"]
     assert ctrl._pending_apply == {}
     assert ctrl._apply_warnings_sent == set()
-    # double-tap on the same message: silent no-op
+    # A double tap on the same message is a silent no-op.
     assert asyncio.run(ctrl.handle_callback("apply_now:abcd")) is None
     assert recorder.restart_calls == ["twitch:channel1"]
-    # stale/unknown nonce: silent no-op
+    # A stale or unknown nonce is a silent no-op.
     assert asyncio.run(ctrl.handle_callback("apply_now:zzzz")) is None
     assert recorder.restart_calls == ["twitch:channel1"]
-    # keep current recording: existing cancel branch, nothing restarted;
-    # the entry stays so a later Apply now tap on the same message still works
+    # Cancel keeps the current recording and restarts nothing. The entry stays
+    # pending, so a later Apply now tap on the same message still works.
     ctrl._pending_apply["wxyz"] = ("Output mode set to youtube", ["twitch:channel1"])
     result = asyncio.run(ctrl.handle_callback("cancel:wxyz"))
     assert result == ("Cancelled \u2014 nothing changed", None)
@@ -1300,7 +1300,7 @@ def test_callback_cancel_works_per_confirm_message(tmp_path):
     before = read_file(tmp_path)
     text, markup = asyncio.run(ctrl.handle_callback("cancel:aaaa1111"))
     assert text == "Cancelled \u2014 nothing changed"
-    # a second confirm message has a different nonce -> its cancel still works
+    # A second confirm message has a different nonce, so its cancel still works.
     text, markup = asyncio.run(ctrl.handle_callback("cancel:bbbb2222"))
     assert text == "Cancelled \u2014 nothing changed"
     assert read_file(tmp_path) == before
@@ -1964,7 +1964,7 @@ def test_chat_off_twitch_only(tmp_path):
     assert read_file(tmp_path)["kick"]["record_chat"] is True
     assert config.record_chat is False
     assert config.kick.record_chat is True
-    # only the twitch channel's chat is stopped; the kick buffer keeps collecting
+    # Only the twitch channel's chat stops. The kick buffer keeps collecting.
     assert recorder.chat_stop_calls == [("twitch:channel1", "twitch")]
 
 
@@ -1978,7 +1978,7 @@ def test_chat_off_kick_only(tmp_path):
     assert read_file(tmp_path)["kick"]["record_chat"] is False
     assert config.record_chat is True
     assert config.kick.record_chat is False
-    # only the kick channel's chat is finalized; the twitch IRC recorder keeps running
+    # Only the kick channel's chat is finalized. The twitch IRC recorder keeps running.
     assert recorder.chat_stop_calls == [("kick:xqc", "kick")]
 
 
@@ -2400,7 +2400,7 @@ def test_create_cloudflare_dns_no_zone_fails(tmp_path, monkeypatch):
 
 
 def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path, monkeypatch):
-    # cfat_ account tokens reject /user/tokens/verify; the account-scoped
+    # cfat_ account tokens cannot pass /user/tokens/verify. The account-scoped
     # verify endpoint must be used instead.
     client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}], verify_status="account-owned")
     config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
@@ -2501,8 +2501,8 @@ def test_reply_text_kick_webhook_tailscale_detected(tmp_path, monkeypatch):
     text, markup = asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
     assert "https://box.tail1234.ts.net/kick/webhook" in text
     assert "tailscale funnel 8787 is enabled" in text
-    # No reachability probe for tailscale: the funnel is verified against the
-    # daemon, and the container can't reach the host's tailnet IP (hairpin).
+    # No reachability probe for tailscale. The funnel is verified against the
+    # daemon, and the container cannot reach the host's tailnet IP (hairpin).
     assert "URL is reachable" not in text
     assert "doesn't respond yet" not in text
     assert read_file(tmp_path)["kick"]["webhook"]["enabled"] is True
@@ -2755,8 +2755,9 @@ def test_remove_clears_hold_override(tmp_path):
 
 
 def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkeypatch):
-    """A proxy 502 HTML page on token-verify must come back as (False, message)
-    ('not valid'), never escape as a JSONDecodeError mid-setup-flow."""
+    """A proxy 502 HTML page on token verify returns (False, message), with a
+    'not valid' message, and never escapes as a JSONDecodeError during the
+    setup flow."""
 
     class _HtmlVerifyResp:
         status_code = 200

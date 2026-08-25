@@ -3,23 +3,22 @@ services:
     image: ghcr.io/giou/stream-archive:latest
     restart: unless-stopped
     init: true                     # tini: zombie reaping + SIGTERM forwarding
-    # No `user:` — the entrypoint runs the app as the data-dir owner's
+    # No `user:` key. The entrypoint runs the app as the data-dir owner's
     # uid/gid, so deployments work on hosts where the user's uid != 1000.
-    # Force a specific identity with USER_UID/USER_GID in `.env` (passed
-    # through below).
+    # Force a specific identity with USER_UID/USER_GID in `.env` below.
     working_dir: /data
     volumes:
-      # All state lives in the data dir (default: the folder containing this
-      # compose file; override with STREAM_ARCHIVE_DATA in .env): config.json,
-      # recordings/, chat/, tokens, update_state.json.
+      # All state lives in the data dir: config.json, recordings/, chat/,
+      # tokens, update_state.json. The default is the folder containing this
+      # compose file. Override it with STREAM_ARCHIVE_DATA in .env.
       - ${STREAM_ARCHIVE_DATA:-.}:/data
-      # Host tailscaled socket: lets the bot run `tailscale funnel` for the
-      # kick webhook tunnel. Requires tailscale installed on the docker host.
+      # Host tailscaled socket. It lets the bot run `tailscale funnel` for the
+      # kick webhook tunnel. Tailscale must be installed on the docker host.
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
     ports:
-      # Kick webhook receiver: the host's tailscale funnel forwards to the
-      # host loopback, so publish the container listener there (requires
-      # kick.webhook.listen_host = "0.0.0.0" in config.json under docker).
+      # Kick webhook receiver. The host's tailscale funnel forwards to the
+      # host loopback, so we publish the container listener there. This needs
+      # kick.webhook.listen_host = "0.0.0.0" in config.json under docker.
       - "127.0.0.1:8787:8787"
     environment:
       - PYTHONUNBUFFERED=1
@@ -27,7 +26,7 @@ services:
       - TZ=${TZ:-UTC}
       - USER_UID=${USER_UID:-}
       - USER_GID=${USER_GID:-}
-    # The image owns all code; the rootfs is read-only and only the data dir
+    # The image owns all code. The rootfs is read-only, and only the data dir
     # and /tmp (tmpfs) are writable.
     read_only: true
     tmpfs:

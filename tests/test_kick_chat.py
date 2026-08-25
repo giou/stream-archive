@@ -78,11 +78,12 @@ def test_chat_root_no_emotes_single_fragment():
 
 
 def test_chat_root_tokens_split_without_emotes_field():
-    # kick's webhook often omits/breaks the "emotes" array (live data) — the
-    # self-describing tokens in the body must still become emoticon fragments
+    # Kick's webhook often omits or breaks the "emotes" array in live data.
+    # The self-describing tokens in the body must still become emoticon
+    # fragments.
     msg = make_msg(
         message_id="q",
-        emotes=None,  # the quirk: no emotes payload at all
+        emotes=None,  # the quirk under test, no emotes payload at all
         content="[emote:39265:EDMusiC][emote:5756616:DanceDance] hi",
     )
     c = build_chat_root("kick:xqc", "xqc", "T", START, [msg])["comments"][0]
@@ -98,7 +99,7 @@ def test_chat_root_tokens_split_without_emotes_field():
 
 
 def test_chat_root_bad_positions_ignored_tokens_win():
-    # bogus/out-of-bounds positions in the emotes array must not break splitting
+    # Bogus or out-of-bounds positions in the emotes array must not break splitting.
     msg = make_msg(content="abc [emote:37226:KEKW]", emotes=[{"emote_id": "37226", "positions": [{"s": 99, "e": 120}]}])
     root = build_chat_root("kick:xqc", "xqc", "T", START, [msg])
     assert root["comments"][0]["message"]["fragments"] == [
@@ -147,7 +148,7 @@ def test_chat_root_offsets_and_missing_fields():
 def test_chat_root_no_start_time_zero_offsets():
     root = build_chat_root("kick:xqc", "xqc", "T", None, [make_msg()])
     assert root["comments"][0]["content_offset_seconds"] == 0.0
-    assert "created_at" not in root["video"]  # TD DateTime: omit, never ""
+    assert "created_at" not in root["video"]  # TD DateTime field omitted, never ""
 
 
 def test_chat_root_empty_messages():
@@ -204,7 +205,8 @@ def test_embed_emotes_fills_first_party_base64():
             "name": "KEKW",  # parsed from the [emote:id:NAME] token
         }
     ]
-    # TwitchDownloader can deserialize it: FileInfo > 1.2.2 gates the modern shape
+    # TwitchDownloader can deserialize the result. FileInfo versions above
+    # 1.2.2 gate this modern shape.
     json.dumps(root)
 
 

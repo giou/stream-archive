@@ -35,7 +35,8 @@ class FakeCreds:
         self.refresh_calls = 0
 
     def refresh(self, request):
-        # Synchronous network stand-in; runs via asyncio.to_thread.
+        # Synchronous network stand-in. The streamer calls it through
+        # asyncio.to_thread.
         time.sleep(0.05)
         self.refresh_calls += 1
         self.valid = True

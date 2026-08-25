@@ -1,7 +1,8 @@
 """Twitch IRC live-chat capture, written as TwitchDownloader-compatible ChatRoot JSON.
 
-Read-only anonymous IRC (`justinfan` login) over TLS; no external dependencies.
-The app only saves the JSON — rendering is done externally with TwitchDownloaderCLI.
+The recorder logs in anonymously (`justinfan`) over TLS and needs no external
+packages. This module only saves the JSON file. Rendering happens externally
+with TwitchDownloaderCLI.
 """
 
 import asyncio
@@ -20,7 +21,10 @@ _TAG_ESCAPES = {"s": " ", ":": ";", "\\": "\\", "r": "\r", "n": "\n"}
 
 
 def _unescape_tag(value: str) -> str:
-    """Unescape an IRCv3 tag value (\\s \\: \\\\ \\r \\n; unknown escapes keep the char)."""
+    """Unescape an IRCv3 tag value (\\s \\: \\\\ \\r \\n).
+
+    An unknown escape keeps its character.
+    """
     out = []
     i = 0
     n = len(value)
@@ -38,8 +42,9 @@ def _unescape_tag(value: str) -> str:
 def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split body into TwitchDownloader fragments/emoticons from an `emotes` tag value.
 
-    Tag format: `25:0-4,12-16/1902:8-15`; character ranges are inclusive.
-    Returns ([fragments], [emoticons]); malformed/overlapping ranges are dropped.
+    Tag format: `25:0-4,12-16/1902:8-15`. Character ranges are inclusive.
+    The return value is ([fragments], [emoticons]). The parser drops malformed
+    and overlapping ranges.
     """
     if not emotes_tag:
         return [{"text": body}], []
@@ -83,9 +88,9 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
 class ChatRecorder:
     """Connects to Twitch IRC for one channel and accumulates comments until stopped.
 
-    The chat JSON target is only ever created via an atomic same-directory rename,
-    so a crash mid-write leaves at most an orphan `.tmp`; `stop()` is idempotent and
-    writes the file exactly once.
+    The app creates the chat JSON file only through an atomic same-directory
+    rename, so a crash mid-write leaves at most an orphan `.tmp` file. The
+    `stop()` method is idempotent and writes the file exactly once.
     """
 
     def __init__(
@@ -121,7 +126,7 @@ class ChatRecorder:
         return self._task
 
     async def stop(self) -> int:
-        """Cancel the run task, then finalize. Idempotent; writes the file once."""
+        """Cancel the run task, then finalize."""
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
@@ -178,7 +183,7 @@ class ChatRecorder:
                     if comment is not None:
                         self._comments.append(comment)
                         self._connected_once = True
-                # anything else (001/353/366/NOTICE/ROOMSTATE) is ignored
+                # ignore everything else (001/353/366/NOTICE/ROOMSTATE)
         finally:
             try:
                 writer.close()
@@ -211,7 +216,7 @@ class ChatRecorder:
             return None
         login = prefix[1:].split("!", 1)[0]
         if kind == "USERNOTICE":
-            body = _unescape_tag(body)  # system message: Twitch escapes \s etc.
+            body = _unescape_tag(body)  # Twitch escapes \s in these system messages
 
         try:
             ts = int(tags.get("tmi-sent-ts", 0))
@@ -270,11 +275,11 @@ class ChatRecorder:
         now_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             streamer_id = int(self._user_id) if self._user_id else 0
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             streamer_id = 0
-        # TDL convention (ChatDownloader.cs): live chat gets length/end from the
-        # last comment's offset; chatrender derives the render duration from
-        # video.end - video.start, so leaving them 0 renders a 0-second video.
+        # TDL convention (ChatDownloader.cs): live chat takes length/end from
+        # the last comment's offset. chatrender derives the render duration
+        # from video.end - video.start, so zeros render a 0-second video.
         if self._comments:
             end = self._comments[-1]["content_offset_seconds"]
         else:
@@ -293,12 +298,13 @@ class ChatRecorder:
             "video": {
                 "title": self._title,
                 "description": "",
-                # Sentinel "0": the GUI's chat-update preview takes the VOD
-                # branch (numeric id) and handles data.video == null gracefully.
-                # "" crashes long.Parse(""); null falls back to comments'
-                # content_id (channel login), and a bogus clip slug makes
-                # GetClipInfo return data.clip == null -> NullReferenceException
-                # in the GUI (TDL 1.56.5 PageChatUpdate).
+                # Sentinel id "0". In TDL 1.56.5 PageChatUpdate, the GUI's
+                # chat-update preview takes the VOD branch for a numeric id
+                # and handles data.video == null gracefully.
+                # "" crashes long.Parse(""). null makes the GUI fall back to
+                # the comments' content_id (the channel login). A bogus clip
+                # slug makes GetClipInfo return data.clip == null, which
+                # raises a NullReferenceException in the GUI.
                 "id": "0",
                 "created_at": self._start_z,
                 "start": 0.0,

@@ -39,7 +39,7 @@ extend-exclude = ["plugins"]   # dev-only plugin dir, not shipped in this repo
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501"]              # ruff-format wraps code; strings/URLs legitimately exceed
+ignore = ["E501"]              # ruff-format wraps code, but long strings and URLs legitimately exceed
 
 [tool.mypy]
 python_version = "3.14"
@@ -48,7 +48,7 @@ mypy_path = "src"
 files = ["src/stream_archive"]
 plugins = ["pydantic.mypy"]
 ignore_missing_imports = true
-warn_return_any = false        # untyped third-party APIs (streamlink/httpx) return Any; avoid noise in glue code
+warn_return_any = false        # avoids Any noise from untyped streamlink/httpx APIs
 show_error_codes = true
 
 [[tool.mypy.overrides]]

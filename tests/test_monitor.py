@@ -231,7 +231,7 @@ def test_clean_end_skips_restart_until_offline(caplog):
     assert rec.started == []  # no restart while the API still reports live
     assert "ended cleanly, awaiting offline event" in caplog.text
 
-    # The offline event clears the live flag; a later online event starts fresh.
+    # The offline event clears the live flag. A later online event then starts fresh.
     asyncio.run(mon.handle_offline("kick:xqc", config))
     assert rec.stopped == ["kick:xqc"]
     asyncio.run(mon.handle_online("kick:xqc", "T", "G", None, config))
@@ -622,8 +622,11 @@ def test_kick_only_config_skips_twitch_api():
 
 
 def test_partial_resolve_keeps_unresolved_live_channel():
-    """A Helix resolve returning a subset must not read unresolved-but-live
-    channels as offline: the sweep stops only channels it actually resolved."""
+    """A subset resolve must not treat unresolved live channels as offline.
+
+    When Helix resolves only some configured channels, the sweep stops only
+    the channels it actually resolved.
+    """
     rec = FakeRecorder()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch1": "u1"})
     mon = make_monitor(recorder=rec)

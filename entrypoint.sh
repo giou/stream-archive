@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runs the app as the data-dir owner so recorded files stay manageable on the
-# host regardless of the host user's uid/gid (docker-compose mounts the data
-# dir at /data). USER_UID/USER_GID force a specific identity; without a data
-# dir (plain `docker run`) the image user is kept.
+# Runs the app as the data-dir owner so the host user can manage recorded
+# files regardless of their uid/gid (docker-compose mounts the data dir at
+# /data). USER_UID/USER_GID force a specific identity. Without a data dir
+# (plain `docker run`) the image user is kept.
 set -eu
 
 DATA_DIR="${STREAM_ARCHIVE_DATA:-/data}"
@@ -17,7 +17,7 @@ fi
 if [ -n "$uid" ]; then
     [ -n "$gid" ] || gid="$uid"
     # setpriv (util-linux) switches to arbitrary numeric ids without a
-    # passwd entry; --clear-groups drops any supplementary groups.
+    # passwd entry. --clear-groups drops any supplementary groups.
     exec setpriv --reuid="$uid" --regid="$gid" --clear-groups "$@"
 fi
 

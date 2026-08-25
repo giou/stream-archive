@@ -17,7 +17,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube"]
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Serves the OAuth redirect; captures the code into server.auth_code."""
+    """Serves the OAuth redirect and stores the code on server.auth_code."""
 
     def do_GET(self) -> None:
         query = parse_qs(urlparse(self.path).query)
@@ -74,8 +74,8 @@ def main() -> None:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
 
-    # Local callback server: when the browser can reach localhost the code is
-    # captured automatically; otherwise the user pastes the redirect URL.
+    # When the browser can reach localhost, the callback server captures
+    # the code automatically. Otherwise the user pastes the redirect URL.
     server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)  # port 0 -> free port
     server.auth_code = None  # type: ignore[attr-defined]
     flow.redirect_uri = f"http://localhost:{server.server_address[1]}/"
@@ -85,7 +85,8 @@ def main() -> None:
     print("1. Open this URL in your browser (trying to open it automatically):")
     print(f"   {auth_url}")
     with contextlib.suppress(Exception):
-        webbrowser.open(auth_url)  # headless/SSH: the printed URL is the fallback    print()
+        webbrowser.open(auth_url)  # headless/SSH: the printed URL is the fallback
+    print()
     print("2. Authorize the app. Google redirects you to a local page.")
     print("   - If it shows 'Authorization successful!', return here and press Enter.")
     print("   - If the page fails to load (SSH/Docker/headless), copy the FULL")

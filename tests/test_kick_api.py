@@ -182,9 +182,9 @@ def test_list_event_subscriptions_filters_foreign_app():
     api = make_api(handler)
     result = asyncio.run(api.list_event_subscriptions())
 
-    # Fail-closed: only subscriptions provably owned by this app are returned;
-    # a missing app_id is never assumed to be ours (the reconcile deletes
-    # subscriptions for unmonitored broadcasters).
+    # Fail closed. Return only subscriptions provably owned by this app, and
+    # never treat a missing app_id as ours. Reconcile deletes subscriptions
+    # for unmonitored broadcasters.
     assert [s["id"] for s in result] == ["ours-1"]
 
 
@@ -387,7 +387,7 @@ def test_get_public_key_keeps_cache_on_malformed_response():
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(200, json={"data": {"public_key": pem}})
-        return httpx.Response(200, json={})  # malformed 200: no data at all
+        return httpx.Response(200, json={})  # malformed 200 response without any data
 
     api = make_api(handler)
 

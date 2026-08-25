@@ -22,7 +22,7 @@ from pydantic import (
 logger = logging.getLogger(__name__)
 
 _CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_]{0,24}$")
-_KICK_CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,24}$")  # slug: 1-25 chars, alnum start, then alnum/_/-
+_KICK_CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,24}$")  # slug: 1-25 chars, starts alphanumeric, then alphanumeric/_/-
 _PROXY_RE = re.compile(r"^(https?|httpproxy)://")
 
 KICK_PREFIX = "kick:"
@@ -36,7 +36,7 @@ def is_kick_channel(channel: str) -> bool:
 
 
 def bare_name(channel: str) -> str:
-    """Channel identity without the platform prefix (kick:xqc -> xqc)."""
+    """Channel identity without the platform prefix, for example kick:xqc -> xqc."""
     for prefix in (KICK_PREFIX, TWITCH_PREFIX):
         if channel.startswith(prefix):
             return channel[len(prefix) :]
@@ -48,7 +48,7 @@ def kick_bare_name(channel: str) -> str:
 
 
 def channel_url(channel: str) -> str:
-    """Public profile URL used in notifications."""
+    """Return the public profile URL for notifications."""
     return (
         f"https://kick.com/{bare_name(channel)}"
         if is_kick_channel(channel)
@@ -57,11 +57,12 @@ def channel_url(channel: str) -> str:
 
 
 def normalize_channel_name(name: str) -> str | None:
-    """Canonical monitored-channel identity; None when invalid.
+    """Canonical monitored-channel identity, or None when invalid.
 
-    Accepts bare names, platform-prefixed names, and profile URLs. Canonical
-    form is prefixed: bare/twitch:<x>/https://twitch.tv/x -> twitch:<x>;
-    kick:<x>/https://kick.com/x -> kick:<x.lower()>."""
+    Accepts bare names, platform-prefixed names, and profile URLs. The
+    canonical form carries a platform prefix. bare, twitch:<x>, and
+    https://twitch.tv/x map to twitch:<x>. kick:<x> and
+    https://kick.com/x map to kick:<x.lower()>."""
     name = name.strip()
     if name.startswith(("http://", "https://")):
         try:
@@ -191,7 +192,7 @@ class AppConfig(BaseModel):
     """Typed, validated view of config.json.
 
     All optional settings carry the same defaults the dict-based validator
-    applied; required keys missing from the file fail validation with a
+    applied. Required keys missing from the file fail validation with a
     pydantic.ValidationError (a ValueError subclass).
     """
 
@@ -277,7 +278,7 @@ class AppConfig(BaseModel):
     def _valid_timezone(cls, v: str) -> str:
         try:
             ZoneInfo(v)
-        except ZoneInfoNotFoundError, KeyError:
+        except (ZoneInfoNotFoundError, KeyError):
             raise ValueError(f"Invalid timezone: {v!r}") from None
         return v
 
@@ -302,11 +303,13 @@ _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[tuple[Any, ...], str]]:
-    """Resolve ``${ENV_VAR}`` in every string value; returns (data, placeholders).
+    """Resolve ``${ENV_VAR}`` references in every string value.
 
-    ``placeholders`` maps each interpolated value's config path to its original
-    text, so ``save_config`` can restore it and never write resolved secrets.
-    A missing variable raises ValueError naming the variable and config key.
+    Returns ``(data, placeholders)``. ``placeholders`` maps each
+    interpolated value's config path to its original text, so
+    ``save_config`` restores the placeholder and never writes resolved
+    secrets. A missing variable raises ValueError naming the variable
+    and the config key.
     """
 
     placeholders: dict[tuple[Any, ...], str] = {}
@@ -362,9 +365,9 @@ def get_config(path: Path | None = None) -> AppConfig:
 
     data, placeholders = _interpolate_env(raw)
     cfg = AppConfig.model_validate(data)
-    # Absolutize so relative settings (recordings/, chat/, tokens, state) resolve
-    # against the config's directory regardless of the process cwd — in Docker
-    # the config lives in the mounted data dir.
+    # Absolutize so relative settings (recordings/, chat/, tokens, state)
+    # resolve against the config directory regardless of the process cwd.
+    # In Docker the config lives inside the mounted data dir.
     cfg._workdir = config_path.parent.resolve()
     cfg._config_path = config_path.resolve()
     cfg._env_placeholders = placeholders
@@ -372,32 +375,29 @@ def get_config(path: Path | None = None) -> AppConfig:
 
 
 def save_config(config: AppConfig) -> None:
-    """Validate and atomically write config to the file it was loaded from."""
+    """Validate the config and atomically write it to its source file."""
     validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
     data = validated.model_dump()
     for key_path, raw in list(config._env_placeholders.items()):
         try:
             current = _get_at(data, key_path)
         except KeyError, IndexError, TypeError:
-            # Placeholder recorded under a key pydantic dropped (extra='ignore'):
-            # nothing left in the output to mask — drop the tracker instead of
-            # aborting this and every future save.
+            # Pydantic dropped the key (extra='ignore'), so the output has
+            # no value left to mask. Drop the tracker entry instead of
+            # failing this save and every later save.
             del config._env_placeholders[key_path]
             continue
-        # Restore the ${VAR} placeholder only while the live value still equals
-        # its env interpolation (untouched secret -> stays masked on disk).
-        # Anything else is a deliberate bot-persisted literal: write it and
-        # stop masking, so saves no longer silently revert edits to ${VAR}.
         try:
             resolved = _ENV_RE.sub(lambda m: os.environ[m.group(1)], raw)
         except Exception:
-            resolved = None  # env var vanished since load: keep masking, don't persist a guess
+            resolved = None  # env var vanished since load: mask rather than guess
         if resolved is None or current == resolved:
-            # Untouched value (still equal to its interpolation), or the env
-            # var vanished since load: keep masking either way.
+            # Untouched value, or an interpolation we can no longer compute:
+            # write the ${VAR} placeholder back so the secret never reaches disk.
             _set_at(data, key_path, raw)
         else:
-            # Deliberate bot-persisted literal: write it and stop masking.
+            # Deliberate bot-persisted literal: write it and drop the tracker
+            # so later saves keep this value instead of reverting it to ${VAR}.
             del config._env_placeholders[key_path]
     config_path = config._config_path
     tmp = Path(str(config_path) + ".tmp")
@@ -416,7 +416,10 @@ def save_config(config: AppConfig) -> None:
 
 
 def reload_config(config: AppConfig) -> None:
-    """Re-read config.json from disk into the live instance; raises ValueError on any failure."""
+    """Re-read config.json from disk into the live instance.
+
+    Raises ValueError on any failure.
+    """
     try:
         _replace_in_place(config, get_config(config._config_path))
     except json.JSONDecodeError as e:
@@ -426,9 +429,10 @@ def reload_config(config: AppConfig) -> None:
 
 
 def _replace_in_place(target: AppConfig, source: AppConfig) -> None:
-    """Copy source's state onto target without changing target's object identity.
+    """Copy source's state onto target without changing target's identity.
 
-    Every module holds the same config instance; swaps must keep that identity.
+    Every module holds the same config instance. A reload must replace
+    the state while keeping that object identity.
     """
     for name in type(target).model_fields:
         object.__setattr__(target, name, getattr(source, name))

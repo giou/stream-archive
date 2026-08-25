@@ -16,16 +16,17 @@ class ChatOutputMixin:
     _recordings: dict[str, dict[str, Any]]
 
     async def _finalize_chat(self, channel: str, chat_recorder: Any) -> None:
-        """Fire-and-forget chat finalize for the failure path; never raises."""
+        """Finalize chat after a failure. The method logs errors and never raises."""
         try:
             await chat_recorder.stop()
         except Exception as e:
             logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
 
     async def stop_chat(self, channel: str, platform: str | None = None) -> None:
-        """Stop and finalize chat capture for an active recording; the video continues.
+        """Stop and finalize chat capture for an active recording.
 
-        platform=None stops both; "twitch" only the IRC recorder; "kick" only kick chat.
+        The video itself keeps recording. platform=None stops both recorders,
+        "twitch" stops only the IRC recorder, and "kick" stops only kick chat.
         """
         entry = self._recordings.get(channel)
         if entry is None:
@@ -43,18 +44,19 @@ class ChatOutputMixin:
     async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None:
         """Append one normalized kick chat message to the active recording's buffer.
 
-        No-op when the channel is not being recorded (webhook delivery is
-        best-effort and there is no replay).
+        The method does nothing when nobody records the channel. Kick webhook
+        delivery is best-effort, and there is no replay.
         """
         entry = self._recordings.get(channel)
         if entry is not None and entry.get("kick_chat") is not None:
             entry["kick_chat"]["messages"].append(payload)
 
     async def _finalize_kick_chat(self, entry: dict[str, Any]) -> None:
-        """Write the collected kick chat buffer atomically; skip when empty.
+        """Write the collected kick chat buffer atomically to its target path.
 
-        Output is TwitchDownloader ChatRoot JSON with embedded emote images
-        (see kick_chat.build_chat_root / embed_kick_emotes).
+        The method skips empty buffers. The output file is TwitchDownloader
+        ChatRoot JSON with embedded emote images (see kick_chat.build_chat_root
+        and embed_kick_emotes).
         """
         kick_chat = entry.pop("kick_chat", None)
         if kick_chat is None or not kick_chat.get("messages"):

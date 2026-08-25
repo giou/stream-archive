@@ -15,10 +15,10 @@ WELCOME_TIMEOUT = 30
 
 
 class EventSubClient:
-    """EventSub over a single conduit WebSocket shard, authenticated with the app token.
+    """EventSub over one conduit WebSocket shard, authenticated with the app token.
 
-    Drives the monitor's handle_online/handle_offline entry points; the Helix poll
-    in scheduler.py remains the reconciliation/fallback path.
+    The client calls the monitor's handle_online and handle_offline entry points.
+    The Helix poll in scheduler.py stays as the reconciliation and fallback path.
     """
 
     def __init__(self, twitch_api: Any, monitor: Any, config: AppConfig):
@@ -37,8 +37,9 @@ class EventSubClient:
         self._subscribed = False
         self._ws: Any = None
         self._task: asyncio.Task[Any] | None = None
-        # Strong refs to in-flight dispatch tasks; CPython GCs unreferenced
-        # tasks, which would silently drop a live/offline event mid-flight.
+        # Hold strong refs to in-flight dispatch tasks. The CPython GC drops
+        # unreferenced tasks, which would silently discard a live/offline
+        # event mid-flight.
         self._dispatch_tasks: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
@@ -174,12 +175,12 @@ class EventSubClient:
             return
         except websockets.ConnectionClosed as e:
             if e.code == 4007:
-                # 4007 is Twitch's normal server-initiated reconnect (the
-                # session_reconnect message precedes it); not a fault.
+                # Code 4007 is Twitch's normal server-initiated reconnect.
+                # Twitch sends the session_reconnect message before it.
                 logger.info("[eventsub] reconnect requested by Twitch (code=4007)")
             elif e.code == 1006:
-                # Abnormal closure; happens during Twitch deploys. The
-                # reconnect/backoff loop recovers on its own.
+                # Abnormal closure. Twitch deploys cause this often. The
+                # reconnect and backoff loop recovers on its own.
                 logger.warning("[eventsub] connection closed abnormally (code=1006), reconnecting")
             else:
                 logger.error("[eventsub] connection closed (code=%s), reconnecting", e.code)
@@ -192,7 +193,10 @@ class EventSubClient:
                     await ws.close()
 
     async def _ensure_conduit(self) -> bool:
-        """Delete existing conduits (cascade removes their subscriptions) and create one."""
+        """Delete every existing conduit, then create one.
+
+        Deleting a conduit also deletes its subscriptions.
+        """
         try:
             for conduit in await self._api.list_conduits():
                 await self._api.delete_conduit(conduit["id"])
@@ -264,7 +268,7 @@ class EventSubClient:
                     and s["condition"].get("broadcaster_user_id") == self._user_ids.get(channel)
                 )
                 self._subs.setdefault(channel, {})[kind] = existing["id"]
-            except StopIteration, KeyError:
+            except (StopIteration, KeyError):
                 logger.error("[eventsub] could not resolve existing subscription id for %s", channel)
         elif status in (400, 403):
             logger.error("[eventsub] subscription rejected for %s (%s); channel relies on polling", channel, status)

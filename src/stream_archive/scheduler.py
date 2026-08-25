@@ -46,8 +46,7 @@ async def _healthz(request: web.Request) -> web.Response:
 async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_PORT) -> web.AppRunner | None:
     """Loopback-only liveness endpoint for the container HEALTHCHECK.
 
-    Binding failure is non-fatal: an absent /healthz just means no
-    healthcheck, never a broken app.
+    If the bind fails, the app logs a warning and runs without a healthcheck.
     """
     app = web.Application()
     app.router.add_get("/healthz", _healthz)
@@ -87,8 +86,8 @@ async def run_scheduler() -> None:
     health_runner = await _start_health_server()
 
     # Constructed unconditionally so a live /mode youtube|both always has a
-    # streamer available; it only stores paths and creates an httpx client.
-    # Missing youtube_token.json is handled per-task in _stream_youtube.
+    # streamer available. It only stores paths and creates an httpx client.
+    # A missing youtube_token.json is handled per task in _stream_youtube.
     youtube_streamer = YouTubeStreamer(config)
     logger.info("YouTube streaming enabled (privacy: %s)", config.youtube.privacy_status)
 
@@ -120,7 +119,6 @@ async def run_scheduler() -> None:
     )
     await telegram.start()
 
-    # Startup notification: monitored channels + current version.
     version = _installed_app_version() or "unknown"
     await notifier.notify_startup(config.channels, version)
     await eventsub.wait_ready(timeout=15)
@@ -166,7 +164,10 @@ async def run_scheduler() -> None:
 
 
 def main() -> None:
-    """Console entry point (``stream-archive``): logging setup + run loop."""
+    """Console entry point for ``stream-archive``.
+
+    Sets up logging and runs the scheduler.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
