@@ -747,7 +747,7 @@ def test_quality_audio_only_conflict_cancel_changes_nothing(tmp_path):
     result = asyncio.run(ctrl.handle_callback(f"cancel:{nonce}"))
     assert result is not None
     assert read_file(tmp_path) == before
-    # A cancelled prompt can never be confirmed later.
+    # The bot never confirms a prompt that the admin cancelled.
     assert asyncio.run(ctrl.handle_callback(f"audio_confirm:{nonce}")) is None
     assert read_file(tmp_path) == before
 

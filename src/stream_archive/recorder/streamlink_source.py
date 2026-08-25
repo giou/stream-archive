@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 class _AudioOnlyStream:
     """Wraps a stream so open() yields lossless audio-only fragmented MP4.
 
-    Used for every audio_only recording: on Twitch it remuxes the native
-    audio-only HLS rendition; on Kick it strips video from a regular
-    rendition when the streamlink plugin has no audio_only variant. A pump
-    thread feeds the source bytes into ffmpeg (-c:a copy, no re-encode).
-    Consumers read the filtered output exactly like a plain streamlink fd
-    (read/close only).
+    Every audio_only recording uses this wrapper. On Twitch it remuxes
+    the native audio-only HLS rendition. On Kick it removes the video
+    track from a regular rendition because the plugin has no audio_only
+    variant. A pump thread feeds the source bytes into ffmpeg
+    (-c:a copy, no re-encode). Consumers read the output like a plain
+    streamlink fd (read/close only).
     """
 
     def __init__(self, inner: Any) -> None:
@@ -184,13 +184,14 @@ class StreamlinkMixin:
         if quality == AUDIO_ONLY_QUALITY:
             native = streams.get("audio_only")
             if native is not None:
-                # Native rendition is AAC inside MPEG-TS: remux it losslessly
-                # to fragmented MP4 so the recording lands as .m4a.
+                # The native rendition carries AAC inside MPEG-TS. This remux
+                # keeps the audio lossless and gives the file the .m4a format.
                 best = _AudioOnlyStream(native)
             else:
-                # Plugin has no native audio-only rendition (Kick): pull the
-                # 480p variant and let ffmpeg strip the video track. Fallback
-                # is best, never worst: worst lowers the audio bitrate.
+                # The Kick plugin has no native audio-only rendition. Take the
+                # 480p variant and let ffmpeg remove the video track. The
+                # fallback is best, never worst, because worst lowers the
+                # audio bitrate.
                 base = streams.get("480p") or streams.get("best")
                 if base is None:
                     raise PluginError("No stream available for audio-only extraction")

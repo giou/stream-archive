@@ -21,7 +21,8 @@ class SettingsCommands:
     _recorder: Any
     _eventsub: Any
     _kick_webhook: Any
-    # nonce -> (quality mutation, affected channels) awaiting the admin's choice.
+    # Maps a nonce to its quality mutation and the affected channels.
+    # The admin must confirm before the change applies.
     _pending_audio_switch: dict[str, tuple[Callable[[AppConfig], Any], list[str]]]
 
     def handle_retention(self, args: list[str]) -> str:
@@ -101,9 +102,9 @@ class SettingsCommands:
         )
 
     def _probe_quality_change(self, mutate: Callable[[AppConfig], Any]) -> tuple[list[str], BaseException | None]:
-        """Run a quality mutation on a throwaway copy without saving.
+        """Run a quality change on a temporary copy without saving.
 
-        Returns the conflicting channels, or the validation error from an
+        Returns the conflicting channels, or the validation error for an
         invalid value. Nothing touches config.json.
         """
         probe = self._config.model_copy(deep=True)
@@ -114,7 +115,7 @@ class SettingsCommands:
         return self._audio_conflicts(probe), None
 
     def _gate_quality(self, mutate: Callable[[AppConfig], Any], conflicts: list[str]) -> str | None:
-        """Stash a pending audio-only switch when the change would conflict."""
+        """Stores a pending audio-only switch when the change creates a conflict."""
         if not conflicts:
             return None
         nonce = secrets.token_hex(4)

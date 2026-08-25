@@ -849,7 +849,7 @@ def test_resolve_stream_audio_only_kick_falls_back_to_best(tmp_path, monkeypatch
     monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s_best})
     best, _, _, _ = rec._resolve_stream("kick:xqc", None, None)
     assert isinstance(best, _AudioOnlyStream)
-    assert best._inner is s_best  # best keeps the full audio bitrate; never worst
+    assert best._inner is s_best  # best keeps the full audio bitrate. worst lowers it.
 
 
 def test_resolve_stream_audio_only_kick_demux_uses_480p(tmp_path, monkeypatch):
@@ -885,8 +885,8 @@ def test_audio_only_stream_remuxes_to_fragmented_mp4(tmp_path):
     fd.close()
     data = b"".join(chunks)
     assert data  # ffmpeg produced audio-only output
-    assert data[4:8] == b"ftyp"  # MP4 container, not raw TS/ADTS
-    assert b"moof" in data  # fragmented: survives truncation mid-recording
+    assert data[4:8] == b"ftyp"  # output is MP4, not raw TS or ADTS
+    assert b"moof" in data  # fragments keep a truncated file playable
 
     out = tmp_path / "out.m4a"
     out.write_bytes(data)
@@ -906,9 +906,8 @@ def test_audio_only_stream_remuxes_to_fragmented_mp4(tmp_path):
     )
     assert probe.stdout.strip() == b"aac"
 
-    # A crash-truncated file must stay playable: empty_moov puts the header
-    # first and frag_duration keeps cutting fragments even without video
-    # keyframes.
+    # A crash-truncated file must stay playable. empty_moov puts the header
+    # first. frag_duration cuts new fragments even without video keyframes.
     half = tmp_path / "half.m4a"
     half.write_bytes(data[: len(data) // 2])
     probe_half = subprocess.run(

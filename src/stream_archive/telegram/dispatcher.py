@@ -775,7 +775,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         if action == "cancel" and len(parts) == 2:
             if data in self._confirm_done:  # double-tap on the same message
                 return None
-            self._pending_audio_switch.pop(parts[1], None)  # a cancelled choice can never be confirmed later
+            self._pending_audio_switch.pop(parts[1], None)  # deletion here makes a later confirm press harmless
             self._confirm_done.add(data)
             return "Cancelled \u2014 nothing changed", None
         if action == "confirm_remove" and len(parts) >= 3:
@@ -816,7 +816,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 return None
             audio_pending = self._pending_audio_switch.pop(parts[1], None)
             if audio_pending is None:
-                return None  # stale message: already handled or bot restarted
+                return None  # the message is stale: the bot handled it or restarted
             self._confirm_done.add(data)
             self._apply_warnings_sent.discard(parts[1])
             quality_mutate, channels = audio_pending
