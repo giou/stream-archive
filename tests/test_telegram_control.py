@@ -419,6 +419,13 @@ def test_deferred_affected_quality_change(tmp_path):
     assert _deferred_affected_channels(cfg, rec) == ["twitch:ch", "twitch:channel1"]
 
 
+def test_deferred_affected_per_channel_quality_override(tmp_path):
+    cfg = _load_config(tmp_path)
+    cfg.channel_preferred_qualities = {"twitch:ch": "1080p"}
+    rec = _recordings(["twitch:ch", "twitch:channel1"])  # both snapshots report quality best
+    assert _deferred_affected_channels(cfg, rec) == ["twitch:ch"]
+
+
 def test_deferred_affected_chat_twitch_enable(tmp_path):
     cfg = _load_config(tmp_path)
     cfg.record_chat = True
@@ -676,7 +683,11 @@ def test_quality_show_set_invalid(tmp_path):
     assert text == "Quality set to 720p"
     assert read_file(tmp_path)["preferred_quality"] == "720p"
     assert config.preferred_quality == "720p"
-    assert ctrl.handle_quality(["a", "b"]) == "Usage: /quality <best|1080p|720p|...>"
+    assert "\u274c Invalid channel name" in ctrl.handle_quality(["bad name!", "720p"])
+    assert (
+        ctrl.handle_quality(["twitch:ch", "720p", "extra"])
+        == "Usage: /quality <best|1080p|720p|...> or /quality <channel> <quality|default>"
+    )
 
 
 def test_quality_empty_rejected(tmp_path):
@@ -684,6 +695,60 @@ def test_quality_empty_rejected(tmp_path):
     before = read_file(tmp_path)
     text = ctrl.handle_quality([""])
     assert text.startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_quality_per_channel_persists_and_resets(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text = ctrl.handle_quality(["twitch:channel1", "720p"])
+    assert text == "Quality for twitch:channel1 set to 720p"
+    assert read_file(tmp_path)["channel_preferred_qualities"] == {"twitch:channel1": "720p"}
+    text = ctrl.handle_quality(["twitch:channel1", "default"])
+    assert text == "Quality for twitch:channel1 reset to global (best)"
+    assert read_file(tmp_path)["channel_preferred_qualities"] == {}
+
+
+def test_quality_audio_only_conflict_confirm_applies_both_overrides(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.output_mode = "youtube"
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    before = read_file(tmp_path)
+    text = ctrl.handle_quality(["twitch:channel1", "audio_only"])
+    assert "output mode to disk" in text
+    # Nothing is saved while the choice is pending.
+    assert read_file(tmp_path) == before
+    asyncio.run(ctrl._maybe_send_apply_warnings())
+    assert bot.send_message.await_count == 1
+    kwargs = bot.send_message.await_args.kwargs
+    assert "audio-only" in kwargs["text"].lower()
+    buttons = kwargs["reply_markup"].to_dict()["inline_keyboard"][0]
+    nonce = buttons[0]["callback_data"].split(":")[1]
+    assert buttons[0]["callback_data"] == f"audio_confirm:{nonce}"
+    assert buttons[1]["callback_data"] == f"cancel:{nonce}"
+    result = asyncio.run(ctrl.handle_callback(f"audio_confirm:{nonce}"))
+    assert result is not None
+    saved = read_file(tmp_path)
+    assert saved["channel_preferred_qualities"]["twitch:channel1"] == "audio_only"
+    assert saved["channel_output_modes"]["twitch:channel1"] == "disk"
+    # Double-tap guard: a second identical press does nothing.
+    assert asyncio.run(ctrl.handle_callback(f"audio_confirm:{nonce}")) is None
+
+
+def test_quality_audio_only_conflict_cancel_changes_nothing(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    bot = unittest.mock.AsyncMock()
+    config.output_mode = "youtube"
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    before = read_file(tmp_path)
+    text = ctrl.handle_quality(["twitch:channel1", "audio_only"])
+    assert "output mode to disk" in text
+    nonce = next(iter(ctrl._pending_audio_switch))
+    result = asyncio.run(ctrl.handle_callback(f"cancel:{nonce}"))
+    assert result is not None
+    assert read_file(tmp_path) == before
+    # A cancelled prompt can never be confirmed later.
+    assert asyncio.run(ctrl.handle_callback(f"audio_confirm:{nonce}")) is None
     assert read_file(tmp_path) == before
 
 
@@ -756,7 +821,7 @@ def test_disk_show_block(tmp_path):
 def test_help_lists_new_commands(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text = ctrl.handle_help()
-    assert "/quality [value]" in text
+    assert "/quality [channel] <value|default>" in text
     assert "/maxrecordings <n>" in text
     assert "/maxyoutube <n>" in text
     assert "/disk <maxsize|delete_oldest> <value>" in text
@@ -958,8 +1023,7 @@ def test_reply_keyboard_root_layout(tmp_path):
         [{"text": "Chat recording"}, {"text": "Output mode"}],
         [{"text": "Quality"}, {"text": "Retention"}],
         [{"text": "Max recordings"}, {"text": "Max YouTube"}],
-        [{"text": "Disk"}],
-        [{"text": "Kick webhook"}],
+        [{"text": "Disk"}, {"text": "Kick webhook"}],
     ]
     assert d["resize_keyboard"] is True
 
@@ -967,21 +1031,21 @@ def test_reply_keyboard_root_layout(tmp_path):
 def test_reply_keyboard_channels_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1", "twitch:ch"])
     assert ctrl.reply_keyboard("channels").to_dict()["keyboard"] == [
+        [{"text": "Back"}],
         [{"text": "Add channel"}],
         [{"text": "\u2022 twitch:channel1"}],
         [{"text": "\u2022 twitch:ch"}],
-        [{"text": "Back"}],
     ]
 
 
 def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"] == [
-        [{"text": "Delete channel"}],
+        [{"text": "Back"}],
         [{"text": "Mode: disk"}, {"text": "Mode: youtube"}],
         [{"text": "Mode: both"}, {"text": "Mode: default"}],
-        [{"text": "Hold delay"}],
-        [{"text": "Back"}],
+        [{"text": "Hold delay"}, {"text": "Quality"}],
+        [{"text": "Delete channel"}],
     ]
 
 
@@ -989,7 +1053,7 @@ def test_reply_text_navigates_to_channels(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text, markup = asyncio.run(ctrl.handle_reply_text("Channels"))
     assert "Channels (1): twitch:channel1" in text
-    assert kb_labels(markup) == ["Add channel", "\u2022 twitch:channel1", "Back"]
+    assert kb_labels(markup) == ["Back", "Add channel", "\u2022 twitch:channel1"]
     assert ctrl._menu == "channels"
 
 
@@ -1229,8 +1293,7 @@ def test_reply_text_back_navigation(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Channels"))
     asyncio.run(ctrl.handle_reply_text("\u2022 twitch:channel1"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
-    assert ctrl._menu == "channels"
-    assert kb_labels(markup) == ["Add channel", "\u2022 twitch:channel1", "Back"]
+    assert kb_labels(markup) == ["Back", "Add channel", "\u2022 twitch:channel1"]
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert ctrl._menu == "root"
     assert kb_labels(markup) == ROOT_LABELS

@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import subprocess
 import time
 import types
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from streamlink.exceptions import NoStreamsError, PluginError
 
 from stream_archive.config import AppConfig
 from stream_archive.recorder import Recorder, _sanitize_filename
+from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +131,7 @@ def test_start_success(tmp_path, monkeypatch):
         assert await rec.start("ch") is True
         assert "ch" in rec._recordings
         assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
+        assert rec._recordings["ch"]["filepath"].endswith(".ts")
         await rec.stop("ch")
 
     asyncio.run(scenario())
@@ -759,15 +762,18 @@ def seed_recording(path, mtime):
 def test_cleanup_removes_old_keeps_new(tmp_path):
     rec = Recorder(make_config(tmp_path))
     old = tmp_path / "recordings" / "ch" / "old.ts"
+    old_audio = tmp_path / "recordings" / "ch" / "old.m4a"
     new = tmp_path / "recordings" / "ch" / "new.ts"
     t = time.time() - 3 * 86400
     seed_recording(old, t)
+    seed_recording(old_audio, t)
     seed_recording(new, time.time())
 
     removed = asyncio.run(rec.cleanup_old_recordings(2))
 
-    assert removed == 1
+    assert removed == 2
     assert not old.exists()
+    assert not old_audio.exists()
     assert new.exists()
 
 
@@ -809,6 +815,137 @@ def test_resolve_stream_preferred_quality(tmp_path, monkeypatch):
     rec._config.preferred_quality = "1080p"
     best, _, _, _ = rec._resolve_stream("ch", None, None)
     assert best is s1
+
+
+def test_resolve_stream_per_channel_quality(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    s1, s2 = FakeStream(), FakeStream()
+
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s1, "480p": s2})
+    rec._config.channel_preferred_qualities = {"twitch:ch": "480p"}
+    best, _, _, _ = rec._resolve_stream("twitch:ch", None, None)
+    assert best is s2
+
+
+def test_resolve_stream_audio_only_twitch_native(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    s_best, s_audio = FakeStream(), FakeStream()
+    rec._config.preferred_quality = "audio_only"
+
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FakePlugin, url))
+    monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s_best, "audio_only": s_audio})
+    best, _, _, _ = rec._resolve_stream("ch", None, None)
+    assert isinstance(best, _AudioOnlyStream)
+    assert best._inner is s_audio
+
+
+def test_resolve_stream_audio_only_kick_falls_back_to_best(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    s_best = FakeStream()
+    rec._config.preferred_quality = "audio_only"
+
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("kick", FakePlugin, url))
+    monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s_best})
+    best, _, _, _ = rec._resolve_stream("kick:xqc", None, None)
+    assert isinstance(best, _AudioOnlyStream)
+    assert best._inner is s_best  # best keeps the full audio bitrate; never worst
+
+
+def test_resolve_stream_audio_only_kick_demux_uses_480p(tmp_path, monkeypatch):
+    rec = Recorder(make_config(tmp_path))
+    s_best, s_480p = FakeStream(), FakeStream()
+    rec._config.preferred_quality = "audio_only"
+
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("kick", FakePlugin, url))
+    monkeypatch.setattr(FakePlugin, "streams", lambda self: {"best": s_best, "480p": s_480p})
+    best, _, _, _ = rec._resolve_stream("kick:xqc", None, None)
+    assert isinstance(best, _AudioOnlyStream)
+    assert best._inner is s_480p
+
+
+def test_audio_only_stream_remuxes_to_fragmented_mp4(tmp_path):
+    gen = subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "aac", "-f", "adts", "pipe:1"],
+        check=True,
+        capture_output=True,
+    )
+
+    class AdtsSource:
+        def open(self):
+            return io.BytesIO(gen.stdout)
+
+    fd = _AudioOnlyStream(AdtsSource()).open()
+    chunks = []
+    while True:
+        chunk = fd.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    fd.close()
+    data = b"".join(chunks)
+    assert data  # ffmpeg produced audio-only output
+    assert data[4:8] == b"ftyp"  # MP4 container, not raw TS/ADTS
+    assert b"moof" in data  # fragmented: survives truncation mid-recording
+
+    out = tmp_path / "out.m4a"
+    out.write_bytes(data)
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(out),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert probe.stdout.strip() == b"aac"
+
+    # A crash-truncated file must stay playable: empty_moov puts the header
+    # first and frag_duration keeps cutting fragments even without video
+    # keyframes.
+    half = tmp_path / "half.m4a"
+    half.write_bytes(data[: len(data) // 2])
+    probe_half = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(half),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert float(probe_half.stdout.strip()) > 0
+    assert fd._proc.poll() is not None  # close() reaped the process
+
+
+def test_start_audio_only_forces_disk_mode(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    config.channel_preferred_qualities = {"twitch:ch": "audio_only"}
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    assert rec._effective_mode("twitch:ch") == "disk"
+
+    async def scenario():
+        assert await rec.start("twitch:ch") is True
+        entry = rec._recordings["twitch:ch"]
+        assert entry["mode"] == "disk"
+        assert entry["quality"] == "audio_only"
+        assert entry["filepath"].endswith(".m4a")
+
+    asyncio.run(scenario())
 
 
 def test_start_records_mode_and_started_at(tmp_path, monkeypatch):
@@ -1002,7 +1139,7 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
     base = tmp_path / "recordings" / "ch"
     base.mkdir(parents=True, exist_ok=True)
     t0 = time.time() - 100
-    for i, name in enumerate(["old.ts", "mid.ts", "new.ts"]):
+    for i, name in enumerate(["old.m4a", "mid.ts", "new.ts"]):
         p = base / name
         p.write_bytes(b"x" * 1024)
         os.utime(p, (t0 + i, t0 + i))
@@ -1011,7 +1148,7 @@ def test_delete_oldest_to_cap_deletes_oldest(tmp_path):
 
     assert removed == 1
     assert freed == 1024
-    assert not (base / "old.ts").exists()
+    assert not (base / "old.m4a").exists()
     assert (base / "mid.ts").exists()
     assert (base / "new.ts").exists()
 

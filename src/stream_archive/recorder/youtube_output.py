@@ -162,7 +162,7 @@ class YoutubeOutputMixin:
         proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=10)
-        except (TimeoutError, ProcessLookupError):
+        except TimeoutError, ProcessLookupError:
             try:
                 proc.kill()
                 await proc.wait()
@@ -338,7 +338,7 @@ class YoutubeOutputMixin:
                 try:
                     process.terminate()
                     await asyncio.wait_for(process.wait(), timeout=10)
-                except (TimeoutError, ProcessLookupError):
+                except TimeoutError, ProcessLookupError:
                     try:
                         process.kill()
                         await process.wait()

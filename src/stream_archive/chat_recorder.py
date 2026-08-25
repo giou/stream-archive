@@ -275,7 +275,7 @@ class ChatRecorder:
         now_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             streamer_id = int(self._user_id) if self._user_id else 0
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             streamer_id = 0
         # TDL convention (ChatDownloader.cs): live chat takes length/end from
         # the last comment's offset. chatrender derives the render duration

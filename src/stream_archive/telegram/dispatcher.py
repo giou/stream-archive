@@ -25,6 +25,7 @@ from telegram.ext import (
 from stream_archive.config import (
     AppConfig,
     _replace_in_place,
+    effective_quality,
     is_kick_channel,
     save_config,
 )
@@ -51,7 +52,7 @@ def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, 
     for ch, rec in recordings.items():
         if (
             rec.get("output_mode") != new.channel_output_modes.get(ch, new.output_mode)
-            or rec.get("preferred_quality") != new.preferred_quality
+            or rec.get("preferred_quality") != effective_quality(new, ch)
             or (not is_kick_channel(ch) and new.record_chat and not rec.get("record_chat"))
             or (is_kick_channel(ch) and new.kick.record_chat and not rec.get("kick_record_chat"))
         ):
@@ -76,6 +77,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
     _confirm_done: set[str]
     _pending_apply: dict[str, tuple[str, list[str]]]
     _apply_warnings_sent: set[str]
+    _pending_audio_switch: dict[str, tuple[Callable[[AppConfig], Any], list[str]]]
     _cloudflared: Any
     _cloudflared_drain: Any
 
@@ -104,6 +106,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         self._cloudflare_hostname = None  # hostname picked during the named-tunnel flow
         self._confirm_done = set()  # callback_data already confirmed (double-tap guard)
         self._pending_apply = {}  # nonce -> (summary, channels) awaiting apply-now confirmation
+        self._pending_audio_switch = {}  # nonce -> (quality mutation, channels) awaiting audio-only confirm
         self._apply_warnings_sent = set()  # nonces already messaged to the admin
         self._cloudflared = None  # running cloudflared subprocess (quick or named)
         self._cloudflared_drain = None
@@ -122,7 +125,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             BotCommand("reload", "Re-read config.json from disk"),
             BotCommand("restart", "Restart the service"),
             BotCommand("update", "Check for and apply updates"),
-            BotCommand("quality", "Show or set preferred quality"),
+            BotCommand("quality", "Show or set quality (global or per-channel)"),
             BotCommand("maxrecordings", "Set concurrent recording limit"),
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
@@ -236,6 +239,28 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             except Exception:
                 logger.warning("[telegram] Failed to send apply-now warning", exc_info=True)
 
+        for nonce in list(self._pending_audio_switch):
+            if nonce in self._apply_warnings_sent:
+                continue
+            channels = self._pending_audio_switch[nonce][1]
+            text = (
+                f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(channels)}\n"
+                "Audio-only cannot be restreamed to YouTube."
+            )
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Confirm", callback_data=f"audio_confirm:{nonce}"),
+                        InlineKeyboardButton("Cancel", callback_data=f"cancel:{nonce}"),
+                    ],
+                ]
+            )
+            try:
+                await self._app.bot.send_message(chat_id=self._admin_id, text=text, reply_markup=markup)
+                self._apply_warnings_sent.add(nonce)
+            except Exception:
+                logger.warning("[telegram] Failed to send audio-only warning", exc_info=True)
+
     def reply_keyboard(self, menu: str = "root", channel: str | None = None) -> ReplyKeyboardMarkup:
         """Reply-keyboard rows for ``menu``. Button labels are the routing literals."""
         if menu == "root":
@@ -244,21 +269,22 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 ["Chat recording", "Output mode"],
                 ["Quality", "Retention"],
                 ["Max recordings", "Max YouTube"],
-                ["Disk"],
-                ["Kick webhook"],
+                ["Disk", "Kick webhook"],
             ]
         elif menu == "channels":
-            rows = [["Add channel"], *([f"\u2022 {ch}"] for ch in self._config.channels), ["Back"]]
+            rows = [["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in self._config.channels)]
         elif menu == "channel":
             rows = [
-                ["Delete channel"],
+                ["Back"],
                 ["Mode: disk", "Mode: youtube"],
                 ["Mode: both", "Mode: default"],
-                ["Hold delay"],
-                ["Back"],
+                ["Hold delay", "Quality"],
+                ["Delete channel"],
             ]
         elif menu == "channel_hold":
             rows = [["0 (off)", "30s", "60s", "120s"], ["300s", "600s", "Default"], ["Custom", "Back"]]
+        elif menu == "channel_quality":
+            rows = [["best", "1080p", "720p"], ["480p", "360p", "audio_only"], ["Default"], ["Back"]]
         elif menu == "chat":
             rows = [["Twitch", "Kick"], ["Back"]]
         elif menu in ("chat_twitch", "chat_kick"):
@@ -266,7 +292,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         elif menu == "mode":
             rows = [["disk", "youtube", "both"], ["Back"]]
         elif menu == "quality":
-            rows = [["best", "1080p", "720p"], ["480p", "360p"], ["Back"]]
+            rows = [["best", "1080p", "720p"], ["480p", "360p", "audio_only"], ["Back"]]
         elif menu == "retention":
             rows = [["1 day", "3 days", "7 days"], ["14 days", "30 days", "Off"], ["Custom", "Back"]]
         elif menu in ("maxrec", "maxyt"):
@@ -341,14 +367,13 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             ch = channel or ""
             override = c.channel_output_modes.get(ch)
             mode = override or f"default (global: {c.output_mode})"
+            q_override = c.channel_preferred_qualities.get(ch)
+            quality_text = q_override or f"default (global: {c.preferred_quality})"
             hold_override = c.channel_youtube_hold_seconds.get(ch)
             hold_text = (
                 f"{hold_override:g}s" if hold_override is not None else f"default (global: {c.youtube.hold_seconds:g}s)"
             )
-            return (
-                f"Channel: {ch}\nOutput mode: {mode}\nHold delay: {hold_text}\n\n"
-                "Tap Delete to remove it, or set its output mode or hold delay."
-            )
+            return f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}"
         if menu == "channel_hold":
             ch = channel or ""
             hold_override = c.channel_youtube_hold_seconds.get(ch)
@@ -359,6 +384,14 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 "When the source stream stops, the broadcast stays open this long, waiting for the "
                 "streamer to return \u2014 a return within the delay reuses the same broadcast instead "
                 "of creating a new one."
+            )
+        if menu == "channel_quality":
+            ch = channel or ""
+            q_override = c.channel_preferred_qualities.get(ch)
+            return (
+                f"Recording quality for {ch}: "
+                f"{q_override or f'default (global: {c.preferred_quality})'}\n\n"
+                "audio_only records sound only; it forces output to disk (no YouTube re-stream)."
             )
         if menu == "chat":
             kick_chat = c.kick.record_chat
@@ -374,7 +407,12 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         if menu == "mode":
             return f"Output mode: {c.output_mode}. Choose:"
         if menu == "quality":
-            return f"Quality: {c.preferred_quality}. Choose:"
+            text = f"Quality: {c.preferred_quality}. Choose:"
+            if c.channel_preferred_qualities:
+                text += "\nPer-channel: " + ", ".join(
+                    f"{ch} \u2192 {q}" for ch, q in sorted(c.channel_preferred_qualities.items())
+                )
+            return text
         if menu == "retention":
             return f"Retention: {c.retention_days} day(s) (0 = disabled). Choose:"
         if menu == "maxrec":
@@ -425,6 +463,7 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                     "add_channel": "channels",
                     "channel": "channels",
                     "channel_hold": "channel",
+                    "channel_quality": "channel",
                     "chat": "root",
                     "chat_twitch": "chat",
                     "chat_kick": "chat",
@@ -543,6 +582,9 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
             if text == "Hold delay":
                 self._menu = "channel_hold"
                 return await self.menu_text("channel_hold", ch), self.reply_keyboard("channel_hold")
+            if text == "Quality":
+                self._menu = "channel_quality"
+                return await self.menu_text("channel_quality", ch), self.reply_keyboard("channel_quality")
             values = {
                 "Mode: disk": "disk",
                 "Mode: youtube": "youtube",
@@ -574,6 +616,18 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 self._custom_setting, self._menu = "channel_hold", "custom"
                 return await self.menu_text("custom"), self.reply_keyboard("custom")
             return None
+        if menu == "channel_quality":
+            ch = self._menu_channel
+            if ch is None:
+                return None
+            if text == "Default":
+                result = self.handle_quality([ch, "default"])
+            elif text in _QUALITY_PRESETS:
+                result = self.handle_quality([ch, text])
+            else:
+                return None
+            self._menu = "channel"
+            return result, self.reply_keyboard("channel")
         if menu == "chat":
             if text in ("Twitch", "Kick"):
                 self._menu = "chat_twitch" if text == "Twitch" else "chat_kick"
@@ -712,15 +766,16 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
         Return ``(reply_text, markup)`` on success or ``None`` for an unknown
         or already handled press. Wire format (from ``_confirm_keyboard``):
         ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Apply-now
-        warnings use ``apply_now:<nonce>``. The nonce makes every confirm
-        message's buttons unique, so the double-tap guard covers only the
-        same message.
+        warnings use ``apply_now:<nonce>``, audio-only switches use
+        ``audio_confirm:<nonce>``. The nonce makes every confirm message's
+        buttons unique, so the double-tap guard covers only the same message.
         """
         parts = data.split(":")
         action = parts[0]
         if action == "cancel" and len(parts) == 2:
             if data in self._confirm_done:  # double-tap on the same message
                 return None
+            self._pending_audio_switch.pop(parts[1], None)  # a cancelled choice can never be confirmed later
             self._confirm_done.add(data)
             return "Cancelled \u2014 nothing changed", None
         if action == "confirm_remove" and len(parts) >= 3:
@@ -756,6 +811,28 @@ class TelegramController(ChannelsCommands, SettingsCommands, WebhookCommands, Sy
                 ok = await self._recorder.restart(ch)
                 lines.append(f"{ch}: {'restarted with the new settings' if ok else 'no longer recording'}")
             return f"\u2705 Applied: {summary}\n" + "\n".join(lines), None
+        if action == "audio_confirm" and len(parts) == 2:
+            if data in self._confirm_done:
+                return None
+            audio_pending = self._pending_audio_switch.pop(parts[1], None)
+            if audio_pending is None:
+                return None  # stale message: already handled or bot restarted
+            self._confirm_done.add(data)
+            self._apply_warnings_sent.discard(parts[1])
+            quality_mutate, channels = audio_pending
+
+            def combined(candidate: AppConfig) -> None:
+                quality_mutate(candidate)
+                live = set(candidate.channels)
+                for ch in channels:
+                    if ch in live:
+                        candidate.channel_output_modes[ch] = "disk"
+
+            result = self._apply(
+                combined,
+                lambda c: f"Quality set to audio_only; output mode disk for {', '.join(channels)}",
+            )
+            return result, None
         return None
 
     async def _on_callback(self, update: Any, context: Any) -> None:

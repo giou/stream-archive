@@ -87,7 +87,7 @@ class DiskOutputMixin:
             logger.error("[recorder] [%s] watchdog error: %s", channel, e)
 
     async def delete_oldest_to_cap(self) -> tuple[int, int]:
-        """Delete the oldest .ts files until under disk.max_total_gb.
+        """Delete the oldest recordings until under disk.max_total_gb.
 
         Returns (files_removed, freed_gb).
         """
@@ -106,7 +106,7 @@ class DiskOutputMixin:
             if not base.exists():
                 return (0, 0)
             stats = []
-            for p in base.rglob("*.ts"):
+            for p in disk.iter_recordings(base):
                 try:
                     st = p.stat()
                 except OSError:
@@ -131,7 +131,7 @@ class DiskOutputMixin:
         return await loop.run_in_executor(None, _delete_oldest)
 
     async def cleanup_old_recordings(self, retention_days: float) -> int:
-        """Delete .ts and .chat.json files older than retention_days days.
+        """Delete recordings (.ts/.m4a) and .chat.json files older than retention_days days.
 
         Returns the number of files removed.
         """
@@ -151,7 +151,7 @@ class DiskOutputMixin:
         def _scan() -> list[Path]:
             found: list[Path] = []
             if base.exists():
-                for path in base.rglob("*.ts"):
+                for path in disk.iter_recordings(base):
                     if os.path.realpath(path) in active:
                         continue
                     try:

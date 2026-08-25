@@ -28,10 +28,16 @@ def chat_dir_path(config: AppConfig) -> Path:
     return d
 
 
+def iter_recordings(base: Path):
+    """Yield every recording under base: legacy .ts plus audio-only .m4a."""
+    yield from base.rglob("*.ts")
+    yield from base.rglob("*.m4a")
+
+
 async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
     """Collect filesystem usage and recordings directory totals.
 
-    The slow .ts scan runs in the default executor.
+    The slow recordings scan runs in the default executor.
     """
     loop = asyncio.get_running_loop()
     base = recording_dir_path(config)
@@ -42,7 +48,7 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
 
         def _scan() -> tuple[int, int]:
             total, n = 0, 0
-            for p in base.rglob("*.ts"):
+            for p in iter_recordings(base):
                 try:
                     total += p.stat().st_size
                     n += 1

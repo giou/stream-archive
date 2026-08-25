@@ -268,7 +268,7 @@ class EventSubClient:
                     and s["condition"].get("broadcaster_user_id") == self._user_ids.get(channel)
                 )
                 self._subs.setdefault(channel, {})[kind] = existing["id"]
-            except (StopIteration, KeyError):
+            except StopIteration, KeyError:
                 logger.error("[eventsub] could not resolve existing subscription id for %s", channel)
         elif status in (400, 403):
             logger.error("[eventsub] subscription rejected for %s (%s); channel relies on polling", channel, status)

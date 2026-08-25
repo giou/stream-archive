@@ -14,9 +14,11 @@ from streamlink.session.session import Streamlink
 from stream_archive import disk
 from stream_archive.chat_recorder import ChatRecorder
 from stream_archive.config import (
+    AUDIO_ONLY_QUALITY,
     AppConfig,
     bare_name,
     channel_url,
+    effective_quality,
     is_kick_channel,
     kick_bare_name,
 )
@@ -94,7 +96,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         a finally block once start() has registered or failed.
         """
         async with self._reserve_lock:
-            mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
+            mode = self._effective_mode(channel)
             max_rec = self._config.max_concurrent_recordings
             if max_rec > 0 and len(self._recordings) + len(self._reserved_channels) >= max_rec:
                 return f"concurrent recording limit reached ({max_rec}/{max_rec})"
@@ -111,6 +113,19 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     def release_start(self, channel: str) -> None:
         """Drop a reservation made by reserve_start (idempotent)."""
         self._reserved_channels.pop(channel, None)
+
+    def _effective_mode(self, channel: str) -> str:
+        """Effective output mode for a channel, with the audio-only guard.
+
+        An audio-only stream cannot feed a YouTube re-stream. Channels with an
+        audio-only quality always record to disk. This is also the safety net
+        for manual config.json edits and for config changes made while the
+        bot was down.
+        """
+        mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
+        if mode != "disk" and effective_quality(self._config, channel) == AUDIO_ONLY_QUALITY:
+            return "disk"
+        return mode
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
         if channel not in self._locks:
@@ -129,8 +144,14 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if channel in self._recordings:
             return True
 
-        mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
-        self._load_plugin()
+        raw_mode = self._config.channel_output_modes.get(channel, self._config.output_mode)
+        mode = self._effective_mode(channel)
+        if raw_mode != mode:
+            logger.warning(
+                "[recorder] [%s] audio_only selected but output mode is %s — recording to disk instead",
+                channel,
+                raw_mode,
+            )
         loop = asyncio.get_running_loop()
 
         try:
@@ -170,7 +191,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             entry["title"] = title
             entry["game"] = game
             entry["user_id"] = user_id
-            entry["quality"] = self._config.preferred_quality
+            entry["quality"] = effective_quality(self._config, channel)
             tasks = []
             live_url = channel_url(channel)
 
@@ -180,7 +201,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             if mode in ("disk", "both"):
                 recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
                 os.makedirs(recording_dir, exist_ok=True)
-                filename = f"{safe_title}-{now}.ts"
+                extension = ".m4a" if entry["quality"] == AUDIO_ONLY_QUALITY else ".ts"
+                filename = f"{safe_title}-{now}{extension}"
                 filepath = os.path.join(recording_dir, filename)
                 entry["filepath"] = filepath
 

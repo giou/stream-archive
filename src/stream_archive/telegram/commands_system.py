@@ -25,11 +25,11 @@ class SystemCommands:
             "/reload - re-read config.json\n"
             "/restart - restart the service\n"
             "/update - check for updates (apply by pulling the image)\n"
-            "/quality [value] - preferred stream quality (best, 1080p, 720p, ...)\n"
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
-            "/disk - show disk limits\n"
+            "/quality [channel] <value|default> - preferred stream quality (best, 1080p, ..., audio_only; per-channel override)\n"
             "/disk <maxsize|delete_oldest> <value> - set disk limit\n"
+            "/disk - show disk limits\n"
             "/chat [on|off] [twitch|kick] - enable or disable live chat recording (add twitch or kick for one platform; off stops in-flight capture)\n"
             "/settings - open the settings menu (reply keyboard buttons)\n"
             "/start - this help"
@@ -50,6 +50,12 @@ class SystemCommands:
         if overrides:
             per_channel = (
                 "Per-channel output: " + ", ".join(f"{k} \u2192 {v}" for k, v in sorted(overrides.items())) + "\n"
+            )
+        q_overrides = c.channel_preferred_qualities
+        per_channel_q = ""
+        if q_overrides:
+            per_channel_q = (
+                "Per-channel quality: " + ", ".join(f"{ch} \u2192 {q}" for ch, q in sorted(q_overrides.items())) + "\n"
             )
         rec_parts = []
         for info in active:
@@ -74,6 +80,7 @@ class SystemCommands:
             f"Channels ({len(c.channels)}): {', '.join(c.channels)}\n"
             f"Output mode: {c.output_mode}\n"
             f"{per_channel}"
+            f"{per_channel_q}"
             f"{retention}\n"
             f"Chat recording: {chat_state}\n"
             f"Kick chat recording: {'enabled' if k.record_chat else 'disabled'}\n"

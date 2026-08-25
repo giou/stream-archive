@@ -20,6 +20,7 @@
     "output_mode": "disk",
     "channel_output_modes": {},
     "channel_youtube_hold_seconds": {},
+    "channel_preferred_qualities": {},
     "eventsub": {
         "enabled": true
     },

@@ -1,18 +1,127 @@
 import logging
 import os
+import subprocess
+import threading
+from contextlib import suppress
 from typing import Any
 
 from streamlink.exceptions import NoStreamsError, PluginError
 from streamlink.session.session import Streamlink
 
 from stream_archive.config import (
+    AUDIO_ONLY_QUALITY,
     AppConfig,
     bare_name,
     channel_url,
+    effective_quality,
     is_kick_channel,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _AudioOnlyStream:
+    """Wraps a stream so open() yields lossless audio-only fragmented MP4.
+
+    Used for every audio_only recording: on Twitch it remuxes the native
+    audio-only HLS rendition; on Kick it strips video from a regular
+    rendition when the streamlink plugin has no audio_only variant. A pump
+    thread feeds the source bytes into ffmpeg (-c:a copy, no re-encode).
+    Consumers read the filtered output exactly like a plain streamlink fd
+    (read/close only).
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def open(self) -> Any:
+        src = self._inner.open()
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-i",
+                    "pipe:0",
+                    "-vn",
+                    "-c:a",
+                    "copy",
+                    "-bsf:a",
+                    "aac_adtstoasc",
+                    "-f",
+                    "ipod",
+                    "-movflags",
+                    "+empty_moov+default_base_moof",
+                    "-frag_duration",
+                    "2000000",
+                    "pipe:1",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except BaseException:
+            with suppress(BaseException):
+                src.close()
+            raise
+
+        stdin = proc.stdin
+        stdout = proc.stdout
+        stderr = proc.stderr
+        assert stdin is not None and stdout is not None and stderr is not None
+
+        def pump() -> None:
+            try:
+                while True:
+                    chunk = src.read(65536)
+                    if not chunk:
+                        break
+                    stdin.write(chunk)
+            except BrokenPipeError, OSError, ValueError:
+                pass  # ffmpeg died. The consumer sees stdout EOF.
+            finally:
+                with suppress(BaseException):
+                    stdin.close()
+                with suppress(BaseException):
+                    src.close()
+
+        def drain_stderr() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                text = line.decode(errors="replace").strip()
+                if text:
+                    logger.warning("[recorder] [audio-filter] %s", text)
+
+        threading.Thread(target=pump, daemon=True, name="audio-filter-pump").start()
+        threading.Thread(target=drain_stderr, daemon=True, name="audio-filter-stderr").start()
+        return _PipedFd(proc)
+
+
+class _PipedFd:
+    """read()/close() facade over ffmpeg stdout. close() reaps the process."""
+
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        self._proc = proc
+        stdout = proc.stdout
+        assert stdout is not None
+        self._stdout = stdout
+
+    def read(self, size: int) -> bytes | None:
+        return self._stdout.read(size)
+
+    def close(self) -> None:
+        with suppress(BaseException):
+            self._stdout.close()
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                with suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=5)
 
 
 class StreamlinkMixin:
@@ -70,8 +179,24 @@ class StreamlinkMixin:
                     proxies = proxies[1:]
         if not streams:
             raise PluginError("No streams available")
-        quality = self._config.preferred_quality
-        best = streams.get(quality) or streams.get("best")
+        quality = effective_quality(self._config, channel)
+        best: Any
+        if quality == AUDIO_ONLY_QUALITY:
+            native = streams.get("audio_only")
+            if native is not None:
+                # Native rendition is AAC inside MPEG-TS: remux it losslessly
+                # to fragmented MP4 so the recording lands as .m4a.
+                best = _AudioOnlyStream(native)
+            else:
+                # Plugin has no native audio-only rendition (Kick): pull the
+                # 480p variant and let ffmpeg strip the video track. Fallback
+                # is best, never worst: worst lowers the audio bitrate.
+                base = streams.get("480p") or streams.get("best")
+                if base is None:
+                    raise PluginError("No stream available for audio-only extraction")
+                best = _AudioOnlyStream(base)
+        else:
+            best = streams.get(quality) or streams.get("best")
         if best is None:
             raise PluginError(f"No '{quality}' or 'best' stream available")
         author = getattr(plugin, "author", None) or bare_name(channel)

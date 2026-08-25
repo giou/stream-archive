@@ -1,14 +1,18 @@
+import secrets
+from collections.abc import Callable
 from typing import Any, cast
 
 from stream_archive.config import (
+    AUDIO_ONLY_QUALITY,
     AppConfig,
     OutputMode,
+    effective_quality,
     is_kick_channel,
     normalize_channel_name,
     reload_config,
 )
 
-_QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p")
+_QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p", "audio_only")
 
 
 class SettingsCommands:
@@ -17,6 +21,8 @@ class SettingsCommands:
     _recorder: Any
     _eventsub: Any
     _kick_webhook: Any
+    # nonce -> (quality mutation, affected channels) awaiting the admin's choice.
+    _pending_audio_switch: dict[str, tuple[Callable[[AppConfig], Any], list[str]]]
 
     def handle_retention(self, args: list[str]) -> str:
         if len(args) != 1:
@@ -85,16 +91,93 @@ class SettingsCommands:
 
         return self._apply(set_hold, lambda c: f"Hold delay for {ch} set to {n}s (0 = end immediately)")
 
+    def _audio_conflicts(self, candidate: AppConfig) -> list[str]:
+        """Channels that would record audio-only into YouTube after this change."""
+        return sorted(
+            ch
+            for ch in candidate.channels
+            if effective_quality(candidate, ch) == AUDIO_ONLY_QUALITY
+            and candidate.channel_output_modes.get(ch, candidate.output_mode) != "disk"
+        )
+
+    def _probe_quality_change(self, mutate: Callable[[AppConfig], Any]) -> tuple[list[str], BaseException | None]:
+        """Run a quality mutation on a throwaway copy without saving.
+
+        Returns the conflicting channels, or the validation error from an
+        invalid value. Nothing touches config.json.
+        """
+        probe = self._config.model_copy(deep=True)
+        try:
+            mutate(probe)
+        except ValueError as e:
+            return [], e
+        return self._audio_conflicts(probe), None
+
+    def _gate_quality(self, mutate: Callable[[AppConfig], Any], conflicts: list[str]) -> str | None:
+        """Stash a pending audio-only switch when the change would conflict."""
+        if not conflicts:
+            return None
+        nonce = secrets.token_hex(4)
+        self._pending_audio_switch[nonce] = (mutate, conflicts)
+        return f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(conflicts)}"
+
     def handle_quality(self, args: list[str]) -> str:
+        c = self._config
         if not args:
-            return f"Quality: {self._config.preferred_quality}"
+            text = f"Quality: {c.preferred_quality}"
+            if c.channel_preferred_qualities:
+                text += "\nPer-channel: " + ", ".join(
+                    f"{ch} \u2192 {q}" for ch, q in sorted(c.channel_preferred_qualities.items())
+                )
+            return text
         if len(args) == 1:
             q = args[0]
-            return self._apply(
-                lambda candidate: setattr(candidate, "preferred_quality", q),
-                lambda candidate: f"Quality set to {q}",
-            )
-        return "Usage: /quality <best|1080p|720p|...>"
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.preferred_quality = q
+
+            conflicts, err = self._probe_quality_change(mutate)
+            if err is not None:
+                return f"\u274c {err}"
+            gated = self._gate_quality(mutate, conflicts)
+            if gated is not None:
+                return gated
+            return self._apply(mutate, lambda candidate: f"Quality set to {q}")
+        if len(args) == 2:
+            normalized = normalize_channel_name(args[0])
+            if normalized is None:
+                return (
+                    f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+                )
+            ch, q = normalized, args[1].lower()
+            if q == "default":
+
+                def mutate(candidate: AppConfig) -> None:
+                    candidate.channel_preferred_qualities.pop(ch, None)
+
+                # Resetting to global can create a conflict when the global
+                # quality is audio_only, so this path runs through the same gate.
+                conflicts, err = self._probe_quality_change(mutate)
+                if err is not None:
+                    return f"\u274c {err}"
+                gated = self._gate_quality(mutate, conflicts)
+                if gated is not None:
+                    return gated
+                return self._apply(
+                    mutate, lambda candidate: f"Quality for {ch} reset to global ({candidate.preferred_quality})"
+                )
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.channel_preferred_qualities[ch] = q
+
+            conflicts, err = self._probe_quality_change(mutate)
+            if err is not None:
+                return f"\u274c {err}"
+            gated = self._gate_quality(mutate, conflicts)
+            if gated is not None:
+                return gated
+            return self._apply(mutate, lambda candidate: f"Quality for {ch} set to {q}")
+        return "Usage: /quality <best|1080p|720p|...> or /quality <channel> <quality|default>"
 
     def handle_maxrecordings(self, args: list[str]) -> str:
         if not args:

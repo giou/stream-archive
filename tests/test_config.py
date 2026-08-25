@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from stream_archive.config import AppConfig, get_config, normalize_channel_name, save_config
+from stream_archive.config import AppConfig, effective_quality, get_config, normalize_channel_name, save_config
 
 
 def valid_config():
@@ -35,6 +35,7 @@ def test_valid_config_passes_and_sets_defaults():
     assert config.youtube.hold_seconds == 0
     assert config.channel_youtube_hold_seconds == {}
     assert config.retention_days == 0
+    assert config.channel_preferred_qualities == {}
     assert config.update_check.enabled is True
     assert config.update_check.interval_hours == 24
     assert config.update_check.check_app is True
@@ -92,6 +93,8 @@ def test_obsolete_disk_keys_are_dropped():
         lambda c: c.__setitem__("chat_dir", ""),
         lambda c: c.__setitem__("eventsub", {"enabled": "yes"}),
         lambda c: c.__setitem__("eventsub", 5),
+        lambda c: c.__setitem__("channel_preferred_qualities", {"bad!name": "720p"}),
+        lambda c: c.__setitem__("channel_preferred_qualities", {"kick:x": ""}),
     ],
 )
 def test_invalid_new_settings_raise(mutate):
@@ -165,9 +168,14 @@ def test_positive_retention_days_passes():
     assert config.retention_days == 7
 
 
-def test_valid_config_sets_channel_output_modes_default():
-    config = build()
-    assert config.channel_output_modes == {}
+def test_channel_quality_keys_normalized_and_effective_quality():
+    config = build(
+        channel_preferred_qualities={"channel1": "720p"},
+        preferred_quality="audio_only",
+    )
+    assert config.channel_preferred_qualities == {"twitch:channel1": "720p"}
+    assert effective_quality(config, "twitch:channel1") == "720p"
+    assert effective_quality(config, "twitch:other") == "audio_only"
 
 
 def test_valid_channel_output_modes_passes():

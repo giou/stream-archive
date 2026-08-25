@@ -26,7 +26,8 @@ commands over a Telegram bot.
 
 - One config for both platforms. Channels are identified as `twitch:<name>`
   or `kick:<slug>`.
-- Three output modes. `disk` writes `.ts` files to `recording_dir/<channel>/`.
+- Three output modes. `disk` writes recordings to `recording_dir/<channel>/`
+  (`.ts`, or `.m4a` for audio-only channels).
   `youtube` pipes the stream through ffmpeg to a YouTube broadcast. `both`
   runs disk and youtube together.
 - Live chat recording. The app saves Twitch IRC chat and Kick webhook chat as
@@ -53,8 +54,8 @@ commands over a Telegram bot.
 The scheduler runs the poll loop, signal handling, and retention cleanup.
 Each cycle the monitor compares the configured channels against the Twitch
 Helix API and the Kick API, then starts, stops, or restarts recording tasks.
-The recorder captures with streamlink, writes `.ts` files or pipes through
-ffmpeg to YouTube, and finalizes chat files and broadcasts when a task ends.
+The recorder captures with streamlink, writes `.ts`/`.m4a` files or pipes
+through ffmpeg to YouTube, and finalizes chat files and broadcasts when a task ends.
 The notifier sends Telegram messages.
 
 Two extra services feed the monitor directly. The EventSub client holds one
@@ -153,7 +154,7 @@ never written back. A config with placeholders is safe to commit or share.
 | `monitoring_interval` | yes | — | Poll interval in seconds, more than 0 |
 | `timezone` | yes | — | IANA timezone (for example `America/New_York`) used for filenames and timestamps |
 | `plugin_dir` | yes | — | Directory with the streamlink-ttvlol plugin. `/app/plugins` in Docker (baked into the image, read-only). Relative `plugins` for dev runs |
-| `recording_dir` | yes | — | Directory for `.ts` recordings |
+| `recording_dir` | yes | — | Directory for `.ts`/`.m4a` recordings |
 | `record_chat` | no | `true` | Record Twitch IRC chat alongside the video. Kick chat has its own flag |
 | `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`) |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
@@ -171,7 +172,8 @@ never written back. A config with placeholders is safe to commit or share.
 | `kick.webhook.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. Restored on boot |
 | `kick.webhook.setup_notified` | no | `false` | Internal: tracks the "webhook is working" confirmation for the current enable |
 | `retention_days` | no | `0` | Delete recordings older than this many days. `0` disables cleanup |
-| `preferred_quality` | no | `best` | Stream quality requested from streamlink (`best`, `1080p`, `720p`, …) |
+| `preferred_quality` | no | `best` | Stream quality requested from streamlink (`best`, `1080p`, `720p`, …, `audio_only`) |
+| `channel_preferred_qualities` | no | `{}` | Per-channel quality override, for example `{"channel": "720p"}`. Channels without an entry use `preferred_quality` |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` = unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams. `0` = unlimited |
 | `disk.max_total_gb` | no | `0` | Delete oldest recordings when the archive exceeds this size in GB. `0` disables the cap |
@@ -288,7 +290,7 @@ leaves memory and disk untouched.
 | `/reload` | Re-read `config.json` from disk and re-sync webhook/EventSub subscriptions |
 | `/restart` | Gracefully restart the service |
 | `/update` | Check for updates now (app, streamlink, plugin). Check-only: nothing is downloaded or applied. Apply an app update with `docker compose pull && docker compose up -d` |
-| `/quality [value]` | Show the preferred quality, or set it (`best`, `1080p`, `720p`, …) |
+| `/quality [channel] <value\|default>` | Show the preferred quality, or set it globally or per channel (`best`, `1080p`, `720p`, …, `audio_only`). `default` clears the per-channel override |
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
 | `/disk` | Show disk limits |
@@ -301,6 +303,15 @@ Notes:
   mode it started with. A per-channel override wins over the global
   `output_mode`. `/status` lists active overrides, and `/remove` clears the
   override of that channel.
+- `audio_only` records sound without video. On Twitch, streamlink supplies an
+  audio-only stream. On Kick, ffmpeg strips the video from the 480p stream.
+  YouTube does not accept an audio-only live stream. When you select
+  `audio_only` for a channel with `youtube` or `both` output, the bot asks
+  you to confirm. If you confirm, the bot sets the quality and switches the
+  output of that channel to `disk`. If you cancel, nothing changes. The
+  recorder also forces `disk` for audio-only channels as a safety net.
+  Audio-only recordings are saved as `.m4a`: ffmpeg remuxes the AAC track
+  into a fragmented MP4 without re-encoding.
 - The per-channel YouTube hold delay lives under
   `/settings → Channels → <channel> → Hold delay` (presets, `0` = off, or a
   custom value in seconds). `Default` clears the override back to the global

@@ -22,11 +22,14 @@ from pydantic import (
 logger = logging.getLogger(__name__)
 
 _CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_]{0,24}$")
-_KICK_CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,24}$")  # slug: 1-25 chars, starts alphanumeric, then alphanumeric/_/-
+_KICK_CHANNEL_RE = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,24}$"
+)  # slug: 1-25 chars, starts alphanumeric, then alphanumeric/_/-
 _PROXY_RE = re.compile(r"^(https?|httpproxy)://")
 
 KICK_PREFIX = "kick:"
 TWITCH_PREFIX = "twitch:"
+AUDIO_ONLY_QUALITY = "audio_only"
 
 OutputMode = Literal["disk", "youtube", "both"]
 
@@ -54,6 +57,11 @@ def channel_url(channel: str) -> str:
         if is_kick_channel(channel)
         else f"https://twitch.tv/{bare_name(channel)}"
     )
+
+
+def effective_quality(config: AppConfig, channel: str) -> str:
+    """Per-channel quality override, or the global preferred_quality."""
+    return config.channel_preferred_qualities.get(channel, config.preferred_quality)
 
 
 def normalize_channel_name(name: str) -> str | None:
@@ -215,6 +223,7 @@ class AppConfig(BaseModel):
     output_mode: OutputMode = "disk"
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, float] = {}
+    channel_preferred_qualities: dict[str, str] = {}
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
@@ -260,6 +269,19 @@ class AppConfig(BaseModel):
             normalized[norm] = mode
         return normalized
 
+    @field_validator("channel_preferred_qualities")
+    @classmethod
+    def _normalize_quality_keys(cls, v: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for ch, quality in v.items():
+            norm = normalize_channel_name(ch)
+            if norm is None:
+                raise ValueError(f"Invalid channel name in channel_preferred_qualities: {ch!r}")
+            if not quality.strip():
+                raise ValueError(f"channel_preferred_qualities.{ch} must be a non-empty quality string")
+            normalized[norm] = quality
+        return normalized
+
     @field_validator("channel_youtube_hold_seconds")
     @classmethod
     def _normalize_hold_keys(cls, v: dict[str, float]) -> dict[str, float]:
@@ -278,7 +300,7 @@ class AppConfig(BaseModel):
     def _valid_timezone(cls, v: str) -> str:
         try:
             ZoneInfo(v)
-        except (ZoneInfoNotFoundError, KeyError):
+        except ZoneInfoNotFoundError, KeyError:
             raise ValueError(f"Invalid timezone: {v!r}") from None
         return v
 

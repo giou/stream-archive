@@ -52,6 +52,7 @@ class ChannelsCommands:
             candidate.channels.remove(ch)
             candidate.channel_output_modes.pop(ch, None)
             candidate.channel_youtube_hold_seconds.pop(ch, None)
+            candidate.channel_preferred_qualities.pop(ch, None)
 
         result = self._apply(mutate, lambda c: f"Removed {ch} \u2014 {len(c.channels)} channel(s) monitored")
         if not result.startswith("\u274c") and self._recorder.is_recording(ch):
