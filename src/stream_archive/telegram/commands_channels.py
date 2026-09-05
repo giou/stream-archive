@@ -18,7 +18,7 @@ class ChannelsCommands:
     def handle_channels(self) -> str:
         return "\n".join(f"{i}. {ch}" for i, ch in enumerate(self._config.channels, 1))
 
-    async def handle_add(self, args: list[str]) -> str:
+    async def handle_add(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
             return "Usage: /add <channel>"
         ch = normalize_channel_name(args[0])
@@ -27,10 +27,13 @@ class ChannelsCommands:
 
         def mutate(candidate: AppConfig) -> None:
             if ch in candidate.channels:
-                raise ValueError(f"{ch} is already monitored")
+                msg = f"{ch} is already monitored"
+                raise ValueError(msg)
             candidate.channels.append(ch)
 
-        result = self._apply(mutate, lambda c: f"Added {ch} \u2014 {len(c.channels)} channel(s) monitored")
+        result: str = self._apply(
+            mutate, lambda c: f"Added {ch} \u2014 {len(c.channels)} channel(s) monitored", chat_id
+        )
         if not result.startswith("\u274c"):
             if is_kick_channel(ch):
                 if self._kick_webhook:
@@ -39,7 +42,7 @@ class ChannelsCommands:
                 await self._eventsub.add_channel(ch)
         return result
 
-    async def handle_remove(self, args: list[str]) -> str:
+    async def handle_remove(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
             return "Usage: /remove <channel>"
         ch = normalize_channel_name(args[0])
@@ -48,13 +51,16 @@ class ChannelsCommands:
 
         def mutate(candidate: AppConfig) -> None:
             if ch not in candidate.channels:
-                raise ValueError(f"{ch} is not in the monitored list")
+                msg = f"{ch} is not in the monitored list"
+                raise ValueError(msg)
             candidate.channels.remove(ch)
             candidate.channel_output_modes.pop(ch, None)
             candidate.channel_youtube_hold_seconds.pop(ch, None)
             candidate.channel_preferred_qualities.pop(ch, None)
 
-        result = self._apply(mutate, lambda c: f"Removed {ch} \u2014 {len(c.channels)} channel(s) monitored")
+        result: str = self._apply(
+            mutate, lambda c: f"Removed {ch} \u2014 {len(c.channels)} channel(s) monitored", chat_id
+        )
         if not result.startswith("\u274c") and self._recorder.is_recording(ch):
             await self._recorder.stop(ch)
             self._monitor.remove_channel(ch)

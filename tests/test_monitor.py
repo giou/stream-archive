@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import httpx
+
 from stream_archive import monitor as monitor_module
 from stream_archive.config import AppConfig
 from stream_archive.monitor import Monitor
@@ -270,7 +272,8 @@ def test_unknown_user_stream_is_skipped():
 
 def test_transient_api_error_does_not_raise_or_act():
     rec = FakeRecorder()
-    api = FakeTwitchAPI(error=RuntimeError("boom"), user_ids={"ch": "u1"})
+    msg = "boom"
+    api = FakeTwitchAPI(error=httpx.ConnectError(msg), user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
     config = make_config()
 
@@ -282,7 +285,8 @@ def test_transient_api_error_does_not_raise_or_act():
 
 def test_twitch_api_failure_keeps_live_recordings():
     rec = FakeRecorder()
-    api = FakeTwitchAPI(error=RuntimeError("helix down"), user_ids={"ch": "u1"})
+    msg = "helix down"
+    api = FakeTwitchAPI(error=httpx.ConnectError(msg), user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
     config = make_config()
     mon._live_channels.add("twitch:ch")

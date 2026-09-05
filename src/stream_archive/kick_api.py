@@ -33,12 +33,17 @@ class KickAPI:
     EVENTS_SUBS_URL = "https://api.kick.com/public/v1/events/subscriptions"
     MAX_SLUGS_PER_REQUEST = 50
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, http: httpx.AsyncClient | None = None):
         kick = config.kick
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10, connect=5),
-            headers={"User-Agent": _USER_AGENT},
+        self.client = (
+            http
+            if http is not None
+            else httpx.AsyncClient(
+                timeout=httpx.Timeout(10, connect=5),
+                headers={"User-Agent": _USER_AGENT},
+            )
         )
+        self._owns_client = http is None
         self._client_id = kick.client_id
         self._client_secret = kick.client_secret
         self._token: str | None = None
@@ -63,7 +68,8 @@ class KickAPI:
             if resp is not None and (resp.status_code not in _RETRY_STATUSES or attempt == _MAX_ATTEMPTS - 1):
                 return resp
             await asyncio.sleep(_RETRY_DELAYS[attempt])
-        raise RuntimeError("unreachable")
+        msg = "unreachable"
+        raise RuntimeError(msg)
 
     async def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self._get_token()}"}
@@ -92,10 +98,11 @@ class KickAPI:
                 data = resp.json()
                 self._token = data["access_token"]
                 self._token_expires_at = time.time() + data.get("expires_in", 3600)
-                return self._token
             except httpx.HTTPStatusError as e:
                 logger.error("[kick_api] Token request failed: %s", e)
                 raise
+            else:
+                return self._token
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]:
         """Map slug to {title, game, is_live, broadcaster_user_id}.
@@ -175,7 +182,8 @@ class KickAPI:
             },
         )
         resp.raise_for_status()
-        return resp.json()["data"]
+        items: list[dict[str, Any]] = resp.json()["data"]
+        return items
 
     async def delete_event_subscriptions(self, ids: list[str]) -> None:
         if not ids:
@@ -189,4 +197,5 @@ class KickAPI:
         resp.raise_for_status()
 
     async def close(self) -> None:
-        await self.client.aclose()
+        if self._owns_client:
+            await self.client.aclose()

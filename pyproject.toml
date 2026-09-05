@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stream-archive"
-version = "1.1.1"
+version = "1.1.2"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
@@ -31,15 +31,23 @@ packages = ["src/stream_archive"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py314"
 extend-exclude = ["plugins"]   # dev-only plugin dir, not shipped in this repo
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501"]              # ruff-format wraps code, but long strings and URLs legitimately exceed
+select = ["E", "F", "I", "UP", "B", "SIM", "TRY", "EM", "RUF100", "TID"]
+ignore = [
+    "E501",  # ruff-format wraps code, but long strings and URLs legitimately exceed
+    # Validation raises carry messages by design (config validators, notifier): message-less raises hide the cause.
+    "TRY003",
+    # logger.error with exc_info keeps the call-site level: exception() forces ERROR level name only.
+    "TRY400",
+    # Boolean/coercion validators raise ValueError uniformly: callers catch ValueError, not TypeError.
+    "TRY004",
+]
 
 [tool.mypy]
 python_version = "3.14"
@@ -47,18 +55,22 @@ strict = true
 mypy_path = "src"
 files = ["src/stream_archive"]
 plugins = ["pydantic.mypy"]
-ignore_missing_imports = true
-warn_return_any = false        # avoids Any noise from untyped streamlink/httpx APIs
+ignore_missing_imports = false
+warn_return_any = true
 show_error_codes = true
 
 [[tool.mypy.overrides]]
 module = ["google.*"]
 ignore_errors = true           # google-auth ships partial stubs with untyped methods
 
+[[tool.mypy.overrides]]
+module = ["google_auth_oauthlib.flow"]
+ignore_missing_imports = true  # no stubs or py.typed marker upstream
+
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
-    "ruff>=0.16.3",
+    "ruff>=0.16.6",
 ]

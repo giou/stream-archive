@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 class TwitchAPI:
-    def __init__(self, config: AppConfig):
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
+    def __init__(self, config: AppConfig, http: httpx.AsyncClient | None = None):
+        self.client = http if http is not None else httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
+        self._owns_client = http is None
         self._client_id = config.twitch_client_id
         self._client_secret = config.twitch_client_secret
         self._token: str | None = None
@@ -43,10 +44,11 @@ class TwitchAPI:
                 data = resp.json()
                 self._token = data["access_token"]
                 self._token_expires_at = time.time() + data.get("expires_in", 3600)
-                return self._token
             except httpx.HTTPStatusError as e:
                 logger.error("[twitch_api] Token request failed: %s", e)
                 raise
+            else:
+                return self._token
 
     async def resolve_user_ids(self, usernames: list[str]) -> dict[str, str]:
         if not usernames:
@@ -94,7 +96,8 @@ class TwitchAPI:
         headers = await self._eventsub_headers()
         resp = await self.client.get("https://api.twitch.tv/helix/eventsub/conduits", headers=headers)
         resp.raise_for_status()
-        return resp.json()["data"]
+        data: list[Any] = resp.json()["data"]
+        return data
 
     async def create_conduit(self, shard_count: int = 1) -> dict[str, Any]:
         headers = await self._eventsub_headers()
@@ -104,7 +107,8 @@ class TwitchAPI:
             json={"shard_count": shard_count},
         )
         resp.raise_for_status()
-        return resp.json()["data"][0]
+        conduit: dict[str, Any] = resp.json()["data"][0]
+        return conduit
 
     async def delete_conduit(self, conduit_id: str) -> None:
         """Delete a conduit. Deletion cascades to its subscriptions. Treats 404 as success."""
@@ -128,7 +132,8 @@ class TwitchAPI:
             },
         )
         resp.raise_for_status()
-        return resp.json()["data"][0]
+        shard: dict[str, Any] = resp.json()["data"][0]
+        return shard
 
     async def create_eventsub_subscription(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Create a subscription and return (status_code, body).
@@ -186,4 +191,5 @@ class TwitchAPI:
         return data[0] if data else None
 
     async def close(self) -> None:
-        await self.client.aclose()
+        if self._owns_client:
+            await self.client.aclose()

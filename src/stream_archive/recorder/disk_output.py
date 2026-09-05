@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import time
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +14,17 @@ from stream_archive.config import (
     is_kick_channel,
     kick_bare_name,
 )
+from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
 
 
 class DiskOutputMixin:
     _config: AppConfig
-    _recordings: dict[str, dict[str, Any]]
-    _abort: Any
+    _recordings: dict[str, Recording]
+    # Set by Recorder (core.py). Typed as the exact call shape so a
+    # signature drift fails type checks instead of failing at runtime.
+    _abort: Callable[[str, str], Coroutine[Any, Any, None]]
 
     def _channel_dir(self, channel: str) -> str:
         """Return the recording subdirectory (kick/<slug>, twitch/<name>, else bare)."""
@@ -99,10 +103,10 @@ class DiskOutputMixin:
         # Never unlink a recording that ffmpeg is still writing. The space
         # behind its open fd is reclaimed only at teardown, so deletion here
         # cannot touch the live capture.
-        active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
+        active = {os.path.realpath(fp) for e in self._recordings.values() if (fp := e.get("filepath"))}
 
         def _delete_oldest() -> tuple[int, int]:
-            base = disk.recording_dir_path(self._config)
+            base = disk.resolve_recording_dir(self._config)
             if not base.exists():
                 return (0, 0)
             stats = []
@@ -137,7 +141,7 @@ class DiskOutputMixin:
         """
         if retention_days <= 0:
             return 0
-        base = disk.recording_dir_path(self._config)
+        base = disk.resolve_recording_dir(self._config)
         chat_base = disk.chat_dir_path(self._config)
         if not base.exists() and not chat_base.exists():
             return 0
@@ -146,7 +150,7 @@ class DiskOutputMixin:
         # A stalled feed can sit past retention_days while still writing.
         # Never unlink that in-flight file. Its fd stays open, and removal
         # would cut off the live capture mid-write.
-        active = {os.path.realpath(e["filepath"]) for e in self._recordings.values() if e.get("filepath")}
+        active = {os.path.realpath(fp) for e in self._recordings.values() if (fp := e.get("filepath"))}
 
         def _scan() -> list[Path]:
             found: list[Path] = []

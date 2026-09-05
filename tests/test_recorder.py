@@ -180,7 +180,8 @@ class FakePlugin:
         self.options = options
 
     def streams(self):
-        raise AssertionError("streams() not scripted")
+        msg = "streams() not scripted"
+        raise AssertionError(msg)
 
 
 def _make_proxy_config(tmp_path, proxies):
@@ -199,7 +200,8 @@ def test_resolve_stream_tries_next_proxy_on_plugin_error(tmp_path, monkeypatch):
     def scripted_streams(self):
         calls.append(self.options["proxy-playlist"])
         if len(calls) == 1:
-            raise PluginError("proxy boom")
+            msg = "proxy boom"
+            raise PluginError(msg)
         return {"best": stream}
 
     monkeypatch.setattr(FakePlugin, "streams", scripted_streams)
@@ -221,7 +223,8 @@ def test_resolve_stream_all_proxies_fail_raises_nostreams(tmp_path, monkeypatch)
 
     def scripted_streams(self):
         calls.append(self.options["proxy-playlist"])
-        raise PluginError("proxy boom")
+        msg = "proxy boom"
+        raise PluginError(msg)
 
     monkeypatch.setattr(FakePlugin, "streams", scripted_streams)
 
@@ -287,14 +290,16 @@ class RaisingReadStream:
     def open(self):
         class _Fd:
             def read(self, n):
-                raise RuntimeError("read boom")
+                msg = "read boom"
+                raise RuntimeError(msg)
 
         return _Fd()
 
 
 class FakeFailingStream:
     def open(self):
-        raise RuntimeError("disk boom")
+        msg = "disk boom"
+        raise RuntimeError(msg)
 
 
 class FakeYouTubeStreamer:
@@ -391,7 +396,8 @@ def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
 
     async def scenario():
         async def boom():
-            raise RuntimeError("stream interrupted")
+            msg = "stream interrupted"
+            raise RuntimeError(msg)
 
         task = asyncio.create_task(boom())
         rec._recordings["ch"] = {
@@ -1291,7 +1297,8 @@ def test_start_kick_403_block_warns_once_per_30min(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
     def blocked(*a):
-        raise PluginError("Error while querying Kick API: 403 Forbidden")
+        msg = "Error while querying Kick API: 403 Forbidden"
+        raise PluginError(msg)
 
     monkeypatch.setattr(rec, "_resolve_stream", blocked)
 
@@ -1316,7 +1323,8 @@ def test_start_kick_plugin_error_without_403_no_warning(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
     def other_error(*a):
-        raise PluginError("other error")
+        msg = "other error"
+        raise PluginError(msg)
 
     monkeypatch.setattr(rec, "_resolve_stream", other_error)
 
@@ -1560,7 +1568,8 @@ def test_failed_reused_task_ends_immediately(tmp_path, monkeypatch):
 
     async def scenario():
         async def boom():
-            raise RuntimeError("stream interrupted")
+            msg = "stream interrupted"
+            raise RuntimeError(msg)
 
         task = asyncio.create_task(boom())
         rec._recordings["ch"] = {
@@ -1653,7 +1662,8 @@ def test_start_keepalive_uses_bundled_clip(tmp_path, monkeypatch):
     )
 
     async def failing_exec(*args, **kwargs):
-        raise FileNotFoundError("ffmpeg missing")
+        msg = "ffmpeg missing"
+        raise FileNotFoundError(msg)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_exec)
     assert asyncio.run(rec._start_keepalive("rtmp://x")) is None  # spawn failure -> None, no exception
@@ -1765,7 +1775,8 @@ def test_start_setup_failure_cleans_registered_entry(tmp_path, monkeypatch):
 
     def flaky_makedirs(path, *a, **k):
         if denied["on"]:
-            raise PermissionError(f"denied: {path}")
+            msg = f"denied: {path}"
+            raise PermissionError(msg)
         return real_makedirs(path, *a, **k)
 
     monkeypatch.setattr(os, "makedirs", flaky_makedirs)

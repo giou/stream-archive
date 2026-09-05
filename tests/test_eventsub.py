@@ -164,7 +164,8 @@ def test_ensure_conduit_deletes_then_creates():
 def test_ensure_conduit_failure_sets_ready_and_status_error():
     class BoomAPI(FakeTwitchAPI):
         async def list_conduits(self):
-            raise RuntimeError("invalid client id")
+            msg = "invalid client id"
+            raise RuntimeError(msg)
 
     client = make_client(api=BoomAPI())
 

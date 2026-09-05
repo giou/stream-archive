@@ -2,6 +2,7 @@ import asyncio
 
 from aiohttp import ClientSession
 
+from stream_archive import scheduler as scheduler_module
 from stream_archive.scheduler import _HEALTH_HOST, _HEALTH_PORT, _start_health_server
 
 
@@ -21,6 +22,32 @@ def test_healthz_serves_ok():
                 assert await resp.text() == "ok"
         finally:
             await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_readyz_flips_with_ready_flag():
+    async def scenario():
+        old = scheduler_module._READY
+        scheduler_module._READY = False
+        try:
+            runner = await _start_health_server(port=0)
+            assert runner is not None
+            try:
+                host, port = runner.addresses[0][:2]
+                async with ClientSession() as session:
+                    async with session.get(f"http://{host}:{port}/readyz") as resp:
+                        assert resp.status == 503
+                    scheduler_module._READY = True
+                    async with session.get(f"http://{host}:{port}/readyz") as resp:
+                        assert resp.status == 200
+                        assert await resp.text() == "ready"
+                    async with session.get(f"http://{host}:{port}/healthz") as resp:
+                        assert resp.status == 200
+            finally:
+                await runner.cleanup()
+        finally:
+            scheduler_module._READY = old
 
     asyncio.run(scenario())
 

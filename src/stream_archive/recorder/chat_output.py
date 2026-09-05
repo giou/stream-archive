@@ -8,12 +8,13 @@ from stream_archive.config import (
     kick_bare_name,
 )
 from stream_archive.kick_chat import build_chat_root, embed_kick_emotes
+from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
 
 
 class ChatOutputMixin:
-    _recordings: dict[str, dict[str, Any]]
+    _recordings: dict[str, Recording]
 
     async def _finalize_chat(self, channel: str, chat_recorder: Any) -> None:
         """Finalize chat after a failure. The method logs errors and never raises."""
@@ -48,10 +49,11 @@ class ChatOutputMixin:
         delivery is best-effort, and there is no replay.
         """
         entry = self._recordings.get(channel)
-        if entry is not None and entry.get("kick_chat") is not None:
-            entry["kick_chat"]["messages"].append(payload)
+        kick_chat = entry.get("kick_chat") if entry is not None else None
+        if kick_chat is not None:
+            kick_chat["messages"].append(payload)
 
-    async def _finalize_kick_chat(self, entry: dict[str, Any]) -> None:
+    async def _finalize_kick_chat(self, entry: Recording) -> None:
         """Write the collected kick chat buffer atomically to its target path.
 
         The method skips empty buffers. The output file is TwitchDownloader

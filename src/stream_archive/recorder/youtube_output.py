@@ -1,18 +1,28 @@
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import logging
 import os
 import time
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+from stream_archive import disk
 from stream_archive.config import (
     AppConfig,
     channel_url,
 )
 from stream_archive.recorder.common import _sanitize_filename
+from stream_archive.recorder.types import HoldState, Recording
+
+if TYPE_CHECKING:
+    from stream_archive.notifier import Notifier
+    from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
 
@@ -34,32 +44,51 @@ _YOUTUBE_BUDGET_WINDOW_S = 86400
 _RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect_clip.mp4"
 
 
+@dataclass(frozen=True)
+class YouTubeLimits:
+    """Bounds for YouTube re-streams. One place for every magic number.
+
+    Recorder takes one of these so calls shrink the windows without
+    touching module state. Defaults equal the old module constants.
+    """
+
+    quick_end_s: float = _QUICK_END_S
+    backoff_base_s: float = _BACKOFF_BASE_S
+    backoff_max_s: float = _BACKOFF_MAX_S
+    daily_budget: int = _YOUTUBE_DAILY_BUDGET
+    budget_window_s: float = _YOUTUBE_BUDGET_WINDOW_S
+    reconnect_clip: Path = _RECONNECT_CLIP
+
+
 class YoutubeOutputMixin:
     _config: AppConfig
-    _youtube: Any
-    _notifier: Any
-    _recordings: dict[str, dict[str, Any]]
-    _held: dict[str, dict[str, Any]]
+    _youtube: YouTubeStreamer | None
+    _notifier: Notifier | None
+    _recordings: dict[str, Recording]
+    _held: dict[str, HoldState]
+    _limits: YouTubeLimits
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
-    _track: Any
-    _record_disk: Any
-    _pipe_stream: Any
-    _read_ffmpeg_stderr: Any
-    _channel_dir: Any
+    # Set by sibling mixins and Recorder (core.py). Exact call shapes so
+    # a signature drift fails type checks instead of failing at runtime.
+    _track: Callable[[str, Coroutine[Any, Any, Any]], asyncio.Task[Any]]
+    _record_disk: Callable[[str, str, Any], Coroutine[Any, Any, None]]
+    _pipe_stream: Callable[[str, Any, Any, str | None], Coroutine[Any, Any, bool]]
+    _read_ffmpeg_stderr: Callable[[str, Any], Coroutine[Any, Any, None]]
+    _channel_dir: Callable[[str], str]
 
-    def _note_youtube_end(self, channel: str, entry: dict[str, Any]) -> None:
+    def _note_youtube_end(self, channel: str, entry: Recording) -> None:
         """Apply quick-end backoff after a short recording.
 
         A stable recording clears the backoff instead.
         """
         started = entry.get("started_at")
         lifetime = time.monotonic() - started if started else None
-        if lifetime is not None and lifetime < _QUICK_END_S:
+        if lifetime is not None and lifetime < self._limits.quick_end_s:
             n = self._quick_ends.get(channel, 0) + 1
             self._quick_ends[channel] = n
-            wait = min(_BACKOFF_BASE_S * (2 ** (n - 1)), _BACKOFF_MAX_S)
+            wait = min(self._limits.backoff_base_s * (2 ** (n - 1)), self._limits.backoff_max_s)
             self._backoff_until[channel] = time.monotonic() + wait
             logger.warning(
                 "[recorder] [%s] Recording ended after %.0fs — backing off restarts for %ds",
@@ -87,12 +116,12 @@ class YoutubeOutputMixin:
         if backoff > now:
             return f"restarting in {backoff - now:.0f}s (short recording, YouTube quota guard)"
         now_wall = time.time()
-        self._youtube_starts = [t for t in self._youtube_starts if t > now_wall - _YOUTUBE_BUDGET_WINDOW_S]
-        if len(self._youtube_starts) >= _YOUTUBE_DAILY_BUDGET:
-            wait = self._youtube_starts[0] + _YOUTUBE_BUDGET_WINDOW_S - now_wall
+        self._youtube_starts = [t for t in self._youtube_starts if t > now_wall - self._limits.budget_window_s]
+        if len(self._youtube_starts) >= self._limits.daily_budget:
+            wait = self._youtube_starts[0] + self._limits.budget_window_s - now_wall
             return (
                 f"YouTube daily broadcast limit reached "
-                f"({len(self._youtube_starts)}/{_YOUTUBE_DAILY_BUDGET} in the last 24h), "
+                f"({len(self._youtube_starts)}/{self._limits.daily_budget} in the last 24h), "
                 f"next slot in {wait / 60:.0f} min"
             )
         return None
@@ -103,8 +132,16 @@ class YoutubeOutputMixin:
 
     async def _end_broadcast(self, channel: str, broadcast_id: str) -> None:
         """Move a YouTube broadcast to the complete state. Never raises."""
+
+        def _require_streamer() -> YouTubeStreamer:
+            youtube = self._youtube
+            if youtube is None:
+                msg = f"no YouTube streamer configured for {channel}"
+                raise RuntimeError(msg)
+            return youtube
+
         try:
-            await self._youtube.end_stream(broadcast_id)
+            await _require_streamer().end_stream(broadcast_id)
         except Exception as e:
             logger.error("[recorder] [youtube] Error ending broadcast for %s: %s", channel, e)
 
@@ -128,7 +165,7 @@ class YoutubeOutputMixin:
             "-stream_loop",
             "-1",
             "-i",
-            str(_RECONNECT_CLIP),
+            str(self._limits.reconnect_clip),
             "-c:v",
             "copy",
             "-c:a",
@@ -146,7 +183,6 @@ class YoutubeOutputMixin:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            return proc
         except asyncio.CancelledError:
             if proc is not None:
                 proc.terminate()
@@ -154,6 +190,8 @@ class YoutubeOutputMixin:
         except Exception as e:
             logger.warning("[recorder] [youtube] keep-alive spawn failed (hold without keep-alive): %s", e)
             return None
+        else:
+            return proc
 
     async def _stop_keepalive(self, proc: asyncio.subprocess.Process | None) -> None:
         """Stop the keep-alive feed. Safe to call more than once."""
@@ -169,9 +207,7 @@ class YoutubeOutputMixin:
             except ProcessLookupError:
                 pass
 
-    async def _release_broadcast(
-        self, channel: str, youtube_info: dict[str, Any] | None, entry: dict[str, Any]
-    ) -> None:
+    async def _release_broadcast(self, channel: str, youtube_info: dict[str, Any] | None, entry: Recording) -> None:
         """End the broadcast now, or hold it open for the configured delay."""
         if youtube_info is None:
             return
@@ -183,8 +219,10 @@ class YoutubeOutputMixin:
             return
         old = self._held.get(channel)
         if old:
-            old["end_task"].cancel()
-        hold: dict[str, Any] = {"youtube_info": youtube_info, "end_task": None, "keepalive": None}
+            end_task = old.get("end_task")
+            if end_task is not None:
+                end_task.cancel()
+        hold: HoldState = {"youtube_info": youtube_info, "end_task": None, "keepalive": None}
         self._held[channel] = hold
         hold["end_task"] = asyncio.create_task(self._hold_then_end(channel, delay, hold))
         logger.info(
@@ -194,7 +232,7 @@ class YoutubeOutputMixin:
             delay,
         )
 
-    async def _hold_then_end(self, channel: str, delay: float, hold: dict[str, Any]) -> None:
+    async def _hold_then_end(self, channel: str, delay: float, hold: HoldState) -> None:
         """Feed the held broadcast for the delay, or end early if the feed dies."""
         keepalive = await self._start_keepalive(hold["youtube_info"]["rtmp_url"])
         hold["keepalive"] = keepalive
@@ -244,15 +282,26 @@ class YoutubeOutputMixin:
             return
         held = self._held.pop(channel, None)
         if held is not None:
-            held["end_task"].cancel()
+            end_task = held.get("end_task")
+            if end_task is not None:
+                end_task.cancel()
             await self._stop_keepalive(held.get("keepalive"))
             youtube_info = held["youtube_info"]
             entry["youtube_info"] = youtube_info
             entry["reused"] = True
             logger.info("[recorder] [youtube] %s reusing held broadcast %s", channel, youtube_info["broadcast_id"])
         else:
+
+            def _require_streamer() -> YouTubeStreamer:
+                youtube = self._youtube
+                if youtube is None:
+                    msg = f"YouTube streamer is not configured for {channel}"
+                    raise RuntimeError(msg)
+                return youtube
+
             try:
-                youtube_info = await self._youtube.create_stream(author, title, channel, game)
+                youtube = _require_streamer()
+                youtube_info = await youtube.create_stream(author, title, channel, game)
                 self._record_youtube_start()  # count quota for fresh creates only
             except Exception as e:
                 logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
@@ -264,10 +313,13 @@ class YoutubeOutputMixin:
                         f"Stream link: {channel_url(channel)}"
                     )
                     if self._notifier:
-                        await self._notifier.notify(msg)
+                        try:
+                            await self._notifier.notify(msg)
+                        except Exception:
+                            logger.error("[recorder] rate-limit notification failed for %s", channel, exc_info=True)
                     entry = self._recordings.get(channel)
                     if entry is not None:
-                        recording_dir = f"{self._config.recording_dir}/{self._channel_dir(channel)}"
+                        recording_dir = str(disk.channel_recording_dir(self._config, self._channel_dir(channel)))
                         os.makedirs(recording_dir, exist_ok=True)
                         now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
                         safe_title = _sanitize_filename(f"{author} - {title}")
@@ -277,7 +329,10 @@ class YoutubeOutputMixin:
                         disk_task = self._track(channel, self._record_disk(channel, filepath, stream))
                         entry["tasks"].append(disk_task)
                         if self._notifier and notify:
-                            await self._notifier.notify_live(channel, title, game, channel_url(channel))
+                            try:
+                                await self._notifier.notify_live(channel, title, game, channel_url(channel))
+                            except Exception:
+                                logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
                     return
                 raise
             entry = self._recordings.get(channel)
@@ -286,8 +341,12 @@ class YoutubeOutputMixin:
             entry["youtube_info"] = youtube_info
 
         if self._notifier and youtube_notify:
-            await self._notifier.notify_live(channel, title, game, channel_url(channel), youtube_info["youtube_url"])
-
+            try:
+                await self._notifier.notify_live(
+                    channel, title, game, channel_url(channel), youtube_info["youtube_url"]
+                )
+            except Exception:
+                logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
         rtmp_url = youtube_info["rtmp_url"]
         ffmpeg_cmd = [
             "ffmpeg",
@@ -347,7 +406,8 @@ class YoutubeOutputMixin:
             logger.info("[recorder] [youtube] %s ffmpeg stopped (rc=%s)", channel, process.returncode)
 
         if not results[0]:
-            raise RuntimeError(f"[youtube] {channel} stream interrupted")
+            msg = f"[youtube] {channel} stream interrupted"
+            raise RuntimeError(msg)
 
     def youtube_active_count(self) -> int:
         """Active recordings whose mode uses a YouTube re-stream (for the uplink cap)."""

@@ -284,7 +284,8 @@ def test_failed_dispatch_not_marked_seen(keypair):
     async def flaky_online(channel, title, game, user_id, config):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise RuntimeError("transient handler boom")
+            msg = "transient handler boom"
+            raise RuntimeError(msg)
         await original_online(channel, title, game, user_id, config)
 
     monitor.handle_online = flaky_online
@@ -611,7 +612,8 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
         async def get_channel_statuses(self, slugs):
             calls["n"] += 1
             if calls["n"] < 3:
-                raise httpx.ConnectError("boom")
+                msg = "boom"
+                raise httpx.ConnectError(msg)
             return {}
 
         async def list_event_subscriptions(self):
@@ -639,7 +641,8 @@ def test_sync_failure_logged_once_per_episode(caplog):
 
     class AlwaysFails:
         async def get_channel_statuses(self, slugs):
-            raise httpx.ConnectError("boom")
+            msg = "boom"
+            raise httpx.ConnectError(msg)
 
         async def list_event_subscriptions(self):
             return []

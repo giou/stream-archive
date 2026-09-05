@@ -48,13 +48,15 @@ class YouTubeStreamer:
                 return self._credentials
 
             if not self._token_path.exists():
-                raise RuntimeError("YouTube token not found. Run 'python setup_youtube.py' first to authenticate.")
+                msg = "YouTube token not found. Run 'python setup_youtube.py' first to authenticate."
+                raise RuntimeError(msg)
 
             with open(self._token_path) as f:
                 data = json.load(f)
             creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
             if creds is None:
-                raise RuntimeError("YouTube token could not be loaded.")
+                msg = "YouTube token could not be loaded."
+                raise RuntimeError(msg)
             self._credentials = creds
 
             if not creds.valid:
@@ -62,9 +64,8 @@ class YouTubeStreamer:
                     await asyncio.to_thread(creds.refresh, Request())
                     self._save_token()
                 else:
-                    raise RuntimeError(
-                        "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
-                    )
+                    msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
+                    raise RuntimeError(msg)
 
             return self._credentials
 

@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.14.7-slim
 
 # Runtime dependencies. Chromium is not needed. The recorder plays live streams
 # through the ttvlol playlist proxies (config proxy_list -> plugin option
@@ -17,15 +17,15 @@ FROM python:3.14-slim
 #
 ARG TARGETARCH
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg git tzdata ca-certificates curl \
+ && apt-get install -y --no-install-recommends ffmpeg tzdata ca-certificates curl \
  && curl -fsSL https://tailscale.com/install.sh | sh \
- && case "$TARGETARCH" in amd64|arm64|arm) cf_arch="$TARGETARCH";; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; esac \
+ && case "$TARGETARCH" in amd64|arm64) cf_arch="$TARGETARCH";; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; esac \
  && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/2026.8.2/cloudflared-linux-${cf_arch}" -o /usr/local/bin/cloudflared \
  && chmod +x /usr/local/bin/cloudflared \
  && rm -rf /var/lib/apt/lists/*
 
 # Pinned uv version used to build the image. Bump it deliberately with releases.
-COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -78,4 +78,4 @@ CMD ["stream-archive"]
 # Liveness for the hung-process case. The scheduler serves /healthz on the
 # loopback interface (scheduler.py _start_health_server). Compose inherits
 # this healthcheck automatically. Do not duplicate it in docker-compose.yml.
-HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4)"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4)"]

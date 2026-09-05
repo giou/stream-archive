@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from stream_archive.config import AppConfig
+from stream_archive.telegram.menu_state import ChatId, MenuState
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,10 @@ def _decode_cloudflared_token(token: str) -> dict[str, Any] | None:
     padded = token + "=" * (-len(token) % 4)
     for decoder in (base64.b64decode, base64.urlsafe_b64decode):
         try:
-            return json.loads(decoder(padded))
+            payload: dict[str, Any] | None = json.loads(decoder(padded))
         except Exception:
             continue
+        return payload
     return None
 
 
@@ -75,13 +77,18 @@ def _parse_public_hostname(text: str) -> str | None:
 
 
 class WebhookCommands:
+    def _state_for(self, chat_id: ChatId) -> MenuState:
+        """Per-chat menu state. ChatStateMixin provides this on the controller."""
+        raise NotImplementedError
+
     _config: AppConfig
     _apply: Any
     _kick_webhook: Any
+    _http: httpx.AsyncClient | None
     _cloudflared: Any
     _cloudflared_drain: Any
     _send_admin: Any
-    _cloudflare_hostname: str | None
+    _admin_id: int
     reply_keyboard: Any
 
     def _webhook_state_text(self) -> str:
@@ -335,37 +342,35 @@ class WebhookCommands:
         """Restart an app-managed cloudflared after a service restart (webhook enabled)."""
         try:
             w = self._config.kick.webhook
-            if not (w.enabled and w.tunnel == "cloudflare" and w.cloudflare_managed):
-                return
-            token = w.cloudflare_token
-            if token:
-                host = urlsplit(w.public_url or "").hostname
-                cfg = await self._write_cloudflared_config(host) if host else None
-                ok, hint = await self._cloudflared_named_start(token, config_path=cfg)
-                if not ok:
-                    await self._send_admin(f"\u274c cloudflared failed to restart your named tunnel:\n{hint}")
-                return
-            url, hint = await self._cloudflared_quick_start()
-            if url is None:
-                await self._send_admin(f"\u274c cloudflared quick tunnel failed to restart:\n{hint}")
-                return
-            if url != w.public_url:
+            if w.enabled and w.tunnel == "cloudflare" and w.cloudflare_managed:
+                token = w.cloudflare_token
+                if token:
+                    host = urlsplit(w.public_url or "").hostname
+                    cfg = await self._write_cloudflared_config(host) if host else None
+                    ok, hint = await self._cloudflared_named_start(token, config_path=cfg)
+                    if not ok:
+                        await self._send_admin(f"\u274c cloudflared failed to restart your named tunnel:\n{hint}")
+                else:
+                    url, hint = await self._cloudflared_quick_start()
+                    if url is None:
+                        await self._send_admin(f"\u274c cloudflared quick tunnel failed to restart:\n{hint}")
+                    elif url != w.public_url:
 
-                def mutate(candidate: AppConfig) -> None:
-                    candidate.kick.webhook.public_url = url
-                    candidate.kick.webhook.setup_notified = False
+                        def mutate(candidate: AppConfig) -> None:
+                            candidate.kick.webhook.public_url = url
+                            candidate.kick.webhook.setup_notified = False
 
-                self._apply(mutate, lambda c: "public_url updated")
-                note = await self._reachability_note(url, "cloudflare")
-                await self._send_admin(
-                    "\U0001f4a1 Your cloudflared quick tunnel restarted with a new temporary URL:\n\n"
-                    f"```\n{url}\n```\n"
-                    "The previous trycloudflare URL expired. " + _KICK_DASHBOARD_HINT + note
-                )
+                        self._apply(mutate, lambda c: "public_url updated")
+                        note = await self._reachability_note(url, "cloudflare")
+                        await self._send_admin(
+                            "\U0001f4a1 Your cloudflared quick tunnel restarted with a new temporary URL:\n\n"
+                            f"```\n{url}\n```\n"
+                            "The previous trycloudflare URL expired. " + _KICK_DASHBOARD_HINT + note
+                        )
         except Exception:
             logger.exception("[telegram] cloudflared restore failed")
 
-    async def _handle_cloudflare_token(self, text: str) -> tuple[bool, str]:
+    async def _handle_cloudflare_token(self, text: str, chat_id: int | None = None) -> tuple[bool, str]:
         """Validate a pasted cloudflared token/command and persist it.
 
         Return (True, message) with the next-step prompt, or (False, error).
@@ -379,9 +384,10 @@ class WebhookCommands:
                 "Send the token from the Cloudflare dashboard command "
                 "(cloudflared service install <TOKEN>) \u2014 or paste the whole command."
             )
-        result = self._apply(
+        result: str = self._apply(
             lambda candidate: setattr(candidate.kick.webhook, "cloudflare_token", token),
             lambda c: "token saved",
+            chat_id,
         )
         if result.startswith("\u274c"):
             return False, result
@@ -405,13 +411,14 @@ class WebhookCommands:
         )
         return path
 
-    async def _create_cloudflare_dns(self, api_token: str) -> tuple[bool, str]:
+    async def _create_cloudflare_dns(self, api_token: str, chat_id: int | None = None) -> tuple[bool, str]:
         """Create the CNAME for the named tunnel's hostname via the Cloudflare API.
 
         Return (True, message) on success, including when the record already
         points at the tunnel, or (False, error) otherwise. Never raises.
         """
-        host = self._cloudflare_hostname or ""
+        chat = chat_id if chat_id is not None else self._admin_id
+        host = self._state_for(chat).cloudflare_hostname or ""
         wh = self._config.kick.webhook
         data = _decode_cloudflared_token(wh.cloudflare_token)
         tunnel_id = (data or {}).get("t") or ""
@@ -420,74 +427,94 @@ class WebhookCommands:
             return False, "\u274c Missing hostname or tunnel token \u2014 start the Named tunnel flow again."
         headers = {"Authorization": f"Bearer {api_token}"}
         target = f"{tunnel_id}.cfargotunnel.com"
+        client = self._http
+        if client is None:
+            return False, "\u274c HTTP client is not ready \u2014 try again in a moment."
+        # Account-owned tokens (cfat_ prefix) reject the user-scoped
+        # verify endpoint. Fall back to the account-scoped endpoint.
+        # Each raising call has its own guard: .json() raises ValueError
+        # on a non-JSON body (proxy 502 HTML pages). This handler must
+        # never escape with an exception mid-flow.
         try:
-            async with httpx.AsyncClient(timeout=15, base_url=_CLOUDFLARE_API) as client:
-                # Account-owned tokens (cfat_ prefix) reject the user-scoped
-                # verify endpoint. Fall back to the account-scoped endpoint.
-                verify = await client.get("/user/tokens/verify", headers=headers)
-                if verify.status_code != 200 and account_id:
-                    verify = await client.get(f"/accounts/{account_id}/tokens/verify", headers=headers)
-                try:
-                    verify_active = (
-                        verify.status_code == 200 and (verify.json().get("result") or {}).get("status") == "active"
-                    )
-                except ValueError:
-                    # json() fails on a non-JSON body (proxy 502 HTML
-                    # pages). Treat the token as unusable instead of
-                    # escaping mid-flow.
-                    verify_active = False
-                if not verify_active:
-                    return False, "\u274c That Cloudflare API token is not valid."
-                zones_resp = await client.get("/zones?per_page=50", headers=headers)
-                if zones_resp.status_code != 200:
-                    return False, (
-                        "\u274c The token can't list zones \u2014 it needs Zone read "
-                        "(use the 'Edit zone DNS' template)."
-                    )
-                zone = None
-                for z in zones_resp.json().get("result") or []:
-                    name = (z.get("name") or "").lower()
-                    if (host == name or host.endswith("." + name)) and (zone is None or len(name) > len(zone["name"])):
-                        zone = z
-                if zone is None:
-                    return False, (
-                        f"\u274c No Cloudflare zone matches {host} \u2014 is the domain "
-                        "on the Cloudflare account of this API token?"
-                    )
-                zone_id = zone["id"]
-                existing_resp = await client.get(
-                    f"/zones/{zone_id}/dns_records?name={host}&type=CNAME", headers=headers
-                )
-                existing = (existing_resp.json().get("result") or []) if existing_resp.status_code == 200 else []
-                if existing:
-                    if existing[0].get("content") == target:
-                        return True, "\u2705 DNS record already points at your tunnel."
-                    return False, (
-                        f"\u274c {host} is already used by another DNS record ({existing[0].get('content')})."
-                    )
-                created = await client.post(
-                    f"/zones/{zone_id}/dns_records",
-                    headers=headers,
-                    json={"type": "CNAME", "name": host, "content": target, "proxied": True},
-                )
-                if created.status_code not in (200, 201):
-                    err = (created.json().get("errors") or [{}])[0].get("message", created.text)
-                    return False, f"\u274c Could not create the DNS record: {err}"
+            verify = await client.get(f"{_CLOUDFLARE_API}/user/tokens/verify", headers=headers)
+            if verify.status_code != 200 and account_id:
+                verify = await client.get(f"{_CLOUDFLARE_API}/accounts/{account_id}/tokens/verify", headers=headers)
         except (httpx.HTTPError, ValueError) as e:
-            # .json() raises ValueError on a non-JSON body (proxy 502 HTML
-            # pages). This handler must never escape with an exception
-            # mid-flow.
             return False, f"\u274c Cloudflare API request failed: {e}"
+        try:
+            verify_active = verify.status_code == 200 and (verify.json().get("result") or {}).get("status") == "active"
+        except ValueError:
+            # json() fails on a non-JSON body (proxy 502 HTML
+            # pages). Treat the token as unusable instead of
+            # escaping mid-flow.
+            verify_active = False
+        if not verify_active:
+            return False, "\u274c That Cloudflare API token is not valid."
+        try:
+            zones_resp = await client.get(f"{_CLOUDFLARE_API}/zones?per_page=50", headers=headers)
+        except (httpx.HTTPError, ValueError) as e:
+            return False, f"\u274c Cloudflare API request failed: {e}"
+        if zones_resp.status_code != 200:
+            return False, (
+                "\u274c The token can't list zones \u2014 it needs Zone read (use the 'Edit zone DNS' template)."
+            )
+        try:
+            zones_result: list[dict[str, Any]] = zones_resp.json().get("result") or []
+        except ValueError as e:
+            return False, f"\u274c Cloudflare API request failed: {e}"
+        zone: dict[str, Any] | None = None
+        for z in zones_result:
+            name = (z.get("name") or "").lower()
+            if (host == name or host.endswith("." + name)) and (zone is None or len(name) > len(zone["name"])):
+                zone = z
+        if zone is None:
+            return False, (
+                f"\u274c No Cloudflare zone matches {host} \u2014 is the domain "
+                "on the Cloudflare account of this API token?"
+            )
+        zone_id = zone["id"]
+        try:
+            existing_resp = await client.get(
+                f"{_CLOUDFLARE_API}/zones/{zone_id}/dns_records?name={host}&type=CNAME", headers=headers
+            )
+        except (httpx.HTTPError, ValueError) as e:
+            return False, f"\u274c Cloudflare API request failed: {e}"
+        try:
+            existing: list[dict[str, Any]] = (
+                (existing_resp.json().get("result") or []) if existing_resp.status_code == 200 else []
+            )
+        except ValueError as e:
+            return False, f"\u274c Cloudflare API request failed: {e}"
+        if existing:
+            if existing[0].get("content") == target:
+                return True, "\u2705 DNS record already points at your tunnel."
+            return False, (f"\u274c {host} is already used by another DNS record ({existing[0].get('content')}).")
+        try:
+            created = await client.post(
+                f"{_CLOUDFLARE_API}/zones/{zone_id}/dns_records",
+                headers=headers,
+                json={"type": "CNAME", "name": host, "content": target, "proxied": True},
+            )
+        except (httpx.HTTPError, ValueError) as e:
+            return False, f"\u274c Cloudflare API request failed: {e}"
+        if created.status_code not in (200, 201):
+            try:
+                err = (created.json().get("errors") or [{}])[0].get("message", created.text)
+            except ValueError as e:
+                return False, f"\u274c Cloudflare API request failed: {e}"
+            return False, f"\u274c Could not create the DNS record: {err}"
         return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
 
-    async def _finish_named_setup(self, dns_note: str | None) -> tuple[str, Any]:
+    async def _finish_named_setup(self, dns_note: str | None, chat_id: int | None = None) -> tuple[str, Any]:
         """Wire up the named tunnel: local ingress config, run, enable the webhook.
 
         ``dns_note`` is the DNS success message, or None when the user chose
         'skip'. Then include the manual CNAME instructions instead.
         """
-        host = self._cloudflare_hostname or ""
-        self._cloudflare_hostname = None
+        chat = chat_id if chat_id is not None else self._admin_id
+        state = self._state_for(chat)
+        host = state.cloudflare_hostname or ""
+        state.cloudflare_hostname = None
         if not host:
             return "\u274c No hostname \u2014 start the Named tunnel flow again.", self.reply_keyboard(
                 "kick_cloudflare"
@@ -500,7 +527,7 @@ class WebhookCommands:
             return f"\u274c cloudflared failed to start:\n{hint}", self.reply_keyboard("kick_cloudflare_dns")
         url = _normalize_webhook_url(f"https://{host}")
         result = await self._apply_webhook_state(
-            True, url, "cloudflare", cloudflare_token=token, cloudflare_managed=True
+            True, url, "cloudflare", cloudflare_token=token, cloudflare_managed=True, chat_id=chat
         )
         if result.startswith("\u274c"):
             return result, self.reply_keyboard("kick_cloudflare")
@@ -514,23 +541,25 @@ class WebhookCommands:
                 "The webhook only starts receiving events once the record resolves."
             )
         note = await self._reachability_note(url, "cloudflare")
-        self._menu = "kick_webhook"
+        state.menu = "kick_webhook"
         return (
             f"{result}\n\n```\n{url}\n```\n" + _KICK_DASHBOARD_HINT + "\n" + dns_note + note,
             self.reply_keyboard("kick_webhook"),
         )
 
-    async def _apply_cloudflare_url(self, text: str) -> tuple[str, Any]:
+    async def _apply_cloudflare_url(self, text: str, chat_id: int | None = None) -> tuple[str, Any]:
         """Enable the webhook with a pasted URL of the user's own (external) tunnel.
 
         The app does not manage this tunnel and never restarts it on boot.
         """
+        chat = chat_id if chat_id is not None else self._admin_id
+        state = self._state_for(chat)
         url = _normalize_webhook_url(text.strip())
-        result = await self._apply_webhook_state(True, url, "cloudflare")
+        result = await self._apply_webhook_state(True, url, "cloudflare", chat_id=chat)
         if result.startswith("\u274c"):
-            return result, self.reply_keyboard(self._menu)
+            return result, self.reply_keyboard(state.menu)
         note = await self._reachability_note(url, "cloudflare")
-        self._menu = "kick_webhook"
+        state.menu = "kick_webhook"
         return (f"{result}\n\n```\n{url}\n```\n" + _KICK_DASHBOARD_HINT + note, self.reply_keyboard("kick_webhook"))
 
     async def _probe_webhook_url(self, url: str) -> bool:
@@ -539,12 +568,14 @@ class WebhookCommands:
         Any response counts, including a 4xx from the receiver. The point
         is that the request reached the app through the tunnel.
         """
+        client = self._http
+        if client is None:
+            return False
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.get(url)
-            return True
+            await client.get(url)
         except httpx.HTTPError:
             return False
+        return True
 
     async def _reachability_note(self, url: str, tunnel: str = "") -> str:
         """Probe the public URL and return a user-facing status line.
@@ -584,7 +615,13 @@ class WebhookCommands:
         return proc.returncode == 0
 
     async def _apply_webhook_state(
-        self, enabled: bool, url: str, tunnel: str = "", cloudflare_token: str = "", cloudflare_managed: bool = False
+        self,
+        enabled: bool,
+        url: str,
+        tunnel: str = "",
+        cloudflare_token: str = "",
+        cloudflare_managed: bool = False,
+        chat_id: int | None = None,
     ) -> str:
         """Persist kick.webhook.{enabled,public_url,tunnel,...} and reconcile live state.
 
@@ -622,9 +659,10 @@ class WebhookCommands:
                 cw.cloudflare_managed = False
                 cw.setup_notified = old_setup_notified
 
-        result = self._apply(
+        result: str = self._apply(
             mutate,
             lambda c: f"Kick webhook {'enabled' if enabled else 'disabled'}",
+            chat_id,
         )
         if result.startswith("\u274c"):
             return result

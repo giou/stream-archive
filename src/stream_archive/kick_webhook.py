@@ -191,13 +191,16 @@ class KickWebhook:
                 return
         self._sync_failed_notified = True
         detail = str(e).strip() or e.__class__.__name__
-        await self._notifier.notify(
-            "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
-            "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
-            "your app \u2192 Enable webhooks)? "
-            f"{self._config.kick.webhook.public_url}\n"
-            f"Error: {detail}"
-        )
+        try:
+            await self._notifier.notify(
+                "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
+                "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
+                "your app \u2192 Enable webhooks)? "
+                f"{self._config.kick.webhook.public_url}\n"
+                f"Error: {detail}"
+            )
+        except Exception:
+            logger.error("[kick_webhook] sync-failure notification failed", exc_info=True)
 
     async def _handle(self, request: Any) -> Any:
         client = request.remote or "unknown"
@@ -206,11 +209,19 @@ class KickWebhook:
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=0.1)
         except TimeoutError:
-            return web.Response(status=503, text="busy")
+            return web.Response(status=503, text="busy", headers={"Retry-After": "1"})
         try:
-            body = await request.read()
+            try:
+                body = await asyncio.wait_for(request.read(), timeout=5)
+            except TimeoutError:
+                return web.Response(status=413, text="body too slow")
             event_type = request.headers.get("Kick-Event-Type", "")
-            if not await self._verify(request, body):
+            try:
+                verified = await self._verify(request, body)
+            except UnicodeDecodeError:
+                logger.warning("[kick_webhook] event body is not valid UTF-8")
+                return web.Response(status=400, text="bad encoding")
+            if not verified:
                 # Attackers control event_type, so log only known values.
                 known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
                 logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
@@ -228,6 +239,13 @@ class KickWebhook:
                 else:
                     logger.debug("[kick_webhook] unknown event type %r", event_type)
                     return web.Response(status=204)
+            except json.JSONDecodeError:
+                # Truncated body. Answer 400 so Kick retries, and roll back
+                # the dedup mark so the retry dispatches instead of reading
+                # as a replay.
+                if msg_id:
+                    self._seen_ids.pop(msg_id, None)
+                return web.Response(status=400, text="bad body")
             except Exception:
                 # Roll back the dedup mark, so the code processes Kick's
                 # retry instead of answering 200 as if it were a replay.
@@ -242,10 +260,11 @@ class KickWebhook:
     def _remember_id(self, message_id: str | None) -> bool:
         """True when the message id is new within the freshness window.
 
-        False for replays.
+        False for replays, including a missing id. An unsigned replay
+        carries no id, so it must never pass as new.
         """
         if not message_id:
-            return True
+            return False
         now = time.monotonic()
         seen = self._seen_ids
         expires = seen.get(message_id)
@@ -274,13 +293,17 @@ class KickWebhook:
         if event_time is None or abs(time.time() - event_time) > _VERIFY_WINDOW_S:
             logger.warning("[kick_webhook] event timestamp outside freshness window")
             return False
+        # Strict decode: a non-UTF-8 body is corrupt, not a rotation. It
+        # raises UnicodeDecodeError, and the caller answers 400.
+        body_text = body.decode("utf-8", errors="strict")
         try:
-            message = f"{message_id}.{timestamp}.{body.decode()}".encode()
+            message = f"{message_id}.{timestamp}.{body_text}".encode()
             public_key = await self._api.get_public_key()
             self._verify_signature(public_key, message, signature)
-            return True
         except Exception:
             pass
+        else:
+            return True
         # The failure can mean that Kick rotated the key. Refetch
         # (rate-limited) and retry once. The refetch bypasses the cache
         # (force), so the code detects rotation reliably. Meanwhile, a flood
@@ -293,16 +316,18 @@ class KickWebhook:
         try:
             public_key = await self._api.get_public_key(force=True)
             self._verify_signature(public_key, message, signature)
-            return True
         except Exception:
             return False
+        else:
+            return True
 
     def _verify_signature(self, public_key_pem: Any, message: bytes, signature: bytes) -> None:
         key = serialization.load_pem_public_key(
             public_key_pem.encode() if isinstance(public_key_pem, str) else public_key_pem
         )
         if not isinstance(key, rsa.RSAPublicKey):
-            raise ValueError("webhook public key is not an RSA key")
+            msg = "webhook public key is not an RSA key"
+            raise ValueError(msg)
         key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
 
     async def _dispatch_live(self, body: bytes) -> None:
@@ -310,7 +335,7 @@ class KickWebhook:
             event = json.loads(body)
         except json.JSONDecodeError:
             logger.warning("[kick_webhook] invalid livestream event body")
-            return
+            raise
         broadcaster = event.get("broadcaster") or {}
         slug = broadcaster.get("channel_slug")
         if not slug:
@@ -332,10 +357,14 @@ class KickWebhook:
             event = json.loads(body)
         except json.JSONDecodeError:
             logger.warning("[kick_webhook] invalid chat event body")
-            return
+            raise
         broadcaster = event.get("broadcaster") or {}
         slug = broadcaster.get("channel_slug")
         if not slug:
+            return
+        channel = f"kick:{slug}"
+        if channel not in self._config.channels:
+            logger.debug("[kick_webhook] chat event for unmonitored channel %s, ignoring", channel)
             return
         sender = event.get("sender") or {}
         identity = sender.get("identity") or {}
@@ -369,7 +398,7 @@ class KickWebhook:
             ],
             "badges": badges,
         }
-        await self._recorder.add_kick_chat(f"kick:{slug}", payload)
+        await self._recorder.add_kick_chat(channel, payload)
 
     async def _sync_subscriptions(self, channels: list[str]) -> int:
         """Reconcile webhook subscriptions with the monitored kick channels."""

@@ -88,11 +88,18 @@ class _AudioOnlyStream:
                     src.close()
 
         def drain_stderr() -> None:
-            assert proc.stderr is not None
-            for line in proc.stderr:
-                text = line.decode(errors="replace").strip()
-                if text:
-                    logger.warning("[recorder] [audio-filter] %s", text)
+            err = proc.stderr
+            assert err is not None
+            try:
+                for line in err:
+                    text = line.decode(errors="replace").strip()
+                    if text:
+                        logger.warning("[recorder] [audio-filter] %s", text)
+            except ValueError:
+                pass  # close() retired stderr; the process is gone.
+            finally:
+                with suppress(BaseException):
+                    err.close()
 
         threading.Thread(target=pump, daemon=True, name="audio-filter-pump").start()
         threading.Thread(target=drain_stderr, daemon=True, name="audio-filter-stderr").start()
@@ -109,11 +116,16 @@ class _PipedFd:
         self._stdout = stdout
 
     def read(self, size: int) -> bytes | None:
-        return self._stdout.read(size)
+        data: bytes | None = self._stdout.read(size)
+        return data
 
     def close(self) -> None:
         with suppress(BaseException):
             self._stdout.close()
+        stderr = self._proc.stderr
+        if stderr is not None:
+            with suppress(BaseException):
+                stderr.close()
         if self._proc.poll() is None:
             self._proc.terminate()
             try:
@@ -178,7 +190,8 @@ class StreamlinkMixin:
                     )
                     proxies = proxies[1:]
         if not streams:
-            raise PluginError("No streams available")
+            msg = "No streams available"
+            raise PluginError(msg)
         quality = effective_quality(self._config, channel)
         best: Any
         if quality == AUDIO_ONLY_QUALITY:
@@ -194,12 +207,14 @@ class StreamlinkMixin:
                 # audio bitrate.
                 base = streams.get("480p") or streams.get("best")
                 if base is None:
-                    raise PluginError("No stream available for audio-only extraction")
+                    msg = "No stream available for audio-only extraction"
+                    raise PluginError(msg)
                 best = _AudioOnlyStream(base)
         else:
             best = streams.get(quality) or streams.get("best")
         if best is None:
-            raise PluginError(f"No '{quality}' or 'best' stream available")
+            msg = f"No '{quality}' or 'best' stream available"
+            raise PluginError(msg)
         author = getattr(plugin, "author", None) or bare_name(channel)
         if title is None:
             title = getattr(plugin, "title", None) or "Untitled"

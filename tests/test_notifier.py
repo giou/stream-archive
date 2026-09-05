@@ -1,29 +1,39 @@
 import asyncio
+import warnings
+
+import pytest
+from telegram.error import RetryAfter, TimedOut
 
 from stream_archive import notifier
 from stream_archive.notifier import Notifier
 
 
 class FakeBot:
-    def __init__(self, token=None, fail_times=0):
+    def __init__(self, token=None, fail_times=0, fail_with=None):
         self.token = token
         self.calls = []
         self.fail_times = fail_times
+        self.fail_with = fail_with or TimedOut
         self.attempts = 0
 
     async def send_message(self, chat_id, text):
         self.attempts += 1
         if self.attempts <= self.fail_times:
-            raise Exception("boom")
+            if self.fail_with is RetryAfter:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    raise RetryAfter(0)
+            msg = "boom"
+            raise self.fail_with(msg)
         self.calls.append((chat_id, text))
 
     async def shutdown(self):
         pass
 
 
-def make_notifier(fail_times=0):
+def make_notifier(fail_times=0, fail_with=None):
     n = Notifier("token", 123)
-    n.bot = FakeBot(fail_times=fail_times)
+    n.bot = FakeBot(fail_times=fail_times, fail_with=fail_with)
     n._retry_delay = 0
     return n
 
@@ -41,6 +51,26 @@ def test_notify_retries_then_succeeds(monkeypatch):
     asyncio.run(n.notify("hello"))
     assert n.bot.attempts == 3
     assert n.bot.calls == [(123, "hello")]
+
+
+def test_notify_retry_after_does_not_count_attempt(monkeypatch):
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier(fail_times=1, fail_with=RetryAfter)
+    n._max_retries = 1
+    # Flood control sleeps retry_after (0 here) and retries without
+    # counting the attempt, so the single retry still succeeds.
+    asyncio.run(n.notify("hello"))
+    assert n.bot.attempts == 2
+    assert n.bot.calls == [(123, "hello")]
+
+
+def test_notify_raises_after_final_failure(monkeypatch):
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier(fail_times=10)
+    with pytest.raises(RuntimeError, match="telegram send failed after 3 retries"):
+        asyncio.run(n.notify("hello"))
+    assert n.bot.attempts == 3
+    assert n.bot.calls == []
 
 
 def test_notify_live_contains_details(monkeypatch):

@@ -2,8 +2,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any
 
+import httpx
 import websockets
 
 from stream_archive.config import AppConfig, bare_name, is_kick_channel
@@ -12,6 +14,16 @@ logger = logging.getLogger(__name__)
 
 BASE_WS_URL = "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=60"
 WELCOME_TIMEOUT = 30
+# Dedup window and bound mirror the Kick webhook store: one entry per
+# unique Twitch message id, swept on overflow.
+_DEDUP_WINDOW_S = 300
+_MAX_SEEN_IDS = 50_000
+# Cap on concurrent notification dispatches. Slow handlers wait on this
+# instead of growing tasks without bound.
+_MAX_CONCURRENT_DISPATCH = 16
+# A slow dispatch drops only its own event. The socket stays up: Twitch
+# redelivers, and polling covers the gap.
+_DISPATCH_TIMEOUT_S = 15
 
 
 class EventSubClient:
@@ -25,6 +37,8 @@ class EventSubClient:
         self._api = twitch_api
         self._monitor = monitor
         self._config = config
+        self._seen_ids: dict[str, float] = {}  # message_id -> expires (monotonic)
+        self._dispatch_sem = asyncio.Semaphore(_MAX_CONCURRENT_DISPATCH)
         self._conduit_id: str | None = None
         self._session_id: str | None = None
         self._subs: dict[str, dict[str, str]] = {}  # channel -> {"online": sub_id, "offline": sub_id}
@@ -52,9 +66,10 @@ class EventSubClient:
     async def wait_ready(self, timeout: float = 15.0) -> bool:
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
-            return True
         except TimeoutError:
             return False
+        else:
+            return True
 
     async def close(self) -> None:
         self._stop.set()
@@ -204,12 +219,13 @@ class EventSubClient:
             self._conduit_id = created["id"]
             self._status_error = None
             logger.info("[eventsub] conduit created: %s", self._conduit_id)
-            return True
         except Exception as e:
             logger.error("[eventsub] conduit setup failed: %s", e)
             self._status_error = str(e)[:80] or type(e).__name__
             self._ready.set()
             return False
+        else:
+            return True
 
     async def _activate_shard(self) -> None:
         result = await self._api.update_conduit_shards(self._conduit_id, self._session_id)
@@ -279,7 +295,11 @@ class EventSubClient:
         """Dispatch one WebSocket message. Returns True when the socket must reconnect."""
         mtype = msg.get("metadata", {}).get("message_type")
         if mtype == "notification":
-            t = asyncio.create_task(self._dispatch(msg))
+            msg_id = msg.get("metadata", {}).get("message_id")
+            if msg_id is not None and not self._remember_id(msg_id):
+                logger.debug("[eventsub] duplicate event, ignoring")
+                return False
+            t = asyncio.create_task(self._bounded_dispatch(msg))
             self._dispatch_tasks.add(t)
             t.add_done_callback(self._dispatch_tasks.discard)
         elif mtype == "session_keepalive":
@@ -291,6 +311,42 @@ class EventSubClient:
             await self._handle_revocation(msg)
         return False
 
+    def _remember_id(self, message_id: str | None) -> bool:
+        """True when the message id is new within the dedup window.
+
+        False for a replay. A message without an id has no key to dedup
+        on, so it still dispatches. This differs from the Kick webhook,
+        where a missing id means an unsigned body that verify rejects.
+        """
+        if not message_id:
+            return True
+        now = time.monotonic()
+        seen = self._seen_ids
+        expires = seen.get(message_id)
+        if expires is not None and expires > now:
+            return False
+        if len(seen) >= _MAX_SEEN_IDS:
+            for mid, exp in list(seen.items()):
+                if exp <= now:
+                    del seen[mid]
+        if len(seen) >= _MAX_SEEN_IDS:
+            seen.pop(next(iter(seen)))
+        seen[message_id] = now + _DEDUP_WINDOW_S
+        return True
+
+    async def _bounded_dispatch(self, msg: dict[str, Any]) -> None:
+        """Run one dispatch under the concurrency bound and a timeout.
+
+        A slow handler drops only its own event. The socket stays up.
+        """
+        try:
+            async with self._dispatch_sem:
+                await asyncio.wait_for(self._dispatch(msg), timeout=_DISPATCH_TIMEOUT_S)
+        except TimeoutError:
+            logger.warning("[eventsub] dispatch timed out, keeping connection")
+        except Exception:
+            logger.error("[eventsub] bounded dispatch failed", exc_info=True)
+
     async def _handle_revocation(self, msg: dict[str, Any]) -> None:
         sub = msg.get("payload", {}).get("subscription", {})
         sub_id = sub.get("id")
@@ -299,6 +355,18 @@ class EventSubClient:
             for kind, sid in list(kinds.items()):
                 if sid == sub_id:
                     del self._subs[channel][kind]
+                    # Recreate at once through the normal subscribe path.
+                    # The surviving kind answers 409 and re-resolves its id.
+                    # A 400/403 keeps the existing polling fallback log.
+                    uid = self._user_ids.get(channel)
+                    if uid is None:
+                        logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
+                        return
+                    try:
+                        await self._create_channel_subs(channel, uid)
+                    except Exception as e:
+                        logger.error("[eventsub] resubscribe failed for %s: %s", channel, e, exc_info=True)
+                    return
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         try:
@@ -324,5 +392,5 @@ class EventSubClient:
                 await self._monitor.handle_offline(channel, self._config)
             else:
                 logger.debug("[eventsub] ignoring event type %s", sub_type)
-        except Exception as e:
-            logger.error("[eventsub] dispatch failed: %s", e)
+        except (httpx.HTTPError, TimeoutError, ValueError, KeyError) as e:
+            logger.error("[eventsub] dispatch failed: %s", e, exc_info=True)

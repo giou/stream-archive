@@ -53,14 +53,19 @@ class UpdateChecker:
     applies nothing. Updates ship in new images.
     """
 
-    def __init__(self, config: AppConfig, notifier: Any, http: Any = None):
+    def __init__(self, config: AppConfig, notifier: Any, http: httpx.AsyncClient | None = None):
         self._config = config
         self._notifier = notifier
         self._workdir = config._workdir
         # GitHub serves release assets from a 302 redirect to
         # release-assets.githubusercontent.com, so the client must follow
         # redirects.
-        self._http = http or httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=True)
+        if http is not None:
+            self._http = http
+            self._owns_client = False
+        else:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=True)
+            self._owns_client = True
         self._lock = asyncio.Lock()
         self._state_path = self._workdir / "update_state.json"
         self._state: dict[str, Any] = {}
@@ -75,7 +80,7 @@ class UpdateChecker:
 
     def _load_state(self) -> None:
         try:
-            with open(self._state_path) as f:
+            with open(self._state_path, encoding="utf-8") as f:
                 self._state = json.load(f)
         except FileNotFoundError:
             self._state = {}
@@ -85,21 +90,29 @@ class UpdateChecker:
 
     def _save_state(self) -> None:
         tmp = Path(str(self._state_path) + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump(self._state, f, indent=2)
-        os.replace(tmp, self._state_path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, indent=2)
+            os.replace(tmp, self._state_path)
+        except OSError as e:
+            logger.error("[updater] failed to save state to %s: %s", tmp, e, exc_info=True)
 
     # ---- checks ------------------------------------------------------------
 
     async def _check_app(self) -> dict[str, Any]:
         local = _installed_app_version()
+
+        def _missing_tag() -> None:
+            msg = "no tag_name in releases payload"
+            raise ValueError(msg)
+
         try:
             resp = await self._http.get(_APP_RELEASES_URL)
             resp.raise_for_status()
             data = resp.json()
             tag = (data.get("tag_name") or "").removeprefix("v")
             if not tag:
-                raise ValueError("no tag_name in releases payload")
+                _missing_tag()
         except Exception as e:
             logger.warning("[updater] app update check failed: %s", e)
             return {"status": "unknown", "current": local, "latest": None}
@@ -122,13 +135,18 @@ class UpdateChecker:
 
     async def _check_plugin(self) -> dict[str, Any]:
         current = self._plugin_version()
+
+        def _missing_tag() -> None:
+            msg = "no tag_name in releases payload"
+            raise ValueError(msg)
+
         try:
             resp = await self._http.get(_PLUGIN_RELEASES_URL)
             resp.raise_for_status()
             data = resp.json()
             tag = data.get("tag_name")
             if not tag:
-                raise ValueError("no tag_name in releases payload")
+                _missing_tag()
         except Exception as e:
             logger.warning("[updater] plugin update check failed: %s", e)
             return {"status": "unknown", "current": current, "latest": None}
@@ -183,19 +201,19 @@ class UpdateChecker:
     # ---- check / notify ----------------------------------------------------
 
     async def check(self, notify: bool) -> dict[str, Any]:
+        uc = self._config.update_check
+        report = {}
+        if uc.check_app:
+            report["app"] = await self._check_app()
+        if uc.check_streamlink:
+            report["streamlink"] = await self._check_streamlink()
+        if uc.check_plugin:
+            report["plugin"] = await self._check_plugin()
+
+        if not notify:
+            return report
+
         async with self._lock:
-            uc = self._config.update_check
-            report = {}
-            if uc.check_app:
-                report["app"] = await self._check_app()
-            if uc.check_streamlink:
-                report["streamlink"] = await self._check_streamlink()
-            if uc.check_plugin:
-                report["plugin"] = await self._check_plugin()
-
-            if not notify:
-                return report
-
             self._load_state()
             lines = []
             state_changed = False
@@ -223,18 +241,22 @@ class UpdateChecker:
                         self._state[source] = latest
                         state_changed = True
 
-            if lines:
-                app_update = report.get("app", {}).get("status") == "update"
-                footer = (
-                    "Apply: docker compose pull && docker compose up -d"
-                    if app_update
-                    else "No action needed — plugin/streamlink updates ship in a future image release."
-                )
-                text = "📦 Update available for stream-archive\n" + "\n".join(lines) + "\n" + footer
-                await self._notifier.notify(text)
             if state_changed:
                 self._save_state()
-            return report
+
+        if lines:
+            app_update = report.get("app", {}).get("status") == "update"
+            footer = (
+                "Apply: docker compose pull && docker compose up -d"
+                if app_update
+                else "No action needed — plugin/streamlink updates ship in a future image release."
+            )
+            text = "📦 Update available for stream-archive\n" + "\n".join(lines) + "\n" + footer
+            try:
+                await self._notifier.notify(text)
+            except Exception:
+                logger.error("[updater] update notification failed", exc_info=True)
+        return report
 
     # ---- loop / lifecycle --------------------------------------------------
 
@@ -250,4 +272,5 @@ class UpdateChecker:
             await asyncio.sleep(interval)
 
     async def close(self) -> None:
-        await self._http.aclose()
+        if self._owns_client:
+            await self._http.aclose()

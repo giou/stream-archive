@@ -38,8 +38,9 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
+            msg = f"HTTP {self.status_code}"
             raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}",
+                msg,
                 request=httpx.Request("GET", "http://fake"),
                 response=httpx.Response(self.status_code),
             )

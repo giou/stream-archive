@@ -49,7 +49,8 @@ def extract_code(text: str) -> str:
         return text
     query = parse_qs(urlparse(text).query)
     if "error" in query:
-        raise ValueError(f"Authorization failed: {query['error'][0]}")
+        msg = f"Authorization failed: {query['error'][0]}"
+        raise ValueError(msg)
     codes = query.get("code", [])
     return codes[0] if codes else ""
 

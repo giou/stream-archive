@@ -10,29 +10,45 @@ from stream_archive.config import AppConfig
 logger = logging.getLogger(__name__)
 
 
-def recording_dir_path(config: AppConfig) -> Path:
-    """Resolve recording_dir against _workdir when it is relative.
+def _resolve_dir(config: AppConfig, raw: str) -> Path:
+    """Resolve one configured directory against _workdir when relative.
 
-    Applies the same rule as cleanup_old_recordings.
+    This is the single rule for recording_dir and chat_dir. Absolute
+    paths pass through unchanged.
     """
-    d = Path(config.recording_dir)
+    d = Path(raw)
     if not d.is_absolute():
         d = config._workdir / d
     return d
+
+
+def resolve_recording_dir(config: AppConfig) -> Path:
+    """Resolve recording_dir against _workdir when it is relative."""
+    return _resolve_dir(config, config.recording_dir)
 
 
 def chat_dir_path(config: AppConfig) -> Path:
-    """Resolve chat_dir against _workdir when relative, like recording_dir_path."""
-    d = Path(config.chat_dir)
-    if not d.is_absolute():
-        d = config._workdir / d
-    return d
+    """Resolve chat_dir against _workdir when relative, like resolve_recording_dir."""
+    return _resolve_dir(config, config.chat_dir)
+
+
+def channel_recording_dir(config: AppConfig, channel_dir: str) -> Path:
+    """Recording subdirectory for one channel, resolved against _workdir."""
+    return resolve_recording_dir(config) / channel_dir
+
+
+_RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a", "*.jsonl")
 
 
 def iter_recordings(base: Path) -> Iterator[Path]:
-    """Yield every recording under base: legacy .ts plus audio-only .m4a."""
-    yield from base.rglob("*.ts")
-    yield from base.rglob("*.m4a")
+    """Yield every recording artifact under base.
+
+    Covers video captures (.ts, .mp4, .mkv), audio-only captures (.m4a),
+    and sidecar segment logs (.jsonl). Chat files (.chat.json) are not
+    recording artifacts and stay with the chat cleanup pass.
+    """
+    for pattern in _RECORDING_PATTERNS:
+        yield from base.rglob(pattern)
 
 
 async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
@@ -41,7 +57,7 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
     The slow recordings scan runs in the default executor.
     """
     loop = asyncio.get_running_loop()
-    base = recording_dir_path(config)
+    base = resolve_recording_dir(config)
     fs_dir = base if base.exists() else base.parent  # missing dir: report parent fs
     usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
     dir_bytes, count = 0, 0

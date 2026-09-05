@@ -11,6 +11,7 @@ from stream_archive.config import (
     normalize_channel_name,
     reload_config,
 )
+from stream_archive.telegram.menu_state import AudioSwitch, PendingKey
 
 _QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p", "audio_only")
 
@@ -21,11 +22,12 @@ class SettingsCommands:
     _recorder: Any
     _eventsub: Any
     _kick_webhook: Any
-    # Maps a nonce to its quality mutation and the affected channels.
+    _admin_id: int
+    # Maps a (chat id, nonce) pair to its quality mutation and the affected channels.
     # The admin must confirm before the change applies.
-    _pending_audio_switch: dict[str, tuple[Callable[[AppConfig], Any], list[str]]]
+    _pending_audio_switch: dict[PendingKey, AudioSwitch]
 
-    def handle_retention(self, args: list[str]) -> str:
+    def handle_retention(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
             return "Usage: /retention <days>"
         try:
@@ -36,16 +38,16 @@ class SettingsCommands:
         def mutate(candidate: AppConfig) -> None:
             candidate.retention_days = n
 
-        return self._apply(mutate, lambda c: f"Retention set to {n} day(s)")
+        return cast(str, self._apply(mutate, lambda c: f"Retention set to {n} day(s)", chat_id))
 
-    def handle_mode(self, args: list[str]) -> str:
+    def handle_mode(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) == 1:
             m = args[0].lower()
 
             def mutate(candidate: AppConfig) -> None:
                 candidate.output_mode = cast(OutputMode, m)
 
-            return self._apply(mutate, lambda c: f"Output mode set to {m}")
+            return cast(str, self._apply(mutate, lambda c: f"Output mode set to {m}", chat_id))
 
         if len(args) == 2:
             ch, m = args[0], args[1].lower()
@@ -58,16 +60,19 @@ class SettingsCommands:
                 def mutate(candidate: AppConfig) -> None:
                     candidate.channel_output_modes.pop(ch, None)
 
-                return self._apply(mutate, lambda c: f"Output mode for {ch} reset to global ({c.output_mode})")
+                return cast(
+                    str,
+                    self._apply(mutate, lambda c: f"Output mode for {ch} reset to global ({c.output_mode})", chat_id),
+                )
 
             def mutate(candidate: AppConfig) -> None:
                 candidate.channel_output_modes[ch] = cast(OutputMode, m)
 
-            return self._apply(mutate, lambda c: f"Output mode for {ch} set to {m}")
+            return cast(str, self._apply(mutate, lambda c: f"Output mode for {ch} set to {m}", chat_id))
 
         return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
 
-    def handle_channel_hold(self, args: list[str]) -> str:
+    def handle_channel_hold(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 2:
             return "Usage: /channelhold <channel> <seconds|default>"
         ch = normalize_channel_name(args[0])
@@ -78,7 +83,12 @@ class SettingsCommands:
             def mutate(candidate: AppConfig) -> None:
                 candidate.channel_youtube_hold_seconds.pop(ch, None)
 
-            return self._apply(mutate, lambda c: f"Hold delay for {ch} reset to global ({c.youtube.hold_seconds:g}s)")
+            return cast(
+                str,
+                self._apply(
+                    mutate, lambda c: f"Hold delay for {ch} reset to global ({c.youtube.hold_seconds:g}s)", chat_id
+                ),
+            )
 
         try:
             n = int(args[1])
@@ -90,7 +100,9 @@ class SettingsCommands:
         def set_hold(candidate: AppConfig) -> None:
             candidate.channel_youtube_hold_seconds[ch] = n
 
-        return self._apply(set_hold, lambda c: f"Hold delay for {ch} set to {n}s (0 = end immediately)")
+        return cast(
+            str, self._apply(set_hold, lambda c: f"Hold delay for {ch} set to {n}s (0 = end immediately)", chat_id)
+        )
 
     def _audio_conflicts(self, candidate: AppConfig) -> list[str]:
         """Channels that would record audio-only into YouTube after this change."""
@@ -114,15 +126,18 @@ class SettingsCommands:
             return [], e
         return self._audio_conflicts(probe), None
 
-    def _gate_quality(self, mutate: Callable[[AppConfig], Any], conflicts: list[str]) -> str | None:
+    def _gate_quality(
+        self, mutate: Callable[[AppConfig], Any], conflicts: list[str], chat_id: int | None = None
+    ) -> str | None:
         """Stores a pending audio-only switch when the change creates a conflict."""
         if not conflicts:
             return None
         nonce = secrets.token_hex(4)
-        self._pending_audio_switch[nonce] = (mutate, conflicts)
+        chat = chat_id if chat_id is not None else self._admin_id
+        self._pending_audio_switch[(chat, nonce)] = (mutate, conflicts)
         return f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(conflicts)}"
 
-    def handle_quality(self, args: list[str]) -> str:
+    def handle_quality(self, args: list[str], chat_id: int | None = None) -> str:
         c = self._config
         if not args:
             text = f"Quality: {c.preferred_quality}"
@@ -140,10 +155,10 @@ class SettingsCommands:
             conflicts, err = self._probe_quality_change(mutate)
             if err is not None:
                 return f"\u274c {err}"
-            gated = self._gate_quality(mutate, conflicts)
+            gated = self._gate_quality(mutate, conflicts, chat_id)
             if gated is not None:
                 return gated
-            return self._apply(mutate, lambda candidate: f"Quality set to {q}")
+            return cast(str, self._apply(mutate, lambda candidate: f"Quality set to {q}", chat_id))
         if len(args) == 2:
             normalized = normalize_channel_name(args[0])
             if normalized is None:
@@ -161,11 +176,16 @@ class SettingsCommands:
                 conflicts, err = self._probe_quality_change(mutate)
                 if err is not None:
                     return f"\u274c {err}"
-                gated = self._gate_quality(mutate, conflicts)
+                gated = self._gate_quality(mutate, conflicts, chat_id)
                 if gated is not None:
                     return gated
-                return self._apply(
-                    mutate, lambda candidate: f"Quality for {ch} reset to global ({candidate.preferred_quality})"
+                return cast(
+                    str,
+                    self._apply(
+                        mutate,
+                        lambda candidate: f"Quality for {ch} reset to global ({candidate.preferred_quality})",
+                        chat_id,
+                    ),
                 )
 
             def mutate(candidate: AppConfig) -> None:
@@ -174,13 +194,13 @@ class SettingsCommands:
             conflicts, err = self._probe_quality_change(mutate)
             if err is not None:
                 return f"\u274c {err}"
-            gated = self._gate_quality(mutate, conflicts)
+            gated = self._gate_quality(mutate, conflicts, chat_id)
             if gated is not None:
                 return gated
-            return self._apply(mutate, lambda candidate: f"Quality for {ch} set to {q}")
+            return cast(str, self._apply(mutate, lambda candidate: f"Quality for {ch} set to {q}", chat_id))
         return "Usage: /quality <best|1080p|720p|...> or /quality <channel> <quality|default>"
 
-    def handle_maxrecordings(self, args: list[str]) -> str:
+    def handle_maxrecordings(self, args: list[str], chat_id: int | None = None) -> str:
         if not args:
             return f"Max recordings: {self._config.max_concurrent_recordings} (0 = unlimited)"
         if len(args) == 1:
@@ -188,13 +208,17 @@ class SettingsCommands:
                 n = int(args[0])
             except ValueError:
                 return "\u274c max recordings must be an integer"
-            return self._apply(
-                lambda candidate: setattr(candidate, "max_concurrent_recordings", n),
-                lambda candidate: f"Max recordings set to {n}",
+            return cast(
+                str,
+                self._apply(
+                    lambda candidate: setattr(candidate, "max_concurrent_recordings", n),
+                    lambda candidate: f"Max recordings set to {n}",
+                    chat_id,
+                ),
             )
         return "Usage: /maxrecordings <n> (0 = unlimited)"
 
-    def handle_maxyoutube(self, args: list[str]) -> str:
+    def handle_maxyoutube(self, args: list[str], chat_id: int | None = None) -> str:
         if not args:
             return f"Max YouTube re-streams: {self._config.max_concurrent_youtube_streams} (0 = unlimited)"
         if len(args) == 1:
@@ -202,13 +226,17 @@ class SettingsCommands:
                 n = int(args[0])
             except ValueError:
                 return "\u274c max YouTube re-streams must be an integer"
-            return self._apply(
-                lambda candidate: setattr(candidate, "max_concurrent_youtube_streams", n),
-                lambda candidate: f"Max YouTube re-streams set to {n}",
+            return cast(
+                str,
+                self._apply(
+                    lambda candidate: setattr(candidate, "max_concurrent_youtube_streams", n),
+                    lambda candidate: f"Max YouTube re-streams set to {n}",
+                    chat_id,
+                ),
             )
         return "Usage: /maxyoutube <n> (0 = unlimited)"
 
-    def handle_disk(self, args: list[str]) -> str:
+    def handle_disk(self, args: list[str], chat_id: int | None = None) -> str:
         c = self._config
         usage = "Usage: /disk <maxsize|delete_oldest> <value>"
         if not args:
@@ -222,14 +250,22 @@ class SettingsCommands:
         cmd, val = args[0].lower(), args[1]
         if cmd == "delete_oldest":
             if val == "on":
-                return self._apply(
-                    lambda candidate: setattr(candidate.disk, "delete_oldest", True),
-                    lambda candidate: "Delete oldest enabled",
+                return cast(
+                    str,
+                    self._apply(
+                        lambda candidate: setattr(candidate.disk, "delete_oldest", True),
+                        lambda candidate: "Delete oldest enabled",
+                        chat_id,
+                    ),
                 )
             if val == "off":
-                return self._apply(
-                    lambda candidate: setattr(candidate.disk, "delete_oldest", False),
-                    lambda candidate: "Delete oldest disabled",
+                return cast(
+                    str,
+                    self._apply(
+                        lambda candidate: setattr(candidate.disk, "delete_oldest", False),
+                        lambda candidate: "Delete oldest disabled",
+                        chat_id,
+                    ),
                 )
             return usage
         try:
@@ -237,13 +273,17 @@ class SettingsCommands:
         except ValueError:
             return f"\u274c {cmd} must be a number"
         if cmd == "maxsize":
-            return self._apply(
-                lambda candidate: setattr(candidate.disk, "max_total_gb", v),
-                lambda candidate: f"Disk max total set to {v:g} GB",
+            return cast(
+                str,
+                self._apply(
+                    lambda candidate: setattr(candidate.disk, "max_total_gb", v),
+                    lambda candidate: f"Disk max total set to {v:g} GB",
+                    chat_id,
+                ),
             )
         return usage
 
-    async def handle_chat(self, args: list[str]) -> str:
+    async def handle_chat(self, args: list[str], chat_id: int | None = None) -> str:
         if not args:
             twitch_state = "enabled" if self._config.record_chat else "disabled"
             kick_state = "enabled" if self._config.kick.record_chat else "disabled"
@@ -255,9 +295,10 @@ class SettingsCommands:
                 candidate.record_chat = enabled
                 candidate.kick.record_chat = enabled
 
-            text = self._apply(
+            text: str = self._apply(
                 mutate,
                 lambda candidate: f"Chat recording {'enabled' if enabled else 'disabled'}",
+                chat_id,
             )
             if not enabled and not text.startswith("\u274c"):
                 for channel in self._recorder.active_channels():
@@ -277,6 +318,7 @@ class SettingsCommands:
             text = self._apply(
                 mutate,
                 lambda candidate: f"{label} {'enabled' if enabled else 'disabled'}",
+                chat_id,
             )
             if not enabled and not text.startswith("\u274c"):
                 for channel in self._recorder.active_channels():

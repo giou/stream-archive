@@ -311,7 +311,8 @@ def test_transport_error_retried_then_succeeds(monkeypatch):
             return token_handler(request)
         calls["n"] += 1
         if calls["n"] == 1:
-            raise httpx.ConnectError("boom")
+            msg = "boom"
+            raise httpx.ConnectError(msg)
         return httpx.Response(200, json={"data": []})
 
     api = make_api(handler)

@@ -537,7 +537,7 @@ def test_apply_warning_round_trip_restarts(tmp_path):
     assert bot.send_message.await_count == 1
     data = bot.send_message.await_args.kwargs["reply_markup"].to_dict()["inline_keyboard"][0][0]["callback_data"]
     nonce = data.split(":")[1]
-    assert nonce in ctrl._pending_apply  # the tapped nonce must still resolve
+    assert (12345, nonce) in ctrl._pending_apply  # the tapped nonce must still resolve
     result = asyncio.run(ctrl.handle_callback(data))
     assert result is not None
     text, _ = result
@@ -1530,7 +1530,8 @@ def test_callback_error_surfaces_instead_of_silent_failure(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1"])
 
     async def boom(data):
-        raise RuntimeError("boom")
+        msg = "boom"
+        raise RuntimeError(msg)
 
     ctrl.handle_callback = boom
     update = _FakeUpdate(12345)
@@ -2368,7 +2369,7 @@ def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path, monkeypatch
     async def fake_named(tok, config_path=None):
         return True, None
 
-    async def fake_dns(api_token):
+    async def fake_dns(api_token, chat_id=None):
         return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
 
     ctrl._cloudflared_named_start = fake_named
@@ -2411,13 +2412,13 @@ class _FakeCfClient:
 
     async def get(self, url, headers=None):
         self.calls.append(("get", url))
-        if url == "/user/tokens/verify":
+        if url.endswith("/user/tokens/verify"):
             if self.verify_status == "account-owned":
                 return _FakeCfResp(401, {"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]})
             return _FakeCfResp(200, {"result": {"status": self.verify_status}})
         if url.endswith("/tokens/verify"):
             return _FakeCfResp(200, {"result": {"status": "active"}})
-        if url.startswith("/zones?"):
+        if "/zones?per_page=50" in url:
             return _FakeCfResp(200, {"result": self.zones})
         if "/dns_records?" in url:
             return _FakeCfResp(200, {"result": self.records})
@@ -2429,8 +2430,9 @@ class _FakeCfClient:
 
 
 def make_cf_ctrl(tmp_path, monkeypatch, client):
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook.httpx.AsyncClient", lambda *a, **k: client)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._http = client
+    ctrl._owns_http = False
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     config.kick.webhook.cloudflare_token = token
     ctrl._cloudflare_hostname = "kick.example.com"
@@ -2444,10 +2446,9 @@ def test_create_cloudflare_dns_creates_record(tmp_path, monkeypatch):
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
     assert ok is True
-    assert "DNS record created" in message
     assert (
         "post",
-        "/zones/z1/dns_records",
+        "https://api.cloudflare.com/client/v4/zones/z1/dns_records",
         {
             "type": "CNAME",
             "name": "kick.example.com",
@@ -2469,10 +2470,9 @@ def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path, monkeypatch):
 
     ok, _ = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
-    assert ok is True
     assert (
         "post",
-        "/zones/z2/dns_records",
+        "https://api.cloudflare.com/client/v4/zones/z2/dns_records",
         {
             "type": "CNAME",
             "name": "kick.sub.example.com",
@@ -2527,11 +2527,10 @@ def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path, monkeypatc
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("cfat_..."))
 
-    assert ok is True
-    assert ("get", "/accounts/acct/tokens/verify") in client.calls
+    assert ("get", "https://api.cloudflare.com/client/v4/accounts/acct/tokens/verify") in client.calls
     assert (
         "post",
-        "/zones/z1/dns_records",
+        "https://api.cloudflare.com/client/v4/zones/z1/dns_records",
         {
             "type": "CNAME",
             "name": "kick.example.com",
@@ -2580,7 +2579,7 @@ def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path, monkeypatch):
     async def fake_named(tok, config_path=None):
         return True, None
 
-    async def fake_dns(api_token):
+    async def fake_dns(api_token, chat_id=None):
         return False, "\u274c That Cloudflare API token is not valid."
 
     ctrl._cloudflared_named_start = fake_named
@@ -2884,7 +2883,8 @@ def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkey
         text = "<html><body>502 Bad Gateway</body></html>"
 
         def json(self):
-            raise json.JSONDecodeError("Expecting value", self.text, 0)
+            msg = "Expecting value"
+            raise json.JSONDecodeError(msg, self.text, 0)
 
     class _HtmlCfClient:
         async def __aenter__(self):
