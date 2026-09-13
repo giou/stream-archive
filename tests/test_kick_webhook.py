@@ -31,16 +31,17 @@ def base_config():
         "timezone": "UTC",
         "plugin_dir": "plugins",
         "recording_dir": "recordings",
+        "endpoint": {
+            "enabled": False,
+            "listen_host": "127.0.0.1",
+            "listen_port": 0,  # ephemeral for tests
+            "public_url": "",
+        },
         "kick": {
             "client_id": "cid",
             "client_secret": "csec",
             "record_chat": True,
-            "webhook": {
-                "enabled": False,
-                "listen_host": "127.0.0.1",
-                "listen_port": 0,  # ephemeral for tests
-                "public_url": "",
-            },
+            "webhook": {"enabled": False},
         },
     }
 
@@ -94,21 +95,31 @@ class FakeKickAPI:
         return []
 
 
+def enabled_config(**overrides):
+    """base_config with endpoint and webhook on: the listener and sync loop need both."""
+    config = base_config()
+    config["endpoint"]["enabled"] = True
+    config["endpoint"]["public_url"] = "https://x.example.com"
+    config["kick"]["webhook"]["enabled"] = True
+    config.update(overrides)
+    return config
+
+
 def make_webhook(config=None, monitor=None, recorder=None, api=None, notifier=None):
     raw = config or base_config()
     # base_config uses listen_port 0 for an ephemeral port so bind tests never
     # collide. The config model allows only ports 1-65535, so make_webhook
     # validates with a placeholder port and re-applies 0 afterwards.
     if isinstance(raw, AppConfig):
-        ephemeral = raw.kick.webhook.listen_port == 0
+        ephemeral = raw.endpoint.listen_port == 0
         config = raw
     else:
-        ephemeral = raw.get("kick", {}).get("webhook", {}).get("listen_port") == 0
+        ephemeral = raw.get("endpoint", {}).get("listen_port") == 0
         if ephemeral:
-            raw["kick"]["webhook"]["listen_port"] = 8787
+            raw["endpoint"]["listen_port"] = 8787
         config = AppConfig.model_validate(raw)
     if ephemeral:
-        object.__setattr__(config.kick.webhook, "listen_port", 0)
+        object.__setattr__(config.endpoint, "listen_port", 0)
     return KickWebhook(
         config,
         monitor or FakeMonitor(),
@@ -179,25 +190,28 @@ def keypair():
     return private_key, public_pem
 
 
-def test_start_twice_binds_once_and_close_twice_safe():
-    wh = make_webhook()
+def test_apply_state_is_idempotent_and_close_twice_safe():
+    wh = make_webhook(config=enabled_config())
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         assert wh._runner is not None
-        await wh.start()  # second start is a no-op
+        assert wh._sync_task is not None
+        await wh.apply_state()  # second call is a no-op
         assert wh._runner is not None
         await wh.close()
         assert wh._runner is None
+        assert wh._sync_task is None
         await wh.close()  # double close is safe
         assert wh._runner is None
 
     asyncio.run(scenario())
 
 
-def test_sync_loop_runs_on_interval_cadence():
+def test_apply_state_keeps_the_listener_for_the_api_alone():
+    """The API needs the listener but never the webhook subscription sync."""
     config = base_config()
-    config["monitoring_interval"] = 0.01
+    config["api"] = {"enabled": True, "key": "k"}
     calls = {"n": 0}
 
     class CountingAPI:
@@ -211,7 +225,65 @@ def test_sync_loop_runs_on_interval_cadence():
     wh = make_webhook(config=config, api=CountingAPI())
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
+        assert wh._runner is not None
+        assert wh._sync_task is None  # no webhook: no reconcile that deletes subs
+        await asyncio.sleep(0.03)
+        await wh.apply_state()  # a keep-listener reconcile changes nothing
+        assert wh._runner is not None
+        assert wh._sync_task is None
+        await wh.close()
+        assert wh._runner is None
+
+    asyncio.run(scenario())
+    assert calls["n"] == 0
+
+
+def test_apply_state_stops_the_listener_when_nothing_is_enabled():
+    config = base_config()
+    config["api"] = {"enabled": True, "key": "k"}
+    wh = make_webhook(config=config)
+
+    async def scenario():
+        await wh.apply_state()
+        assert wh._runner is not None
+        wh._config.api.enabled = False
+        await wh.apply_state()
+        assert wh._runner is None
+
+    asyncio.run(scenario())
+
+
+def test_apply_state_serves_webhook_and_api_together():
+    config = enabled_config()
+    config["api"] = {"enabled": True, "key": "k"}
+    wh = make_webhook(config=config)
+
+    async def scenario():
+        await wh.apply_state()
+        assert wh._runner is not None
+        assert wh._sync_task is not None  # webhook on: sync runs
+        await wh.close()
+
+    asyncio.run(scenario())
+
+
+def test_sync_loop_runs_on_interval_cadence():
+    config = enabled_config(monitoring_interval=0.01)
+    calls = {"n": 0}
+
+    class CountingAPI:
+        async def get_channel_statuses(self, slugs):
+            calls["n"] += 1
+            return {}
+
+        async def list_event_subscriptions(self):
+            return []
+
+    wh = make_webhook(config=config, api=CountingAPI())
+
+    async def scenario():
+        await wh.apply_state()
         await asyncio.sleep(0.06)
         await wh.close()
 
@@ -414,7 +486,7 @@ def test_live_event_unmonitored_channel_ignored(keypair):
 def make_mock_api(handler):
     config = base_config()
     # The config model needs a real port, although KickAPI itself never binds.
-    config["kick"]["webhook"]["listen_port"] = 8787
+    config["endpoint"]["listen_port"] = 8787
     api = KickAPI(AppConfig.model_validate(config))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return api
@@ -439,16 +511,17 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
         "timezone": "UTC",
         "plugin_dir": "plugins",
         "recording_dir": "recordings",
+        "endpoint": {
+            "enabled": True,
+            "listen_host": "127.0.0.1",
+            "listen_port": 8799,  # != 8787 (occupied by the docker-published port)
+            "public_url": "https://x.example.com",
+        },
         "kick": {
             "client_id": "cid",
             "client_secret": "csec",
             "record_chat": True,
-            "webhook": {
-                "enabled": True,
-                "listen_host": "127.0.0.1",
-                "listen_port": 8799,  # != 8787 (occupied by the docker-published port)
-                "public_url": "https://x.example.com/kick/webhook",
-            },
+            "webhook": {"enabled": True},
         },
     }
     config["_workdir"] = tmp_path
@@ -603,8 +676,7 @@ def test_reconcile_deletes_stale_subscriptions():
 
 
 def test_reconcile_failure_notifies_once_and_clears_on_success():
-    config = base_config()
-    config["monitoring_interval"] = 0.01
+    config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
     calls = {"n": 0}
 
@@ -622,7 +694,7 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
     wh = make_webhook(config=config, api=FlakyAPI(), notifier=notifier)
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         await asyncio.sleep(0.09)
         await wh.close()
 
@@ -635,8 +707,7 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
 
 
 def test_sync_failure_logged_once_per_episode(caplog):
-    config = base_config()
-    config["monitoring_interval"] = 0.01
+    config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
 
     class AlwaysFails:
@@ -650,7 +721,7 @@ def test_sync_failure_logged_once_per_episode(caplog):
     wh = make_webhook(config=config, api=AlwaysFails(), notifier=notifier)
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         await asyncio.sleep(0.05)
         await wh.close()
 
@@ -689,13 +760,12 @@ class ScriptedAPI:
 def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
     # A Kick-side 500 must not notify while it is shorter than the delay.
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 3600)
-    config = base_config()
-    config["monitoring_interval"] = 0.01
+    config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=ScriptedAPI([True] * 100), notifier=notifier)
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         await asyncio.sleep(0.08)
         await wh.close()
 
@@ -707,15 +777,14 @@ def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
 
 def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch):
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.02)
-    config = base_config()
-    config["monitoring_interval"] = 0.01
+    config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
     # Two 500-error episodes, separated by one recovery, each exceed the
     # delay and notify once.
     wh = make_webhook(config=config, api=ScriptedAPI([True] * 6 + [False] + [True] * 6), notifier=notifier)
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         await asyncio.sleep(0.22)
         await wh.close()
 
@@ -729,13 +798,12 @@ def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
     # Recovery resets the episode timer. Brief blips stay silent when each
     # failing run is shorter than the delay, even across several episodes.
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
-    config = base_config()
-    config["monitoring_interval"] = 0.01
+    config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=ScriptedAPI([True] * 3 + [False] + [True] * 3), notifier=notifier)
 
     async def scenario():
-        await wh.start()
+        await wh.apply_state()
         await asyncio.sleep(0.15)
         await wh.close()
 

@@ -47,7 +47,8 @@ commands over a Telegram bot.
   cover channels, retention, output mode, quality, chat recording, limits,
   the Kick webhook, status, reload, and restart. Other users get no reply.
   Every change is validated and written atomically to `config.json`, and
-  applies on the next poll cycle.
+  applies on the next poll cycle. The **Remote Access** menu holds the Kick
+  webhook and the HTTP control API.
 
 ## Architecture
 
@@ -61,10 +62,12 @@ The notifier sends Telegram messages.
 Two extra services feed the monitor directly. The EventSub client holds one
 authenticated WebSocket for Twitch events. The Kick webhook receiver
 verifies and deduplicates incoming HTTP events and keeps subscriptions in
-sync. The Telegram package runs alongside as an admin-only polling bot. It
+sync. Its listener also serves the control API under `/api/v1`. The
+Telegram package runs alongside as an admin-only polling bot. It
 validates changes on a copy, writes `config.json` atomically, and applies
-them on the next cycle. See [Project layout](#project-layout) for the module
-map.
+them on the next cycle. The control API calls the same command layer, so
+both paths behave the same. See [Project layout](#project-layout) for the
+module map.
 
 ## Requirements
 
@@ -164,13 +167,16 @@ never written back. A config with placeholders is safe to commit or share.
 | `kick.client_secret` | yes¹ | — | Kick app client secret. Same requirement |
 | `kick.record_chat` | no | `true` | Record Kick chat (delivered by the webhook). Requires `kick.webhook.enabled` |
 | `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live/offline + chat) and keep subscriptions in sync. `false` = Kick polling only (no chat) |
-| `kick.webhook.listen_host` | no | `127.0.0.1` | Bind address of the receiver. Set to `0.0.0.0` under Docker so the host tunnel reaches it |
-| `kick.webhook.listen_port` | no | `8787` | Port of the receiver. The tunnels forward to it |
-| `kick.webhook.public_url` | yes² | `""` | Public URL that Kick POSTs to (a host-root URL gets `/kick/webhook` appended). Required when `kick.webhook.enabled` is true |
-| `kick.webhook.tunnel` | no | `""` | `cloudflare` or `tailscale` when the bot manages the tunnel. The bot sets this key |
-| `kick.webhook.cloudflare_token` | no | `""` | cloudflared tunnel token for a managed Cloudflare tunnel |
-| `kick.webhook.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. Restored on boot |
 | `kick.webhook.setup_notified` | no | `false` | Internal: tracks the "webhook is working" confirmation for the current enable |
+| `endpoint.enabled` | no | `false` | Serve the public endpoint: the HTTP listener plus its tunnel. The Kick webhook and the control API use it |
+| `endpoint.listen_host` | no | `127.0.0.1` | Bind address of the listener. Set to `0.0.0.0` under Docker so the host tunnel reaches it |
+| `endpoint.listen_port` | no | `8787` | Port of the listener. The tunnels forward to it |
+| `endpoint.public_url` | yes² | `""` | Public base URL of the endpoint, for example `https://streamarchive.example.com`. Kick POSTs to `<base>/kick/webhook`, the control API answers on `<base>/api/v1/`. Required when `endpoint.enabled` is true |
+| `endpoint.tunnel` | no | `""` | `cloudflare` or `tailscale` when the bot manages the tunnel. The bot sets this key |
+| `endpoint.cloudflare_token` | no | `""` | cloudflared tunnel token for a managed Cloudflare tunnel |
+| `endpoint.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. Restored on boot |
+| `api.enabled` | no | `false` | Serve the HTTP control API under `/api/v1` on the Kick webhook listener. The bot sets this key |
+| `api.key` | no | `""` | API key (bearer token). The bot generates it on the first enable. Keep it secret |
 | `retention_days` | no | `0` | Delete recordings older than this many days. `0` disables cleanup |
 | `preferred_quality` | no | `best` | Stream quality requested from streamlink (`best`, `1080p`, `720p`, …, `audio_only`) |
 | `channel_preferred_qualities` | no | `{}` | Per-channel quality override, for example `{"channel": "720p"}`. Channels without an entry use `preferred_quality` |
@@ -190,7 +196,12 @@ never written back. A config with placeholders is safe to commit or share.
 | `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"channel": 60}`. A channel set to `0` is off. Absent = global value. Managed from the Telegram channel submenu |
 
 ¹ Required when the channel list contains a `kick:` entry.
-² Required when the webhook is enabled.
+² Required when the endpoint is enabled.
+
+Older files keep the listener, the public URL, and the tunnel keys under
+`kick.webhook`. The app moves those keys to `endpoint` when it loads the
+file, so a working setup keeps working. The first save writes the new
+layout.
 
 `output_mode: youtube` additionally requires `youtube_token.json` (see
 [YouTube setup](#youtube-setup)).
@@ -199,7 +210,7 @@ never written back. A config with placeholders is safe to commit or share.
 
 The webhook gives near-instant live/offline signals and Kick chat. The poll
 alone cannot deliver chat (Kick has no chat replay). Open `/settings` in
-Telegram and choose **Kick webhook**, then choose a tunnel option:
+Telegram and choose **Remote Access**. That menu sets the public URL:
 
 - **Cloudflare tunnel**: a *Quick tunnel* (no account, temporary URL) or a
   *Named tunnel* (paste the `cloudflared service install <TOKEN>` command or
@@ -212,13 +223,23 @@ Telegram and choose **Kick webhook**, then choose a tunnel option:
 - **Your own tunnel**: paste the public URL of a tunnel you already run.
 
 The bot probes the URL for reachability and persists its state to
-`config.json`. Then register the URL in the Kick app: **Kick → Settings →
-Developer → your app → Enable webhooks**, and paste the URL there. The
-first verified event from Kick triggers a "Kick webhook is working"
-confirmation. The bot tears down its tunnels when you disable the webhook
-or switch to another provider. A managed Cloudflare tunnel comes back
-automatically on service restart. Its trycloudflare URL can change, and you
-get a new notification when it does.
+`config.json`. Then register the webhook URL in the Kick app: **Kick →
+Settings → Developer → your app → Enable webhooks**. The bot prints the
+exact URL (`<endpoint>/kick/webhook`) after each tunnel setup. The first
+verified event from Kick triggers a "Kick webhook is working"
+confirmation.
+
+Remote Access has one endpoint On/Off button that shows the action you can
+take. **Off** stops the managed tunnel and keeps the saved URL and tunnel
+type, so **On** restores the same setup without new input. The **Cloudflare tunnel**
+and **Tailscale funnel** submenus have their own On/Off control, so you can
+switch provider or stop one tunnel without touching the other. The
+**Kick webhook** and **API** submenus hold only their own toggle and their
+settings. A managed Cloudflare tunnel comes back automatically on service
+restart. Its trycloudflare URL can change, and you get a new notification
+when it does. The endpoint serves both features, so the status shows
+`Endpoint: on (cloudflare · https://…)` and `Kick webhook: on` on
+separate lines.
 
 Internals: the receiver is `POST /kick/webhook` on
 `kick.webhook.listen_host:listen_port`. Every request is verified against
@@ -234,6 +255,30 @@ monitored Kick channels every poll cycle, and immediately on `/add`,
 registered in the Kick app), one Telegram alert is sent until it recovers.
 Webhook delivery is best-effort: the poll covers missed live/offline
 events, and chat gaps stay absent from the chat file.
+
+## Control API
+
+The control API manages channels and settings over HTTP. It is served on
+the public endpoint under `/api/v1`, next to the Kick webhook, so it uses
+the same listener and the same tunnel. The API is off by default.
+
+Open `/settings` in Telegram, choose **Remote Access → API**, and tap
+**On**. On the first enable the bot generates the API key and shows it in
+the reply. Tap **Show key** to show the key again, and **Rotate key** to
+replace it. A rotated key stops the old key at once. Disabling the API
+keeps the key, so a later enable uses the same key. The button shows only
+the action that applies: **Off** while the API is on, **On** while it is
+off.
+
+Send the key in the `Authorization` header (`Bearer <key>`) or in the
+`X-API-Key` header. Without a valid key the API answers `401`. While the
+API is off, it answers `404`. The API never prints a secret. Every applied
+change sends the admin a Telegram message, goes through the same validated,
+atomic `config.json` write as a Telegram change, and applies on the next
+monitoring cycle.
+
+See [docs/control-api.md](docs/control-api.md) for the endpoint list, the
+accepted values, the error answers, and complete examples.
 
 ## Live chat recording
 
@@ -269,12 +314,13 @@ Only the admin user (`telegram_user_id`) gets replies from the bot. The bot
 registers a command menu (type `/`). It also offers a `/settings` reply
 keyboard. The submenus cover channels, chat recording, output mode,
 quality, retention, recording and disk limits, the YouTube hold delay, and
-the Kick webhook. Destructive actions (remove
-a channel, enable delete-oldest) use inline confirmation buttons. The bot
-re-sends the settings menu after every restart, so the reply keyboard
-survives updates and reboots. Every change is validated, written atomically
-to `config.json`, and applies on the next poll cycle. A failed command
-leaves memory and disk untouched.
+**Remote Access** (the public URL tunnels, the Kick webhook toggle, and the
+HTTP control API). On/Off menus show one button with the action that
+applies now. Destructive actions (remove a channel, enable delete-oldest)
+use inline confirmation buttons. The bot re-sends the settings menu after
+every restart, so the reply keyboard survives updates and reboots. Every
+change is validated, written atomically to `config.json`, and applies on
+the next poll cycle. A failed command leaves memory and disk untouched.
 
 | Command | Action |
 | --- | --- |
@@ -357,11 +403,11 @@ docker compose stop     # graceful shutdown: recordings stopped, broadcasts ende
   `TZ=America/New_York` in the same `.env` to match the `timezone` in
   config.
 - Compose rotates logs (10 MB × 3 files).
-- Kick webhook under Docker: a host tailscale funnel forwards to the host
-  loopback, and the compose file publishes the receiver on
-  `127.0.0.1:8787`. Set `kick.webhook.listen_host` to `"0.0.0.0"` in
-  config. The image ships `cloudflared` and the tailscale CLI, and the
-  tailscaled socket is mounted from the host.
+- Kick webhook and control API under Docker: a host tailscale funnel
+  forwards to the host loopback, and the compose file publishes the
+  listener on `127.0.0.1:8787`. Set `kick.webhook.listen_host` to
+  `"0.0.0.0"` in config. The image ships `cloudflared` and the tailscale
+  CLI, and the tailscaled socket is mounted from the host.
 - One-time YouTube OAuth:
   `docker compose run --rm stream-archive stream-archive-setup-youtube`.
   The browser opens on your host. Paste the full address-bar URL at the
@@ -411,6 +457,8 @@ src/stream_archive/
   monitor.py             # start/stop/restart decisions, failure alerts (Twitch + Kick)
   eventsub.py            # Twitch EventSub conduit client (stream.online/offline fast-path)
   kick_webhook.py        # Kick webhook receiver (/kick/webhook), signature verification, subscription sync
+  api.py                 # HTTP control API (/api/v1): channels and settings over the webhook listener
+docs/control-api.md      # control API reference: auth, endpoints, values, examples
   kick_api.py            # Kick OAuth client (token, channel statuses, webhook subscriptions, public key)
   kick_chat.py           # Kick chat -> TwitchDownloader ChatRoot conversion + emote embedding
   recorder/              # streamlink capture, ffmpeg pipe, task tracking, chat finalization (core + mixins)
@@ -428,6 +476,24 @@ tests/                   # pytest suite (config, recorder, monitor, eventsub, ki
 
 At runtime all state lives in the data dir (see [Running](#running)). The
 repository itself is only needed for development.
+
+### Dependency updates
+
+Dependabot checks three ecosystems every week and opens one pull request per
+update:
+
+- `uv`: the Python dependencies in `pyproject.toml` and `uv.lock`, including
+  streamlink.
+- `docker`: the base images of the Dockerfile: python, cloudflared, and uv.
+  Cloudflared and uv sit in their own build stages, so their tags stay
+  visible to Dependabot.
+- `github-actions`: the workflows in `.github/workflows`.
+
+CI runs the five release gates on every pull request, so a merge cannot
+break the lockfile or the tests. The vendored streamlink-ttvlol plugin stays
+pinned to a release plus sha256 on purpose: the bot reports newer plugin
+releases in `/update`, and a maintainer bumps the two `ARG` lines together
+with the image release.
 
 ## Development
 

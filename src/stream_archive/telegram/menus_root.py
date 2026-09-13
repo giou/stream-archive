@@ -27,7 +27,7 @@ async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
         "Max recordings": "maxrec",
         "Max YouTube": "maxyt",
         "Disk": "disk",
-        "Kick webhook": "kick_webhook",
+        "Remote Access": "remote_access",
     }.get(text)
     if new_menu is None:
         return None

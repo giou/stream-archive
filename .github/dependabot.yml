@@ -1,14 +1,19 @@
 version: 2
 updates:
+  # The app and its tools ship in the image, so every ecosystem below feeds
+  # the same release. CI validates each pull request: uv sync --frozen,
+  # ruff format --check, ruff check, mypy, pytest.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+  # Dockerfile base images: python, cloudflared, uv.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
-  - package-ecosystem: "pip"
+  # Python dependencies from uv.lock (streamlink, aiohttp, pydantic, ...).
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"

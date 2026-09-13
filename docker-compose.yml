@@ -16,8 +16,9 @@ services:
       # kick webhook tunnel. Tailscale must be installed on the docker host.
       - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
     ports:
-      # Kick webhook receiver. The host's tailscale funnel forwards to the
-      # host loopback, so we publish the container listener there. This needs
+      # Kick webhook receiver and control API (/api/v1, same listener). The
+      # host's tailscale funnel forwards to the host loopback, so we publish
+      # the container listener there. This needs
       # kick.webhook.listen_host = "0.0.0.0" in config.json under docker.
       - "127.0.0.1:8787:8787"
     environment:

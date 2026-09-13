@@ -24,20 +24,27 @@
     "eventsub": {
         "enabled": true
     },
+    "endpoint": {
+        "enabled": false,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8787,
+        "public_url": "https://streamarchive.example.com",
+        "tunnel": "",
+        "cloudflare_token": "",
+        "cloudflare_managed": false
+    },
     "kick": {
         "client_id": "<your_kick_client_id>",
         "client_secret": "<your_kick_client_secret>",
         "record_chat": true,
         "webhook": {
             "enabled": false,
-            "listen_host": "127.0.0.1",
-            "listen_port": 8787,
-            "public_url": "https://kick-webhook.example.com/kick/webhook",
-            "setup_notified": false,
-            "tunnel": "",
-            "cloudflare_token": "",
-            "cloudflare_managed": false
+            "setup_notified": false
         }
+    },
+    "api": {
+        "enabled": false,
+        "key": ""
     },
     "retention_days": 0,
     "preferred_quality": "best",

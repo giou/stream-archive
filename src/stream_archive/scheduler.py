@@ -7,6 +7,7 @@ from typing import Any
 
 from aiohttp import web
 
+from stream_archive.api import ControlAPI
 from stream_archive.config import AppConfig, get_config
 from stream_archive.eventsub import EventSubClient
 from stream_archive.http import build_shared_client
@@ -108,9 +109,6 @@ async def run_scheduler() -> None:
     await eventsub.start()
 
     kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
-    if config.kick.webhook.enabled:
-        await kick_webhook.start()
-        logger.info("[kick_webhook] started (public: %s)", config.kick.webhook.public_url)
 
     updater = UpdateChecker(config, notifier, http=shared_http)
     updater_task = asyncio.create_task(updater.run_loop())
@@ -126,6 +124,14 @@ async def run_scheduler() -> None:
         kick_webhook=kick_webhook,
         http=shared_http,
     )
+    # The control API shares the Kick webhook listener and calls the
+    # Telegram command layer for every change.
+    control_api = ControlAPI(config, telegram, recorder)
+    control_api.register_routes(kick_webhook)
+    await kick_webhook.apply_state()
+    if kick_webhook.listening_needed():
+        logger.info("[kick_webhook] started (public: %s)", config.endpoint.public_url or "(none)")
+
     await telegram.start()
 
     version = _installed_app_version() or "unknown"
@@ -152,7 +158,6 @@ async def run_scheduler() -> None:
             updater_task=updater_task,
             telegram=telegram,
             youtube_streamer=youtube_streamer,
-            config=config,
             shared_http=shared_http,
         )
 
@@ -198,7 +203,6 @@ async def _shutdown(
     updater_task: asyncio.Task[None],
     telegram: TelegramController,
     youtube_streamer: YouTubeStreamer,
-    config: AppConfig,
     shared_http: Any,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest."""
@@ -219,8 +223,9 @@ async def _shutdown(
             await health_runner.cleanup()
         except Exception:
             logger.error("[scheduler] health server cleanup failed", exc_info=True)
-    if kick_webhook is not None and config.kick.webhook.enabled:
+    if kick_webhook is not None:
         try:
+            # Runs also when only the control API kept the listener alive.
             await kick_webhook.close()
         except Exception:
             logger.error("[scheduler] kick webhook close failed", exc_info=True)

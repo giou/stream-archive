@@ -3,7 +3,17 @@ from pathlib import Path
 
 import pytest
 
-from stream_archive.config import AppConfig, effective_quality, get_config, normalize_channel_name, save_config
+from stream_archive.config import (
+    AppConfig,
+    api_base_url,
+    apply_config_change,
+    effective_quality,
+    endpoint_base_url,
+    get_config,
+    normalize_channel_name,
+    save_config,
+    webhook_public_url,
+)
 
 
 def valid_config():
@@ -244,16 +254,17 @@ def test_eventsub_disabled_passes():
 def kick_config(channels=None):
     config = valid_config()
     config["channels"] = channels or ["kick:xqc"]
+    config["endpoint"] = {
+        "enabled": False,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8787,
+        "public_url": "",
+    }
     config["kick"] = {
         "client_id": "cid",
         "client_secret": "csec",
         "record_chat": True,
-        "webhook": {
-            "enabled": False,
-            "listen_host": "127.0.0.1",
-            "listen_port": 8787,
-            "public_url": "",
-        },
+        "webhook": {"enabled": False},
     }
     return config
 
@@ -263,8 +274,8 @@ def test_kick_channel_with_creds_passes_and_sets_defaults():
     assert config.channels == ["kick:xqc"]
     assert config.kick.record_chat is True
     assert config.kick.webhook.enabled is False
-    assert config.kick.webhook.listen_host == "127.0.0.1"
-    assert config.kick.webhook.listen_port == 8787
+    assert config.endpoint.listen_host == "127.0.0.1"
+    assert config.endpoint.listen_port == 8787
 
 
 def test_kick_channel_normalized_lowercase():
@@ -303,21 +314,21 @@ def test_kick_channel_output_modes_key_passes():
     assert config.channel_output_modes == {"kick:xqc": "youtube"}
 
 
-def test_kick_webhook_enabled_requires_public_url():
+def test_endpoint_enabled_requires_public_url():
     config = kick_config()
-    config["kick"]["webhook"]["enabled"] = True
-    with pytest.raises(ValueError, match="kick.webhook.public_url is required"):
+    config["endpoint"]["enabled"] = True
+    with pytest.raises(ValueError, match="endpoint.public_url is required"):
         AppConfig.model_validate(config)
 
     config = kick_config()
-    config["kick"]["webhook"]["enabled"] = True
-    config["kick"]["webhook"]["public_url"] = "ftp://nope"
-    with pytest.raises(ValueError, match="kick.webhook.public_url is required"):
+    config["endpoint"]["enabled"] = True
+    config["endpoint"]["public_url"] = "ftp://nope"
+    with pytest.raises(ValueError, match="endpoint.public_url is required"):
         AppConfig.model_validate(config)
 
     config = kick_config()
-    config["kick"]["webhook"]["enabled"] = True
-    config["kick"]["webhook"]["public_url"] = "https://host.ts.net/kick/webhook"
+    config["endpoint"]["enabled"] = True
+    config["endpoint"]["public_url"] = "https://host.ts.net"
     AppConfig.model_validate(config)
 
 
@@ -328,23 +339,42 @@ def test_kick_record_chat_non_bool_raises():
         AppConfig.model_validate(config)
 
 
-def test_kick_webhook_invalid_values_raise():
+def test_endpoint_invalid_values_raise():
     config = kick_config()
-    config["kick"]["webhook"]["listen_port"] = 0
+    config["endpoint"]["listen_port"] = 0
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
     config = kick_config()
-    config["kick"]["webhook"]["listen_port"] = 70000
+    config["endpoint"]["listen_port"] = 70000
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
     config = kick_config()
-    config["kick"]["webhook"]["listen_port"] = "8787"
+    config["endpoint"]["listen_port"] = "8787"
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
     config = kick_config()
-    config["kick"]["webhook"]["listen_host"] = ""
+    config["endpoint"]["listen_host"] = ""
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
+    config = kick_config()
+    config["endpoint"]["enabled"] = "yes"
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["endpoint"]["tunnel"] = "wireguard"
+    with pytest.raises(ValueError, match="endpoint.tunnel"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["endpoint"]["cloudflare_token"] = 42
+    with pytest.raises(ValueError, match="endpoint.cloudflare_token"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["endpoint"]["cloudflare_managed"] = "yes"
+    with pytest.raises(ValueError, match="endpoint.cloudflare_managed"):
+        AppConfig.model_validate(config)
+
+
+def test_webhook_feature_invalid_values_raise():
     config = kick_config()
     config["kick"]["webhook"]["enabled"] = "yes"
     with pytest.raises(ValueError):
@@ -353,31 +383,53 @@ def test_kick_webhook_invalid_values_raise():
     config["kick"]["webhook"]["setup_notified"] = "yes"
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
+
+
+def test_legacy_webhook_config_migrates_to_the_endpoint():
     config = kick_config()
-    config["kick"]["webhook"]["tunnel"] = "wireguard"
-    with pytest.raises(ValueError, match="kick.webhook.tunnel"):
-        AppConfig.model_validate(config)
-    config = kick_config()
-    config["kick"]["webhook"]["cloudflare_token"] = 42
-    with pytest.raises(ValueError, match="kick.webhook.cloudflare_token"):
-        AppConfig.model_validate(config)
-    config = kick_config()
-    config["kick"]["webhook"]["cloudflare_managed"] = "yes"
-    with pytest.raises(ValueError, match="kick.webhook.cloudflare_managed"):
-        AppConfig.model_validate(config)
+    del config["endpoint"]  # older files had no endpoint section
+    config["kick"]["webhook"] = {
+        "enabled": True,
+        "listen_host": "0.0.0.0",
+        "listen_port": 9000,
+        "public_url": "https://kick.example.com/kick/webhook",
+        "setup_notified": True,
+        "tunnel": "cloudflare",
+        "cloudflare_token": "tok",
+        "cloudflare_managed": True,
+    }
+    parsed = AppConfig.model_validate(config)
+
+    assert parsed.endpoint.enabled is True
+    assert parsed.endpoint.listen_host == "0.0.0.0"
+    assert parsed.endpoint.listen_port == 9000
+    assert parsed.endpoint.public_url == "https://kick.example.com/kick/webhook"
+    assert parsed.endpoint.tunnel == "cloudflare"
+    assert parsed.endpoint.cloudflare_token == "tok"
+    assert parsed.endpoint.cloudflare_managed is True
+    # The old file used one flag for both features: keep both on.
+    assert parsed.kick.webhook.enabled is True
+    assert parsed.kick.webhook.setup_notified is True
+    # The endpoint section wins when a file already has one.
+    config["endpoint"] = {"enabled": False}
+    config["kick"]["webhook"]["enabled"] = False
+    parsed = AppConfig.model_validate(config)
+    assert parsed.endpoint.enabled is False
+    assert parsed.kick.webhook.enabled is False
 
 
 def test_bare_channels_valid_without_kick_section():
     config = build()
     assert config.kick.record_chat is True
     assert config.kick.webhook.enabled is False
-    assert config.kick.webhook.listen_host == "127.0.0.1"
-    assert config.kick.webhook.listen_port == 8787
-    assert config.kick.webhook.public_url == ""
     assert config.kick.webhook.setup_notified is False
-    assert config.kick.webhook.tunnel == ""
-    assert config.kick.webhook.cloudflare_token == ""
-    assert config.kick.webhook.cloudflare_managed is False
+    assert config.endpoint.enabled is False
+    assert config.endpoint.listen_host == "127.0.0.1"
+    assert config.endpoint.listen_port == 8787
+    assert config.endpoint.public_url == ""
+    assert config.endpoint.tunnel == ""
+    assert config.endpoint.cloudflare_token == ""
+    assert config.endpoint.cloudflare_managed is False
 
 
 def test_bare_name_and_channel_url_helpers():
@@ -535,6 +587,54 @@ def test_config_example_is_valid_json_and_appconfig():
     config = AppConfig.model_validate(data)
     assert config.youtube.hold_seconds == 0
     assert config.output_mode == "disk"
+
+
+def test_api_defaults_and_validation():
+    config = build()
+    assert config.api.enabled is False
+    assert config.api.key == ""
+    with pytest.raises(ValueError, match="api.enabled must be a boolean"):
+        build(api={"enabled": "yes"})
+
+
+def test_public_url_helpers():
+    config = build()
+    assert api_base_url(config) == ""  # no public URL yet
+    assert webhook_public_url(config) == ""
+    config.endpoint.public_url = "https://kick.example.com"
+    assert endpoint_base_url(config) == "https://kick.example.com"
+    assert api_base_url(config) == "https://kick.example.com/api/v1/"
+    assert webhook_public_url(config) == "https://kick.example.com/kick/webhook"
+    # The old layout stored the webhook URL: strip that path.
+    config.endpoint.public_url = "https://kick.example.com/kick/webhook/"
+    assert endpoint_base_url(config) == "https://kick.example.com"
+    assert api_base_url(config) == "https://kick.example.com/api/v1/"
+    assert webhook_public_url(config) == "https://kick.example.com/kick/webhook"
+
+
+def test_apply_config_change_writes_and_adopts_the_change(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(valid_config()))
+    cfg = get_config(path)
+
+    apply_config_change(cfg, lambda c: setattr(c, "output_mode", "youtube"))
+
+    assert cfg.output_mode == "youtube"  # the live instance adopted the change
+    assert json.loads(path.read_text())["output_mode"] == "youtube"
+    assert not (tmp_path / "config.json.tmp").exists()  # atomic replace, no leftover
+
+
+def test_apply_config_change_rejects_a_bad_change_and_writes_nothing(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(valid_config()))
+    cfg = get_config(path)
+    before = path.read_text()
+
+    with pytest.raises(ValueError):
+        apply_config_change(cfg, lambda c: setattr(c, "output_mode", "nope"))
+
+    assert cfg.output_mode == "disk"
+    assert path.read_text() == before
 
 
 def test_save_preserves_file_mode(tmp_path):

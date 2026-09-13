@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +13,7 @@ from aiohttp import web
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from stream_archive.config import AppConfig, is_kick_channel, kick_bare_name, save_config
+from stream_archive.config import AppConfig, is_kick_channel, kick_bare_name, save_config, webhook_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -120,31 +121,68 @@ class KickWebhook:
         self._app = web.Application()
         self._app.router.add_post("/kick/webhook", self._handle)
 
-    async def start(self) -> None:
-        """Bind the HTTP listener and start the subscription sync loop. Idempotent."""
-        if self._runner is not None:
+    def add_routes(self, register: Callable[[web.Application], None]) -> None:
+        """Register extra routes on the shared listener (the control API uses this).
+
+        Call before the first ``apply_state``. One listener serves the
+        webhook and every extra route.
+        """
+        register(self._app)
+
+    def listening_needed(self) -> bool:
+        """True when the listener must run: the endpoint or the control API is on."""
+        return self._config.endpoint.enabled or self._config.api.enabled
+
+    async def apply_state(self) -> None:
+        """Match the live listener and sync loop to the config. Idempotent.
+
+        The listener serves the public endpoint, which carries the Kick
+        webhook and the control API, so it runs while the endpoint or the
+        API is enabled. The subscription sync loop needs the webhook and a
+        reachable endpoint, and it deletes subscriptions for unmonitored
+        channels.
+        """
+        if not self.listening_needed():
+            await self._stop_sync()
+            await self._unbind()
             return
-        wh = self._config.kick.webhook
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, wh.listen_host, wh.listen_port)
-        await self._site.start()
-        self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info(
-            "[kick_webhook] listening on http://%s:%s (public: %s)",
-            wh.listen_host,
-            wh.listen_port,
-            wh.public_url or "(none)",
-        )
+        if self._runner is None:
+            ep = self._config.endpoint
+            self._runner = web.AppRunner(self._app)
+            await self._runner.setup()
+            try:
+                self._site = web.TCPSite(self._runner, ep.listen_host, ep.listen_port)
+                await self._site.start()
+            except OSError:
+                await self._unbind()  # a failed bind leaves no half-built runner
+                raise
+            logger.info(
+                "[kick_webhook] listening on http://%s:%s (public: %s)",
+                ep.listen_host,
+                ep.listen_port,
+                ep.public_url or "(none)",
+            )
+        if self._sync_needed() and self._sync_task is None:
+            self._sync_task = asyncio.create_task(self._sync_loop())
+
+    def _sync_needed(self) -> bool:
+        """True when Kick delivers events here: endpoint and webhook both on."""
+        return self._config.endpoint.enabled and self._config.kick.webhook.enabled
 
     async def close(self) -> None:
         """Stop the sync loop and the HTTP listener. Idempotent."""
+        await self._stop_sync()
+        await self._unbind()
+
+    async def _stop_sync(self) -> None:
         task = self._sync_task
         self._sync_task = None
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+
+    async def _unbind(self) -> None:
         site = self._site
         self._site = None
         if site is not None:
@@ -196,7 +234,7 @@ class KickWebhook:
                 "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
                 "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
                 "your app \u2192 Enable webhooks)? "
-                f"{self._config.kick.webhook.public_url}\n"
+                f"{webhook_public_url(self._config)}\n"
                 f"Error: {detail}"
             )
         except Exception:

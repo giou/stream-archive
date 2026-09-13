@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from stream_archive.config import AppConfig
+from stream_archive.config import WEBHOOK_PATH, AppConfig, endpoint_base_url, webhook_public_url
 from stream_archive.telegram.menu_state import ChatId, MenuState
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ _CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 
 _HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
 
+#: User-facing names of the tunnel values in endpoint.tunnel.
+_TUNNEL_LABELS = {"cloudflare": "Cloudflare tunnel", "tailscale": "Tailscale funnel"}
+
 
 def _decode_cloudflared_token(token: str) -> dict[str, Any] | None:
     """Decode a cloudflared install token into its JSON payload, or return None."""
@@ -59,11 +62,18 @@ def _valid_cloudflare_token(token: str) -> bool:
     return bool(isinstance(data, dict) and all(isinstance(data.get(k), str) and data[k] for k in ("a", "t", "s")))
 
 
-def _normalize_webhook_url(url: str) -> str:
-    """Append the receiver path when the URL points at the host root."""
-    if urlsplit(url).path in ("", "/"):
-        return url.rstrip("/") + "/kick/webhook"
+def _normalize_endpoint_url(url: str) -> str:
+    """Base form of a pasted public URL: no trailing slash, no webhook path."""
+    url = url.strip().rstrip("/")
+    if url.endswith(WEBHOOK_PATH):
+        return url[: -len(WEBHOOK_PATH)]
     return url
+
+
+def _public_url_note(config: AppConfig) -> str:
+    """Endpoint and Kick webhook URL lines for the tunnel setup replies."""
+    base = endpoint_base_url(config)
+    return f"Endpoint: {base}/\nKick app webhook URL: {webhook_public_url(config)}\n" + _KICK_DASHBOARD_HINT
 
 
 def _parse_public_hostname(text: str) -> str | None:
@@ -92,12 +102,16 @@ class WebhookCommands:
     reply_keyboard: Any
 
     def _webhook_state_text(self) -> str:
-        w = self._config.kick.webhook
-        if not w.enabled:
+        """One-line state of the Kick webhook feature."""
+        return "on" if self._config.kick.webhook.enabled else "off"
+
+    def _endpoint_state_text(self) -> str:
+        """One-line state of the public endpoint: tunnel and base URL."""
+        ep = self._config.endpoint
+        if not ep.enabled:
             return "off"
-        tunnel = w.tunnel or ""
-        url = w.public_url
-        return f"on ({tunnel} \u00b7 {url})" if tunnel else f"on ({url})"
+        base = endpoint_base_url(self._config)
+        return f"on ({ep.tunnel} \u00b7 {base}/)" if ep.tunnel else f"on ({base}/)"
 
     async def _tailscale_webhook_url(self) -> tuple[str | None, str | None]:
         """Detect tailscale, enable a funnel for the webhook port, return its public URL.
@@ -105,7 +119,7 @@ class WebhookCommands:
         Returns (url, None) on success, or (None, hint) with a user-facing
         explanation when tailscale is missing or unusable. Never raises.
         """
-        port = self._config.kick.webhook.listen_port
+        port = self._config.endpoint.listen_port
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -168,7 +182,7 @@ class WebhookCommands:
             # success.
             if "listener already exists" not in stderr_text or not await self._funnel_serving(port):
                 return None, (f"tailscale funnel {port} failed: " + (stderr_text or f"exit {proc.returncode}"))
-        return f"https://{dns_name}/kick/webhook", None
+        return f"https://{dns_name}", None
 
     async def _funnel_serving(self, port: int) -> bool:
         """True when a foreground tailscale funnel proxies / to 127.0.0.1:<port>."""
@@ -214,7 +228,7 @@ class WebhookCommands:
         webhook with the published trycloudflare URL.
         """
         self._cloudflared_stop()
-        port = self._config.kick.webhook.listen_port
+        port = self._config.endpoint.listen_port
         try:
             proc = await asyncio.create_subprocess_exec(
                 # --no-autoupdate is a root flag. It must precede the subcommand.
@@ -244,7 +258,7 @@ class WebhookCommands:
             return None, "cloudflared exited before publishing a URL:\n" + "\n".join(tail[-8:])
         self._cloudflared = proc
         self._cloudflared_drain = asyncio.create_task(self._drain_cloudflared(proc))
-        return _normalize_webhook_url(url), None
+        return _normalize_endpoint_url(url), None
 
     async def _cloudflared_named_start(self, token: str, config_path: Path | None = None) -> tuple[bool, str | None]:
         """Start a named tunnel with ``cloudflared tunnel run --token``.
@@ -338,35 +352,44 @@ class WebhookCommands:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
 
+    async def _start_cloudflare_tunnel(self) -> tuple[str | None, str | None]:
+        """Start the saved managed Cloudflare tunnel. Return (url, hint).
+
+        A stored token starts the named tunnel with the local ingress
+        config. Without a token the quick tunnel starts, and its temporary
+        trycloudflare URL can differ from the stored one.
+        """
+        ep = self._config.endpoint
+        if ep.cloudflare_token:
+            host = urlsplit(ep.public_url or "").hostname
+            cfg = await self._write_cloudflared_config(host) if host else None
+            ok, hint = await self._cloudflared_named_start(ep.cloudflare_token, config_path=cfg)
+            return (_normalize_endpoint_url(ep.public_url), None) if ok else (None, hint)
+        url, hint = await self._cloudflared_quick_start()
+        return (_normalize_endpoint_url(url), hint) if url else (None, hint)
+
     async def _restore_cloudflared(self) -> None:
-        """Restart an app-managed cloudflared after a service restart (webhook enabled)."""
+        """Restart an app-managed cloudflared after a service restart (endpoint on)."""
         try:
-            w = self._config.kick.webhook
-            if w.enabled and w.tunnel == "cloudflare" and w.cloudflare_managed:
-                token = w.cloudflare_token
-                if token:
-                    host = urlsplit(w.public_url or "").hostname
-                    cfg = await self._write_cloudflared_config(host) if host else None
-                    ok, hint = await self._cloudflared_named_start(token, config_path=cfg)
-                    if not ok:
-                        await self._send_admin(f"\u274c cloudflared failed to restart your named tunnel:\n{hint}")
-                else:
-                    url, hint = await self._cloudflared_quick_start()
-                    if url is None:
-                        await self._send_admin(f"\u274c cloudflared quick tunnel failed to restart:\n{hint}")
-                    elif url != w.public_url:
+            ep = self._config.endpoint
+            if not (ep.enabled and ep.tunnel == "cloudflare" and ep.cloudflare_managed):
+                return
+            url, hint = await self._start_cloudflare_tunnel()
+            if url is None:
+                await self._send_admin(f"\u274c cloudflared failed to restart your tunnel:\n{hint}")
+            elif url != _normalize_endpoint_url(ep.public_url):
 
-                        def mutate(candidate: AppConfig) -> None:
-                            candidate.kick.webhook.public_url = url
-                            candidate.kick.webhook.setup_notified = False
+                def mutate(candidate: AppConfig) -> None:
+                    candidate.endpoint.public_url = url
+                    candidate.kick.webhook.setup_notified = False
 
-                        self._apply(mutate, lambda c: "public_url updated")
-                        note = await self._reachability_note(url, "cloudflare")
-                        await self._send_admin(
-                            "\U0001f4a1 Your cloudflared quick tunnel restarted with a new temporary URL:\n\n"
-                            f"```\n{url}\n```\n"
-                            "The previous trycloudflare URL expired. " + _KICK_DASHBOARD_HINT + note
-                        )
+                self._apply(mutate, lambda c: "public_url updated")
+                note = await self._reachability_note(url, "cloudflare")
+                await self._send_admin(
+                    "\U0001f4a1 Your cloudflared quick tunnel restarted with a new temporary URL:\n\n"
+                    f"```\n{url}\n```\n"
+                    "The previous trycloudflare URL expired. " + _public_url_note(self._config) + note
+                )
         except Exception:
             logger.exception("[telegram] cloudflared restore failed")
 
@@ -385,7 +408,7 @@ class WebhookCommands:
                 "(cloudflared service install <TOKEN>) \u2014 or paste the whole command."
             )
         result: str = self._apply(
-            lambda candidate: setattr(candidate.kick.webhook, "cloudflare_token", token),
+            lambda candidate: setattr(candidate.endpoint, "cloudflare_token", token),
             lambda c: "token saved",
             chat_id,
         )
@@ -399,9 +422,9 @@ class WebhookCommands:
 
     async def _write_cloudflared_config(self, host: str) -> Path:
         """Write the local ingress config for the named tunnel and return its path."""
-        wh = self._config.kick.webhook
-        port = wh.listen_port
-        data = _decode_cloudflared_token(wh.cloudflare_token)
+        ep = self._config.endpoint
+        port = ep.listen_port
+        data = _decode_cloudflared_token(ep.cloudflare_token)
         tunnel_id = (data or {}).get("t") or "tunnel"
         directory = Path(self._config._workdir) / "cloudflared"
         directory.mkdir(parents=True, exist_ok=True)
@@ -419,8 +442,8 @@ class WebhookCommands:
         """
         chat = chat_id if chat_id is not None else self._admin_id
         host = self._state_for(chat).cloudflare_hostname or ""
-        wh = self._config.kick.webhook
-        data = _decode_cloudflared_token(wh.cloudflare_token)
+        ep = self._config.endpoint
+        data = _decode_cloudflared_token(ep.cloudflare_token)
         tunnel_id = (data or {}).get("t") or ""
         account_id = (data or {}).get("a") or ""
         if not host or not tunnel_id:
@@ -519,14 +542,13 @@ class WebhookCommands:
             return "\u274c No hostname \u2014 start the Named tunnel flow again.", self.reply_keyboard(
                 "kick_cloudflare"
             )
-        wh = self._config.kick.webhook
-        token = wh.cloudflare_token
+        token = self._config.endpoint.cloudflare_token
         cfg = await self._write_cloudflared_config(host)
         ok, hint = await self._cloudflared_named_start(token, config_path=cfg)
         if not ok:
             return f"\u274c cloudflared failed to start:\n{hint}", self.reply_keyboard("kick_cloudflare_dns")
-        url = _normalize_webhook_url(f"https://{host}")
-        result = await self._apply_webhook_state(
+        url = _normalize_endpoint_url(f"https://{host}")
+        result = await self._apply_endpoint_state(
             True, url, "cloudflare", cloudflare_token=token, cloudflare_managed=True, chat_id=chat
         )
         if result.startswith("\u274c"):
@@ -538,29 +560,32 @@ class WebhookCommands:
                 "\n\nOne last step: add this DNS record in the Cloudflare dashboard "
                 "(DNS \u2192 Records \u2192 Add record):\n"
                 f"CNAME {host} \u2192 {tunnel_id}.cfargotunnel.com (proxied).\n"
-                "The webhook only starts receiving events once the record resolves."
+                "Kick only reaches the endpoint once the record resolves."
             )
         note = await self._reachability_note(url, "cloudflare")
-        state.menu = "kick_webhook"
+        state.menu = "kick_cloudflare"
         return (
-            f"{result}\n\n```\n{url}\n```\n" + _KICK_DASHBOARD_HINT + "\n" + dns_note + note,
-            self.reply_keyboard("kick_webhook"),
+            f"{result}\n\n{_public_url_note(self._config)}\n" + dns_note + note,
+            self.reply_keyboard("kick_cloudflare"),
         )
 
     async def _apply_cloudflare_url(self, text: str, chat_id: int | None = None) -> tuple[str, Any]:
-        """Enable the webhook with a pasted URL of the user's own (external) tunnel.
+        """Enable the endpoint with a pasted URL of the user's own (external) tunnel.
 
         The app does not manage this tunnel and never restarts it on boot.
         """
         chat = chat_id if chat_id is not None else self._admin_id
         state = self._state_for(chat)
-        url = _normalize_webhook_url(text.strip())
-        result = await self._apply_webhook_state(True, url, "cloudflare", chat_id=chat)
+        url = _normalize_endpoint_url(text)
+        result = await self._apply_endpoint_state(True, url, "cloudflare", chat_id=chat)
         if result.startswith("\u274c"):
             return result, self.reply_keyboard(state.menu)
         note = await self._reachability_note(url, "cloudflare")
-        state.menu = "kick_webhook"
-        return (f"{result}\n\n```\n{url}\n```\n" + _KICK_DASHBOARD_HINT + note, self.reply_keyboard("kick_webhook"))
+        state.menu = "kick_cloudflare"
+        return (
+            f"{result}\n\n{_public_url_note(self._config)}{note}",
+            self.reply_keyboard("kick_cloudflare"),
+        )
 
     async def _probe_webhook_url(self, url: str) -> bool:
         """True when the public URL answers an HTTP request (tunnel and DNS work).
@@ -614,66 +639,163 @@ class WebhookCommands:
             return False
         return proc.returncode == 0
 
-    async def _apply_webhook_state(
+    def _tunnel_active(self, tunnel: str) -> bool:
+        """True when the endpoint runs on ``tunnel`` right now."""
+        ep = self._config.endpoint
+        return ep.enabled and ep.tunnel == tunnel
+
+    async def _teardown_tunnel(self, tunnel: str) -> None:
+        """Stop the managed tunnel that the endpoint no longer uses."""
+        if tunnel == "tailscale":
+            if not await self._tailscale_funnel_off():
+                logger.warning("[telegram] Cannot turn off the tailscale funnel for the listener port")
+        elif tunnel == "cloudflare":
+            self._cloudflared_stop()
+
+    async def _tailscale_enable(self, chat_id: int | None = None) -> tuple[bool, str]:
+        """Enable the endpoint on a tailscale funnel. Return (ok, message)."""
+        port = self._config.endpoint.listen_port
+        url, hint = await self._tailscale_webhook_url()
+        if url is None:
+            return False, f"{hint}\n\nFix tailscale and tap On again, or use Cloudflare tunnel instead."
+        result: str = await self._apply_endpoint_state(True, url, "tailscale", chat_id=chat_id)
+        if result.startswith("\u274c"):
+            return False, result
+        note = await self._reachability_note(url, "tailscale")
+        return True, (
+            f"{result}\n\ntailscale funnel {port} is enabled on this host.\n{_public_url_note(self._config)}{note}"
+        )
+
+    async def _disable_endpoint(self, chat_id: int | None = None, tunnel: str | None = None) -> str:
+        """Turn the endpoint off and stop its tunnel. The setup stays saved.
+
+        ``tunnel`` scopes the press to one tunnel menu, so an Off press
+        there never stops the endpoint of another tunnel.
+        """
+        if tunnel is not None and not self._tunnel_active(tunnel):
+            return f"{_TUNNEL_LABELS.get(tunnel, tunnel)} is not on."
+        if not self._config.endpoint.enabled:
+            return "Endpoint is already off."
+        result: str = await self._apply_endpoint_state(False, chat_id=chat_id)
+        if result.startswith("\u274c"):
+            return result
+        saved = self._config.endpoint
+        where = f"{saved.tunnel} \u00b7 {saved.public_url}" if saved.tunnel else saved.public_url
+        return f"{result}\n\nYour setup is saved ({where}). Tap On to restore it."
+
+    async def _set_webhook_enabled(self, enabled: bool, chat_id: int | None = None) -> str:
+        """Turn the Kick webhook feature on or off. The endpoint is untouched."""
+        if self._config.kick.webhook.enabled == enabled:
+            return f"Kick webhook is already {'on' if enabled else 'off'}."
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.kick.webhook.enabled = enabled
+            if enabled:
+                # Re-arm the delivery confirmation for the new enable.
+                candidate.kick.webhook.setup_notified = False
+
+        result: str = self._apply(mutate, lambda c: f"Kick webhook {'enabled' if enabled else 'disabled'}", chat_id)
+        if result.startswith("\u274c"):
+            return result
+        if enabled and not self._config.endpoint.enabled:
+            return f"{result}\n\nThe endpoint is off, so Kick cannot deliver events yet."
+        return result
+
+    async def _enable_endpoint(self, chat_id: int | None = None, tunnel: str | None = None) -> str:
+        """Turn the endpoint on again with the saved tunnel setup.
+
+        ``tunnel`` scopes the press to one tunnel menu: the enable then
+        needs a saved setup for that tunnel. The Tailscale menu has no
+        stored setup to restore, so it runs the funnel flow itself.
+        """
+        ep = self._config.endpoint
+        if ep.enabled:
+            if tunnel is None or ep.tunnel == tunnel:
+                return "Endpoint is already on."
+            active = _TUNNEL_LABELS.get(ep.tunnel, "your own URL")
+            return f"The active tunnel is {active}. Turn it off first, or pick a tunnel below."
+        if tunnel is not None and ep.tunnel != tunnel:
+            return f"No saved {_TUNNEL_LABELS.get(tunnel, tunnel)}. Pick a tunnel below, or send me your public URL."
+        if not ep.public_url:
+            return "No saved tunnel yet. Choose Cloudflare tunnel or Tailscale funnel, or send me your public URL."
+        if ep.tunnel == "tailscale":
+            _ok, message = await self._tailscale_enable(chat_id=chat_id)
+            return message
+        tunnel = ep.tunnel
+        if tunnel == "cloudflare" and ep.cloudflare_managed:
+            url, hint = await self._start_cloudflare_tunnel()
+            if url is None:
+                return f"\u274c {hint}"
+        else:
+            url = ep.public_url
+        result: str = await self._apply_endpoint_state(
+            True,
+            url,
+            tunnel,
+            cloudflare_token=ep.cloudflare_token,
+            cloudflare_managed=ep.cloudflare_managed,
+            chat_id=chat_id,
+        )
+        if result.startswith("\u274c"):
+            return result
+        note = await self._reachability_note(url, tunnel)
+        return f"{result}\n\n{_public_url_note(self._config)}{note}"
+
+    async def _apply_endpoint_state(
         self,
         enabled: bool,
-        url: str,
+        url: str = "",
         tunnel: str = "",
         cloudflare_token: str = "",
         cloudflare_managed: bool = False,
         chat_id: int | None = None,
     ) -> str:
-        """Persist kick.webhook.{enabled,public_url,tunnel,...} and reconcile live state.
+        """Persist endpoint.{enabled,public_url,tunnel,...} and reconcile live state.
 
-        Kick accepts a single webhook URL, so only one tunnel can expose
-        the receiver. Enabling a different provider, or disabling the
-        webhook, tears down the previously managed tunnel: the tailscale
-        funnel for the webhook port, or the cloudflared subprocess.
-        ``cloudflare_managed`` marks a cloudflare tunnel that the app
-        started itself and restores on boot. A pasted URL with no token is
-        the user's own tunnel, and the app never restarts it.
+        One tunnel exposes the endpoint, which carries the Kick webhook
+        and the control API. Enabling a different provider, or disabling
+        the endpoint, tears down the previously managed tunnel: the
+        tailscale funnel for the listener port, or the cloudflared
+        subprocess. ``cloudflare_managed`` marks a cloudflare tunnel that
+        the app started itself and restores on boot. A pasted URL with no
+        token is the user's own tunnel, and the app never restarts it.
+        Disabling keeps the saved URL and tunnel, so On restores the same
+        setup without new input.
         """
-        wh = self._config.kick.webhook
-        old_tunnel = wh.tunnel
-        old_setup_notified = wh.setup_notified
+        ep = self._config.endpoint
+        old_tunnel = ep.tunnel
+        was_enabled = ep.enabled
 
         def mutate(candidate: AppConfig) -> None:
-            cw = candidate.kick.webhook
+            ce = candidate.endpoint
             if enabled:
                 # Set public_url first: the model requires an http(s)
                 # URL the moment enabled flips to True.
-                cw.public_url = url
-                cw.tunnel = cast(Any, tunnel)
-                cw.cloudflare_token = cloudflare_token
-                cw.cloudflare_managed = cloudflare_managed
-                # Re-arm the "webhook is working" confirmation. It fires on
-                # the first verified Kick event, so a re-enable with a new
-                # tunnel or URL confirms again.
-                cw.setup_notified = False
-                cw.enabled = True
-            else:
-                cw.enabled = False
-                cw.public_url = url
-                cw.tunnel = ""
-                cw.cloudflare_token = ""
-                cw.cloudflare_managed = False
-                cw.setup_notified = old_setup_notified
+                ce.public_url = url
+                ce.tunnel = cast(Any, tunnel)
+                ce.cloudflare_token = cloudflare_token
+                ce.cloudflare_managed = cloudflare_managed
+                # The delivery confirmation belongs to the URL, so a new
+                # enable (or a new URL) proves delivery again.
+                candidate.kick.webhook.setup_notified = False
+            ce.enabled = enabled
 
         result: str = self._apply(
             mutate,
-            lambda c: f"Kick webhook {'enabled' if enabled else 'disabled'}",
+            lambda c: f"Endpoint {'enabled' if enabled else 'disabled'}",
             chat_id,
         )
         if result.startswith("\u274c"):
             return result
         if self._kick_webhook is not None:
+            # The listener also serves the control API, so this reconciles
+            # both features instead of a plain start or stop.
+            await self._kick_webhook.apply_state()
             if enabled:
-                await self._kick_webhook.start()  # idempotent
                 await self._kick_webhook.sync_channels(self._config.channels)
-            else:
-                await self._kick_webhook.close()  # idempotent
-        if old_tunnel == "tailscale" and tunnel != "tailscale" and not await self._tailscale_funnel_off():
-            logger.warning("[telegram] Could not turn off the tailscale funnel for the webhook port")
-        if old_tunnel == "cloudflare" and tunnel != "cloudflare":
-            self._cloudflared_stop()
+        if enabled:
+            if old_tunnel != tunnel:
+                await self._teardown_tunnel(old_tunnel)
+        elif was_enabled:
+            await self._teardown_tunnel(old_tunnel)
         return result

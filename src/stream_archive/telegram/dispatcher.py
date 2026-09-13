@@ -16,10 +16,16 @@ from telegram import BotCommandScopeChat, ReplyKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from stream_archive.config import AppConfig, _replace_in_place, effective_quality, is_kick_channel, save_config
+from stream_archive.config import (
+    AppConfig,
+    apply_config_change,
+    effective_quality,
+    is_kick_channel,
+)
 from stream_archive.http import build_shared_client
 from stream_archive.telegram import menus
 from stream_archive.telegram import menus_callbacks as callbacks
+from stream_archive.telegram.commands_api import ApiCommands
 from stream_archive.telegram.commands_channels import ChannelsCommands
 from stream_archive.telegram.commands_settings import SettingsCommands
 from stream_archive.telegram.commands_system import SystemCommands
@@ -58,7 +64,7 @@ def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, 
 
 
 class TelegramController(
-    ChatStateMixin, CommandsMixin, ChannelsCommands, SettingsCommands, WebhookCommands, SystemCommands
+    ChatStateMixin, CommandsMixin, ChannelsCommands, SettingsCommands, ApiCommands, WebhookCommands, SystemCommands
 ):
     _config: AppConfig
     _recorder: Any
@@ -147,8 +153,8 @@ class TelegramController(
             )
         except Exception:
             logger.warning("[telegram] Failed to re-send settings menu after restart", exc_info=True)
-        w = self._config.kick.webhook
-        if w.enabled and w.tunnel == "cloudflare" and w.cloudflare_managed:
+        ep = self._config.endpoint
+        if ep.enabled and ep.tunnel == "cloudflare" and ep.cloudflare_managed:
             asyncio.create_task(self._restore_cloudflared())
 
     async def stop(self) -> None:
@@ -164,14 +170,11 @@ class TelegramController(
     def _apply(
         self, mutate: Callable[[AppConfig], Any], ok_text: Callable[[AppConfig], str], chat_id: ChatId | None = None
     ) -> str:
-        candidate = self._config.model_copy(deep=True)
         try:
-            mutate(candidate)
-            save_config(candidate)
+            candidate = apply_config_change(self._config, mutate)
         except ValueError as e:
             return f"\u274c {e}"
         affected = _deferred_affected_channels(candidate, self._recorder.recording_settings())
-        _replace_in_place(self._config, candidate)
         if affected:
             chat = chat_id if chat_id is not None else self._admin_id
             self._pending_apply[(chat, secrets.token_hex(4))] = (ok_text(candidate), affected)

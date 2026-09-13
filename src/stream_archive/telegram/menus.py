@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 from telegram import ReplyKeyboardMarkup
 
+from stream_archive.config import api_base_url
+from stream_archive.telegram import menus_api as api_menus
 from stream_archive.telegram import menus_kick as kick_menus
 from stream_archive.telegram import menus_root as root_menus
 from stream_archive.telegram import menus_settings as settings_menus
@@ -37,14 +39,20 @@ def _frame(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     )
 
 
-# Static keyboards. The channels menu lists live channels, so it builds dynamically.
+def _toggle(enabled: bool) -> str:
+    """Label of the one-button on/off toggle for one state."""
+    return "Off" if enabled else "On"
+
+
+# Static keyboards. The channels, api, and remote-access menus read live
+# state, so they build dynamically.
 _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
     "root": [
         ["Channels", "Status"],
         ["Chat recording", "Output mode"],
         ["Quality", "Retention"],
         ["Max recordings", "Max YouTube"],
-        ["Disk", "Kick webhook"],
+        ["Disk", "Remote Access"],
     ],
     "channel": [
         ["Back"],
@@ -65,8 +73,6 @@ _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
     "maxyt": [["0 (unlimited)", "1", "2"], ["3", "5"], ["Custom", "Back"]],
     "disk": [["Max total"], ["Delete oldest"], ["Back"]],
     "disk_maxsize": [["0", "25", "50"], ["100", "200"], ["Custom", "Back"]],
-    "kick_webhook": [["Off", "Cloudflare tunnel"], ["Tailscale funnel"], ["Back"]],
-    "kick_cloudflare": [["Quick tunnel", "Named tunnel"], ["Back"]],
     "kick_cloudflare_dns": [["Skip"], ["Back"]],
     "kick_cloudflare_token": [["Back"]],
     "kick_cloudflare_hostname": [["Back"]],
@@ -80,6 +86,23 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
     if menu == "channels":
         rows = [["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in ctrl._config.channels)]
         return _frame(rows)
+    if menu == "api":
+        return _frame([[_toggle(ctrl._config.api.enabled)], ["Show key", "Rotate key"], ["Back"]])
+    if menu == "remote_access":
+        return _frame(
+            [
+                [_toggle(ctrl._config.endpoint.enabled)],
+                ["Cloudflare tunnel", "Tailscale funnel"],
+                ["Kick webhook", "API"],
+                ["Back"],
+            ]
+        )
+    if menu == "kick_webhook":
+        return _frame([[_toggle(ctrl._config.kick.webhook.enabled)], ["Back"]])
+    if menu == "kick_cloudflare":
+        return _frame([[_toggle(ctrl._tunnel_active("cloudflare"))], ["Quick tunnel", "Named tunnel"], ["Back"]])
+    if menu == "kick_tailscale":
+        return _frame([[_toggle(ctrl._tunnel_active("tailscale"))], ["Back"]])
     return _frame([list(row) for row in _STATIC_KEYBOARDS.get(menu, [["Back"]])])
 
 
@@ -100,16 +123,65 @@ async def _text_add_channel(ctrl: TelegramController, state: MenuState) -> str:
     )
 
 
+async def _text_remote_access(ctrl: TelegramController, state: MenuState) -> str:
+    return (
+        f"Endpoint: {ctrl._endpoint_state_text()}\n"
+        f"Kick webhook: {ctrl._webhook_state_text()}\n"
+        f"Control API: {ctrl._api_state_text()}\n\n"
+        "Cloudflare tunnel and Tailscale funnel set the public URL. The toggle starts and stops "
+        "the endpoint. The Kick webhook and the control API are served there."
+    )
+
+
+async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
+    if not ctrl._config.api.enabled:
+        return (
+            "Control API: off\n\n"
+            "The API manages channels and settings over HTTP under /api/v1/, on the same "
+            "listener and public URL as the Kick webhook.\n"
+            "Enable it and I generate the API key."
+        )
+    base = api_base_url(ctrl._config)
+    url_line = f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Remote Access."
+    text = f"Control API: on\n{url_line}\nTap Show key to display the key. Changes apply on the next cycle."
+    if not ctrl._config.kick.webhook.enabled:
+        text += "\nThe public URL needs remote access. Turn it on to reach the API from outside."
+    return text
+
+
 async def _text_kick_webhook(ctrl: TelegramController, state: MenuState) -> str:
-    return f"Kick webhook: {ctrl._webhook_state_text()}\n\nChoose the tunnel you use to expose this service:"
+    text = f"Kick webhook: {ctrl._webhook_state_text()}\n"
+    if not ctrl._config.endpoint.enabled:
+        text += "The endpoint is off, so Kick cannot deliver events.\n"
+    return text + "\nThe endpoint and its tunnels are set in Remote Access."
 
 
 async def _text_kick_cloudflare(ctrl: TelegramController, state: MenuState) -> str:
+    ep = ctrl._config.endpoint
+    active = ctrl._tunnel_active("cloudflare")
+    text = f"Cloudflare tunnel: {'on' if active else 'off'}\n"
+    if not active and ep.tunnel == "cloudflare" and ep.public_url:
+        text += f"Saved setup: {ep.public_url}. Tap On to restore it.\n"
     return (
-        "Cloudflare tunnel\n\n"
+        f"{text}\n"
         "\u2022 Quick tunnel \u2014 no Cloudflare account needed, temporary URL.\n"
         "\u2022 Named tunnel \u2014 your Cloudflare account, stable hostname.\n"
         "\u2022 Already running your own tunnel? Send me its URL directly."
+    )
+
+
+async def _text_kick_tailscale(ctrl: TelegramController, state: MenuState) -> str:
+    ep = ctrl._config.endpoint
+    active = ctrl._tunnel_active("tailscale")
+    text = f"Tailscale funnel: {'on' if active else 'off'}"
+    if active:
+        text += f" \u00b7 {ep.public_url}"
+    elif ep.tunnel == "tailscale" and ep.public_url:
+        text += f"\nSaved setup: {ep.public_url}. Tap On to restore it."
+    return (
+        f"{text}\n\n"
+        f"On runs tailscale funnel {ep.listen_port} on this host for the endpoint. "
+        "Off stops the funnel and the endpoint."
     )
 
 
@@ -284,8 +356,11 @@ MENU: dict[str, MenuDef] = {
     "disk": _pair("disk", _text_disk),
     "disk_maxsize": _pair("disk_maxsize", _text_disk_maxsize),
     "custom": _pair("custom", _text_custom),
+    "remote_access": _pair("remote_access", _text_remote_access),
+    "api": _pair("api", _text_api),
     "kick_webhook": _pair("kick_webhook", _text_kick_webhook),
     "kick_cloudflare": _pair("kick_cloudflare", _text_kick_cloudflare),
+    "kick_tailscale": _pair("kick_tailscale", _text_kick_tailscale),
     "kick_cloudflare_token": _pair("kick_cloudflare_token", _text_kick_cloudflare_token),
     "kick_cloudflare_hostname": _pair("kick_cloudflare_hostname", _text_kick_cloudflare_hostname),
     "kick_cloudflare_dns": _pair("kick_cloudflare_dns", _text_kick_cloudflare_dns),
@@ -309,8 +384,11 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "disk": settings_menus.menu_disk,
     "disk_maxsize": settings_menus.menu_disk_maxsize,
     "custom": settings_menus.menu_custom,
+    "remote_access": kick_menus.menu_remote_access,
+    "api": api_menus.menu_api,
     "kick_webhook": kick_menus.menu_kick_webhook,
     "kick_cloudflare": kick_menus.menu_kick_cloudflare,
+    "kick_tailscale": kick_menus.menu_kick_tailscale,
     "kick_cloudflare_token": kick_menus.menu_kick_token,
     "kick_cloudflare_hostname": kick_menus.menu_kick_hostname,
     "kick_cloudflare_dns": kick_menus.menu_kick_dns,
@@ -333,8 +411,11 @@ PARENT: dict[str, str] = {
     "maxyt": "root",
     "disk": "root",
     "disk_maxsize": "disk",
-    "kick_webhook": "root",
-    "kick_cloudflare": "kick_webhook",
+    "remote_access": "root",
+    "api": "remote_access",
+    "kick_webhook": "remote_access",
+    "kick_cloudflare": "remote_access",
+    "kick_tailscale": "remote_access",
     "kick_cloudflare_token": "kick_cloudflare",
     "kick_cloudflare_hostname": "kick_cloudflare_token",
     "kick_cloudflare_dns": "kick_cloudflare_hostname",

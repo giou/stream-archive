@@ -1,3 +1,12 @@
+# cloudflared: the bot runs the cloudflare quick/named tunnel itself. The
+# official image is multi-arch, so no architecture case is needed. The tag is
+# a plain image reference, so Dependabot opens the version bumps.
+FROM cloudflare/cloudflared:2026.9.1 AS cloudflared
+
+# Pinned uv version used to build the image. A separate stage keeps the tag
+# visible to Dependabot.
+FROM ghcr.io/astral-sh/uv:0.12.13 AS uv
+
 FROM python:3.14.7-slim
 
 # Runtime dependencies. Chromium is not needed. The recorder plays live streams
@@ -7,25 +16,19 @@ FROM python:3.14.7-slim
 # but this app never triggers it. The recorder sets neither
 # proxy-playlist-exclude nor proxy-playlist-fallback.
 #
-# Tailscale CLI. The Telegram bot enables `tailscale funnel` for the kick
-# webhook tunnel. It talks to the host's tailscaled through the socket that
+# Tailscale CLI. The Telegram bot enables `tailscale funnel` for the public
+# endpoint. It talks to the host's tailscaled through the socket that
 # docker-compose mounts at /var/run/tailscale/tailscaled.sock. We install from
 # the official pkgs.tailscale.com repo with install.sh. The Alpine base was
 # considered and rejected because Tailscale publishes no official Alpine
 # packages (install.sh falls back to the community-maintained apk there).
-# cloudflared: the bot runs the cloudflare quick/named tunnel itself.
-#
-ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg tzdata ca-certificates curl \
  && curl -fsSL https://tailscale.com/install.sh | sh \
- && case "$TARGETARCH" in amd64|arm64) cf_arch="$TARGETARCH";; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; esac \
- && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/2026.8.2/cloudflared-linux-${cf_arch}" -o /usr/local/bin/cloudflared \
- && chmod +x /usr/local/bin/cloudflared \
  && rm -rf /var/lib/apt/lists/*
 
-# Pinned uv version used to build the image. Bump it deliberately with releases.
-COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /usr/local/bin/uv
+COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 

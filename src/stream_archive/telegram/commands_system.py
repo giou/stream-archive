@@ -11,6 +11,7 @@ class SystemCommands:
     _updater: Any
     _on_restart: Any
     _webhook_state_text: Any
+    _endpoint_state_text: Any
 
     def handle_help(self) -> str:
         return (
@@ -45,6 +46,7 @@ class SystemCommands:
         chat_state = "enabled" if c.record_chat else "disabled"
         k = c.kick
         webhook_state = self._webhook_state_text()
+        endpoint_state = self._endpoint_state_text()
         overrides = c.channel_output_modes
         per_channel = ""
         if overrides:
@@ -84,6 +86,7 @@ class SystemCommands:
             f"{retention}\n"
             f"Chat recording: {chat_state}\n"
             f"Kick chat recording: {'enabled' if k.record_chat else 'disabled'}\n"
+            f"Endpoint: {endpoint_state}\n"
             f"Kick webhook: {webhook_state}\n"
             f"Quality: {c.preferred_quality}\n"
             f"Simultaneous recordings: {rec_limit}\n"

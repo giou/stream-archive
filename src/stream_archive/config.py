@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse, urlsplit
@@ -33,6 +34,23 @@ TWITCH_PREFIX = "twitch:"
 AUDIO_ONLY_QUALITY = "audio_only"
 
 OutputMode = Literal["disk", "youtube", "both"]
+
+#: Config keys that moved from kick.webhook to the endpoint section.
+_LEGACY_ENDPOINT_KEYS = (
+    "enabled",
+    "listen_host",
+    "listen_port",
+    "public_url",
+    "tunnel",
+    "cloudflare_token",
+    "cloudflare_managed",
+)
+
+#: Path of the Kick webhook receiver on the endpoint.
+WEBHOOK_PATH = "/kick/webhook"
+
+#: Path prefix of the control API on the endpoint.
+API_PATH = "/api/v1"
 
 
 _CONFIG_LOCK = threading.Lock()
@@ -168,40 +186,59 @@ class EventSubConfig(BaseModel):
         return _require_bool(v, "eventsub.enabled")
 
 
-class KickWebhookConfig(BaseModel):
+class EndpointConfig(BaseModel):
+    """Public endpoint: the HTTP listener and the tunnel that exposes it.
+
+    The Kick webhook receiver and the control API are both served here, so
+    the endpoint is not tied to either feature.
+    """
+
     model_config = ConfigDict(validate_assignment=True)
 
     enabled: bool = False
     listen_host: str = Field("127.0.0.1", min_length=1)
     listen_port: StrictInt = Field(8787, ge=1, le=65535)
     public_url: StrictStr = ""
-    setup_notified: bool = False
     tunnel: Literal["", "cloudflare", "tailscale"] = ""
     cloudflare_token: StrictStr = ""
     cloudflare_managed: bool = False
 
-    @field_validator("enabled", "setup_notified", "cloudflare_managed", mode="before")
+    @field_validator("enabled", "cloudflare_managed", mode="before")
     @classmethod
     def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
-        return _require_bool(v, f"kick.webhook.{info.field_name}")
+        return _require_bool(v, f"endpoint.{info.field_name}")
 
     @field_validator("tunnel")
     @classmethod
     def _tunnel_only(cls, v: Any) -> str:
         if v not in ("", "cloudflare", "tailscale"):
-            msg = "kick.webhook.tunnel must be one of '', 'cloudflare', 'tailscale'"
+            msg = "endpoint.tunnel must be one of '', 'cloudflare', 'tailscale'"
             raise ValueError(msg)
         out: str = v
         return out
 
     @model_validator(mode="after")
-    def _require_public_url_when_enabled(self) -> KickWebhookConfig:
+    def _require_public_url_when_enabled(self) -> EndpointConfig:
         if self.enabled:
             parts = urlparse(self.public_url)
             if parts.scheme not in ("http", "https") or not parts.hostname:
-                msg = "kick.webhook.public_url is required when kick.webhook.enabled is true"
+                msg = "endpoint.public_url is required when endpoint.enabled is true"
                 raise ValueError(msg)
         return self
+
+
+class KickWebhookConfig(BaseModel):
+    """Kick webhook receiver: live/offline events, chat, and subscriptions."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: bool = False
+    setup_notified: bool = False
+
+    @field_validator("enabled", "setup_notified", mode="before")
+    @classmethod
+    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
+        return _require_bool(v, f"kick.webhook.{info.field_name}")
 
 
 class KickConfig(BaseModel):
@@ -216,6 +253,20 @@ class KickConfig(BaseModel):
     @classmethod
     def _bool_only(cls, v: Any) -> bool:
         return _require_bool(v, "kick.record_chat")
+
+
+class ApiConfig(BaseModel):
+    """Control API served on the Kick webhook listener under /api/v1."""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: bool = False
+    key: str = ""
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
+        return _require_bool(v, f"api.{info.field_name}")
 
 
 class AppConfig(BaseModel):
@@ -255,7 +306,9 @@ class AppConfig(BaseModel):
     chat_dir: str = Field("chat", min_length=1)
     disk: DiskConfig = DiskConfig()
     eventsub: EventSubConfig = EventSubConfig()
+    endpoint: EndpointConfig = EndpointConfig()
     kick: KickConfig = KickConfig()
+    api: ApiConfig = ApiConfig()
 
     _workdir: Path = PrivateAttr()
     _config_path: Path = PrivateAttr()
@@ -345,6 +398,29 @@ class AppConfig(BaseModel):
             msg = "preferred_quality must be a non-empty quality string"
             raise ValueError(msg)
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_webhook_settings(cls, data: Any) -> Any:
+        """Move listener and tunnel settings of older configs to ``endpoint``.
+
+        Before the endpoint split, ``kick.webhook`` held the listener, the
+        public URL, and the tunnel. The old files used one flag for the
+        listener and the webhook, so the migration keeps both features on.
+        A file that already has an ``endpoint`` section is left alone.
+        """
+        if not isinstance(data, dict) or "endpoint" in data:
+            return data
+        kick = data.get("kick")
+        if not isinstance(kick, dict) or not isinstance(kick.get("webhook"), dict):
+            return data
+        webhook: dict[str, Any] = kick["webhook"]
+        moved = {key: webhook[key] for key in _LEGACY_ENDPOINT_KEYS if key in webhook}
+        if not moved:
+            return data
+        if "enabled" in moved:
+            webhook = {**webhook, "enabled": moved["enabled"]}
+        return {**data, "endpoint": moved, "kick": {**kick, "webhook": webhook}}
 
     @model_validator(mode="after")
     def _require_kick_creds(self) -> AppConfig:
@@ -525,6 +601,47 @@ def save_config(config: AppConfig) -> None:
         except (FileNotFoundError, PermissionError) as e:
             msg = f"{config_path}: cannot write config: {e}"
             raise ValueError(msg) from e
+
+
+def endpoint_base_url(config: AppConfig) -> str:
+    """Public base URL of the endpoint, without a trailing slash.
+
+    The endpoint serves the Kick webhook and the control API, so the base
+    URL is the tunnel host. Configs that stored the old webhook URL lose
+    that path here.
+    """
+    url = config.endpoint.public_url.rstrip("/")
+    if url.endswith(WEBHOOK_PATH):
+        return url[: -len(WEBHOOK_PATH)]
+    return url
+
+
+def webhook_public_url(config: AppConfig) -> str:
+    """Public URL that Kick POSTs to, or "" when no public URL is set."""
+    base = endpoint_base_url(config)
+    return f"{base}{WEBHOOK_PATH}" if base else ""
+
+
+def api_base_url(config: AppConfig) -> str:
+    """Public base URL of the control API, or "" when no public URL is set."""
+    base = endpoint_base_url(config)
+    return f"{base}{API_PATH}/" if base else ""
+
+
+def apply_config_change(config: AppConfig, mutate: Callable[[AppConfig], None]) -> AppConfig:
+    """Validate a change on a copy of ``config``, write it, then adopt it.
+
+    The shared change path of the Telegram bot and the control API. The
+    mutation runs against a deep copy, so a rejected change leaves the live
+    config and config.json untouched. ``save_config`` validates the copy
+    again and writes it atomically. On success the live config takes the
+    candidate's state, keeping its identity for the modules that hold it.
+    """
+    candidate = config.model_copy(deep=True)
+    mutate(candidate)
+    save_config(candidate)
+    _replace_in_place(config, candidate)
+    return candidate
 
 
 def reload_config(config: AppConfig) -> None:
