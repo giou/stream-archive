@@ -9,6 +9,7 @@ directly, like the webhook tests do.
 import asyncio
 import json
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from stream_archive.api import ControlAPI
@@ -260,6 +261,35 @@ def test_patch_settings_keeps_good_keys_when_one_fails(tmp_path):
     assert sent_messages(ctrl) == ["\U0001f310 Control API\n\u2022 Output mode set to youtube"]
 
 
+def test_patch_settings_rejects_default_as_the_global_quality(tmp_path):
+    """'default' clears a per-channel override, so it is not a global quality."""
+    _, _, _, _, wh = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch("/api/v1/settings", json={"preferred_quality": "default"}, headers=auth())
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 400
+    assert "preferred_quality" in body["errors"]["preferred_quality"]
+    assert read_file(tmp_path).get("preferred_quality", "best") == "best"  # the bad value changed nothing
+
+
+def test_patch_settings_accepts_a_real_global_quality(tmp_path):
+    config, _, _, _, wh = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch("/api/v1/settings", json={"preferred_quality": "720p"}, headers=auth())
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 200
+    assert body["applied"]["preferred_quality"] == "Quality set to 720p"
+    assert config.preferred_quality == "720p"
+
+
 def test_patch_settings_rejects_unknown_keys(tmp_path):
     _, _, _, _, wh = make_api(tmp_path)
 
@@ -483,6 +513,7 @@ def test_rotating_the_key_invalidates_the_old_one(tmp_path):
 
 def test_webhook_route_still_guards_itself_next_to_the_api(tmp_path):
     _, _, _, _, wh = make_api(tmp_path)
+    wh._config.kick.webhook.enabled = True  # the receiver answers only while the feature is on
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -491,3 +522,21 @@ def test_webhook_route_still_guards_itself_next_to_the_api(tmp_path):
             return unsigned.status, api_call.status
 
     assert asyncio.run(scenario()) == (401, 200)
+
+
+def test_a_header_that_is_not_ascii_answers_401(tmp_path):
+    """A header can carry bytes that are not UTF-8. The key comparison must
+    reject them and never raise."""
+    from stream_archive.api import _ApiError
+
+    config, ctrl, recorder, _, _ = make_api(tmp_path)
+    api = ControlAPI(config, ctrl, recorder)
+
+    class Request:
+        remote = "127.0.0.1"
+        # aiohttp decodes header bytes that are not UTF-8 like this.
+        headers = {"X-API-Key": "\udcff"}
+
+    with pytest.raises(_ApiError) as err:
+        api._check_key(Request())
+    assert err.value.status == 401

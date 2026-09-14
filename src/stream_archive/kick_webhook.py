@@ -6,14 +6,21 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from aiohttp import web
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from stream_archive.config import AppConfig, is_kick_channel, kick_bare_name, save_config, webhook_public_url
+from stream_archive.config import (
+    KICK_PREFIX,
+    AppConfig,
+    is_kick_channel,
+    kick_bare_name,
+    save_config,
+    webhook_public_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +104,49 @@ def _parse_timestamp(value: str) -> float | None:
         return None
 
 
+class MonitorProtocol(Protocol):
+    """The monitor calls that the receiver needs."""
+
+    async def handle_online(
+        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
+    ) -> None: ...
+    async def handle_offline(self, channel: str, config: AppConfig) -> None: ...
+
+
+class RecorderProtocol(Protocol):
+    """The recorder call that the receiver needs."""
+
+    async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None: ...
+
+
+class KickAPIProtocol(Protocol):
+    """The Kick API calls that the receiver needs."""
+
+    async def get_public_key(self, force: bool = False) -> str | None: ...
+    async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]: ...
+    async def list_event_subscriptions(self) -> list[dict[str, Any]]: ...
+    async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]: ...
+    async def delete_event_subscriptions(self, ids: list[str]) -> None: ...
+
+
+class NotifierProtocol(Protocol):
+    """The notification call that the receiver needs."""
+
+    async def notify(self, message: str) -> None: ...
+
+
 class KickWebhook:
     EVENT_LIVE = "livestream.status.updated"  # v1
     EVENT_CHAT = "chat.message.sent"  # v1
 
-    def __init__(self, config: AppConfig, monitor: Any, recorder: Any, kick_api: Any, notifier: Any):
+    def __init__(
+        self,
+        config: AppConfig,
+        monitor: MonitorProtocol,
+        recorder: RecorderProtocol,
+        kick_api: KickAPIProtocol,
+        notifier: NotifierProtocol | None,
+    ):
         self._config = config
         self._monitor = monitor
         self._recorder = recorder
@@ -140,7 +185,8 @@ class KickWebhook:
         webhook and the control API, so it runs while the endpoint or the
         API is enabled. The subscription sync loop needs the webhook and a
         reachable endpoint, and it deletes subscriptions for unmonitored
-        channels.
+        channels. When the webhook goes off, the loop stops and the app
+        deletes the subscriptions it created, so Kick stops the deliveries.
         """
         if not self.listening_needed():
             await self._stop_sync()
@@ -162,8 +208,20 @@ class KickWebhook:
                 ep.listen_port,
                 ep.public_url or "(none)",
             )
-        if self._sync_needed() and self._sync_task is None:
+        if not self._sync_needed():
+            await self._stop_sync()
+            await self._drop_subscriptions()
+            return
+        if self._sync_task is None:
             self._sync_task = asyncio.create_task(self._sync_loop())
+
+    async def _drop_subscriptions(self) -> None:
+        """Delete the subscriptions of every tracked channel.
+
+        The webhook disable path uses this method. Idempotent.
+        """
+        for bare in list(self._subs):
+            await self.remove_channel(f"{KICK_PREFIX}{bare}")
 
     def _sync_needed(self) -> bool:
         """True when Kick delivers events here: endpoint and webhook both on."""
@@ -241,6 +299,10 @@ class KickWebhook:
             logger.error("[kick_webhook] sync-failure notification failed", exc_info=True)
 
     async def _handle(self, request: Any) -> Any:
+        if not self._config.kick.webhook.enabled:
+            # The feature is off, so the route behaves as if it did not exist.
+            # The listener can stay up because the control API uses it.
+            return web.Response(status=404, text="not found")
         client = request.remote or "unknown"
         if not self._rate_limiter.allow(client):
             return web.Response(status=429, text="too many requests")

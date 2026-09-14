@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stream-archive"
-version = "1.1.3"
+version = "1.1.4"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
@@ -38,6 +38,7 @@ line-length = 120
 target-version = "py314"
 extend-exclude = ["plugins"]   # dev-only plugin dir, not shipped in this repo
 
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "TRY", "EM", "RUF100", "TID"]
 ignore = [
     "E501",  # ruff-format wraps code, but long strings and URLs legitimately exceed

@@ -648,6 +648,55 @@ def test_save_preserves_file_mode(tmp_path):
     assert (path.stat().st_mode & 0o777) == 0o600
 
 
+def test_rotated_env_secret_keeps_placeholder_and_the_new_value_applies(monkeypatch, tmp_path):
+    """A rotated variable must not become a plaintext literal of the old value."""
+    monkeypatch.setenv("MY_TOK", "old-secret")
+    data = valid_config()
+    data["bot_telegram_api"] = "${MY_TOK}"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(data))
+    cfg = get_config(path)
+
+    monkeypatch.setenv("MY_TOK", "new-secret")  # the operator rotates the value
+    save_config(cfg)  # any later save, for example a Telegram change
+
+    raw = path.read_text()
+    assert "${MY_TOK}" in raw
+    assert "old-secret" not in raw
+    assert "new-secret" not in raw
+    # The rotated value takes effect on the next start, not the stale one.
+    assert get_config(path).bot_telegram_api == "new-secret"
+
+
+def test_save_creates_a_new_file_with_a_private_mode(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(valid_config()))
+    cfg = get_config(path)
+    path.unlink()  # an editor or a cleanup step removed the file
+
+    save_config(cfg)
+
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_save_removes_the_tmp_copy_when_the_write_fails(monkeypatch, tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(valid_config()))
+    cfg = get_config(path)
+
+    def no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("stream_archive.config.os.replace", no_space)
+
+    with pytest.raises(ValueError, match="cannot write config"):
+        save_config(cfg)
+
+    # The plaintext copy must not stay behind.
+    assert not (tmp_path / "config.json.tmp").exists()
+    assert json.loads(path.read_text())["bot_telegram_api"] == valid_config()["bot_telegram_api"]
+
+
 def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
     monkeypatch.delenv("DEFINITELY_UNSET_VAR_12345", raising=False)
     data = valid_config()
@@ -655,7 +704,7 @@ def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
     cfg = get_config(tmp_path / "config.json")
     # A ${VAR} can survive in _env_placeholders under a key that pydantic
     # dropped (extra='ignore'). Then nothing in the saved output matches it.
-    cfg._env_placeholders[("bogus",)] = "${DEFINITELY_UNSET_VAR_12345}"
+    cfg._env_placeholders[("bogus",)] = ("${DEFINITELY_UNSET_VAR_12345}", "resolved-at-load")
 
     save_config(cfg)  # must not raise
 

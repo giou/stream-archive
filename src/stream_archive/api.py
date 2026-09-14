@@ -20,12 +20,12 @@ import json
 import logging
 import secrets
 from collections.abc import Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from aiohttp import web
 
 from stream_archive.config import AppConfig, api_base_url, effective_quality, endpoint_base_url, normalize_channel_name
-from stream_archive.updater import _installed_app_version
+from stream_archive.updater import installed_app_version
 
 if TYPE_CHECKING:
     from stream_archive.telegram import TelegramController
@@ -66,6 +66,13 @@ class _ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class RecorderProtocol(Protocol):
+    """The recorder calls that the API needs."""
+
+    def active_channels(self) -> list[str]: ...
+    def is_recording(self, channel: str) -> bool: ...
 
 
 def _plain(text: str) -> str:
@@ -161,6 +168,19 @@ def _quality(value: Any) -> str:
     return value.strip()
 
 
+def _global_quality(value: Any) -> str:
+    """Validated quality for every channel without an override.
+
+    The word ``default`` clears a per-channel override. It has no meaning
+    as the value of every channel, so this method rejects it.
+    """
+    quality = _quality(value)
+    if quality.lower() == "default":
+        msg = "preferred_quality must be a quality name, not 'default'"
+        raise _ApiError(400, msg)
+    return quality
+
+
 def _hold_seconds(value: Any) -> str:
     """Validated YouTube hold delay: a whole number of seconds, or 'default'."""
     if isinstance(value, str) and value.strip().lower() == "default":
@@ -174,7 +194,7 @@ def _hold_seconds(value: Any) -> str:
 class ControlAPI:
     """Serve /api/v1 on the shared listener and apply changes like the bot."""
 
-    def __init__(self, config: AppConfig, controller: TelegramController, recorder: Any) -> None:
+    def __init__(self, config: AppConfig, controller: TelegramController, recorder: RecorderProtocol) -> None:
         self._config = config
         self._ctrl = controller
         self._recorder = recorder
@@ -218,7 +238,12 @@ class ControlAPI:
             msg = "not found"
             raise _ApiError(404, msg)
         token = _request_token(request)
-        if token is None or not secrets.compare_digest(token, cfg.key):
+        # Compare bytes. A header can carry bytes that are not UTF-8, and
+        # secrets.compare_digest rejects a str that is not ASCII. The
+        # encoding maps such bytes back, so they fail the comparison.
+        if token is None or not secrets.compare_digest(
+            token.encode("utf-8", "surrogateescape"), cfg.key.encode("utf-8", "surrogateescape")
+        ):
             logger.warning("[api] rejected request from %s: bad or missing API key", request.remote)
             msg = "unauthorized"
             raise _ApiError(401, msg)
@@ -281,7 +306,7 @@ class ControlAPI:
         """Service summary: version, channel count, active recordings."""
         return web.json_response(
             {
-                "version": _installed_app_version() or "unknown",
+                "version": installed_app_version() or "unknown",
                 "channels": len(self._config.channels),
                 "recording": self._recorder.active_channels(),
                 "monitoring_interval_s": self._config.monitoring_interval,
@@ -310,7 +335,7 @@ class ControlAPI:
         if key == "output_mode":
             return await self._run(ctrl.handle_mode, [_mode(value)])
         if key == "preferred_quality":
-            return await self._run(ctrl.handle_quality, [_quality(value)])
+            return await self._run(ctrl.handle_quality, [_global_quality(value)])
         if key == "retention_days":
             return await self._run(ctrl.handle_retention, [_scalar(value, key)])
         if key == "max_concurrent_recordings":

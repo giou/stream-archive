@@ -1,5 +1,6 @@
 import asyncio
 import warnings
+from datetime import timedelta
 
 import pytest
 from telegram.error import RetryAfter, TimedOut
@@ -9,11 +10,12 @@ from stream_archive.notifier import Notifier
 
 
 class FakeBot:
-    def __init__(self, token=None, fail_times=0, fail_with=None):
+    def __init__(self, token=None, fail_times=0, fail_with=None, retry_after=0):
         self.token = token
         self.calls = []
         self.fail_times = fail_times
         self.fail_with = fail_with or TimedOut
+        self.retry_after = retry_after
         self.attempts = 0
 
     async def send_message(self, chat_id, text):
@@ -22,7 +24,7 @@ class FakeBot:
             if self.fail_with is RetryAfter:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    raise RetryAfter(0)
+                    raise RetryAfter(self.retry_after)
             msg = "boom"
             raise self.fail_with(msg)
         self.calls.append((chat_id, text))
@@ -128,3 +130,21 @@ def test_notify_shutdown_sends_message(monkeypatch):
     n = make_notifier()
     asyncio.run(n.notify_shutdown())
     assert n.bot.calls == [(123, "⏹ StreamArchive stopping")]
+
+
+def test_notify_retry_after_accepts_a_timedelta(monkeypatch):
+    """PTB returns a timedelta with PTB_TIMEDELTA=1, the form the image uses."""
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier(fail_times=1, fail_with=RetryAfter)
+    n._max_retries = 1
+    n.bot.retry_after = timedelta(seconds=7)
+    delays = []
+
+    async def fake_sleep(duration):
+        delays.append(duration)
+
+    monkeypatch.setattr(notifier.asyncio, "sleep", fake_sleep)
+    asyncio.run(n.notify("hello"))
+
+    assert delays == [7.0]
+    assert n.bot.calls == [(123, "hello")]

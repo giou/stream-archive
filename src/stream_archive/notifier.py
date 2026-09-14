@@ -26,8 +26,10 @@ class Notifier:
                 # Flood control: wait as told, then retry without
                 # counting the attempt against the budget.
                 with warnings.catch_warnings():
-                    # PTB 22 deprecates the int form of retry_after; the
-                    # value is still correct, so mute the warning here.
+                    # PTB returns a timedelta with PTB_TIMEDELTA=1 (the
+                    # Dockerfile sets it) and a number otherwise, where the
+                    # read itself warns. Both forms are handled below, so
+                    # mute the warning of the number form.
                     warnings.simplefilter("ignore")
                     retry_after = e.retry_after
                 if isinstance(retry_after, timedelta):

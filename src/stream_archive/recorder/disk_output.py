@@ -14,6 +14,7 @@ from stream_archive.config import (
     is_kick_channel,
     kick_bare_name,
 )
+from stream_archive.recorder.common import _redact_credentials
 from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,9 @@ class DiskOutputMixin:
             async for line in process.stderr:
                 text = line.decode(errors="replace").strip()
                 if text and "Resumed reading" not in text:
-                    logger.info("[recorder] [ffmpeg:%s] %s", channel, text)
+                    # ffmpeg can echo the output URL, which holds the
+                    # YouTube stream key.
+                    logger.info("[recorder] [ffmpeg:%s] %s", channel, _redact_credentials(text))
         except asyncio.CancelledError:
             pass
 

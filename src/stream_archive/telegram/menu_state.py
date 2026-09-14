@@ -18,9 +18,7 @@ from stream_archive.config import AppConfig
 ChatId = int
 
 #: Key for confirm guards: the chat that owns the prompt plus its nonce.
-#: Plain strings are legacy keys from before per-chat state; they read as
-#: the passed chat's entry.
-PendingKey = tuple[ChatId, str] | str
+PendingKey = tuple[ChatId, str]
 
 #: Audio-only switch awaiting confirm: quality change plus affected channels.
 AudioSwitch = tuple[Callable[[AppConfig], Any], list[str]]
@@ -37,13 +35,6 @@ class MenuState:
     channel: str | None = None
     custom: str | None = None
     cloudflare_hostname: str | None = None
-
-
-def split_key(key: PendingKey, chat_id: ChatId) -> tuple[ChatId, str]:
-    """Split a pending key into ``(chat_id, nonce)``."""
-    if isinstance(key, tuple):
-        return key
-    return (chat_id, key)
 
 
 class ChatStateMixin:

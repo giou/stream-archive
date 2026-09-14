@@ -32,6 +32,7 @@ from stream_archive.telegram.commands_system import SystemCommands
 from stream_archive.telegram.commands_webhook import WebhookCommands
 from stream_archive.telegram.menu_state import ChatId, ChatStateMixin, MenuResult
 from stream_archive.telegram.menus_commands import CommandsMixin
+from stream_archive.tunnels import CloudflaredTunnel
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +77,7 @@ class TelegramController(
     _owns_http: bool
     _app: Application[Any, Any, Any, Any, Any, Any]
     _admin_id: int
-    _cloudflared: Any
-    _cloudflared_drain: Any
+    _cloudflared: CloudflaredTunnel
 
     def __init__(
         self,
@@ -106,33 +106,40 @@ class TelegramController(
         self._admin_id = config.telegram_user_id
         self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
-        self._cloudflared = None  # running cloudflared subprocess (quick or named)
-        self._cloudflared_drain = None
+        self._cloudflared = CloudflaredTunnel()
+
+    def command_handlers(self) -> list[Any]:
+        """Handlers of the admin commands, the reply text, and the buttons.
+
+        The tests and ``start`` use this list, so every advertised command
+        has a handler. Keep the order: a command handler comes before the
+        text handler, and the text handler before the buttons.
+        """
+        admin = filters.User(user_id=self._admin_id)
+        return [
+            CommandHandler("help", self._cmd_help, filters=admin),
+            CommandHandler("status", self._cmd_status, filters=admin),
+            CommandHandler("channels", self._cmd_channels, filters=admin),
+            CommandHandler("add", self._cmd_add, filters=admin),
+            CommandHandler("remove", self._cmd_remove, filters=admin),
+            CommandHandler("retention", self._cmd_retention, filters=admin),
+            CommandHandler("mode", self._cmd_mode, filters=admin),
+            CommandHandler("reload", self._cmd_reload, filters=admin),
+            CommandHandler("restart", self._cmd_restart, filters=admin),
+            CommandHandler("update", self._cmd_update, filters=admin),
+            CommandHandler("quality", self._cmd_quality, filters=admin),
+            CommandHandler("maxrecordings", self._cmd_maxrecordings, filters=admin),
+            CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
+            CommandHandler("disk", self._cmd_disk, filters=admin),
+            CommandHandler("chat", self._cmd_chat, filters=admin),
+            CommandHandler("settings", self._cmd_settings, filters=admin),
+            CommandHandler("start", self._cmd_start, filters=admin),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=self._admin_id), self._on_text),
+            callbacks.AdminCallbackQueryHandler(self._on_callback, admin_id=self._admin_id),
+        ]
 
     async def start(self) -> None:
-        admin = filters.User(user_id=self._admin_id)
-        self._app.add_handlers(
-            [
-                CommandHandler("help", self._cmd_help, filters=admin),
-                CommandHandler("status", self._cmd_status, filters=admin),
-                CommandHandler("channels", self._cmd_channels, filters=admin),
-                CommandHandler("add", self._cmd_add, filters=admin),
-                CommandHandler("remove", self._cmd_remove, filters=admin),
-                CommandHandler("retention", self._cmd_retention, filters=admin),
-                CommandHandler("mode", self._cmd_mode, filters=admin),
-                CommandHandler("reload", self._cmd_reload, filters=admin),
-                CommandHandler("restart", self._cmd_restart, filters=admin),
-                CommandHandler("update", self._cmd_update, filters=admin),
-                CommandHandler("quality", self._cmd_quality, filters=admin),
-                CommandHandler("maxrecordings", self._cmd_maxrecordings, filters=admin),
-                CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
-                CommandHandler("disk", self._cmd_disk, filters=admin),
-                CommandHandler("settings", self._cmd_settings, filters=admin),
-                CommandHandler("start", self._cmd_start, filters=admin),
-                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=self._admin_id), self._on_text),
-                callbacks.AdminCallbackQueryHandler(self._on_callback, admin_id=self._admin_id),
-            ]
-        )
+        self._app.add_handlers(self.command_handlers())
         await self._app.initialize()
         await self._app.start()
         try:

@@ -38,7 +38,7 @@ def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> lis
     return out
 
 
-def _installed_app_version() -> str | None:
+def installed_app_version() -> str | None:
     """Installed package version, or None when the distribution is missing."""
     try:
         return importlib.metadata.version("stream-archive")
@@ -81,12 +81,25 @@ class UpdateChecker:
     def _load_state(self) -> None:
         try:
             with open(self._state_path, encoding="utf-8") as f:
-                self._state = json.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             self._state = {}
+            return
         except json.JSONDecodeError:
             logger.warning("[updater] update_state.json corrupt; starting fresh")
             self._state = {}
+            return
+        except OSError as e:
+            logger.warning("[updater] cannot read update_state.json (%s); starting fresh", e)
+            self._state = {}
+            return
+        if not isinstance(data, dict):
+            # A list or a scalar breaks every later check with an
+            # AttributeError, so treat it like a corrupt file.
+            logger.warning("[updater] update_state.json is not a JSON object; starting fresh")
+            self._state = {}
+            return
+        self._state = data
 
     def _save_state(self) -> None:
         tmp = Path(str(self._state_path) + ".tmp")
@@ -100,7 +113,7 @@ class UpdateChecker:
     # ---- checks ------------------------------------------------------------
 
     async def _check_app(self) -> dict[str, Any]:
-        local = _installed_app_version()
+        local = installed_app_version()
 
         def _missing_tag() -> None:
             msg = "no tag_name in releases payload"

@@ -84,25 +84,20 @@ class KickAPI:
         async with self._token_lock:
             if self._token and time.time() < self._token_expires_at - 60:
                 return self._token
-            try:
-                resp = await self._request(
-                    "POST",
-                    self.TOKEN_URL,
-                    data={
-                        "grant_type": "client_credentials",
-                        "client_id": self._client_id,
-                        "client_secret": self._client_secret,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                self._token = data["access_token"]
-                self._token_expires_at = time.time() + data.get("expires_in", 3600)
-            except httpx.HTTPStatusError as e:
-                logger.error("[kick_api] Token request failed: %s", e)
-                raise
-            else:
-                return self._token
+            resp = await self._request(
+                "POST",
+                self.TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._token = data["access_token"]
+            self._token_expires_at = time.time() + data.get("expires_in", 3600)
+            return self._token
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]:
         """Map slug to {title, game, is_live, broadcaster_user_id}.

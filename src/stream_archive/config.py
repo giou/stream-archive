@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -312,7 +313,8 @@ class AppConfig(BaseModel):
 
     _workdir: Path = PrivateAttr()
     _config_path: Path = PrivateAttr()
-    _env_placeholders: dict[tuple[Any, ...], str] = PrivateAttr(default_factory=dict)
+    #: Config path -> (placeholder text, value that the environment gave at load time).
+    _env_placeholders: dict[tuple[Any, ...], tuple[str, str]] = PrivateAttr(default_factory=dict)
 
     @property
     def workdir(self) -> Path:
@@ -365,6 +367,9 @@ class AppConfig(BaseModel):
             if not quality.strip():
                 msg = f"channel_preferred_qualities.{ch} must be a non-empty quality string"
                 raise ValueError(msg)
+            if quality.strip().lower() == "default":
+                msg = f"channel_preferred_qualities.{ch}: 'default' clears an override, so it is not a value"
+                raise ValueError(msg)
         return _normalize_channel_map(v, "channel_preferred_qualities")
 
     @field_validator("channel_youtube_hold_seconds")
@@ -396,6 +401,9 @@ class AppConfig(BaseModel):
     def _non_blank_preferred_quality(cls, v: str) -> str:
         if not v.strip():
             msg = "preferred_quality must be a non-empty quality string"
+            raise ValueError(msg)
+        if v.strip().lower() == "default":
+            msg = "preferred_quality must be a quality name; 'default' clears a per-channel override"
             raise ValueError(msg)
         return v
 
@@ -462,7 +470,7 @@ def _bind(
     cfg: AppConfig,
     workdir: Path,
     config_path: Path,
-    placeholders: dict[tuple[Any, ...], str],
+    placeholders: dict[tuple[Any, ...], tuple[str, str]],
 ) -> None:
     """Attach file locations and env placeholders to a validated config."""
     cfg._workdir = workdir
@@ -497,17 +505,19 @@ def _load_json_file(config_path: Path) -> Any:
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[tuple[Any, ...], str]]:
+def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[tuple[Any, ...], tuple[str, str]]]:
     """Resolve ``${ENV_VAR}`` references in every string value.
 
     Returns ``(data, placeholders)``. ``placeholders`` maps each
-    interpolated value's config path to its original text, so
-    ``save_config`` restores the placeholder and never writes resolved
-    secrets. A missing variable raises ValueError naming the variable
-    and the config key.
+    interpolated value's config path to its original text and to the value
+    that the environment gave at load time. ``save_config`` compares the
+    live value against the load-time value. That comparison tells a
+    program-written literal from an environment change, and it keeps the
+    placeholder for a rotated variable. A missing variable raises
+    ValueError naming the variable and the config key.
     """
 
-    placeholders: dict[tuple[Any, ...], str] = {}
+    placeholders: dict[tuple[Any, ...], tuple[str, str]] = {}
 
     def walk(node: Any, p: tuple[Any, ...]) -> Any:
         if isinstance(node, dict):
@@ -515,7 +525,7 @@ def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[t
         if isinstance(node, list):
             return [walk(v, p + (i,)) for i, v in enumerate(node)]
         if isinstance(node, str) and _ENV_RE.search(node):
-            placeholders[p] = node
+            raw = node
 
             def repl(match: re.Match[str]) -> str:
                 name = match.group(1)
@@ -525,7 +535,9 @@ def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[t
                     msg = f"Environment variable {name} not set (referenced at config key {'/'.join(map(str, p))})"
                     raise ValueError(msg) from None
 
-            return _ENV_RE.sub(repl, node)
+            resolved = _ENV_RE.sub(repl, node)
+            placeholders[p] = (raw, resolved)
+            return resolved
         return node
 
     return walk(data, path), placeholders
@@ -558,12 +570,19 @@ def get_config(path: Path | None = None) -> AppConfig:
 
 
 def save_config(config: AppConfig) -> None:
-    """Validate the config and atomically write it to its source file."""
+    """Validate the config and atomically write it to its source file.
+
+    A value from an environment placeholder stays masked. The comparison
+    uses the value that the environment gave at load time, not the current
+    environment. Thus a rotated variable keeps its ``${VAR}`` reference and
+    takes effect on the next start. Only a value that a program changed
+    becomes a literal.
+    """
     with _CONFIG_LOCK:
         config_path = _bound_config_path(config)
         validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
         data = validated.model_dump()
-        for key_path, raw in list(config._env_placeholders.items()):
+        for key_path, (raw, loaded) in list(config._env_placeholders.items()):
             try:
                 current = _get_at(data, key_path)
             except KeyError, IndexError, TypeError:
@@ -572,13 +591,10 @@ def save_config(config: AppConfig) -> None:
                 # failing this save and every later save.
                 del config._env_placeholders[key_path]
                 continue
-            try:
-                resolved: str | None = _ENV_RE.sub(lambda m: os.environ[m.group(1)], raw)
-            except ValueError, KeyError, TypeError:
-                resolved = None  # env var vanished since load: mask rather than guess
-            if resolved is None or current == resolved:
-                # Untouched value, or an interpolation we can no longer compute:
-                # write the ${VAR} placeholder back so the secret never reaches disk.
+            if current == loaded:
+                # The value did not change since load. Write the placeholder
+                # back, so the secret never reaches disk. A rotated
+                # environment variable then takes effect on the next start.
                 _set_at(data, key_path, raw)
             else:
                 # Deliberate bot-persisted literal: write it and drop the tracker
@@ -588,17 +604,25 @@ def save_config(config: AppConfig) -> None:
         try:
             existing_mode: int | None = config_path.stat().st_mode & 0o777
         except FileNotFoundError:
-            existing_mode = None  # new file: keep the umask default
+            existing_mode = None  # new file: use a private mode
+        mode = 0o600 if existing_mode is None else existing_mode
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
+            # Create the temporary file with its final mode. The file holds the
+            # same secrets as config.json, so no other user may read it, not
+            # even during the write.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
-            if existing_mode is not None:
-                os.chmod(tmp, existing_mode)
+            os.chmod(tmp, mode)  # the umask can clear bits of the open() mode
             os.replace(tmp, config_path)
-        except (FileNotFoundError, PermissionError) as e:
+        except OSError as e:
+            # Remove the partial copy: it holds plaintext secrets. A full disk
+            # raises OSError too, and every caller expects ValueError.
+            with contextlib.suppress(OSError):
+                tmp.unlink()
             msg = f"{config_path}: cannot write config: {e}"
             raise ValueError(msg) from e
 
@@ -610,7 +634,12 @@ def endpoint_base_url(config: AppConfig) -> str:
     URL is the tunnel host. Configs that stored the old webhook URL lose
     that path here.
     """
-    url = config.endpoint.public_url.rstrip("/")
+    return normalize_endpoint_url(config.endpoint.public_url)
+
+
+def normalize_endpoint_url(url: str) -> str:
+    """Base form of a pasted public URL: no trailing slash, no webhook path."""
+    url = url.strip().rstrip("/")
     if url.endswith(WEBHOOK_PATH):
         return url[: -len(WEBHOOK_PATH)]
     return url

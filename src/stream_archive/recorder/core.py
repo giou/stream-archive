@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections.abc import Coroutine
 from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from streamlink.exceptions import NoPluginError, NoStreamsError, PluginError
@@ -25,7 +26,7 @@ from stream_archive.config import (
     kick_bare_name,
 )
 from stream_archive.recorder.chat_output import ChatOutputMixin
-from stream_archive.recorder.common import _sanitize_filename
+from stream_archive.recorder.common import sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, Recording
@@ -50,63 +51,6 @@ def _require_filepath(entry: Recording, channel: str) -> str:
     return disk_filepath
 
 
-_ENDED_CLEAN_GRACE_S = 600.0
-
-
-class StreamlinkProto(Protocol):
-    """What Recorder needs from StreamlinkMixin. Implemented in streamlink_source.py."""
-
-    def _load_plugin(self) -> None: ...
-    def _resolve_stream(self, channel: str, title: str | None, game: str | None) -> tuple[Any, str, str, str]: ...
-
-
-class DiskOutputProto(Protocol):
-    """What Recorder needs from DiskOutputMixin. Implemented in disk_output.py."""
-
-    def _channel_dir(self, channel: str) -> str: ...
-    async def _record_disk(self, channel: str, filepath: str, stream: Any) -> None: ...
-    async def _read_ffmpeg_stderr(self, channel: str, process: Any) -> None: ...
-    async def _watch_growth(self, channel: str) -> None: ...
-    async def delete_oldest_to_cap(self) -> tuple[int, int]: ...
-    async def cleanup_old_recordings(self, retention_days: float) -> int: ...
-    async def disk_snapshot(self) -> dict[str, Any]: ...
-
-
-class YoutubeOutputProto(Protocol):
-    """What Recorder needs from YoutubeOutputMixin. Implemented in youtube_output.py."""
-
-    async def _note_youtube_end(self, channel: str, entry: Recording) -> None: ...
-    def youtube_restart_blocked_reason(self, channel: str) -> str | None: ...
-    def _record_youtube_start(self) -> None: ...
-    async def _end_broadcast(self, channel: str, broadcast_id: str) -> None: ...
-    def _hold_seconds(self, channel: str) -> float: ...
-    async def _start_keepalive(self, rtmp_url: str) -> asyncio.subprocess.Process | None: ...
-    async def _stop_keepalive(self, proc: asyncio.subprocess.Process | None) -> None: ...
-    async def _release_broadcast(self, channel: str, youtube_info: dict[str, Any] | None, entry: Recording) -> None: ...
-    async def _hold_then_end(self, channel: str, delay: float, hold: HoldState) -> None: ...
-    async def _stream_youtube(
-        self,
-        channel: str,
-        author: str,
-        title: str,
-        game: str,
-        stream: Any,
-        filepath: str | None,
-        notify: bool = True,
-        youtube_notify: bool = True,
-    ) -> None: ...
-    def youtube_active_count(self) -> int: ...
-
-
-class ChatOutputProto(Protocol):
-    """What Recorder needs from ChatOutputMixin. Implemented in chat_output.py."""
-
-    async def _finalize_chat(self, channel: str, chat_recorder: Any) -> None: ...
-    async def _finalize_kick_chat(self, entry: Recording) -> None: ...
-    async def stop_chat(self, channel: str, platform: str | None = None) -> None: ...
-    async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None: ...
-
-
 class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputMixin):
     _config: AppConfig
     _youtube: YouTubeStreamer | None
@@ -115,6 +59,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _locks: dict[str, asyncio.Lock]
     _session: Streamlink
     _plugin_loaded: bool
+    _plugin_lock: threading.Lock
     _last_kick_block_notify: dict[str, float]
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
@@ -146,6 +91,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # is still detected, and the poll cycle covers the rest.
         self._session.set_option("stream-segmented-queue-deadline", 10)
         self._plugin_loaded = False
+        self._plugin_lock = threading.Lock()
         self._last_kick_block_notify = {}
         self._quick_ends = {}  # channel -> consecutive short YouTube recordings
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
@@ -206,6 +152,44 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if channel not in self._locks:
             self._locks[channel] = asyncio.Lock()
         return self._locks[channel]
+
+    def _start_chat_capture(
+        self,
+        entry: Recording,
+        channel: str,
+        stream_title: str,
+        stream_game: str,
+        author: str,
+        user_id: str | None,
+        safe_title: str,
+        now: str,
+    ) -> None:
+        """Attach the chat capture of a new recording to its entry.
+
+        Twitch chat comes from IRC, so a recorder object starts here. Kick
+        chat arrives over the webhook, so the entry only gets its buffer.
+        """
+        if self._config.record_chat and not is_kick_channel(channel):
+            chat_dir = disk.chat_dir_path(self._config)
+            chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
+            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+            chat_recorder = ChatRecorder(
+                bare_name(channel), chat_path, stream_title, stream_game, author=author, user_id=user_id
+            )
+            entry["chat_recorder"] = chat_recorder
+            entry["chat_task"] = chat_recorder.start()
+
+        if is_kick_channel(channel) and self._config.kick.record_chat:
+            chat_dir = disk.chat_dir_path(self._config)
+            chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
+            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+            entry["kick_chat"] = {
+                "path": chat_path,
+                "messages": [],
+                "title": stream_title,
+                "channel": channel,
+                "started_wall": datetime.now(ZoneInfo(self._config.timezone)).isoformat(),
+            }
 
     async def _start_unlocked(
         self,
@@ -274,7 +258,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             live_url = channel_url(channel)
 
             now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
-            safe_title = _sanitize_filename(stream_title)
+            safe_title = sanitize_filename(stream_title)
 
             if mode in ("disk", "both"):
                 recording_dir = str(disk.channel_recording_dir(self._config, self._channel_dir(channel)))
@@ -287,11 +271,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             if mode == "disk":
                 disk_task = self._track(channel, self._record_disk(channel, _require_filepath(entry, channel), best))
                 tasks.append(disk_task)
-                if self._notifier and notify:
-                    try:
-                        await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
-                    except Exception:
-                        logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
+                # The live notification goes out at the end of this method.
+                # A task that ends during that wait then finds its task list
+                # here, and the entry cannot stay behind without a task.
             elif mode == "youtube":
                 if self._youtube is not None:
                     yt_task = self._track(
@@ -329,27 +311,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 del self._recordings[channel]
                 return False
 
-            if self._config.record_chat and not is_kick_channel(channel):
-                chat_dir = disk.chat_dir_path(self._config)
-                chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
-                os.makedirs(os.path.dirname(chat_path), exist_ok=True)
-                chat_recorder = ChatRecorder(
-                    bare_name(channel), chat_path, stream_title, stream_game, author=author, user_id=user_id
-                )
-                entry["chat_recorder"] = chat_recorder
-                entry["chat_task"] = chat_recorder.start()
-
-            if is_kick_channel(channel) and self._config.kick.record_chat:
-                chat_dir = disk.chat_dir_path(self._config)
-                chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
-                os.makedirs(os.path.dirname(chat_path), exist_ok=True)
-                entry["kick_chat"] = {
-                    "path": chat_path,
-                    "messages": [],
-                    "title": stream_title,
-                    "channel": channel,
-                    "started_wall": datetime.now(ZoneInfo(self._config.timezone)).isoformat(),
-                }
+            self._start_chat_capture(entry, channel, stream_title, stream_game, author, user_id, safe_title, now)
 
             entry["tasks"] = tasks
 
@@ -359,21 +321,31 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
             self._ended_clean.pop(channel, None)
             logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
-        except Exception as e:
+            if mode == "disk" and notify and self._notifier:
+                try:
+                    await self._notifier.notify_live(channel, stream_title, stream_game, live_url)
+                except Exception:
+                    logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
+        except BaseException as e:
             # The entry is already registered here. Without this cleanup, any
-            # OSError below (makedirs, task creation) leaves a taskless entry
-            # behind. Every later start short-circuits on that entry, and the
-            # monitor reports the channel as LIVE forever. Returning False
-            # routes the failure into _handle_start_failure (rate-limited alert
-            # plus next-cycle retry).
+            # failure below (makedirs, task creation) or a cancellation from
+            # the caller leaves a taskless entry behind. Every later start
+            # short-circuits on that entry, and the monitor reports the
+            # channel as LIVE forever. Returning False routes the failure
+            # into _handle_start_failure (rate-limited alert plus
+            # next-cycle retry).
             to_cancel: list[asyncio.Task[Any]] = list(tasks)
             chat_task = entry.get("chat_task")
             if chat_task is not None:
                 to_cancel.append(chat_task)
             for t in to_cancel:
                 t.cancel()
-            await asyncio.gather(*to_cancel, return_exceptions=True)
             self._recordings.pop(channel, None)
+            if not isinstance(e, Exception):
+                # CancelledError and the like: the caller does not want a
+                # result, so clean up and let the caller handle it.
+                raise
+            await asyncio.gather(*to_cancel, return_exceptions=True)
             logger.error("[recorder] [%s] Failed to start recording: %s", channel, e)
             return False
         else:

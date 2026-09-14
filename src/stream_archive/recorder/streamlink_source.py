@@ -16,6 +16,7 @@ from stream_archive.config import (
     effective_quality,
     is_kick_channel,
 )
+from stream_archive.recorder.common import _redact_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -140,18 +141,38 @@ class StreamlinkMixin:
     _config: AppConfig
     _session: Streamlink
     _plugin_loaded: bool
+    _plugin_lock: threading.Lock
 
     def _load_plugin(self) -> None:
+        """Load the plugins of ``plugin_dir`` into the session. Run this once.
+
+        The directory holds the ad-block Twitch plugin, which overrides the
+        built-in plugin of the same name. Resolution runs in a worker
+        thread, so a lock protects the one-time load. A load failure is not
+        fatal: the built-in plugins stay in use, and the log names the
+        directory.
+        """
         if self._plugin_loaded:
             return
-        plugin_dir = self._config.plugin_dir
-        if not os.path.isabs(plugin_dir):
-            self._session.plugins.load_path(str(self._config._workdir / plugin_dir))
-        else:
-            self._session.plugins.load_path(plugin_dir)
-        self._plugin_loaded = True
+        with self._plugin_lock:
+            if self._plugin_loaded:
+                return
+            # Set the flag first. A second thread then resolves with the
+            # plugins that are already in the session.
+            self._plugin_loaded = True
+            plugin_dir = self._config.plugin_dir
+            path = plugin_dir if os.path.isabs(plugin_dir) else str(self._config._workdir / plugin_dir)
+            try:
+                self._session.plugins.load_path(path)
+            except Exception as e:
+                logger.error("[recorder] Cannot load plugins from %s: %s", path, e)
+            else:
+                logger.info("[recorder] Loaded plugins from %s", path)
 
     def _resolve_stream(self, channel: str, title: str | None, game: str | None) -> tuple[Any, str, str, str]:
+        # The ad-block plugin lives in plugin_dir. Without this call, the
+        # session uses the built-in plugin and the proxy list does nothing.
+        self._load_plugin()
         if is_kick_channel(channel):
             # No proxy loop or ad-block workarounds. The built-in kick plugin
             # talks to the kick API itself and solves the JS challenge through
@@ -185,8 +206,8 @@ class StreamlinkMixin:
                     logger.warning(
                         "[recorder] [%s] proxy '%s' failed (%s); trying next proxy",
                         channel,
-                        proxies[0],
-                        err,
+                        _redact_credentials(proxies[0]),
+                        _redact_credentials(str(err)),
                     )
                     proxies = proxies[1:]
         if not streams:

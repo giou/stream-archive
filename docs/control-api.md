@@ -73,7 +73,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 
 ```json
 {
-  "version": "1.1.3",
+  "version": "1.1.4",
   "channels": 6,
   "recording": [],
   "monitoring_interval_s": 60.0

@@ -49,10 +49,14 @@ RUN mkdir -p /app/plugins \
 COPY pyproject.toml uv.lock README.md ./
 
 # Venv lives outside /app so the read-only rootfs never blocks it.
+# PTB 22 moves time periods from numbers to datetime.timedelta. The
+# PTB_TIMEDELTA flag turns on that form now, so this image never reads the
+# deprecated int form (telegram/_utils/datetime.get_timedelta_value).
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PTB_TIMEDELTA=1
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev

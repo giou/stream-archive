@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
 
-from stream_archive.telegram.menu_state import ChatId, split_key
+from stream_archive.telegram.menu_state import ChatId
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -54,16 +54,6 @@ def confirm_keyboard(action: str, value: str) -> InlineKeyboardMarkup:
     )
 
 
-def _lookup_pending(pending: dict[Any, Any], chat_id: ChatId, nonce: str) -> tuple[Any, Any | None]:
-    """Find a pending entry for ``(chat_id, nonce)``, else a legacy plain key."""
-    key = (chat_id, nonce)
-    if key in pending:
-        return key, pending[key]
-    if nonce in pending:
-        return nonce, pending[nonce]
-    return key, None
-
-
 async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
     """Apply one confirmation-button press for ``chat_id``.
 
@@ -80,9 +70,8 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
     if action == "cancel" and len(parts) == 2:
         if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
             return None
-        _key, audio_pending = _lookup_pending(ctrl._pending_audio_switch, chat_id, parts[1])
-        if audio_pending is not None:
-            del ctrl._pending_audio_switch[_key]  # a later confirm press is harmless
+        pending_key = (chat_id, parts[1])
+        ctrl._pending_audio_switch.pop(pending_key, None)  # a later confirm press is harmless
         ctrl._confirm_done.add((chat_id, data))
         return "Cancelled \u2014 nothing changed", None
     if action == "confirm_remove" and len(parts) >= 3:
@@ -107,12 +96,11 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
     if action == "apply_now" and len(parts) == 2:
         if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
             return None
-        key, pending = _lookup_pending(ctrl._pending_apply, chat_id, parts[1])
+        key = (chat_id, parts[1])
+        pending = ctrl._pending_apply.pop(key, None)
         if pending is None:
-            return None  # stale message: bot restarted or already handled
-        del ctrl._pending_apply[key]
+            return None  # stale message: the bot restarted or handled it
         ctrl._apply_warnings_sent.discard(key)
-        ctrl._apply_warnings_sent.discard(parts[1])
         ctrl._confirm_done.add((chat_id, data))
         summary, channels = pending
         lines = []
@@ -123,13 +111,12 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
     if action == "audio_confirm" and len(parts) == 2:
         if (chat_id, data) in ctrl._confirm_done:
             return None
-        key, audio_pending = _lookup_pending(ctrl._pending_audio_switch, chat_id, parts[1])
+        key = (chat_id, parts[1])
+        audio_pending = ctrl._pending_audio_switch.pop(key, None)
         if audio_pending is None:
             return None  # the message is stale: the bot handled it or restarted
-        del ctrl._pending_audio_switch[key]
         ctrl._confirm_done.add((chat_id, data))
         ctrl._apply_warnings_sent.discard(key)
-        ctrl._apply_warnings_sent.discard(parts[1])
         quality_mutate, channels = audio_pending
 
         def combined(candidate: Any) -> None:
@@ -160,7 +147,7 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
     (removed channel or finished stream) is dropped, not sent.
     """
     for key in list(ctrl._pending_apply):
-        chat_id, nonce = split_key(key, ctrl._admin_id)
+        chat_id, nonce = key
         summary, channels = ctrl._pending_apply[key]
         channels = [ch for ch in channels if ctrl._recorder.is_recording(ch)]
         if not channels:
@@ -193,7 +180,7 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
     for key in list(ctrl._pending_audio_switch):
         if key in ctrl._apply_warnings_sent:
             continue
-        chat_id, nonce = split_key(key, ctrl._admin_id)
+        chat_id, nonce = key
         _mutate, channels = ctrl._pending_audio_switch[key]
         text = (
             f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(channels)}\n"

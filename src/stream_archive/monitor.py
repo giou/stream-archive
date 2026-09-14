@@ -189,22 +189,36 @@ class Monitor:
             ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
         finally:
             self.recorder.release_start(channel)
+        removed = False
         async with self._lock_for(channel):
             if not ok:
                 await self._handle_start_failure(channel)
                 return
-            if already_live and channel not in self._live_channels:
+            if channel not in config.channels:
+                # The channel was removed while start() ran outside the lock.
+                # The remove path saw no recording yet, so this method stops
+                # the new recording. Every stop path reads config.channels,
+                # so a recording that outlives its channel has no stop path.
+                removed = True
+            elif already_live and channel not in self._live_channels:
                 # The channel stopped or was removed while start() ran
                 # outside the lock. Leave it stopped instead of registering
                 # a recording nobody asked for.
                 logger.info("[monitor] %s stopped while starting, not registering", channel)
                 return
-            self._live_channels.add(channel)
-            self._last_failure_notify.pop(channel, None)
-            if already_live:
-                logger.info("[monitor] %s recording restarted", channel)
             else:
-                logger.info("[monitor] %s is LIVE", channel)
+                self._live_channels.add(channel)
+                self._last_failure_notify.pop(channel, None)
+                if already_live:
+                    logger.info("[monitor] %s recording restarted", channel)
+                else:
+                    logger.info("[monitor] %s is LIVE", channel)
+        if removed:
+            logger.warning("[monitor] %s was removed while starting, stopping the recording", channel)
+            try:
+                await self.recorder.stop(channel)
+            except Exception:
+                logger.error("[monitor] stop failed for removed channel %s", channel, exc_info=True)
 
     async def _ensure_stopped(self, channel: str, config: AppConfig) -> None:
         """Stop the recording for a channel that is no longer live."""
@@ -235,30 +249,6 @@ class Monitor:
     def remove_channel(self, channel: str) -> None:
         self._live_channels.discard(channel)
         self._evict(channel)
-
-    async def _start_or_block(
-        self,
-        channel: str,
-        title: str | None,
-        game: str | None,
-        config: AppConfig,
-        user_id: str | None = None,
-    ) -> bool:
-        reason = await self._start_blocked_reason(channel, config)
-        if reason:
-            logger.warning("[monitor] %s not started: %s", channel, reason)
-            await self._notify_blocked(channel, reason)
-            return False
-        reserve_reason = await self.recorder.reserve_start(channel)
-        if reserve_reason:
-            logger.warning("[monitor] %s not started: %s", channel, reserve_reason)
-            await self._notify_blocked(channel, reserve_reason)
-            return False
-        try:
-            ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
-        finally:
-            self.recorder.release_start(channel)
-        return ok
 
     async def _start_blocked_reason(self, channel: str, config: AppConfig) -> str | None:
         """Return the reason a start is blocked, or None.

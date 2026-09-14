@@ -8,6 +8,7 @@ import unittest.mock
 from stream_archive.config import get_config
 from stream_archive.telegram import TelegramController
 from stream_archive.telegram.dispatcher import _deferred_affected_channels
+from stream_archive.tunnels import tailscale_funnel_off
 
 
 class FakeRecorder:
@@ -143,6 +144,10 @@ def base_config(tmp_path):
             },
         },
     }
+
+
+#: Admin chat id of the test config, and the key of its pending prompts.
+ADMIN_ID = 12345
 
 
 def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart=None):
@@ -515,7 +520,7 @@ def test_mode_change_sets_pending_apply(tmp_path):
 
 def test_apply_warning_sent_with_inline_keyboard(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
-    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    ctrl._pending_apply[(ADMIN_ID, "abcd")] = ("Output mode set to youtube", ["twitch:channel1"])
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
     asyncio.run(ctrl._maybe_send_apply_warnings())
@@ -527,8 +532,8 @@ def test_apply_warning_sent_with_inline_keyboard(tmp_path):
     assert buttons[0]["callback_data"] == "apply_now:abcd"
     assert buttons[1]["callback_data"] == "cancel:abcd"
     # The entry stays pending so the button's nonce still resolves on tap.
-    assert ctrl._pending_apply == {"abcd": ("Output mode set to youtube", ["twitch:channel1"])}
-    assert ctrl._apply_warnings_sent == {"abcd"}
+    assert ctrl._pending_apply == {(ADMIN_ID, "abcd"): ("Output mode set to youtube", ["twitch:channel1"])}
+    assert ctrl._apply_warnings_sent == {(ADMIN_ID, "abcd")}
     # A second trigger does not resend the same warning.
     asyncio.run(ctrl._maybe_send_apply_warnings())
     assert bot.send_message.await_count == 1
@@ -558,7 +563,7 @@ def test_apply_warning_dropped_when_recording_ends(tmp_path):
     # A pending prompt whose recording ended before the admin answered is
     # dropped: there is no running recording left to apply settings to.
     config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
-    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    ctrl._pending_apply[(ADMIN_ID, "abcd")] = ("Output mode set to youtube", ["twitch:channel1"])
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
     asyncio.run(recorder.stop("twitch:channel1"))
@@ -570,7 +575,7 @@ def test_apply_warning_dropped_when_recording_ends(tmp_path):
 
 def test_apply_now_callback_restarts(tmp_path):
     config, ctrl, recorder, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
-    ctrl._pending_apply["abcd"] = ("Output mode set to youtube", ["twitch:channel1"])
+    ctrl._pending_apply[(ADMIN_ID, "abcd")] = ("Output mode set to youtube", ["twitch:channel1"])
     result = asyncio.run(ctrl.handle_callback("apply_now:abcd"))
     assert result is not None
     text, _ = result
@@ -587,11 +592,11 @@ def test_apply_now_callback_restarts(tmp_path):
     assert recorder.restart_calls == ["twitch:channel1"]
     # Cancel keeps the current recording and restarts nothing. The entry stays
     # pending, so a later Apply now tap on the same message still works.
-    ctrl._pending_apply["wxyz"] = ("Output mode set to youtube", ["twitch:channel1"])
+    ctrl._pending_apply[(ADMIN_ID, "wxyz")] = ("Output mode set to youtube", ["twitch:channel1"])
     result = asyncio.run(ctrl.handle_callback("cancel:wxyz"))
     assert result == ("Cancelled \u2014 nothing changed", None)
     assert recorder.restart_calls == ["twitch:channel1"]
-    assert ctrl._pending_apply == {"wxyz": ("Output mode set to youtube", ["twitch:channel1"])}
+    assert ctrl._pending_apply == {(ADMIN_ID, "wxyz"): ("Output mode set to youtube", ["twitch:channel1"])}
 
 
 def test_reload_picks_up_disk_edits(tmp_path):
@@ -1741,7 +1746,7 @@ def test_tailscale_webhook_url_listener_conflict_other_port(tmp_path, monkeypatc
 
 
 def test_tailscale_webhook_url_funnel_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook._TAILSCALE_FUNNEL_TIMEOUT", 0.01)
+    monkeypatch.setattr("stream_archive.tunnels._TAILSCALE_FUNNEL_TIMEOUT", 0.01)
     procs = []
 
     def fake_exec(*args, **kwargs):
@@ -1784,7 +1789,7 @@ def test_tailscale_funnel_off_uses_documented_syntax(tmp_path, monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
 
-    assert asyncio.run(ctrl._tailscale_funnel_off()) is True
+    assert asyncio.run(tailscale_funnel_off()) is True
     assert calls == [("tailscale", "funnel", "--https=443", "off")]
 
 
@@ -1837,7 +1842,7 @@ def test_cloudflared_quick_start_parses_url(tmp_path, monkeypatch):
 
     assert url == "https://abc123.trycloudflare.com"  # the endpoint stores the base URL
     assert hint is None
-    assert ctrl._cloudflared is not None
+    assert ctrl._cloudflared.running is True
 
 
 def test_cloudflared_quick_start_exit_reports_output(tmp_path, monkeypatch):
@@ -1855,7 +1860,7 @@ def test_cloudflared_quick_start_exit_reports_output(tmp_path, monkeypatch):
 
 
 def test_cloudflared_quick_start_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook._CLOUDFLARED_QUICK_TIMEOUT", 0.01)
+    monkeypatch.setattr("stream_archive.tunnels._CLOUDFLARED_QUICK_TIMEOUT", 0.01)
     proc = _CloudflaredFakeProc(lines=[], hang=True)
 
     def fake_exec(*args, **kwargs):
@@ -1901,7 +1906,7 @@ def test_cloudflared_named_start_registered(tmp_path, monkeypatch):
 
     assert ok is True
     assert hint is None
-    assert ctrl._cloudflared is not None
+    assert ctrl._cloudflared.running is True
 
 
 def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
@@ -1920,11 +1925,11 @@ def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
 
     assert ok is False
     assert "invalid token" in hint
-    assert ctrl._cloudflared is None
+    assert ctrl._cloudflared.running is False
 
 
 def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook._CLOUDFLARED_RUN_TIMEOUT", 0.01)
+    monkeypatch.setattr("stream_archive.tunnels._CLOUDFLARED_RUN_TIMEOUT", 0.01)
     proc = _CloudflaredFakeProc(lines=[], hang=True, returncode=None)
 
     def fake_exec(*args, **kwargs):
@@ -1936,26 +1941,24 @@ def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
     ok, hint = asyncio.run(ctrl._cloudflared_named_start("tok"))
 
     assert ok is True
-    assert ctrl._cloudflared is proc
+    assert ctrl._cloudflared.running is True
 
 
 def test_cloudflared_token_and_url_helpers():
-    from stream_archive.telegram.commands_webhook import (
-        _normalize_endpoint_url,
-        _valid_cloudflare_token,
-    )
+    from stream_archive.config import normalize_endpoint_url
+    from stream_archive.tunnels import valid_token
 
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun", "s": "sec"}).encode()).decode()
     assert token.endswith("=")
-    assert _valid_cloudflare_token(token)
-    assert _valid_cloudflare_token(token.rstrip("="))  # unpadded still decodes
-    assert not _valid_cloudflare_token("nope")
-    assert not _valid_cloudflare_token(base64.b64encode(b"not json").decode())
-    assert not _valid_cloudflare_token(base64.b64encode(json.dumps({"a": "acct"}).encode()).decode())  # missing t/s
-    assert _normalize_endpoint_url("https://x.example.com") == "https://x.example.com"
-    assert _normalize_endpoint_url("https://x.example.com/") == "https://x.example.com"
-    assert _normalize_endpoint_url("https://x.example.com/kick/webhook") == "https://x.example.com"
-    assert _normalize_endpoint_url("https://x.example.com/custom") == "https://x.example.com/custom"
+    assert valid_token(token)
+    assert valid_token(token.rstrip("="))  # unpadded still decodes
+    assert not valid_token("nope")
+    assert not valid_token(base64.b64encode(b"not json").decode())
+    assert not valid_token(base64.b64encode(json.dumps({"a": "acct"}).encode()).decode())  # missing t/s
+    assert normalize_endpoint_url("https://x.example.com") == "https://x.example.com"
+    assert normalize_endpoint_url("https://x.example.com/") == "https://x.example.com"
+    assert normalize_endpoint_url("https://x.example.com/kick/webhook") == "https://x.example.com"
+    assert normalize_endpoint_url("https://x.example.com/custom") == "https://x.example.com/custom"
 
 
 def test_callback_unknown_data_silent(tmp_path):
@@ -2384,7 +2387,7 @@ def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path, monkeypatch):
     probe_ok(ctrl)
 
     async def fake_quick():
-        return "https://abc123.trycloudflare.com/kick/webhook", None
+        return "https://abc123.trycloudflare.com/kick/webhook", None  # raw tunnel output
 
     ctrl._cloudflared_quick_start = fake_quick
     open_remote_access(ctrl)
@@ -2906,7 +2909,7 @@ def test_reply_text_kick_tailscale_off_turns_off_the_funnel(tmp_path, monkeypatc
         funnel_off_calls.append(1)
         return True
 
-    ctrl._tailscale_funnel_off = fake_funnel_off
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook.tailscale_funnel_off", fake_funnel_off)
     open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
     assert kb_labels(markup) == tailscale_labels(True)
@@ -2936,7 +2939,7 @@ def test_switch_tailscale_to_cloudflare_tears_down_funnel(tmp_path, monkeypatch)
         return True
 
     ctrl._cloudflared_quick_start = fake_quick
-    ctrl._tailscale_funnel_off = fake_funnel_off
+    monkeypatch.setattr("stream_archive.telegram.commands_webhook.tailscale_funnel_off", fake_funnel_off)
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
@@ -3020,7 +3023,7 @@ def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path, monkeypatch)
     sent = []
 
     async def fake_quick():
-        return "https://new.trycloudflare.com/kick/webhook", None
+        return "https://new.trycloudflare.com", None  # the adapter returns a base URL
 
     async def fake_send(text):
         sent.append(text)
@@ -3047,7 +3050,7 @@ def test_restore_quick_tunnel_same_url_stays_silent(tmp_path, monkeypatch):
     sent = []
 
     async def fake_quick():
-        return "https://same.trycloudflare.com/kick/webhook", None
+        return "https://same.trycloudflare.com", None  # the adapter returns a base URL
 
     async def fake_send(text):
         sent.append(text)
@@ -3180,3 +3183,84 @@ def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkey
 
     assert ok is False
     assert "not valid" in message
+
+
+def test_every_advertised_command_has_a_handler(tmp_path):
+    """The help text and the Telegram /-menu must not name a command without a handler."""
+    from telegram.ext import CommandHandler
+
+    _, ctrl, _, _, _ = make_controller(tmp_path)
+
+    registered = {name for h in ctrl.command_handlers() if isinstance(h, CommandHandler) for name in h.commands}
+    advertised = {c.command for c in ctrl.command_list()}
+    assert registered == advertised
+
+
+def test_webhook_toggle_reconciles_the_listener(tmp_path):
+    """Turning the webhook on must start its reconcile, and off must stop it."""
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    config.endpoint.public_url = "https://x.example.com"
+    config.endpoint.enabled = True  # subscriptions need a reachable endpoint
+
+    text = asyncio.run(ctrl._set_webhook_enabled(True))
+    assert text.startswith("Kick webhook enabled")
+    assert ctrl._kick_webhook.applied == [1]
+    assert ctrl._kick_webhook.synced == [config.channels]
+
+    text = asyncio.run(ctrl._set_webhook_enabled(False))
+    assert text == "Kick webhook disabled"
+    assert ctrl._kick_webhook.applied == [1, 1]
+    assert ctrl._kick_webhook.synced == [config.channels]  # no reconcile when it goes off
+    assert read_file(tmp_path)["kick"]["webhook"]["enabled"] is False
+
+
+def test_webhook_toggle_on_without_endpoint_skips_the_reconcile(tmp_path):
+    """Subscriptions need a reachable endpoint, so this path only saves the flag."""
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    config.endpoint.enabled = False
+
+    asyncio.run(ctrl._set_webhook_enabled(True))
+
+    assert ctrl._kick_webhook.applied == [1]
+    assert ctrl._kick_webhook.synced == []
+
+
+def test_reload_reconciles_the_listener(tmp_path):
+    """A hand-edited endpoint or API state must reach the live listener."""
+    _, ctrl, _, _, _ = make_controller(tmp_path)
+    file_config = read_file(tmp_path)
+    file_config["endpoint"] = {
+        "enabled": True,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8787,
+        "public_url": "https://new.example.com",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+
+    text = asyncio.run(ctrl.handle_reload())
+
+    assert text == "\u2705 Config reloaded from config.json"
+    assert ctrl._kick_webhook.applied == [1]
+    assert ctrl._kick_webhook.synced == [ctrl._config.channels]
+
+
+def test_write_cloudflared_config_keeps_the_file_inside_its_directory(tmp_path):
+    """A token can carry a hostile tunnel id, so the file name must not hold a path."""
+    _, ctrl, _, _, _ = make_controller(tmp_path)
+    token = base64.b64encode(json.dumps({"a": "acct", "t": "../../etc/evil", "s": "sec"}).encode()).decode()
+    ctrl._config.endpoint.cloudflare_token = token
+
+    path = asyncio.run(ctrl._write_cloudflared_config("kick.example.com"))
+
+    assert path.parent == tmp_path / "cloudflared"
+    assert path.name == "tunnel.yml"
+    assert path.exists()
+
+
+def test_parse_public_hostname_rejects_malformed_input():
+    from stream_archive.tunnels import parse_public_hostname
+
+    assert parse_public_hostname("https://[::1") is None  # unclosed IPv6 bracket
+    assert parse_public_hostname("not a hostname") is None
+    assert parse_public_hostname("https://kick.example.com/path") == "kick.example.com"
+    assert parse_public_hostname("kick.example.com.") == "kick.example.com"

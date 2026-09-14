@@ -9,8 +9,9 @@ or typed value for one chat. State reads and writes go through that chat's
 import re
 from typing import TYPE_CHECKING
 
-from stream_archive.telegram.commands_webhook import _parse_public_hostname, _public_url_note
+from stream_archive.telegram.commands_webhook import public_url_note
 from stream_archive.telegram.menu_state import ChatId, MenuResult
+from stream_archive.tunnels import parse_public_hostname
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -67,7 +68,7 @@ async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: 
         state.menu = "kick_cloudflare"
         note = await ctrl._reachability_note(url, "cloudflare")
         return (
-            f"{result}\n\ncloudflared quick tunnel is running on this host.\n{_public_url_note(ctrl._config)}{note}",
+            f"{result}\n\ncloudflared quick tunnel is running on this host.\n{public_url_note(ctrl._config)}{note}",
             ctrl.reply_keyboard("kick_cloudflare"),
         )
     if text == "Named tunnel":
@@ -109,7 +110,7 @@ async def menu_kick_token(ctrl: TelegramController, chat_id: ChatId, text: str) 
 async def menu_kick_hostname(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Take any text as a hostname candidate."""
     state = ctrl._state_for(chat_id)
-    host = _parse_public_hostname(text)
+    host = parse_public_hostname(text)
     if host is None:
         return (
             "\u274c That doesn't look like a public hostname (e.g. kick.example.com).",

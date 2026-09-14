@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import pytest
 from streamlink.exceptions import NoStreamsError, PluginError
 
 from stream_archive.config import AppConfig
-from stream_archive.recorder import Recorder, _sanitize_filename
+from stream_archive.recorder import Recorder, sanitize_filename
 from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 
 
@@ -110,16 +111,77 @@ class FakeNotifier:
         pass
 
 
-def test_sanitize_filename_replaces_illegal_chars():
+def testsanitize_filename_replaces_illegal_chars():
     name = 'a<b>c:d"e/f\\g|h?i*j'
-    assert _sanitize_filename(name) == "a_b_c_d_e_f_g_h_i_j"
+    assert sanitize_filename(name) == "a_b_c_d_e_f_g_h_i_j"
 
 
-def test_sanitize_filename_truncates_to_200():
+def testsanitize_filename_truncates_to_200():
     name = "x" * 249 + "/"
-    result = _sanitize_filename(name)
+    result = sanitize_filename(name)
     assert len(result) == 200
     assert result == "x" * 200
+
+
+def test_resolve_stream_loads_the_configured_plugin_dir(tmp_path):
+    """A plugin in plugin_dir must override the built-in plugin of the same name.
+
+    The image keeps the ad-block Twitch plugin in that directory. Without
+    the load, the session uses the built-in plugin and the proxy list does
+    nothing.
+    """
+    plugin_dir = tmp_path / "plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "twitch.py").write_text(
+        "import re\n"
+        "from streamlink.plugin import Plugin, pluginmatcher\n"
+        "from streamlink.stream.stream import Stream\n"
+        "\n"
+        "class StubStream(Stream):\n"
+        '    __shortname__ = "stub"\n'
+        "    def open(self):\n"
+        "        return None\n"
+        "\n"
+        '@pluginmatcher(re.compile(r"https?://(?:www\\.)?twitch\\.tv/(?P<channel>\\w+)"))\n'
+        "class Twitch(Plugin):\n"
+        "    def _get_streams(self):\n"
+        '        return {"best": StubStream(self.session)}\n'
+        "\n"
+        "__plugin__ = Twitch\n"
+    )
+    rec = Recorder(make_config(tmp_path))
+    # A build without the plugin load reaches the network here. Cap the HTTP
+    # timeout so such a build fails this test quickly instead of hanging.
+    rec._session.set_option("http-timeout", 0.01)
+
+    stream, _, _, _ = rec._resolve_stream("twitch:channel1", None, None)
+
+    plugin_class = rec._session.resolve_url("https://twitch.tv/channel1")[1]
+    assert inspect.getfile(plugin_class) == str(plugin_dir / "twitch.py")  # not the built-in plugin
+    assert type(stream).__name__ == "StubStream"
+
+
+def test_proxy_failure_log_hides_credentials(tmp_path, monkeypatch, caplog):
+    """A proxy URL can carry a password, so the log line must not show it."""
+    config = make_config(tmp_path)
+    config.proxy_list = ["https://user:secret@proxy.example:8080", "https://second.example:8080"]
+    rec = Recorder(config)
+
+    class FailingPlugin:
+        def __init__(self, session, url, options=None):
+            self.options = options
+
+        def streams(self):
+            msg = "proxy https://user:secret@proxy.example:8080 refused"
+            raise PluginError(msg)
+
+    monkeypatch.setattr(rec._session, "resolve_url", lambda url: ("twitch", FailingPlugin, url))
+
+    with caplog.at_level("WARNING"), pytest.raises(NoStreamsError):
+        rec._resolve_stream("twitch:channel1", None, None)
+
+    assert "secret" not in caplog.text
+    assert "https://***@proxy.example:8080" in caplog.text
 
 
 def test_start_success(tmp_path, monkeypatch):
@@ -1812,3 +1874,86 @@ def test_cleanup_spares_active_recording(tmp_path):
     assert removed == 1
     assert old_active.exists()
     assert not old_idle.exists()
+
+
+def test_cancelled_start_leaves_no_stale_entry(tmp_path, monkeypatch):
+    """A start that nobody waits for must not leave the channel marked as recording.
+
+    A slow live notification gave the caller time to cancel the start. The
+    entry then stayed behind without tasks, so every later start
+    short-circuited on it and the channel was never recorded again.
+    """
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    class BlockingNotifier(FakeNotifier):
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def notify_live(self, *a, **k):
+            self.entered.set()
+            await self.release.wait()
+
+    notifier = BlockingNotifier()
+    rec._notifier = notifier
+
+    async def scenario():
+        task = asyncio.create_task(rec.start("ch"))
+        await notifier.entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert rec.is_recording("ch") is False
+        assert rec._recordings == {}
+        # The channel can start again, with no stale state in the way.
+        notifier.release.set()
+        assert await rec.start("ch") is True
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_ffmpeg_stderr_log_hides_the_youtube_stream_key(tmp_path, caplog):
+    """ffmpeg can echo the ingest URL, which holds the stream key."""
+    from stream_archive.recorder.disk_output import DiskOutputMixin
+
+    class FakeStderr:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __aiter__(self):
+            async def gen():
+                for line in self._lines:
+                    yield line
+
+            return gen()
+
+    class FakeProcess:
+        stderr = FakeStderr([b"[flv @ 0x1] Failed to open rtmp://a.rtmp.youtube.com/live2/secret-key\n"])
+
+    class Reader(DiskOutputMixin):
+        _config = None
+
+    async def scenario():
+        await Reader()._read_ffmpeg_stderr("twitch:ch", FakeProcess())
+
+    with caplog.at_level("INFO"):
+        asyncio.run(scenario())
+
+    assert "secret-key" not in caplog.text
+    assert "rtmp://a.rtmp.youtube.com/live2/***" in caplog.text
+
+
+def test_redact_credentials_covers_proxy_and_ingest_urls():
+    from stream_archive.recorder.common import _redact_credentials
+
+    proxy = _redact_credentials("proxy 'httpproxy://user:pass@193.32.153.101:9389' failed")
+    assert "pass" not in proxy
+    assert "httpproxy://***@193.32.153.101:9389" in proxy
+
+    ingest = _redact_credentials("rtmp://a.rtmp.youtube.com/live2/abcd-efgh-1234?backup=1 failed")
+    assert "abcd-efgh-1234" not in ingest
+    assert "rtmp://a.rtmp.youtube.com/live2/***?backup=1" in ingest

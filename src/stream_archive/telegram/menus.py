@@ -320,7 +320,9 @@ async def _text_custom(ctrl: TelegramController, state: MenuState) -> str:
         "disk_maxsize": (f"Max total: {d.max_total_gb:g} GB (0 = disabled)", " in GB"),
         "channel_hold": (f"Hold delay for {ch}: {eff:g}s (0 = end immediately)", " in seconds"),
     }
-    label, units = labels[state.custom or ""]
+    # A chat can hold a custom menu name that no longer exists after a
+    # restart, so this lookup must not raise.
+    label, units = labels.get(state.custom or "", ("Value", ""))
     return f"{label}. Send the new value{units}:"
 
 

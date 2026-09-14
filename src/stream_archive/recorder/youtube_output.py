@@ -17,7 +17,7 @@ from stream_archive.config import (
     AppConfig,
     channel_url,
 )
-from stream_archive.recorder.common import _sanitize_filename
+from stream_archive.recorder.common import sanitize_filename
 from stream_archive.recorder.types import HoldState, Recording
 
 if TYPE_CHECKING:
@@ -322,7 +322,7 @@ class YoutubeOutputMixin:
                         recording_dir = str(disk.channel_recording_dir(self._config, self._channel_dir(channel)))
                         os.makedirs(recording_dir, exist_ok=True)
                         now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
-                        safe_title = _sanitize_filename(f"{author} - {title}")
+                        safe_title = sanitize_filename(f"{author} - {title}")
                         filepath = os.path.join(recording_dir, f"{safe_title}-{now}.ts")
                         entry["filepath"] = filepath
                         logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)

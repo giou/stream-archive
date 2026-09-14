@@ -1,12 +1,12 @@
 import httpx
 
-from stream_archive.updater import _installed_app_version
+from stream_archive.updater import installed_app_version
 
 # Single construction site for the shared outbound client. Callers that
 # need different timeouts or headers pass their own client instead.
 # The version comes from the installed package, so it never drifts
 # from the release tag.
-_USER_AGENT = f"stream-archive/{_installed_app_version() or 'dev'}"
+_USER_AGENT = f"stream-archive/{installed_app_version() or 'dev'}"
 
 
 def build_shared_client() -> httpx.AsyncClient:

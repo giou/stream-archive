@@ -336,5 +336,9 @@ class SettingsCommands:
             return f"\u274c Reload failed: {e}"
         await self._eventsub.sync_channels(self._config.channels)
         if self._kick_webhook:
+            # The listener serves the endpoint and the control API. This call
+            # applies a changed endpoint or webhook state, a listener address,
+            # and a changed API state from the reloaded file.
+            await self._kick_webhook.apply_state()
             await self._kick_webhook.sync_channels(self._config.channels)
         return "\u2705 Config reloaded from config.json"

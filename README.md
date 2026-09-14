@@ -156,7 +156,7 @@ never written back. A config with placeholders is safe to commit or share.
 | `proxy_list` | yes | — | Non-empty list of ad-block playlist proxies (Twitch recordings only). `httpproxy://…` entries are ttvlol v2 proxies (optional `httpproxy://user:pass@host:port`). `https://…` entries are v1 |
 | `monitoring_interval` | yes | — | Poll interval in seconds, more than 0 |
 | `timezone` | yes | — | IANA timezone (for example `America/New_York`) used for filenames and timestamps |
-| `plugin_dir` | yes | — | Directory with the streamlink-ttvlol plugin. `/app/plugins` in Docker (baked into the image, read-only). Relative `plugins` for dev runs |
+| `plugin_dir` | yes | — | Directory with the streamlink-ttvlol plugin. `/app/plugins` in Docker (baked into the image, read-only). Relative `plugins` for dev runs. See [Plugin override](#plugin-override) to mount your own copy |
 | `recording_dir` | yes | — | Directory for `.ts`/`.m4a` recordings |
 | `record_chat` | no | `true` | Record Twitch IRC chat alongside the video. Kick chat has its own flag |
 | `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`) |
@@ -166,7 +166,7 @@ never written back. A config with placeholders is safe to commit or share.
 | `kick.client_id` | yes¹ | — | Kick app client id. Required when a `kick:` channel is configured |
 | `kick.client_secret` | yes¹ | — | Kick app client secret. Same requirement |
 | `kick.record_chat` | no | `true` | Record Kick chat (delivered by the webhook). Requires `kick.webhook.enabled` |
-| `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live/offline + chat) and keep subscriptions in sync. `false` = Kick polling only (no chat) |
+| `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live/offline + chat) and keep subscriptions in sync. `false` = Kick polling only (no chat). While it is `false`, the receiver ignores deliveries and the app deletes the subscriptions of the monitored channels |
 | `kick.webhook.setup_notified` | no | `false` | Internal: tracks the "webhook is working" confirmation for the current enable |
 | `endpoint.enabled` | no | `false` | Serve the public endpoint: the HTTP listener plus its tunnel. The Kick webhook and the control API use it |
 | `endpoint.listen_host` | no | `127.0.0.1` | Bind address of the listener. Set to `0.0.0.0` under Docker so the host tunnel reaches it |
@@ -235,7 +235,9 @@ type, so **On** restores the same setup without new input. The **Cloudflare tunn
 and **Tailscale funnel** submenus have their own On/Off control, so you can
 switch provider or stop one tunnel without touching the other. The
 **Kick webhook** and **API** submenus hold only their own toggle and their
-settings. A managed Cloudflare tunnel comes back automatically on service
+settings. **Off** for the Kick webhook stops the subscription reconcile and
+deletes the subscriptions of the monitored channels, so Kick stops the
+deliveries. A managed Cloudflare tunnel comes back automatically on service
 restart. Its trycloudflare URL can change, and you get a new notification
 when it does. The endpoint serves both features, so the status shows
 `Endpoint: on (cloudflare · https://…)` and `Kick webhook: on` on
@@ -333,7 +335,7 @@ the next poll cycle. A failed command leaves memory and disk untouched.
 | `/remove <channel>` | Stop monitoring a channel. A live recording is stopped (offline notification sent) and its webhook/EventSub subscriptions are deleted |
 | `/retention <days>` | Set `retention_days`. `0` disables cleanup |
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode`, or a per-channel override. `default` clears the override. Applies to new recordings |
-| `/reload` | Re-read `config.json` from disk and re-sync webhook/EventSub subscriptions |
+| `/reload` | Re-read `config.json` from disk, then re-apply the endpoint and API state and re-sync the webhook/EventSub subscriptions |
 | `/restart` | Gracefully restart the service |
 | `/update` | Check for updates now (app, streamlink, plugin). Check-only: nothing is downloaded or applied. Apply an app update with `docker compose pull && docker compose up -d` |
 | `/quality [channel] <value\|default>` | Show the preferred quality, or set it globally or per channel (`best`, `1080p`, `720p`, …, `audio_only`). `default` clears the per-channel override |
@@ -458,6 +460,7 @@ src/stream_archive/
   eventsub.py            # Twitch EventSub conduit client (stream.online/offline fast-path)
   kick_webhook.py        # Kick webhook receiver (/kick/webhook), signature verification, subscription sync
   api.py                 # HTTP control API (/api/v1): channels and settings over the webhook listener
+  tunnels.py             # managed public tunnels: cloudflared process, tailscale funnel, tunnel tokens
 docs/control-api.md      # control API reference: auth, endpoints, values, examples
   kick_api.py            # Kick OAuth client (token, channel statuses, webhook subscriptions, public key)
   kick_chat.py           # Kick chat -> TwitchDownloader ChatRoot conversion + emote embedding
@@ -491,9 +494,27 @@ update:
 
 CI runs the five release gates on every pull request, so a merge cannot
 break the lockfile or the tests. The vendored streamlink-ttvlol plugin stays
-pinned to a release plus sha256 on purpose: the bot reports newer plugin
-releases in `/update`, and a maintainer bumps the two `ARG` lines together
-with the image release.
+pinned to a release plus sha256 on purpose: the pin is the verification that
+the image runs the code a maintainer reviewed, and Dependabot cannot watch a
+release asset. The bot reports newer plugin releases in `/update`, and a
+maintainer bumps the two `ARG` lines together with the image release. Users of
+the image pull that release; they edit no Dockerfile.
+
+### Plugin override
+
+To test a plugin release without a new image, mount a directory over
+`/app/plugins` and keep `plugin_dir` at `/app/plugins`:
+
+```yaml
+services:
+  stream-archive:
+    volumes:
+      - ./plugins:/app/plugins   # hosts twitch.py; overrides the copy in the image
+```
+
+The overlay holds the code that the recorder runs, so the image sha256 check
+does not cover it. Remove the mount to return to the pinned plugin that ships
+with the image.
 
 ## Development
 
@@ -504,6 +525,9 @@ uv run ruff check && uv run ruff format --check
 uv run mypy
 uv run pre-commit run --all-files
 ```
+
+The pre-commit hooks run those same tools through `uv`, so a commit checks
+the versions in `uv.lock`, exactly like CI.
 
 ## License
 

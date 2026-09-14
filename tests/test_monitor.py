@@ -420,6 +420,31 @@ def test_handle_online_ignores_unknown_channel():
     assert rec.started == []
 
 
+def test_channel_removed_during_start_stops_the_recording():
+    """A removal that lands while start() runs must not leave a live recording.
+
+    Every stop path reads config.channels, so a recording of a channel that
+    is no longer monitored never stops.
+    """
+    config = make_config(channels=["twitch:ch"])
+
+    class RemovingRecorder(FakeRecorder):
+        async def start(self, channel, title=None, game=None, user_id=None):
+            config.channels.remove(channel)  # the /remove press lands during the start
+            return await super().start(channel, title=title, game=game, user_id=user_id)
+
+    rec = RemovingRecorder()
+    mon = make_monitor(recorder=rec)
+
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+
+    assert rec.stopped == ["twitch:ch"]
+    assert "twitch:ch" not in mon._live_channels
+    # The channel left the config, so the next poll must not touch it.
+    asyncio.run(mon.check_channels(FakeTwitchAPI(streams={}), FakeKickAPI(), config))
+    assert rec.started == ["twitch:ch"]  # no restart
+
+
 def test_recorder_backoff_blocks_restart():
     class BackoffRecorder(FakeRecorder):
         def youtube_restart_blocked_reason(self, channel):

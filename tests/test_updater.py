@@ -128,16 +128,16 @@ def set_streamlink_version(set_installed_versions):
 
 
 @pytest.fixture
-def set_installed_app_version(set_installed_versions):
+def setinstalled_app_version(set_installed_versions):
     def _set(version):
         set_installed_versions("stream-archive", version)
 
     return _set
 
 
-def test_check_all_up_to_date_no_notify_and_records_state(tmp_path, set_streamlink_version, set_installed_app_version):
+def test_check_all_up_to_date_no_notify_and_records_state(tmp_path, set_streamlink_version, setinstalled_app_version):
     set_streamlink_version(STREAMLINK_CURRENT)
-    set_installed_app_version(APP_CURRENT)
+    setinstalled_app_version(APP_CURRENT)
     config = make_config(tmp_path)
     notifier = FakeNotifier()
     u = UpdateChecker(config, notifier, http=plugin_http(app_tag=APP_CURRENT))
@@ -213,9 +213,9 @@ def test_streamlink_update_notifies(tmp_path, set_streamlink_version):
     assert "  • Fixed: stream start offsets" in text
 
 
-def test_app_update_notifies_with_pull_footer(tmp_path, set_streamlink_version, set_installed_app_version):
+def test_app_update_notifies_with_pull_footer(tmp_path, set_streamlink_version, setinstalled_app_version):
     set_streamlink_version(STREAMLINK_CURRENT)
-    set_installed_app_version(APP_CURRENT)
+    setinstalled_app_version(APP_CURRENT)
     config = make_config(tmp_path)
     notifier = FakeNotifier()
     u = UpdateChecker(
@@ -241,8 +241,8 @@ def test_app_update_notifies_with_pull_footer(tmp_path, set_streamlink_version, 
     assert len(notifier.calls) == 1
 
 
-def test_app_release_failure_reports_unknown(tmp_path, set_installed_app_version):
-    set_installed_app_version(APP_CURRENT)
+def test_app_release_failure_reports_unknown(tmp_path, setinstalled_app_version):
+    setinstalled_app_version(APP_CURRENT)
     config = make_config(tmp_path)
     u = UpdateChecker(
         config,
@@ -256,7 +256,7 @@ def test_app_release_failure_reports_unknown(tmp_path, set_installed_app_version
 
 
 def test_app_check_no_installed_distribution(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.updater._installed_app_version", lambda: None)
+    monkeypatch.setattr("stream_archive.updater.installed_app_version", lambda: None)
     config = make_config(tmp_path)
     u = UpdateChecker(config, FakeNotifier(), http=plugin_http(app_tag=APP_LATEST))
     report = asyncio.run(u.check(notify=False))
@@ -265,8 +265,8 @@ def test_app_check_no_installed_distribution(tmp_path, monkeypatch):
     assert report["app"]["latest"] == APP_LATEST
 
 
-def test_all_unknown_no_notify(tmp_path, set_installed_app_version):
-    set_installed_app_version(APP_CURRENT)
+def test_all_unknown_no_notify(tmp_path, setinstalled_app_version):
+    setinstalled_app_version(APP_CURRENT)
     config = make_config(tmp_path)
     config.update_check.check_streamlink = False
     config.update_check.check_plugin = False
@@ -359,3 +359,17 @@ def test_run_loop_disabled_never_checks(tmp_path, monkeypatch):
         asyncio.run(u.run_loop())
     assert checks == []
     assert slept == [24 * 3600]
+
+
+def test_state_file_holding_a_list_starts_fresh(tmp_path, set_streamlink_version):
+    """A state file that is not an object must not break every later check."""
+    set_streamlink_version(STREAMLINK_CURRENT)
+    (tmp_path / "update_state.json").write_text("[]")
+    config = make_config(tmp_path)
+    notifier = FakeNotifier()
+    u = UpdateChecker(config, notifier, http=plugin_http())
+
+    report = asyncio.run(u.check(notify=True))
+
+    assert report["streamlink"]["status"] == "up_to_date"
+    assert json.loads((tmp_path / "update_state.json").read_text())["streamlink"] == STREAMLINK_CURRENT

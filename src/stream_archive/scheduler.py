@@ -18,7 +18,7 @@ from stream_archive.notifier import Notifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
 from stream_archive.twitch_api import TwitchAPI
-from stream_archive.updater import UpdateChecker, _installed_app_version
+from stream_archive.updater import UpdateChecker, installed_app_version
 from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
@@ -103,11 +103,8 @@ async def run_scheduler() -> None:
     monitor = Monitor(recorder, notifier)
 
     kick_api = KickAPI(config, http=shared_http)
-    _READY = True
 
     eventsub = EventSubClient(twitch_api, monitor, config)
-    await eventsub.start()
-
     kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
 
     updater = UpdateChecker(config, notifier, http=shared_http)
@@ -124,24 +121,29 @@ async def run_scheduler() -> None:
         kick_webhook=kick_webhook,
         http=shared_http,
     )
-    # The control API shares the Kick webhook listener and calls the
-    # Telegram command layer for every change.
     control_api = ControlAPI(config, telegram, recorder)
     control_api.register_routes(kick_webhook)
-    await kick_webhook.apply_state()
-    if kick_webhook.listening_needed():
-        logger.info("[kick_webhook] started (public: %s)", config.endpoint.public_url or "(none)")
 
-    await telegram.start()
-
-    version = _installed_app_version() or "unknown"
+    # Every resource above exists, so a failure in this block still shuts
+    # the service down in order. A failed Telegram start, for example, must
+    # not leave a recording or a held YouTube broadcast behind.
     try:
-        await notifier.notify_startup(config.channels, version)
-    except Exception:
-        logger.error("[scheduler] notify_startup failed", exc_info=True)
-    await eventsub.wait_ready(timeout=15)
+        await eventsub.start()
+        await kick_webhook.apply_state()
+        if kick_webhook.listening_needed():
+            logger.info("[kick_webhook] started (public: %s)", config.endpoint.public_url or "(none)")
 
-    try:
+        await telegram.start()
+
+        version = installed_app_version() or "unknown"
+        try:
+            await notifier.notify_startup(config.channels, version)
+        except Exception:
+            logger.error("[scheduler] notify_startup failed", exc_info=True)
+        await eventsub.wait_ready(timeout=15)
+
+        # Ready for orchestrators only now: the signal clients and the bot run.
+        _READY = True
         await _run_loop(monitor, twitch_api, kick_api, config, recorder)
     except asyncio.CancelledError:
         pass

@@ -41,7 +41,10 @@ def base_config():
             "client_id": "cid",
             "client_secret": "csec",
             "record_chat": True,
-            "webhook": {"enabled": False},
+            # The receiver accepts deliveries only while the feature is on, so
+            # the normal test config has it on. Tests of the off state set it
+            # to false themselves.
+            "webhook": {"enabled": True},
         },
     }
 
@@ -212,6 +215,7 @@ def test_apply_state_keeps_the_listener_for_the_api_alone():
     """The API needs the listener but never the webhook subscription sync."""
     config = base_config()
     config["api"] = {"enabled": True, "key": "k"}
+    config["kick"]["webhook"]["enabled"] = False
     calls = {"n": 0}
 
     class CountingAPI:
@@ -673,6 +677,70 @@ def test_reconcile_deletes_stale_subscriptions():
 
     assert deletes == [["stale-1", "stale-2"]]
     assert wh._subs == {}
+
+
+def test_disabled_webhook_ignores_deliveries(keypair):
+    """Off means off: the receiver answers as if the route did not exist."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    config = base_config()
+    config["kick"]["webhook"]["enabled"] = False
+    wh = make_webhook(config=config, monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            body = live_event(is_live=True)
+            live = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
+            )
+            chat = await client.post(
+                "/kick/webhook",
+                data=chat_event(),
+                headers=_signed_headers(private_key, "m2", _fresh_ts(), chat_event(), wh.EVENT_CHAT),
+            )
+            return live.status, chat.status
+
+    assert asyncio.run(scenario()) == (404, 404)
+    assert monitor.online == []
+    assert recorder.chat == []
+
+
+def test_apply_state_stops_the_sync_and_drops_subscriptions_when_the_webhook_goes_off():
+    """Off must stop the reconcile and delete the subscriptions it created."""
+    deletes = []
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            return token_response(request)
+        if request.url.path == "/public/v1/events/subscriptions" and request.method == "DELETE":
+            deletes.append([v for k, v in request.url.params.multi_items() if k == "id"])
+            return httpx.Response(200, json={"data": []})
+        pytest.fail(f"unexpected request: {request.method} {request.url}")
+
+    config = enabled_config()
+    wh = make_webhook(config=config, api=make_mock_api(handler))
+    wh._subs = {"xqc": {"sub-1", "sub-2"}}
+
+    async def scenario():
+        await wh.apply_state()
+        assert wh._sync_task is not None
+        wh._config.kick.webhook.enabled = False
+        await wh.apply_state()
+        assert wh._sync_task is None
+        # The probe order is a race, so wait for the delete calls.
+        for _ in range(100):
+            if deletes:
+                break
+            await asyncio.sleep(0.01)
+        await wh.close()
+
+    asyncio.run(scenario())
+    assert [sorted(ids) for ids in deletes] == [["sub-1", "sub-2"]]  # a set, so order varies
+    assert wh._subs == {}
+    assert wh.listening_needed()  # the endpoint stays on for the control API
 
 
 def test_reconcile_failure_notifies_once_and_clears_on_success():
