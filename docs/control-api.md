@@ -260,7 +260,7 @@ after you confirm. The API changes nothing.
 - Every change goes through the same validation and the same atomic
   `config.json` write as a Telegram change. A rejected change changes
   nothing.
-- A change applies on the next monitoring cycle. A recording that is in
+- A change applies on the next poll cycle. A recording that is in
   progress keeps the settings of its start.
 - The API serves the same settings as the bot. It cannot change secrets,
   the endpoint, or the API itself.
