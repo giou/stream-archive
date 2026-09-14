@@ -6,7 +6,7 @@ reads and writes go through that chat's ``MenuState`` only.
 
 from typing import TYPE_CHECKING
 
-from stream_archive.telegram.commands_settings import _QUALITY_PRESETS
+from stream_archive.telegram.commands_settings import HOLD_CHOICES, MODE_CHOICES, QUALITY_CHOICES
 from stream_archive.telegram.menu_state import ChatId, MenuResult
 
 if TYPE_CHECKING:
@@ -15,19 +15,14 @@ if TYPE_CHECKING:
 
 async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route a press on the root menu."""
-    if text == "Status":
-        return await ctrl.handle_status(), ctrl.reply_keyboard("root")
     state = ctrl._state_for(chat_id)
     new_menu = {
         "Channels": "channels",
-        "Chat recording": "chat",
         "Output mode": "mode",
         "Quality": "quality",
-        "Retention": "retention",
-        "Max recordings": "maxrec",
-        "Max YouTube": "maxyt",
-        "Disk": "disk",
-        "Remote Access": "remote_access",
+        "Chat recording": "chat",
+        "Storage & limits": "storage",
+        "Remote access": "remote_access",
     }.get(text)
     if new_menu is None:
         return None
@@ -63,7 +58,7 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
     ch = state.channel
     if ch is None:
         return None
-    if text == "Delete channel":
+    if text == "Remove channel":
         return (
             f"Remove {ch} from monitoring? This stops any active recording and removes its output-mode override.",
             ctrl._confirm_keyboard("confirm_remove", ch),
@@ -74,35 +69,28 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
     if text == "Quality":
         state.menu = "channel_quality"
         return await ctrl.menu_text("channel_quality", ch, chat_id=chat_id), ctrl.reply_keyboard("channel_quality")
-    values = {
-        "Mode: disk": "disk",
-        "Mode: youtube": "youtube",
-        "Mode: both": "both",
-        "Mode: default": "default",
-    }
-    if text in values:
-        result = ctrl.handle_mode([ch, values[text]], chat_id=chat_id)
+    mode = text.removeprefix("Mode: ")
+    if mode in MODE_CHOICES:
+        result = ctrl.handle_mode([ch, MODE_CHOICES[mode]], chat_id=chat_id)
+        return result, ctrl.reply_keyboard("channel")
+    if text == "Mode: Global":
+        result = ctrl.handle_mode([ch, "default"], chat_id=chat_id)
         return result, ctrl.reply_keyboard("channel")
     return None
 
 
 async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route a hold-delay preset or open the custom value menu."""
+    """Route a hold-delay preset, the global value, or open the custom value menu."""
     state = ctrl._state_for(chat_id)
     ch = state.channel
     if ch is None:
         return None
-    values = {
-        "0 (off)": "0",
-        "30s": "30",
-        "60s": "60",
-        "120s": "120",
-        "300s": "300",
-        "600s": "600",
-        "Default": "default",
-    }
-    if text in values:
-        result = ctrl.handle_channel_hold([ch, values[text]], chat_id=chat_id)
+    if text in HOLD_CHOICES:
+        result = ctrl.handle_channel_hold([ch, HOLD_CHOICES[text]], chat_id=chat_id)
+        state.menu = "channel"
+        return result, ctrl.reply_keyboard("channel")
+    if text == "Global":
+        result = ctrl.handle_channel_hold([ch, "default"], chat_id=chat_id)
         state.menu = "channel"
         return result, ctrl.reply_keyboard("channel")
     if text == "Custom":
@@ -112,15 +100,15 @@ async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str
 
 
 async def menu_channel_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route a quality preset for one channel."""
+    """Route a quality preset or the global value for one channel."""
     state = ctrl._state_for(chat_id)
     ch = state.channel
     if ch is None:
         return None
-    if text == "Default":
+    if text == "Global":
         result = ctrl.handle_quality([ch, "default"], chat_id=chat_id)
-    elif text in _QUALITY_PRESETS:
-        result = ctrl.handle_quality([ch, text], chat_id=chat_id)
+    elif text in QUALITY_CHOICES:
+        result = ctrl.handle_quality([ch, QUALITY_CHOICES[text]], chat_id=chat_id)
     else:
         return None
     state.menu = "channel"

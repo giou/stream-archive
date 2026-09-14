@@ -18,6 +18,14 @@ from stream_archive.telegram import menus_api as api_menus
 from stream_archive.telegram import menus_kick as kick_menus
 from stream_archive.telegram import menus_root as root_menus
 from stream_archive.telegram import menus_settings as settings_menus
+from stream_archive.telegram.commands_settings import (
+    COUNT_CHOICES,
+    DISK_SIZE_CHOICES,
+    HOLD_CHOICES,
+    MODE_CHOICES,
+    QUALITY_CHOICES,
+    RETENTION_CHOICES,
+)
 from stream_archive.telegram.menu_state import ChatId, MenuResult, MenuState
 
 if TYPE_CHECKING:
@@ -39,70 +47,124 @@ def _frame(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     )
 
 
-def _toggle(enabled: bool) -> str:
-    """Label of the one-button on/off toggle for one state."""
-    return "Off" if enabled else "On"
+#: Prefix of the button that holds the current value.
+_ACTIVE = "\u2713 "
 
 
-# Static keyboards. The channels, api, and remote-access menus read live
-# state, so they build dynamically.
+def _mark(label: str, active: bool) -> str:
+    """Prefix the label with the active marker when ``active`` is true."""
+    return f"{_ACTIVE}{label}" if active else label
+
+
+def _unmark(text: str) -> str:
+    """Remove the active marker from a pressed button label."""
+    return text[len(_ACTIVE) :] if text.startswith(_ACTIVE) else text
+
+
+def _toggle_action(enabled: bool) -> str:
+    """Verb of the one-button toggle for one state."""
+    return "Disable" if enabled else "Enable"
+
+
+def _rows(choices: dict[str, str], width: int) -> list[list[str]]:
+    """Wrap the labels of a label-to-value table into rows of ``width``."""
+    labels = list(choices)
+    return [labels[i : i + width] for i in range(0, len(labels), width)]
+
+
+def _marked_rows(layout: list[list[str]], choices: dict[str, str], current: str | None) -> list[list[str]]:
+    """Mark the cells whose label maps to ``current``."""
+    return [[_mark(label, choices.get(label) == current) for label in row] for row in layout]
+
+
+# Keyboards that do not read config state.
 _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
-    "root": [
-        ["Channels", "Status"],
-        ["Chat recording", "Output mode"],
-        ["Quality", "Retention"],
-        ["Max recordings", "Max YouTube"],
-        ["Disk", "Remote Access"],
-    ],
-    "channel": [
-        ["Back"],
-        ["Mode: disk", "Mode: youtube"],
-        ["Mode: both", "Mode: default"],
-        ["Hold delay", "Quality"],
-        ["Delete channel"],
-    ],
-    "channel_hold": [["0 (off)", "30s", "60s", "120s"], ["300s", "600s", "Default"], ["Custom", "Back"]],
-    "channel_quality": [["best", "1080p", "720p"], ["480p", "360p", "audio_only"], ["Default"], ["Back"]],
-    "chat": [["Twitch", "Kick"], ["Back"]],
-    "chat_twitch": [["On", "Off"], ["Back"]],
-    "chat_kick": [["On", "Off"], ["Back"]],
-    "mode": [["disk", "youtube", "both"], ["Back"]],
-    "quality": [["best", "1080p", "720p"], ["480p", "360p", "audio_only"], ["Back"]],
-    "retention": [["1 day", "3 days", "7 days"], ["14 days", "30 days", "Off"], ["Custom", "Back"]],
-    "maxrec": [["0 (unlimited)", "1", "2"], ["3", "5"], ["Custom", "Back"]],
-    "maxyt": [["0 (unlimited)", "1", "2"], ["3", "5"], ["Custom", "Back"]],
-    "disk": [["Max total"], ["Delete oldest"], ["Back"]],
-    "disk_maxsize": [["0", "25", "50"], ["100", "200"], ["Custom", "Back"]],
-    "kick_cloudflare_dns": [["Skip"], ["Back"]],
-    "kick_cloudflare_token": [["Back"]],
-    "kick_cloudflare_hostname": [["Back"]],
+    "root": [["Channels", "Output mode"], ["Quality", "Chat recording"], ["Storage & limits", "Remote access"]],
     "add_channel": [["Back"]],
     "custom": [["Back"]],
+    "kick_cloudflare_token": [["Back"]],
+    "kick_cloudflare_hostname": [["Back"]],
+    "kick_cloudflare_dns": [["Skip DNS"], ["Back"]],
 }
 
 
 def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKeyboardMarkup:
     """Build the keyboard for ``menu``."""
+    c = ctrl._config
     if menu == "channels":
-        rows = [["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in ctrl._config.channels)]
+        # Back stays in the first row: a long channel list would push it out of view.
+        return _frame([["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in c.channels)])
+    if menu == "channel":
+        ch = state.channel or ""
+        mode_override = c.channel_output_modes.get(ch)
+        buttons = [_mark(f"Mode: {label}", value == mode_override) for label, value in MODE_CHOICES.items()]
+        buttons.append(_mark("Mode: Global", mode_override is None))
+        return _frame([buttons[:2], buttons[2:], ["Quality", "Hold delay"], ["Remove channel"], ["Back"]])
+    if menu == "channel_hold":
+        ch = state.channel or ""
+        hold_override = c.channel_youtube_hold_seconds.get(ch)
+        rows = _marked_rows(
+            _rows(HOLD_CHOICES, 3), HOLD_CHOICES, f"{hold_override:g}" if hold_override is not None else None
+        )
+        rows.append([_mark("Global", hold_override is None), "Custom"])
+        rows.append(["Back"])
         return _frame(rows)
-    if menu == "api":
-        return _frame([[_toggle(ctrl._config.api.enabled)], ["Show key", "Rotate key"], ["Back"]])
+    if menu == "channel_quality":
+        ch = state.channel or ""
+        quality_override = c.channel_preferred_qualities.get(ch)
+        rows = _marked_rows(_rows(QUALITY_CHOICES, 3), QUALITY_CHOICES, quality_override)
+        rows.append([_mark("Global", quality_override is None), "Custom"])
+        rows.append(["Back"])
+        return _frame(rows)
+    if menu == "chat":
+        return _frame(
+            [
+                [f"{_toggle_action(c.record_chat)} Twitch chat"],
+                [f"{_toggle_action(c.kick.record_chat)} Kick chat"],
+                ["Back"],
+            ]
+        )
+    if menu == "mode":
+        return _frame([*_marked_rows(_rows(MODE_CHOICES, 3), MODE_CHOICES, c.output_mode), ["Back"]])
+    if menu == "quality":
+        return _frame([*_marked_rows(_rows(QUALITY_CHOICES, 3), QUALITY_CHOICES, c.preferred_quality), ["Back"]])
+    if menu == "retention":
+        rows = _marked_rows(_rows(RETENTION_CHOICES, 3), RETENTION_CHOICES, f"{c.retention_days:g}")
+        return _frame([*rows, ["Custom"], ["Back"]])
+    if menu in ("maxrec", "maxyt"):
+        count = c.max_concurrent_recordings if menu == "maxrec" else c.max_concurrent_youtube_streams
+        rows = _marked_rows(_rows(COUNT_CHOICES, 3), COUNT_CHOICES, f"{count:g}")
+        return _frame([*rows, ["Custom"], ["Back"]])
+    if menu == "storage":
+        return _frame([["Retention", "Disk limits"], ["Max recordings", "Max restreams"], ["Back"]])
+    if menu == "disk":
+        return _frame([["Max total size"], [f"{_toggle_action(c.disk.delete_oldest)} delete oldest"], ["Back"]])
+    if menu == "disk_maxsize":
+        rows = _marked_rows(_rows(DISK_SIZE_CHOICES, 3), DISK_SIZE_CHOICES, f"{c.disk.max_total_gb:g}")
+        return _frame([*rows, ["Custom"], ["Back"]])
     if menu == "remote_access":
         return _frame(
             [
-                [_toggle(ctrl._config.endpoint.enabled)],
+                [f"{_toggle_action(c.endpoint.enabled)} endpoint"],
                 ["Cloudflare tunnel", "Tailscale funnel"],
                 ["Kick webhook", "API"],
                 ["Back"],
             ]
         )
+    if menu == "api":
+        return _frame([[f"{_toggle_action(c.api.enabled)} API"], ["Show key", "Rotate key"], ["Back"]])
     if menu == "kick_webhook":
-        return _frame([[_toggle(ctrl._config.kick.webhook.enabled)], ["Back"]])
+        return _frame([[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"], ["Back"]])
     if menu == "kick_cloudflare":
-        return _frame([[_toggle(ctrl._tunnel_active("cloudflare"))], ["Quick tunnel", "Named tunnel"], ["Back"]])
+        return _frame(
+            [
+                [f"{_toggle_action(ctrl._tunnel_active('cloudflare'))} Cloudflare tunnel"],
+                ["Quick tunnel", "Named tunnel"],
+                ["Back"],
+            ]
+        )
     if menu == "kick_tailscale":
-        return _frame([[_toggle(ctrl._tunnel_active("tailscale"))], ["Back"]])
+        return _frame([[f"{_toggle_action(ctrl._tunnel_active('tailscale'))} Tailscale funnel"], ["Back"]])
     return _frame([list(row) for row in _STATIC_KEYBOARDS.get(menu, [["Back"]])])
 
 
@@ -142,7 +204,7 @@ async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
             "Enable it and I generate the API key."
         )
     base = api_base_url(ctrl._config)
-    url_line = f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Remote Access."
+    url_line = f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Remote access."
     text = f"Control API: on\n{url_line}\nTap Show key to display the key. Changes apply on the next cycle."
     if not ctrl._config.kick.webhook.enabled:
         text += "\nThe public URL needs remote access. Turn it on to reach the API from outside."
@@ -153,7 +215,7 @@ async def _text_kick_webhook(ctrl: TelegramController, state: MenuState) -> str:
     text = f"Kick webhook: {ctrl._webhook_state_text()}\n"
     if not ctrl._config.endpoint.enabled:
         text += "The endpoint is off, so Kick cannot deliver events.\n"
-    return text + "\nThe endpoint and its tunnels are set in Remote Access."
+    return text + "\nThe endpoint and its tunnels are set in Remote access."
 
 
 async def _text_kick_cloudflare(ctrl: TelegramController, state: MenuState) -> str:
@@ -217,11 +279,11 @@ async def _text_channel(ctrl: TelegramController, state: MenuState) -> str:
     c = ctrl._config
     ch = state.channel or ""
     override = c.channel_output_modes.get(ch)
-    mode = override or f"default (global: {c.output_mode})"
+    mode = override or f"global ({c.output_mode})"
     q_override = c.channel_preferred_qualities.get(ch)
-    quality_text = q_override or f"default (global: {c.preferred_quality})"
+    quality_text = q_override or f"global ({c.preferred_quality})"
     hold_override = c.channel_youtube_hold_seconds.get(ch)
-    hold_text = f"{hold_override:g}s" if hold_override is not None else f"default (global: {c.youtube.hold_seconds:g}s)"
+    hold_text = f"{hold_override:g}s" if hold_override is not None else f"global ({c.youtube.hold_seconds:g}s)"
     return f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}"
 
 
@@ -232,7 +294,7 @@ async def _text_channel_hold(ctrl: TelegramController, state: MenuState) -> str:
     eff = c.youtube.hold_seconds if hold_override is None else hold_override
     return (
         f"YouTube hold delay for {ch}: {eff:g}s (0 = end immediately)\n"
-        f"Global default: {c.youtube.hold_seconds:g}s\n\n"
+        f"Global: {c.youtube.hold_seconds:g}s\n\n"
         "When the source stream stops, the broadcast stays open this long, waiting for the "
         "streamer to return \u2014 a return within the delay reuses the same broadcast instead "
         "of creating a new one."
@@ -244,8 +306,8 @@ async def _text_channel_quality(ctrl: TelegramController, state: MenuState) -> s
     ch = state.channel or ""
     q_override = c.channel_preferred_qualities.get(ch)
     return (
-        f"Recording quality for {ch}: {q_override or f'default (global: {c.preferred_quality})'}\n\n"
-        "audio_only records sound only; it forces output to disk (no YouTube re-stream)."
+        f"Recording quality for {ch}: {q_override or f'global ({c.preferred_quality})'}\n\n"
+        "Audio only records sound only. It forces output to disk (no YouTube re-stream)."
     )
 
 
@@ -254,17 +316,9 @@ async def _text_chat(ctrl: TelegramController, state: MenuState) -> str:
     kick_chat = c.kick.record_chat
     return (
         f"Chat recording (Twitch): {'on' if c.record_chat else 'off'}\n"
-        f"Kick chat recording: {'on' if kick_chat else 'off'}\n\nChoose a platform:"
+        f"Kick chat recording: {'on' if kick_chat else 'off'}\n\n"
+        "Off stops an active capture for that platform."
     )
-
-
-async def _text_chat_twitch(ctrl: TelegramController, state: MenuState) -> str:
-    return f"Twitch chat recording: {'on' if ctrl._config.record_chat else 'off'}. Choose:"
-
-
-async def _text_chat_kick(ctrl: TelegramController, state: MenuState) -> str:
-    kick_chat = ctrl._config.kick.record_chat
-    return f"Kick chat recording: {'on' if kick_chat else 'off'}. Choose:"
 
 
 async def _text_mode(ctrl: TelegramController, state: MenuState) -> str:
@@ -281,29 +335,48 @@ async def _text_quality(ctrl: TelegramController, state: MenuState) -> str:
     return text
 
 
+def _retention_label(days: float) -> str:
+    """Retention as a short label, for example ``off`` or ``7 days``."""
+    if not days:
+        return "off"
+    return f"{days:g} day" + ("s" if days != 1 else "")
+
+
 async def _text_retention(ctrl: TelegramController, state: MenuState) -> str:
-    return f"Retention: {ctrl._config.retention_days} day(s) (0 = disabled). Choose:"
+    return f"Retention: {_retention_label(ctrl._config.retention_days)}. Choose:"
 
 
 async def _text_maxrec(ctrl: TelegramController, state: MenuState) -> str:
-    return f"Max recordings: {ctrl._config.max_concurrent_recordings} (0 = unlimited). Choose:"
+    return f"Max recordings: {ctrl._config.max_concurrent_recordings:g} (0 = unlimited). Choose:"
 
 
 async def _text_maxyt(ctrl: TelegramController, state: MenuState) -> str:
-    return f"Max YouTube re-streams: {ctrl._config.max_concurrent_youtube_streams} (0 = unlimited). Choose:"
+    return f"Max YouTube re-streams: {ctrl._config.max_concurrent_youtube_streams:g} (0 = unlimited). Choose:"
+
+
+async def _text_storage(ctrl: TelegramController, state: MenuState) -> str:
+    c = ctrl._config
+    d = c.disk
+    return (
+        f"Retention: {_retention_label(c.retention_days)} (0 = disabled)\n"
+        f"Max total size: {d.max_total_gb:g} GB (0 = disabled)\n"
+        f"Delete oldest: {'on' if d.delete_oldest else 'off'}\n"
+        f"Max recordings: {c.max_concurrent_recordings:g} (0 = unlimited)\n"
+        f"Max YouTube re-streams: {c.max_concurrent_youtube_streams:g} (0 = unlimited)"
+    )
 
 
 async def _text_disk(ctrl: TelegramController, state: MenuState) -> str:
     body: str = ctrl.handle_disk([])
-    return body + "\n\nChoose a limit:"
+    return body + "\n\nChoose what to change:"
 
 
 async def _text_disk_maxsize(ctrl: TelegramController, state: MenuState) -> str:
     d = ctrl._config.disk
     return (
-        f"Max total: {d.max_total_gb:g} GB (0 = disabled)\n"
-        "Limits total recording size; when exceeded, the oldest recordings are deleted "
-        "(or recording stops). Choose:"
+        f"Max total size: {d.max_total_gb:g} GB (0 = disabled)\n"
+        "Limits total recording size. When the limit is reached, the oldest recordings are "
+        "deleted (or recording stops). Choose:"
     )
 
 
@@ -314,10 +387,10 @@ async def _text_custom(ctrl: TelegramController, state: MenuState) -> str:
     hold_override = c.channel_youtube_hold_seconds.get(ch)
     eff = c.youtube.hold_seconds if hold_override is None else hold_override
     labels = {
-        "retention": (f"Retention: {c.retention_days} day(s) (0 = disabled)", " in days"),
-        "maxrec": (f"Max recordings: {c.max_concurrent_recordings} (0 = unlimited)", ""),
-        "maxyt": (f"Max YouTube re-streams: {c.max_concurrent_youtube_streams} (0 = unlimited)", ""),
-        "disk_maxsize": (f"Max total: {d.max_total_gb:g} GB (0 = disabled)", " in GB"),
+        "retention": (f"Retention: {_retention_label(c.retention_days)} (0 = disabled)", " in days"),
+        "maxrec": (f"Max recordings: {c.max_concurrent_recordings:g} (0 = unlimited)", ""),
+        "maxyt": (f"Max YouTube re-streams: {c.max_concurrent_youtube_streams:g} (0 = unlimited)", ""),
+        "disk_maxsize": (f"Max total size: {d.max_total_gb:g} GB (0 = disabled)", " in GB"),
         "channel_hold": (f"Hold delay for {ch}: {eff:g}s (0 = end immediately)", " in seconds"),
     }
     # A chat can hold a custom menu name that no longer exists after a
@@ -348,8 +421,6 @@ MENU: dict[str, MenuDef] = {
     "channel_hold": _pair("channel_hold", _text_channel_hold),
     "channel_quality": _pair("channel_quality", _text_channel_quality),
     "chat": _pair("chat", _text_chat),
-    "chat_twitch": _pair("chat_twitch", _text_chat_twitch),
-    "chat_kick": _pair("chat_kick", _text_chat_kick),
     "mode": _pair("mode", _text_mode),
     "quality": _pair("quality", _text_quality),
     "retention": _pair("retention", _text_retention),
@@ -358,6 +429,7 @@ MENU: dict[str, MenuDef] = {
     "disk": _pair("disk", _text_disk),
     "disk_maxsize": _pair("disk_maxsize", _text_disk_maxsize),
     "custom": _pair("custom", _text_custom),
+    "storage": _pair("storage", _text_storage),
     "remote_access": _pair("remote_access", _text_remote_access),
     "api": _pair("api", _text_api),
     "kick_webhook": _pair("kick_webhook", _text_kick_webhook),
@@ -376,8 +448,6 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "channel_hold": root_menus.menu_channel_hold,
     "channel_quality": root_menus.menu_channel_quality,
     "chat": settings_menus.menu_chat,
-    "chat_twitch": settings_menus.menu_chat_platform,
-    "chat_kick": settings_menus.menu_chat_platform,
     "mode": settings_menus.menu_mode,
     "quality": settings_menus.menu_quality,
     "retention": settings_menus.menu_retention,
@@ -386,6 +456,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "disk": settings_menus.menu_disk,
     "disk_maxsize": settings_menus.menu_disk_maxsize,
     "custom": settings_menus.menu_custom,
+    "storage": settings_menus.menu_storage,
     "remote_access": kick_menus.menu_remote_access,
     "api": api_menus.menu_api,
     "kick_webhook": kick_menus.menu_kick_webhook,
@@ -404,14 +475,13 @@ PARENT: dict[str, str] = {
     "channel_hold": "channel",
     "channel_quality": "channel",
     "chat": "root",
-    "chat_twitch": "chat",
-    "chat_kick": "chat",
     "mode": "root",
     "quality": "root",
-    "retention": "root",
-    "maxrec": "root",
-    "maxyt": "root",
-    "disk": "root",
+    "retention": "storage",
+    "maxrec": "storage",
+    "maxyt": "storage",
+    "storage": "root",
+    "disk": "storage",
     "disk_maxsize": "disk",
     "remote_access": "root",
     "api": "remote_access",
@@ -429,7 +499,7 @@ def _custom_parent(custom: str) -> str:
     if custom == "channel_hold":
         return "channel"
     if custom in ("retention", "maxrec", "maxyt"):
-        return "root"
+        return "storage"
     return "disk"
 
 
@@ -457,6 +527,7 @@ async def dispatch_text(ctrl: TelegramController, chat_id: ChatId, text: str) ->
     Return ``(reply_text, reply_markup)`` for ``reply_text(..., reply_markup=)``.
     Both markup kinds are valid there. Return ``None`` to ignore the message.
     """
+    text = _unmark(text)
     if text == "Back":
         return await menu_back(ctrl, chat_id)
     state = ctrl._state_for(chat_id)

@@ -186,14 +186,19 @@ def probe_ok(ctrl):
 
 
 def open_remote_access(ctrl):
-    """Open the Remote Access menu, which owns the public URL and its tunnels."""
-    return asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    """Open the Remote access menu, which owns the public URL and its tunnels."""
+    return asyncio.run(ctrl.handle_reply_text("Remote access"))
 
 
 def open_webhook_menu(ctrl):
-    """Open Remote Access, then its Kick webhook submenu."""
+    """Open Remote access, then its Kick webhook submenu."""
     open_remote_access(ctrl)
     return asyncio.run(ctrl.handle_reply_text("Kick webhook"))
+
+
+def open_storage(ctrl):
+    """Open Storage & limits, which owns retention, disk, and the two limits."""
+    return asyncio.run(ctrl.handle_reply_text("Storage & limits"))
 
 
 def test_status_contains_settings_and_omits_secrets(tmp_path):
@@ -1042,45 +1047,54 @@ def kb_labels(markup):
 
 ROOT_LABELS = [
     "Channels",
-    "Status",
-    "Chat recording",
     "Output mode",
     "Quality",
-    "Retention",
-    "Max recordings",
-    "Max YouTube",
-    "Disk",
-    "Remote Access",
+    "Chat recording",
+    "Storage & limits",
+    "Remote access",
 ]
-CHAT_LABELS = ["Twitch", "Kick", "Back"]
-CHAT_PLATFORM_LABELS = ["On", "Off", "Back"]
+STORAGE_LABELS = ["Retention", "Disk limits", "Max recordings", "Max restreams", "Back"]
 KICK_TOKEN_LABELS = ["Back"]
-DISK_LABELS = ["Max total", "Delete oldest", "Back"]
 
 
-def toggle_label(enabled):
+def toggle_action(enabled):
     """The one toggle button shows the action that the current state allows."""
-    return "Off" if enabled else "On"
+    return "Disable" if enabled else "Enable"
+
+
+def chat_labels(twitch, kick):
+    return [f"{toggle_action(twitch)} Twitch chat", f"{toggle_action(kick)} Kick chat", "Back"]
+
+
+def disk_labels(delete_oldest):
+    return ["Max total size", f"{toggle_action(delete_oldest)} delete oldest", "Back"]
 
 
 def api_labels(enabled):
-    return [toggle_label(enabled), "Show key", "Rotate key", "Back"]
+    return [f"{toggle_action(enabled)} API", "Show key", "Rotate key", "Back"]
 
 
 def remote_labels(enabled):
-    return [toggle_label(enabled), "Cloudflare tunnel", "Tailscale funnel", "Kick webhook", "API", "Back"]
+    return [
+        f"{toggle_action(enabled)} endpoint",
+        "Cloudflare tunnel",
+        "Tailscale funnel",
+        "Kick webhook",
+        "API",
+        "Back",
+    ]
 
 
 def webhook_labels(enabled):
-    return [toggle_label(enabled), "Back"]
+    return [f"{toggle_action(enabled)} Kick webhook", "Back"]
 
 
 def cloudflare_labels(enabled):
-    return [toggle_label(enabled), "Quick tunnel", "Named tunnel", "Back"]
+    return [f"{toggle_action(enabled)} Cloudflare tunnel", "Quick tunnel", "Named tunnel", "Back"]
 
 
 def tailscale_labels(enabled):
-    return [toggle_label(enabled), "Back"]
+    return [f"{toggle_action(enabled)} Tailscale funnel", "Back"]
 
 
 def test_command_list_covers_all_handlers(tmp_path):
@@ -1111,11 +1125,9 @@ def test_reply_keyboard_root_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     d = ctrl.reply_keyboard("root").to_dict()
     assert d["keyboard"] == [
-        [{"text": "Channels"}, {"text": "Status"}],
-        [{"text": "Chat recording"}, {"text": "Output mode"}],
-        [{"text": "Quality"}, {"text": "Retention"}],
-        [{"text": "Max recordings"}, {"text": "Max YouTube"}],
-        [{"text": "Disk"}, {"text": "Remote Access"}],
+        [{"text": "Channels"}, {"text": "Output mode"}],
+        [{"text": "Quality"}, {"text": "Chat recording"}],
+        [{"text": "Storage & limits"}, {"text": "Remote access"}],
     ]
     assert d["resize_keyboard"] is True
 
@@ -1133,11 +1145,16 @@ def test_reply_keyboard_channels_layout(tmp_path):
 def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"] == [
+        [{"text": "Mode: Disk"}, {"text": "Mode: YouTube"}],
+        [{"text": "Mode: Both"}, {"text": "\u2713 Mode: Global"}],
+        [{"text": "Quality"}, {"text": "Hold delay"}],
+        [{"text": "Remove channel"}],
         [{"text": "Back"}],
-        [{"text": "Mode: disk"}, {"text": "Mode: youtube"}],
-        [{"text": "Mode: both"}, {"text": "Mode: default"}],
-        [{"text": "Hold delay"}, {"text": "Quality"}],
-        [{"text": "Delete channel"}],
+    ]
+    config.channel_output_modes["twitch:channel1"] = "youtube"
+    assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"][0] == [
+        {"text": "Mode: Disk"},
+        {"text": "\u2713 Mode: YouTube"},
     ]
 
 
@@ -1149,11 +1166,11 @@ def test_reply_text_navigates_to_channels(tmp_path):
     assert ctrl._menu == "channels"
 
 
-def test_reply_text_status(tmp_path):
+def test_root_menu_text_shows_status(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Status"))
+    text = asyncio.run(ctrl.menu_text("root"))
     assert "Output mode: disk" in text
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(ctrl.reply_keyboard("root")) == ROOT_LABELS
     assert ctrl._menu == "root"
 
 
@@ -1186,8 +1203,8 @@ def test_reply_text_channel_submenu_mode(tmp_path):
     asyncio.run(ctrl.handle_reply_text("Channels"))
     text, markup = asyncio.run(ctrl.handle_reply_text("\u2022 twitch:channel1"))
     assert "Channel: twitch:channel1" in text
-    assert "default (global: disk)" in text
-    text, markup = asyncio.run(ctrl.handle_reply_text("Mode: youtube"))
+    assert "global (disk)" in text
+    text, markup = asyncio.run(ctrl.handle_reply_text("Mode: YouTube"))
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
     assert config.channel_output_modes == {"twitch:channel1": "youtube"}
     assert ctrl._menu_channel == "twitch:channel1"
@@ -1198,74 +1215,51 @@ def test_reply_text_channel_delete_asks_confirm(tmp_path):
     before = read_file(tmp_path)
     asyncio.run(ctrl.handle_reply_text("Channels"))
     asyncio.run(ctrl.handle_reply_text("\u2022 twitch:channel1"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Delete channel"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Remove channel"))
     assert "Remove twitch:channel1 from monitoring?" in text
     assert kb_labels(markup) == ["Confirm", "Cancel"]
     assert read_file(tmp_path) == before
     assert ctrl._menu == "channel"
 
 
-def test_reply_text_chat_menu_shows_platform_picker(tmp_path):
+def test_reply_text_chat_menu_shows_both_toggles(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text, markup = asyncio.run(ctrl.handle_reply_text("Chat recording"))
     assert "Chat recording (Twitch): on" in text
     assert "Kick chat recording: on" in text
-    assert kb_labels(markup) == CHAT_LABELS
+    assert kb_labels(markup) == chat_labels(True, True)
     assert ctrl._menu == "chat"
 
 
-def test_reply_text_chat_platform_submenu_twitch(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Chat recording"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Twitch"))
-    assert "Twitch chat recording: on" in text
-    assert kb_labels(markup) == CHAT_PLATFORM_LABELS
-    assert ctrl._menu == "chat_twitch"
-
-
-def test_reply_text_chat_platform_submenu_kick(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Chat recording"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Kick"))
-    assert "Kick chat recording: on" in text
-    assert kb_labels(markup) == CHAT_PLATFORM_LABELS
-    assert ctrl._menu == "chat_kick"
-
-
-def test_reply_text_chat_twitch_off_stops_only_twitch(tmp_path):
+def test_reply_text_chat_disable_twitch_only(tmp_path):
     config, ctrl, recorder, _, eventsub = make_controller(
         tmp_path, channels=["twitch:channel1", "kick:xqc"], recording=["twitch:channel1", "kick:xqc"]
     )
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
-    asyncio.run(ctrl.handle_reply_text("Twitch"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Twitch chat"))
     assert text == "Twitch chat recording disabled"
     assert read_file(tmp_path)["record_chat"] is False
     assert read_file(tmp_path)["kick"]["record_chat"] is True
     assert recorder.chat_stop_calls == [("twitch:channel1", "twitch")]
-    assert kb_labels(markup) == CHAT_LABELS  # back at the platform picker
+    assert kb_labels(markup) == chat_labels(False, True)
     assert ctrl._menu == "chat"
 
 
-def test_reply_text_chat_kick_on_only_kick(tmp_path):
+def test_reply_text_chat_enable_kick_only(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     asyncio.run(ctrl.handle_chat(["off"]))  # both off via command
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
-    asyncio.run(ctrl.handle_reply_text("Kick"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Kick chat"))
     assert text == "Kick chat recording enabled"
     assert read_file(tmp_path)["kick"]["record_chat"] is True
     assert read_file(tmp_path)["record_chat"] is False
+    assert kb_labels(markup) == chat_labels(False, True)
     assert ctrl._menu == "chat"
 
 
 def test_reply_text_chat_back_navigation(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
-    asyncio.run(ctrl.handle_reply_text("Twitch"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
-    assert ctrl._menu == "chat"
-    assert kb_labels(markup) == CHAT_LABELS
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert ctrl._menu == "root"
     assert kb_labels(markup) == ROOT_LABELS
@@ -1274,7 +1268,7 @@ def test_reply_text_chat_back_navigation(tmp_path):
 def test_reply_text_mode_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     asyncio.run(ctrl.handle_reply_text("Output mode"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("youtube"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("YouTube"))
     assert read_file(tmp_path)["output_mode"] == "youtube"
     assert config.output_mode == "youtube"
     assert kb_labels(markup) == ROOT_LABELS
@@ -1291,34 +1285,76 @@ def test_reply_text_quality_quick(tmp_path):
 
 def test_reply_text_retention_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Retention"))
     text, markup = asyncio.run(ctrl.handle_reply_text("14 days"))
     assert read_file(tmp_path)["retention_days"] == 14
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == STORAGE_LABELS
 
 
 def test_reply_text_retention_off_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Retention"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
     assert read_file(tmp_path)["retention_days"] == 0
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == STORAGE_LABELS
 
 
 def test_reply_text_retention_custom(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Retention"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Custom"))
     assert "Send the new value in days" in text
     assert kb_labels(markup) == ["Back"]
     text, markup = asyncio.run(ctrl.handle_reply_text("11"))
     assert read_file(tmp_path)["retention_days"] == 11
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == STORAGE_LABELS
+
+
+def test_menu_marks_the_current_value(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.retention_days = 7
+    assert kb_labels(ctrl.reply_keyboard("retention")) == [
+        "Off",
+        "1 day",
+        "3 days",
+        "\u2713 7 days",
+        "14 days",
+        "30 days",
+        "Custom",
+        "Back",
+    ]
+    assert "\u2713 Disk" in kb_labels(ctrl.reply_keyboard("mode"))
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Retention"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("\u2713 14 days"))
+    assert read_file(tmp_path)["retention_days"] == 14
+    assert kb_labels(markup) == STORAGE_LABELS
+
+
+def test_menu_quality_audio_only_maps_to_value(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Quality"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Audio only"))
+    assert read_file(tmp_path)["preferred_quality"] == "audio_only"
+    assert config.preferred_quality == "audio_only"
+
+
+def test_menu_limits_unlimited_maps_to_zero(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Max restreams"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Unlimited"))
+    assert read_file(tmp_path)["max_concurrent_youtube_streams"] == 0
+    assert kb_labels(markup) == STORAGE_LABELS
 
 
 def test_reply_text_custom_invalid_keeps_state(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
+    open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Retention"))
     asyncio.run(ctrl.handle_reply_text("Custom"))
     text, markup = asyncio.run(ctrl.handle_reply_text("x"))
@@ -1329,30 +1365,43 @@ def test_reply_text_custom_invalid_keeps_state(tmp_path):
 
 def test_reply_text_maxrec_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Max recordings"))
     text, markup = asyncio.run(ctrl.handle_reply_text("3"))
     assert read_file(tmp_path)["max_concurrent_recordings"] == 3
     assert config.max_concurrent_recordings == 3
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == STORAGE_LABELS
+
+
+def test_reply_text_storage_menu(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = open_storage(ctrl)
+    assert "Retention: off (0 = disabled)" in text
+    assert "Delete oldest: on" in text
+    assert "Max YouTube re-streams: 0 (0 = unlimited)" in text
+    assert kb_labels(markup) == STORAGE_LABELS
+    assert ctrl._menu == "storage"
 
 
 def test_reply_text_disk_quick_returns_disk_menu(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Disk"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Max total"))
-    assert "Max total: 0 GB (0 = disabled)" in text
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Disk limits"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Max total size"))
+    assert "Max total size: 0 GB (0 = disabled)" in text
     text, markup = asyncio.run(ctrl.handle_reply_text("50"))
     assert read_file(tmp_path)["disk"]["max_total_gb"] == 50
     assert config.disk.max_total_gb == 50
     assert ctrl._menu == "disk"
-    assert kb_labels(markup) == DISK_LABELS
+    assert kb_labels(markup) == disk_labels(True)
 
 
 def test_reply_text_disk_submenu_descriptions(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Disk"))
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Disk limits"))
     cases = [
-        ("Max total", "Limits total recording size"),
+        ("Max total size", "Limits total recording size"),
     ]
     for button, desc in cases:
         text, markup = asyncio.run(ctrl.handle_reply_text(button))
@@ -1364,8 +1413,9 @@ def test_reply_text_disk_delete_oldest_on_confirms(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_disk(["delete_oldest", "off"])
     before = read_file(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Disk"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Delete oldest"))
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Disk limits"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable delete oldest"))
     assert "oldest recordings will be deleted" in text
     assert kb_labels(markup) == ["Confirm", "Cancel"]
     assert read_file(tmp_path) == before
@@ -1373,11 +1423,12 @@ def test_reply_text_disk_delete_oldest_on_confirms(tmp_path):
 
 def test_reply_text_disk_delete_oldest_off_direct(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Disk"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Delete oldest"))
+    open_storage(ctrl)
+    asyncio.run(ctrl.handle_reply_text("Disk limits"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable delete oldest"))
     assert read_file(tmp_path)["disk"]["delete_oldest"] is False
     assert config.disk.delete_oldest is False
-    assert kb_labels(markup) == DISK_LABELS
+    assert kb_labels(markup) == disk_labels(False)
 
 
 def test_reply_text_back_navigation(tmp_path):
@@ -2195,14 +2246,14 @@ def test_reply_text_kick_webhook_menu_flow(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text, markup = open_webhook_menu(ctrl)
     assert "Kick webhook: off" in text
-    assert "tunnels are set in Remote Access" in text
+    assert "tunnels are set in Remote access" in text
     assert kb_labels(markup) == webhook_labels(False)  # only the toggle and Back
     assert ctrl._menu == "kick_webhook"
 
 
 def test_reply_text_remote_access_menu(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Remote access"))
     assert "Endpoint: off" in text
     assert "Kick webhook: off" in text
     assert "Control API: off" in text
@@ -2213,7 +2264,7 @@ def test_reply_text_remote_access_menu(tmp_path):
 
 def test_reply_text_remote_access_back_navigation(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("Kick webhook"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert ctrl._menu == "remote_access"
@@ -2235,7 +2286,7 @@ def test_reply_text_remote_access_toggle_restores_the_saved_url(tmp_path):
     config.endpoint.tunnel = "cloudflare"
     text, markup = open_remote_access(ctrl)
     assert kb_labels(markup) == remote_labels(False)
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
     assert "Endpoint enabled" in text
     assert "https://my-tunnel.example.com/kick/webhook" in text
     assert ctrl._kick_webhook.applied == [1]
@@ -2251,7 +2302,7 @@ def test_reply_text_remote_access_toggle_off_keeps_the_setup(tmp_path):
     stopped = []
     ctrl._cloudflared_stop = lambda: stopped.append(1)
     open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable endpoint"))
     assert "Endpoint disabled" in text
     assert "Your setup is saved" in text
     assert stopped == [1]
@@ -2263,13 +2314,13 @@ def test_reply_text_remote_access_toggle_off_keeps_the_setup(tmp_path):
 
 def test_reply_text_api_enable_shows_generated_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    asyncio.run(ctrl.handle_reply_text("Remote access"))
     text, markup = asyncio.run(ctrl.handle_reply_text("API"))
     assert "Control API: off" in text
     assert kb_labels(markup) == api_labels(False)
     assert ctrl._menu == "api"
     assert config.api.key == ""  # no key before the first enable
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable API"))
     assert "Control API enabled" in text
     assert "No public URL yet" in text
     key = read_file(tmp_path)["api"]["key"]
@@ -2284,9 +2335,9 @@ def test_reply_text_api_enable_shows_generated_key(tmp_path):
 def test_reply_text_api_shows_base_url_and_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://kick.example.com/kick/webhook"
-    asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
-    text, _ = asyncio.run(ctrl.handle_reply_text("On"))
+    text, _ = asyncio.run(ctrl.handle_reply_text("Enable API"))
     assert "https://kick.example.com/api/v1/" in text
     asyncio.run(ctrl.handle_reply_text("Back"))  # remote_access
     text, _ = asyncio.run(ctrl.handle_reply_text("API"))
@@ -2298,11 +2349,11 @@ def test_reply_text_api_shows_base_url_and_key(tmp_path):
 
 def test_reply_text_api_disable_keeps_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
-    asyncio.run(ctrl.handle_reply_text("On"))
+    asyncio.run(ctrl.handle_reply_text("Enable API"))
     key = read_file(tmp_path)["api"]["key"]
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable API"))
     assert "Control API disabled" in text
     assert read_file(tmp_path)["api"]["enabled"] is False
     assert read_file(tmp_path)["api"]["key"] == key
@@ -2312,13 +2363,13 @@ def test_reply_text_api_disable_keeps_key(tmp_path):
 
 def test_reply_text_api_rotate_key_replaces_it(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote Access"))
+    asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
     text, _ = asyncio.run(ctrl.handle_reply_text("Rotate key"))
     assert "API key generated" in text  # no key existed yet
     first_key = read_file(tmp_path)["api"]["key"]
     assert first_key in text
-    asyncio.run(ctrl.handle_reply_text("On"))
+    asyncio.run(ctrl.handle_reply_text("Enable API"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Rotate key"))
     new_key = read_file(tmp_path)["api"]["key"]
     assert new_key != first_key
@@ -2501,9 +2552,9 @@ def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path, monkeypatch):
     asyncio.run(ctrl.handle_reply_text(token))
     text, markup = asyncio.run(ctrl.handle_reply_text("kick.example.com"))
     assert "kick.example.com" in text
-    assert kb_labels(markup) == ["Skip", "Back"]
+    assert kb_labels(markup) == ["Skip DNS", "Back"]
     assert ctrl._menu == "kick_cloudflare_dns"
-    text, markup = asyncio.run(ctrl.handle_reply_text("skip"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Skip DNS"))
     assert "Endpoint enabled" in text
     assert "https://kick.example.com/kick/webhook" in text
     assert "CNAME kick.example.com \u2192 tun-id.cfargotunnel.com" in text
@@ -2777,7 +2828,7 @@ def test_reply_text_kick_webhook_off_keeps_the_setup(tmp_path, monkeypatch):
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Cloudflare tunnel"))
     assert "Endpoint disabled" in text
     assert "Your setup is saved" in text
     assert stopped == [1]  # the managed tunnel stops
@@ -2795,7 +2846,7 @@ def test_reply_text_kick_webhook_off_when_already_off(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     open_webhook_menu(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Kick webhook"))
     assert "already off" in text
     assert read_file(tmp_path) == before
     assert ctrl._kick_webhook.applied == []
@@ -2816,7 +2867,7 @@ def test_reply_text_remote_access_on_restarts_a_managed_quick_tunnel(tmp_path, m
 
     ctrl._cloudflared_quick_start = fake_quick
     open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
     assert started == [1]
     assert "Endpoint: https://new.trycloudflare.com/" in text
     assert "https://new.trycloudflare.com/kick/webhook" in text
@@ -2830,7 +2881,7 @@ def test_reply_text_remote_access_on_without_a_saved_setup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
     assert "No saved tunnel yet" in text
     assert read_file(tmp_path) == before
     assert ctrl._kick_webhook.applied == []
@@ -2840,12 +2891,12 @@ def test_reply_text_remote_access_on_without_a_saved_setup(tmp_path):
 def test_reply_text_webhook_toggle_on_and_off(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     open_webhook_menu(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Kick webhook"))
     assert "Kick webhook enabled" in text
     assert "The endpoint is off" in text  # deliveries need the endpoint
     assert config.kick.webhook.enabled is True
     assert kb_labels(markup) == webhook_labels(True)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Kick webhook"))
     assert "Kick webhook disabled" in text
     assert config.kick.webhook.enabled is False
     assert kb_labels(markup) == webhook_labels(False)
@@ -2864,7 +2915,7 @@ def test_reply_text_kick_webhook_tailscale_detected(tmp_path, monkeypatch):
     assert "Tailscale funnel: off" in text
     assert kb_labels(markup) == tailscale_labels(False)
     assert ctrl._menu == "kick_tailscale"
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
     assert "https://box.tail1234.ts.net" in text
     assert "tailscale funnel 8787 is enabled" in text
     # No reachability probe for tailscale. The funnel is verified against the
@@ -2889,11 +2940,11 @@ def test_reply_text_kick_webhook_tailscale_fallback_to_input(tmp_path, monkeypat
     before = read_file(tmp_path)
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
     assert "Tailscale is not installed" in text
     assert "Cloudflare tunnel instead" in text
-    assert ctrl._menu == "kick_cloudflare"
-    assert kb_labels(markup) == cloudflare_labels(False)
+    assert ctrl._menu == "kick_tailscale"
+    assert kb_labels(markup) == tailscale_labels(False)
     assert read_file(tmp_path) == before
     assert ctrl._kick_webhook.applied == []
 
@@ -2913,7 +2964,7 @@ def test_reply_text_kick_tailscale_off_turns_off_the_funnel(tmp_path, monkeypatc
     open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
     assert kb_labels(markup) == tailscale_labels(True)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Tailscale funnel"))
     assert funnel_off_calls == [1]
     assert "Your setup is saved" in text
     w = read_file(tmp_path)["endpoint"]
@@ -2965,7 +3016,7 @@ def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path, monkeypatch)
     ctrl._cloudflared_stop = lambda: stopped.append(1)
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    asyncio.run(ctrl.handle_reply_text("On"))
+    asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
     assert stopped == [1]
     w = read_file(tmp_path)["endpoint"]
     assert w["tunnel"] == "tailscale"
@@ -2982,7 +3033,7 @@ def test_cloudflare_off_leaves_another_tunnel_alone(tmp_path):
     open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     assert kb_labels(markup) == cloudflare_labels(False)  # cloudflare itself is off
-    text, markup = asyncio.run(ctrl.handle_reply_text("Off"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Cloudflare tunnel"))
     assert "Cloudflare tunnel is not on" in text
     assert read_file(tmp_path) == before  # the tailscale webhook keeps running
 
@@ -2994,7 +3045,7 @@ def test_cloudflare_on_without_a_saved_cloudflare_tunnel(tmp_path):
     before = read_file(tmp_path)
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Cloudflare tunnel"))
     assert "No saved Cloudflare tunnel" in text
     assert read_file(tmp_path) == before
     assert kb_labels(markup) == cloudflare_labels(False)
@@ -3007,7 +3058,7 @@ def test_cloudflare_on_restores_a_saved_cloudflare_tunnel(tmp_path):
     config.endpoint.tunnel = "cloudflare"
     open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("On"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Cloudflare tunnel"))
     assert "Endpoint enabled" in text
     assert read_file(tmp_path)["endpoint"]["enabled"] is True
     assert kb_labels(markup) == cloudflare_labels(True)
@@ -3082,8 +3133,8 @@ def test_reply_text_channel_hold_menu(tmp_path):
     ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"
     text, markup = asyncio.run(ctrl.handle_reply_text("Hold delay"))
     assert "YouTube hold delay for twitch:channel1" in text
-    assert "Global default: 0s" in text
-    assert kb_labels(markup) == ["0 (off)", "30s", "60s", "120s", "300s", "600s", "Default", "Custom", "Back"]
+    assert "Global: 0s" in text
+    assert kb_labels(markup) == ["Off", "30s", "60s", "120s", "300s", "600s", "\u2713 Global", "Custom", "Back"]
     assert ctrl._menu == "channel_hold"
 
 
@@ -3103,7 +3154,7 @@ def test_reply_text_channel_hold_default_resets(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.channel_youtube_hold_seconds = {"twitch:channel1": 60}
     ctrl._menu, ctrl._menu_channel = "channel_hold", "twitch:channel1"
-    text, markup = asyncio.run(ctrl.handle_reply_text("Default"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Global"))
     assert "reset to global" in text
     assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {}
     assert ctrl._menu == "channel"

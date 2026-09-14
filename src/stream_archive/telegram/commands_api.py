@@ -1,6 +1,6 @@
 """Control API commands: enable, disable, show the key, and rotate the key.
 
-The API is set up from the Remote Access menu only. It runs on the Kick
+The API is set up from the Remote access menu only. It runs on the Kick
 webhook listener, so every enable or disable reconciles that listener
 through ``KickWebhook.apply_state``. The key lives in ``api.key`` in
 config.json and is generated on the first enable.

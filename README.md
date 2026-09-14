@@ -47,7 +47,7 @@ commands over a Telegram bot.
   cover channels, retention, output mode, quality, chat recording, limits,
   the Kick webhook, status, reload, and restart. Other users get no reply.
   Every change is validated and written atomically to `config.json`, and
-  applies on the next poll cycle. The **Remote Access** menu holds the Kick
+  applies on the next poll cycle. The **Remote access** menu holds the Kick
   webhook and the HTTP control API.
 
 ## Architecture
@@ -210,7 +210,7 @@ layout.
 
 The webhook gives near-instant live/offline signals and Kick chat. The poll
 alone cannot deliver chat (Kick has no chat replay). Open `/settings` in
-Telegram and choose **Remote Access**. That menu sets the public URL:
+Telegram and choose **Remote access**. That menu sets the public URL:
 
 - **Cloudflare tunnel**: a *Quick tunnel* (no account, temporary URL) or a
   *Named tunnel* (paste the `cloudflared service install <TOKEN>` command or
@@ -229,19 +229,19 @@ exact URL (`<endpoint>/kick/webhook`) after each tunnel setup. The first
 verified event from Kick triggers a "Kick webhook is working"
 confirmation.
 
-Remote Access has one endpoint On/Off button that shows the action you can
-take. **Off** stops the managed tunnel and keeps the saved URL and tunnel
-type, so **On** restores the same setup without new input. The **Cloudflare tunnel**
-and **Tailscale funnel** submenus have their own On/Off control, so you can
-switch provider or stop one tunnel without touching the other. The
-**Kick webhook** and **API** submenus hold only their own toggle and their
-settings. **Off** for the Kick webhook stops the subscription reconcile and
-deletes the subscriptions of the monitored channels, so Kick stops the
-deliveries. A managed Cloudflare tunnel comes back automatically on service
-restart. Its trycloudflare URL can change, and you get a new notification
-when it does. The endpoint serves both features, so the status shows
-`Endpoint: on (cloudflare · https://…)` and `Kick webhook: on` on
-separate lines.
+Remote access has one endpoint toggle that names the action to take:
+**Disable endpoint** stops the managed tunnel and keeps the saved URL and
+tunnel type, so **Enable endpoint** restores the same setup without new
+input. The **Cloudflare tunnel** and **Tailscale funnel** submenus have
+their own toggle, so you can switch provider or stop one tunnel without
+touching the other. The **Kick webhook** and **API** submenus hold only
+their own toggle and their settings. **Disable Kick webhook** stops the
+subscription reconcile and deletes the subscriptions of the monitored
+channels, so Kick stops the deliveries. A managed Cloudflare tunnel comes
+back automatically on service restart. Its trycloudflare URL can change, and
+you get a new notification when it does. The endpoint serves both features,
+so the status shows `Endpoint: on (cloudflare · https://…)` and
+`Kick webhook: on` on separate lines.
 
 Internals: the receiver is `POST /kick/webhook` on
 `kick.webhook.listen_host:listen_port`. Every request is verified against
@@ -264,13 +264,13 @@ The control API manages channels and settings over HTTP. It is served on
 the public endpoint under `/api/v1`, next to the Kick webhook, so it uses
 the same listener and the same tunnel. The API is off by default.
 
-Open `/settings` in Telegram, choose **Remote Access → API**, and tap
-**On**. On the first enable the bot generates the API key and shows it in
-the reply. Tap **Show key** to show the key again, and **Rotate key** to
-replace it. A rotated key stops the old key at once. Disabling the API
-keeps the key, so a later enable uses the same key. The button shows only
-the action that applies: **Off** while the API is on, **On** while it is
-off.
+Open `/settings` in Telegram, choose **Remote access → API**, and tap
+**Enable API**. On the first enable the bot generates the API key and shows
+it in the reply. Tap **Show key** to show the key again, and **Rotate key**
+to replace it. A rotated key stops the old key at once. Disabling the API
+keeps the key, so a later enable uses the same key. The toggle names the
+action that applies: **Disable API** while the API is on, **Enable API**
+while it is off.
 
 Send the key in the `Authorization` header (`Bearer <key>`) or in the
 `X-API-Key` header. Without a valid key the API answers `401`. While the
@@ -314,15 +314,19 @@ also removes old `*.chat.json` files together with the recordings.
 
 Only the admin user (`telegram_user_id`) gets replies from the bot. The bot
 registers a command menu (type `/`). It also offers a `/settings` reply
-keyboard. The submenus cover channels, chat recording, output mode,
-quality, retention, recording and disk limits, the YouTube hold delay, and
-**Remote Access** (the public URL tunnels, the Kick webhook toggle, and the
-HTTP control API). On/Off menus show one button with the action that
-applies now. Destructive actions (remove a channel, enable delete-oldest)
-use inline confirmation buttons. The bot re-sends the settings menu after
-every restart, so the reply keyboard survives updates and reboots. Every
-change is validated, written atomically to `config.json`, and applies on
-the next poll cycle. A failed command leaves memory and disk untouched.
+keyboard. The root holds **Channels**, **Output mode**, **Quality**, **Chat
+recording**, **Storage & limits** (retention, disk, and the two concurrency
+limits), and **Remote access** (the public URL tunnels, the Kick webhook
+toggle, and the HTTP control API). A submenu holds four buttons at most,
+plus **Back**. A toggle button names the action that applies now, for
+example **Disable Kick webhook**. The current value of a preset list carries
+a check mark, for example **✓ 1080p**. The channel list keeps **Back** in
+the first row, because the list can grow long. Destructive actions (remove a
+channel, enable delete-oldest) use inline confirmation buttons. The bot
+re-sends the settings menu after every restart, so the reply keyboard
+survives updates and reboots. Every change is validated, written atomically
+to `config.json`, and applies on the next poll cycle. A failed command
+leaves memory and disk untouched.
 
 | Command | Action |
 | --- | --- |
@@ -362,7 +366,7 @@ Notes:
   into a fragmented MP4 without re-encoding.
 - The per-channel YouTube hold delay lives under
   `/settings → Channels → <channel> → Hold delay` (presets, `0` = off, or a
-  custom value in seconds). `Default` clears the override back to the global
+  custom value in seconds). `Global` clears the override back to the global
   `youtube.hold_seconds`. The value is read when a recording stops, so it
   applies to the next stop immediately.
 - `/chat off` applies immediately. In-flight capture is stopped and

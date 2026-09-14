@@ -13,7 +13,29 @@ from stream_archive.config import (
 )
 from stream_archive.telegram.menu_state import AudioSwitch, PendingKey
 
-_QUALITY_PRESETS = ("best", "1080p", "720p", "480p", "360p", "audio_only")
+#: Button labels for the settings menus. Each table maps a label to its config
+#: value. The keyboards mark the label of the current value, the handlers turn
+#: a pressed label back into the config value.
+MODE_CHOICES: dict[str, str] = {"Disk": "disk", "YouTube": "youtube", "Both": "both"}
+QUALITY_CHOICES: dict[str, str] = {
+    "Best": "best",
+    "1080p": "1080p",
+    "720p": "720p",
+    "480p": "480p",
+    "360p": "360p",
+    "Audio only": "audio_only",
+}
+RETENTION_CHOICES: dict[str, str] = {
+    "Off": "0",
+    "1 day": "1",
+    "3 days": "3",
+    "7 days": "7",
+    "14 days": "14",
+    "30 days": "30",
+}
+COUNT_CHOICES: dict[str, str] = {"Unlimited": "0", "1": "1", "2": "2", "3": "3", "5": "5"}
+DISK_SIZE_CHOICES: dict[str, str] = {"Unlimited": "0", "25": "25", "50": "50", "100": "100", "200": "200"}
+HOLD_CHOICES: dict[str, str] = {"Off": "0", "30s": "30", "60s": "60", "120s": "120", "300s": "300", "600s": "600"}
 
 
 class SettingsCommands:

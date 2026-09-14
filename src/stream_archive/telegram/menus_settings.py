@@ -6,7 +6,13 @@ reads and writes go through that chat's ``MenuState`` only.
 
 from typing import TYPE_CHECKING
 
-from stream_archive.telegram.commands_settings import _QUALITY_PRESETS
+from stream_archive.telegram.commands_settings import (
+    COUNT_CHOICES,
+    DISK_SIZE_CHOICES,
+    MODE_CHOICES,
+    QUALITY_CHOICES,
+    RETENTION_CHOICES,
+)
 from stream_archive.telegram.menu_state import ChatId, MenuResult
 
 if TYPE_CHECKING:
@@ -14,30 +20,25 @@ if TYPE_CHECKING:
 
 
 async def menu_chat(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route the platform pick of the chat menu."""
-    state = ctrl._state_for(chat_id)
-    if text in ("Twitch", "Kick"):
-        state.menu = "chat_twitch" if text == "Twitch" else "chat_kick"
-        return await ctrl.menu_text(state.menu, chat_id=chat_id), ctrl.reply_keyboard(state.menu)
-    return None
-
-
-async def menu_chat_platform(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route the on/off pick for one chat platform."""
-    state = ctrl._state_for(chat_id)
-    if text in ("On", "Off"):
-        platform = "twitch" if state.menu == "chat_twitch" else "kick"
-        result = await ctrl.handle_chat([text.lower(), platform], chat_id=chat_id)
-        state.menu = "chat"
-        return result, ctrl.reply_keyboard("chat")
-    return None
+    """Route the two chat-capture toggles."""
+    toggles = {
+        "Enable Twitch chat": ["on", "twitch"],
+        "Disable Twitch chat": ["off", "twitch"],
+        "Enable Kick chat": ["on", "kick"],
+        "Disable Kick chat": ["off", "kick"],
+    }
+    args = toggles.get(text)
+    if args is None:
+        return None
+    result = await ctrl.handle_chat(args, chat_id=chat_id)
+    return result, ctrl.reply_keyboard("chat")
 
 
 async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the output-mode pick."""
     state = ctrl._state_for(chat_id)
-    if text in ("disk", "youtube", "both"):
-        result = ctrl.handle_mode([text], chat_id=chat_id)
+    if text in MODE_CHOICES:
+        result = ctrl.handle_mode([MODE_CHOICES[text]], chat_id=chat_id)
         state.menu = "root"
         return result, ctrl.reply_keyboard("root")
     return None
@@ -46,8 +47,8 @@ async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
 async def menu_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the global quality pick."""
     state = ctrl._state_for(chat_id)
-    if text in _QUALITY_PRESETS:
-        result = ctrl.handle_quality([text], chat_id=chat_id)
+    if text in QUALITY_CHOICES:
+        result = ctrl.handle_quality([QUALITY_CHOICES[text]], chat_id=chat_id)
         state.menu = "root"
         return result, ctrl.reply_keyboard("root")
     return None
@@ -56,11 +57,10 @@ async def menu_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
 async def menu_retention(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the retention preset or open the custom value menu."""
     state = ctrl._state_for(chat_id)
-    values = {"1 day": "1", "3 days": "3", "7 days": "7", "14 days": "14", "30 days": "30", "Off": "0"}
-    if text in values:
-        result = ctrl.handle_retention([values[text]], chat_id=chat_id)
-        state.menu = "root"
-        return result, ctrl.reply_keyboard("root")
+    if text in RETENTION_CHOICES:
+        result = ctrl.handle_retention([RETENTION_CHOICES[text]], chat_id=chat_id)
+        state.menu = "storage"
+        return result, ctrl.reply_keyboard("storage")
     if text == "Custom":
         state.custom, state.menu = "retention", "custom"
         return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
@@ -68,44 +68,57 @@ async def menu_retention(ctrl: TelegramController, chat_id: ChatId, text: str) -
 
 
 async def menu_limits(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route the max-recordings / max-YouTube presets (``maxrec``/``maxyt``)."""
+    """Route the max-recordings / max-restreams presets (``maxrec``/``maxyt``)."""
     state = ctrl._state_for(chat_id)
     menu = state.menu
-    values = {"0 (unlimited)": "0", "1": "1", "2": "2", "3": "3", "5": "5"}
-    if text in values:
+    if text in COUNT_CHOICES:
         handler = ctrl.handle_maxrecordings if menu == "maxrec" else ctrl.handle_maxyoutube
-        result = handler([values[text]], chat_id=chat_id)
-        state.menu = "root"
-        return result, ctrl.reply_keyboard("root")
+        result = handler([COUNT_CHOICES[text]], chat_id=chat_id)
+        state.menu = "storage"
+        return result, ctrl.reply_keyboard("storage")
     if text == "Custom":
         state.custom, state.menu = menu, "custom"
         return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
     return None
 
 
-async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route the disk menu: max total opens sizes, delete oldest toggles."""
+async def menu_storage(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route the Storage & limits menu."""
     state = ctrl._state_for(chat_id)
-    if text == "Max total":
+    new_menu = {
+        "Retention": "retention",
+        "Disk limits": "disk",
+        "Max recordings": "maxrec",
+        "Max restreams": "maxyt",
+    }.get(text)
+    if new_menu is None:
+        return None
+    state.menu = new_menu
+    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu)
+
+
+async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route the disk menu: max total size opens the sizes, delete oldest toggles."""
+    state = ctrl._state_for(chat_id)
+    if text == "Max total size":
         state.menu = "disk_maxsize"
         return await ctrl.menu_text("disk_maxsize", chat_id=chat_id), ctrl.reply_keyboard("disk_maxsize")
-    if text == "Delete oldest":
-        if ctrl._config.disk.delete_oldest:
-            result = ctrl.handle_disk(["delete_oldest", "off"], chat_id=chat_id)
-            return result, ctrl.reply_keyboard("disk")
+    if text == "Enable delete oldest":
         return (
-            "Enable 'delete oldest'? When the disk is over the max total, the oldest recordings will be deleted.",
+            "Enable 'delete oldest'? When the disk is over the max total size, the oldest recordings will be deleted.",
             ctrl._confirm_keyboard("confirm_delete_oldest", "on"),
         )
+    if text == "Disable delete oldest":
+        result = ctrl.handle_disk(["delete_oldest", "off"], chat_id=chat_id)
+        return result, ctrl.reply_keyboard("disk")
     return None
 
 
 async def menu_disk_maxsize(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route the max-total preset or open the custom value menu."""
+    """Route the max-total-size preset or open the custom value menu."""
     state = ctrl._state_for(chat_id)
-    values = {"0": "0", "25": "25", "50": "50", "100": "100", "200": "200"}
-    if text in values:
-        result = ctrl.handle_disk(["maxsize", values[text]], chat_id=chat_id)
+    if text in DISK_SIZE_CHOICES:
+        result = ctrl.handle_disk(["maxsize", DISK_SIZE_CHOICES[text]], chat_id=chat_id)
         state.menu = "disk"
         return result, ctrl.reply_keyboard("disk")
     if text == "Custom":
@@ -131,7 +144,9 @@ async def menu_custom(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
     if result.startswith("\u274c") or result.startswith("Usage"):
         return result, ctrl.reply_keyboard("custom")
     parent = (
-        "channel" if setting == "channel_hold" else ("root" if setting in ("retention", "maxrec", "maxyt") else "disk")
+        "channel"
+        if setting == "channel_hold"
+        else ("storage" if setting in ("retention", "maxrec", "maxyt") else "disk")
     )
     state.menu = parent
     return result, ctrl.reply_keyboard(parent)
