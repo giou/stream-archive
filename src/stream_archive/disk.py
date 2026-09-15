@@ -39,6 +39,9 @@ def channel_recording_dir(config: AppConfig, channel_dir: str) -> Path:
 
 _RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a", "*.jsonl")
 
+#: Chat files, plus the in-progress `.tmp` files of the streaming writer.
+_CHAT_PATTERNS = ("*.chat.json", "*.chat.json.tmp")
+
 
 def iter_recordings(base: Path) -> Iterator[Path]:
     """Yield every recording artifact under base.
@@ -51,13 +54,27 @@ def iter_recordings(base: Path) -> Iterator[Path]:
         yield from base.rglob(pattern)
 
 
-async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
-    """Collect filesystem usage and recordings directory totals.
+def iter_chat_files(base: Path) -> Iterator[Path]:
+    """Yield every chat artifact under base, including in-progress chat files.
 
-    The slow recordings scan runs in the default executor.
+    The writer creates `<name>.chat.json.tmp` at capture start and renames it
+    to `<name>.chat.json` at stop, so both patterns are chat artifacts.
+    """
+    for pattern in _CHAT_PATTERNS:
+        yield from base.rglob(pattern)
+
+
+async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
+    """Collect filesystem usage and archive directory totals.
+
+    The slow scans run in the default executor. `dir_gb` covers the
+    recordings, `chat_gb` covers the chat files, and `archive_gb` is their
+    total. The disk watchdog measures `archive_gb` against
+    `disk.max_total_gb`.
     """
     loop = asyncio.get_running_loop()
     base = resolve_recording_dir(config)
+    chat_base = chat_dir_path(config)
     fs_dir = base if base.exists() else base.parent  # missing dir: report parent fs
     usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
     dir_bytes, count = 0, 0
@@ -74,6 +91,20 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
             return total, n
 
         dir_bytes, count = await loop.run_in_executor(None, _scan)
+    chat_bytes, chat_count = 0, 0
+    if chat_base.exists():
+
+        def _scan_chat() -> tuple[int, int]:
+            total, n = 0, 0
+            for p in iter_chat_files(chat_base):
+                try:
+                    total += p.stat().st_size
+                    n += 1
+                except OSError:
+                    continue
+            return total, n
+
+        chat_bytes, chat_count = await loop.run_in_executor(None, _scan_chat)
     return {
         "dir": str(base),
         "free_gb": round(usage.free / 1024**3, 2),
@@ -81,6 +112,9 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
         "used_fs_gb": round(usage.used / 1024**3, 2),
         "dir_gb": round(dir_bytes / 1024**3, 2),
         "file_count": count,
+        "chat_gb": round(chat_bytes / 1024**3, 2),
+        "chat_count": chat_count,
+        "archive_gb": round((dir_bytes + chat_bytes) / 1024**3, 2),
     }
 
 

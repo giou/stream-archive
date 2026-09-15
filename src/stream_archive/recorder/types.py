@@ -6,17 +6,31 @@ key during start, so readers must use .get() for keys set later.
 """
 
 import asyncio
+from datetime import datetime
 from typing import Any, TypedDict
+
+from stream_archive.chat_writer import ChatJsonWriter
 
 
 class KickChatState(TypedDict, total=False):
-    """Buffered Kick chat for one active recording."""
+    """Streaming Kick chat state for one active recording.
+
+    Comments land in the file as webhook events arrive, so the state holds the
+    writer, the metadata for the trailer, and the emote ids seen so far.
+    """
 
     path: str
-    messages: list[dict[str, Any]]
+    writer: ChatJsonWriter
     title: str | None
     channel: str
+    slug: str
     started_wall: str
+    start: datetime | None
+    video_id: str
+    streamer_id: int | None
+    streamer_username: str
+    emote_names: dict[str, str]
+    emote_skipped: int
 
 
 class Recording(TypedDict, total=False):

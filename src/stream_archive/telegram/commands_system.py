@@ -92,7 +92,7 @@ class SystemCommands:
             f"Simultaneous recordings: {rec_limit}\n"
             f"YouTube re-streams: {yt_limit}\n"
             f"Recording now: {rec_now}\n"
-            f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB \u00b7 recordings: {disk_snap['dir_gb']:.1f} GB\n"
+            f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB \u00b7 archive: {disk_snap['archive_gb']:.1f} GB\n"
             f"{disk_limit_line}\n"
             f"Update check: {'enabled' if c.update_check.enabled else 'disabled'} "
             f"(every {c.update_check.interval_hours:g}h)"

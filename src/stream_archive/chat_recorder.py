@@ -6,14 +6,15 @@ with TwitchDownloaderCLI.
 """
 
 import asyncio
-import json
 import logging
-import os
 import random
 import ssl
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+
+from stream_archive.chat_writer import ChatJsonWriter, file_info
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +87,13 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
 
 
 class ChatRecorder:
-    """Connects to Twitch IRC for one channel and accumulates comments until stopped.
+    """Connects to Twitch IRC for one channel and writes comments as they arrive.
 
-    The app creates the chat JSON file only through an atomic same-directory
-    rename, so a crash mid-write leaves at most an orphan `.tmp` file. The
-    `stop()` method is idempotent and writes the file exactly once.
+    Comments land in the chat file while the capture runs, so process memory
+    stays flat when chat volume is high. `stop()` writes the closing keys and
+    renames the file into place. The chat JSON file appears only through that
+    same-directory rename, so a crash leaves at most an orphan `.tmp` file.
+    The `stop()` method is idempotent and writes the file exactly once.
     """
 
     def __init__(
@@ -104,6 +107,7 @@ class ChatRecorder:
         host: str = "irc.chat.twitch.tv",
         port: int = 6697,
         use_ssl: bool = True,
+        on_error: Callable[[Exception], None] | None = None,
     ):
         self.channel = channel.lower()
         self.chat_path = chat_path
@@ -114,12 +118,18 @@ class ChatRecorder:
         self._host = host
         self._port = port
         self._use_ssl = use_ssl
-        self._comments: list[dict[str, Any]] = []
+        self._writer = ChatJsonWriter(chat_path, on_error=on_error)
+        self._last_offset: float | None = None
         self._start_mono = time.monotonic()
         self._start_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._task: asyncio.Task[Any] | None = None
         self._connected_once = False
         self._finalized = False
+
+    @property
+    def comments(self) -> int:
+        """Comments written to the chat file so far."""
+        return self._writer.comments
 
     def start(self) -> asyncio.Task[Any]:
         self._task = asyncio.create_task(self._run())
@@ -131,7 +141,7 @@ class ChatRecorder:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         await self._finalize()
-        return len(self._comments)
+        return self._writer.comments
 
     async def _run(self) -> None:
         attempts = 0
@@ -180,8 +190,8 @@ class ChatRecorder:
                 cmd = parts[1] if len(parts) > 1 else None
                 if cmd in ("PRIVMSG", "USERNOTICE"):
                     comment = self._parse_message(text, cmd)
-                    if comment is not None:
-                        self._comments.append(comment)
+                    if comment is not None and self._writer.add_comment(comment):
+                        self._last_offset = comment["content_offset_seconds"]
                         self._connected_once = True
                 # ignore everything else (001/353/366/NOTICE/ROOMSTATE)
         finally:
@@ -267,12 +277,11 @@ class ChatRecorder:
         }
 
     async def _finalize(self) -> None:
-        """Write the ChatRoot JSON atomically (tmp + same-directory rename), exactly once."""
+        """Write the trailer keys, then rename the file into place, exactly once."""
         if self._finalized:
             return
         self._finalized = True
 
-        now_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             streamer_id = int(self._user_id) if self._user_id else 0
         except TypeError, ValueError:
@@ -280,16 +289,9 @@ class ChatRecorder:
         # TDL convention (ChatDownloader.cs): live chat takes length/end from
         # the last comment's offset. chatrender derives the render duration
         # from video.end - video.start, so zeros render a 0-second video.
-        if self._comments:
-            end = self._comments[-1]["content_offset_seconds"]
-        else:
-            end = round(time.monotonic() - self._start_mono, 3)
-        root = {
-            "FileInfo": {
-                "Version": {"Major": 1, "Minor": 4, "Patch": 0},
-                "CreatedAt": now_z,
-                "UpdatedAt": now_z,
-            },
+        end = self._last_offset if self._last_offset is not None else round(time.monotonic() - self._start_mono, 3)
+        trailer = {
+            "FileInfo": file_info(),
             "streamer": {
                 "name": self._author or self.channel,
                 "login": self.channel,
@@ -313,14 +315,6 @@ class ChatRecorder:
                 "viewCount": 0,
                 "game": self._game,
             },
-            "comments": self._comments,
         }
-
-        os.makedirs(os.path.dirname(self.chat_path) or ".", exist_ok=True)
-        tmp = self.chat_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(root, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.chat_path)
-        logger.info("[chat] %s -> %s (%d messages)", self.channel, self.chat_path, len(self._comments))
+        if self._writer.close(trailer):
+            logger.info("[chat] %s -> %s (%d messages)", self.channel, self.chat_path, self._writer.comments)

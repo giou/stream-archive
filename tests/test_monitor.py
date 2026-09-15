@@ -72,6 +72,9 @@ class FakeRecorder:
             "used_fs_gb": 400.0,
             "dir_gb": 0.0,
             "file_count": 0,
+            "chat_gb": 0.0,
+            "chat_count": 0,
+            "archive_gb": 0.0,
             "dir": "recordings",
         }
         self.delete_oldest_calls = []
@@ -102,6 +105,7 @@ class FakeRecorder:
     async def delete_oldest_to_cap(self):
         self.delete_oldest_calls.append(1)
         self.snapshot["dir_gb"] = 0.0
+        self.snapshot["archive_gb"] = 0.0
         return (0, 0.0)
 
     def youtube_active_count(self):
@@ -300,6 +304,7 @@ def test_twitch_api_failure_keeps_live_recordings():
 def test_delete_oldest_and_starts_when_over_cap():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
+    rec.snapshot["archive_gb"] = 25.0
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
     config = make_config(channels=["ch"], disk={"max_total_gb": 20, "delete_oldest": True})
@@ -313,6 +318,7 @@ def test_delete_oldest_and_starts_when_over_cap():
 def test_block_when_cap_reached_and_nothing_to_delete():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
+    rec.snapshot["archive_gb"] = 25.0
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)

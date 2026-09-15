@@ -7,10 +7,12 @@ import subprocess
 import time
 import types
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from streamlink.exceptions import NoStreamsError, PluginError
 
+from stream_archive import disk
 from stream_archive.config import AppConfig
 from stream_archive.recorder import Recorder, sanitize_filename
 from stream_archive.recorder.streamlink_source import _AudioOnlyStream
@@ -20,10 +22,10 @@ from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 def _no_network_emote_embed(monkeypatch):
     """Keep kick chat finalize offline in recorder tests (embedding is covered in test_kick_chat)."""
 
-    async def noop(root, client=None):
+    async def noop(emote_names, client=None):
         return None
 
-    monkeypatch.setattr("stream_archive.recorder.chat_output.embed_kick_emotes", noop)
+    monkeypatch.setattr("stream_archive.recorder.chat_output.embedded_data", noop)
 
 
 def make_config(tmp_path):
@@ -50,13 +52,14 @@ def make_config(tmp_path):
 class FakeChatRecorder:
     instances = []
 
-    def __init__(self, channel, chat_path, title, game, author=None, user_id=None):
+    def __init__(self, channel, chat_path, title, game, author=None, user_id=None, on_error=None):
         self.channel = channel
         self.chat_path = chat_path
         self.title = title
         self.game = game
         self.author = author
         self.user_id = user_id
+        self.on_error = on_error
         self.started = False
         self.stopped = False
         FakeChatRecorder.instances.append(self)
@@ -765,11 +768,13 @@ def test_stop_chat_platform_twitch_keeps_kick_buffer(tmp_path, monkeypatch):
         await rec.add_kick_chat("kick:xqc", {"content": "kept"})
         await rec.stop_chat("kick:xqc", "twitch")  # twitch-only stop must not finalize kick chat
         assert "kick_chat" in rec._recordings["kick:xqc"]
-        assert rec._recordings["kick:xqc"]["kick_chat"]["messages"] == [{"content": "kept"}]
-        chat_path = rec._recordings["kick:xqc"]["kick_chat"]["path"]
-        assert not os.path.exists(chat_path)
+        state = rec._recordings["kick:xqc"]["kick_chat"]
+        # The message is already in the chat file, but the file is not yet in place.
+        assert state["writer"].comments == 1
+        assert '"kept"' in Path(state["writer"].tmp_path).read_text()
+        assert not os.path.exists(state["path"])
         await rec.stop("kick:xqc")
-        with open(chat_path) as f:
+        with open(state["path"]) as f:
             comments = json.load(f)["comments"]
         assert [c["message"]["body"] for c in comments] == ["kept"]
 
@@ -1158,7 +1163,7 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
 
     async def fake_snapshot(config):
-        return {"free_gb": 100.0, "dir_gb": 6.0, "file_count": 1}
+        return {"free_gb": 100.0, "dir_gb": 6.0, "archive_gb": 6.0, "file_count": 1}
 
     monkeypatch.setattr("stream_archive.disk.disk_snapshot", fake_snapshot)
 
@@ -1243,6 +1248,75 @@ def test_delete_oldest_spares_active_recording(tmp_path):
     assert (base / "old.ts").exists()  # active recording is never a deletion candidate
     assert not (base / "mid.ts").exists()  # next-oldest takes the hit instead
     assert (base / "new.ts").exists()
+
+
+def test_delete_oldest_includes_chat_files(tmp_path):
+    """The disk cap counts chat files too, so it deletes the oldest of them."""
+    config = make_config(tmp_path)
+    config.disk = {"max_total_gb": 1.5e-6}  # ~1.6 KB cap
+    rec = Recorder(config)
+    base = tmp_path / "recordings" / "ch"
+    chat = tmp_path / "chat" / "twitch" / "ch"
+    t0 = time.time() - 100
+    old_chat = chat / "old.chat.json"
+    old_chat.parent.mkdir(parents=True, exist_ok=True)
+    old_chat.write_bytes(b"x" * 1024)
+    os.utime(old_chat, (t0, t0))
+    new_recording = base / "new.ts"
+    new_recording.parent.mkdir(parents=True, exist_ok=True)
+    new_recording.write_bytes(b"x" * 1024)
+    os.utime(new_recording, (t0 + 10, t0 + 10))
+
+    removed, freed = asyncio.run(rec.delete_oldest_to_cap())
+
+    assert (removed, freed) == (1, 1024)
+    assert not old_chat.exists()  # the oldest archive file goes first
+    assert new_recording.exists()
+
+
+def test_delete_oldest_spares_active_chat_tmp(tmp_path):
+    """Deletion must skip the chat file that a live capture writes."""
+    config = make_config(tmp_path)
+    config.disk = {"max_total_gb": 1.5e-6}  # ~1.6 KB cap
+    rec = Recorder(config)
+    chat = tmp_path / "chat" / "twitch" / "ch"
+    chat.mkdir(parents=True, exist_ok=True)
+    live = chat / "live.chat.json.tmp"
+    idle = chat / "idle.chat.json"
+    t0 = time.time() - 100
+    live.write_bytes(b"x" * 1024)
+    os.utime(live, (t0, t0))
+    idle.write_bytes(b"x" * 1024)
+    os.utime(idle, (t0 + 10, t0 + 10))
+
+    class LiveChatRecorder:
+        chat_path = str(chat / "live.chat.json")
+
+    rec._recordings["ch"] = {"filepath": None, "chat_recorder": LiveChatRecorder()}
+
+    removed, freed = asyncio.run(rec.delete_oldest_to_cap())
+
+    assert (removed, freed) == (1, 1024)
+    assert live.exists()  # the in-progress chat file is never a candidate
+    assert not idle.exists()  # next-oldest takes the hit instead
+
+
+def test_disk_snapshot_counts_chat_files(tmp_path):
+    config = make_config(tmp_path)
+    base = tmp_path / "recordings" / "ch"
+    chat = tmp_path / "chat" / "twitch" / "ch"
+    sized = 6 * 1024 * 1024
+    for path in (base / "a.ts", chat / "a.chat.json", chat / "live.chat.json.tmp"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * sized)
+
+    snap = asyncio.run(disk.disk_snapshot(config))
+
+    assert snap["file_count"] == 1
+    assert snap["chat_count"] == 2  # the in-progress .tmp file counts
+    assert snap["dir_gb"] == 0.01
+    assert snap["chat_gb"] == 0.01
+    assert snap["archive_gb"] == 0.02  # the watchdog measures this against the cap
 
 
 def make_kick_config(tmp_path, record_chat=True):
@@ -1475,6 +1549,50 @@ def test_stop_chat_finalizes_kick_chat_midstream(tmp_path, monkeypatch):
         await rec.stop("kick:xqc")
 
     asyncio.run(scenario())
+
+
+def test_kick_chat_written_while_recording(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        state = rec._recordings["kick:xqc"]["kick_chat"]
+        await rec.add_kick_chat("kick:xqc", {"created_at": "2026-08-13T10:00:00Z", "content": "live"})
+        # The message is on disk before the recording stops, and the final
+        # file does not exist yet.
+        assert state["writer"].comments == 1
+        assert '"live"' in Path(state["writer"].tmp_path).read_text()
+        assert not os.path.exists(state["path"])
+        await rec.stop("kick:xqc")
+        assert not os.path.exists(state["writer"].tmp_path)
+        with open(state["path"]) as f:
+            comments = json.load(f)["comments"]
+        assert [c["message"]["body"] for c in comments] == ["live"]
+
+    asyncio.run(scenario())
+
+
+def test_kick_chat_open_failure_notifies_and_recording_continues(tmp_path, monkeypatch):
+    config = make_kick_config(tmp_path)
+    blocker = tmp_path / "chat-blocker"
+    blocker.write_text("not a directory")
+    config.chat_dir = str(blocker)
+    notifier = FakeNotifier()
+    rec = Recorder(config, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("kick:xqc") is True
+        assert rec.is_recording("kick:xqc")  # a chat failure never stops the video
+        await asyncio.sleep(0.05)  # let the notification task run
+        await rec.stop("kick:xqc")
+
+    asyncio.run(scenario())
+    assert any("Chat capture stopped" in m for m in notifier.messages)
 
 
 class FakeKeepaliveProc:
@@ -1874,6 +1992,44 @@ def test_cleanup_spares_active_recording(tmp_path):
     assert removed == 1
     assert old_active.exists()
     assert not old_idle.exists()
+
+
+def test_cleanup_removes_stale_chat_tmp(tmp_path):
+    """A crash leaves a partial .tmp file. Retention must remove it."""
+    rec = Recorder(make_config(tmp_path))
+    stale = tmp_path / "chat" / "twitch" / "ch" / "crash.chat.json.tmp"
+    fresh = tmp_path / "chat" / "twitch" / "ch" / "recent.chat.json.tmp"
+    t = time.time() - 30 * 86400
+    seed_recording(stale, t)
+    seed_recording(fresh, time.time())
+
+    removed = asyncio.run(rec.cleanup_old_recordings(7))
+
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_cleanup_spares_active_chat_file(tmp_path):
+    """Retention must not unlink a chat file that a live capture writes."""
+    rec = Recorder(make_config(tmp_path))
+    chat = tmp_path / "chat" / "twitch" / "ch"
+    t = time.time() - 30 * 86400
+    live = chat / "live.chat.json.tmp"
+    stale = chat / "old.chat.json"
+    seed_recording(live, t)
+    seed_recording(stale, t)
+
+    class LiveChatRecorder:
+        chat_path = str(chat / "live.chat.json")
+
+    rec._recordings["ch"] = {"filepath": None, "chat_recorder": LiveChatRecorder()}
+
+    removed = asyncio.run(rec.cleanup_old_recordings(7))
+
+    assert removed == 1
+    assert live.exists()
+    assert not stale.exists()
 
 
 def test_cancelled_start_leaves_no_stale_entry(tmp_path, monkeypatch):

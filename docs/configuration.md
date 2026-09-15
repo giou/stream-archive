@@ -29,7 +29,7 @@ file with placeholders is safe to commit or to share.
 | `timezone` | yes | — | IANA timezone (for example `America/New_York`) for filenames and timestamps |
 | `plugin_dir` | yes | — | Directory with the streamlink-ttvlol plugin. `/app/plugins` in Docker (baked into the image, read-only). Relative `plugins` for a dev run. See [Plugin override](development.md#plugin-override) |
 | `recording_dir` | yes | — | Directory for `.ts`/`.m4a` recordings |
-| `record_chat` | no | `true` | Record Twitch IRC chat alongside the video. Kick chat has its own key |
+| `record_chat` | no | `true` | Record Twitch IRC chat alongside the video. The app writes the chat file while the recording runs. Kick chat has its own key |
 | `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`). See [Chat recording](chat-recording.md) |
 | `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
 | `channel_output_modes` | no | `{}` | Per-channel override, for example `{"channel": "disk" \| "youtube" \| "both"}`. Channels without an entry use `output_mode` |
@@ -53,9 +53,9 @@ file with placeholders is safe to commit or to share.
 | `channel_preferred_qualities` | no | `{}` | Per-channel quality override, for example `{"channel": "720p"}`. Channels without an entry use `preferred_quality` |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` = unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube re-streams. `0` = unlimited |
-| `disk.max_total_gb` | no | `0` | Delete the oldest recordings when the archive exceeds this size in GB. `0` disables the cap |
+| `disk.max_total_gb` | no | `0` | Delete the oldest archive files (recordings and chat) when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no | `60` | Seconds between disk watchdog checks |
-| `disk.delete_oldest` | no | `true` | On a breach, delete the oldest recordings. `false` stops new recordings instead |
+| `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |
 | `update_check.enabled` | no | `true` | Periodic checks for app, streamlink, and plugin updates, with a Telegram notification when one is available |
 | `update_check.interval_hours` | no | `24` | Hours between update checks |
 | `update_check.check_app` | no | `true` | Check GitHub releases for a newer release of this app |

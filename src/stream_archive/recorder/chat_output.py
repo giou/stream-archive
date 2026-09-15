@@ -1,13 +1,15 @@
-import json
 import logging
-import os
 import time
 from typing import Any
 
-from stream_archive.config import (
-    kick_bare_name,
+from stream_archive.kick_chat import (
+    MAX_EMOTES_PER_RECORDING,
+    build_comment,
+    chat_root_trailer,
+    collect_emote_names,
+    embedded_data,
+    streamer_identity,
 )
-from stream_archive.kick_chat import build_chat_root, embed_kick_emotes
 from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
@@ -43,45 +45,66 @@ class ChatOutputMixin:
             await self._finalize_kick_chat(entry)
 
     async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None:
-        """Append one normalized kick chat message to the active recording's buffer.
+        """Write one normalized kick chat message to the active recording's file.
 
         The method does nothing when nobody records the channel. Kick webhook
         delivery is best-effort, and there is no replay.
         """
         entry = self._recordings.get(channel)
-        kick_chat = entry.get("kick_chat") if entry is not None else None
-        if kick_chat is not None:
-            kick_chat["messages"].append(payload)
+        state = entry.get("kick_chat") if entry is not None else None
+        if state is None:
+            return
+        if state.get("streamer_id") is None:
+            streamer_id, username = streamer_identity(payload, state["slug"])
+            if streamer_id is not None:
+                state["streamer_id"] = streamer_id
+                state["streamer_username"] = username
+        comment = build_comment(payload, state.get("streamer_id"), state["video_id"], state["start"])
+        state["writer"].add_comment(comment)
+        skipped = collect_emote_names(state["emote_names"], payload.get("content") or "")
+        if skipped:
+            if not state.get("emote_skipped"):
+                logger.warning(
+                    "[recorder] [%s] kick chat reached the emote limit (%d ids); extra emotes stay as text tokens",
+                    channel,
+                    MAX_EMOTES_PER_RECORDING,
+                )
+            state["emote_skipped"] = state.get("emote_skipped", 0) + skipped
 
     async def _finalize_kick_chat(self, entry: Recording) -> None:
-        """Write the collected kick chat buffer atomically to its target path.
+        """Write the kick chat trailer, then rename the file into place.
 
-        The method skips empty buffers. The output file is TwitchDownloader
-        ChatRoot JSON with embedded emote images (see kick_chat.build_chat_root
-        and embed_kick_emotes).
+        The method skips entries without messages. The output file is
+        TwitchDownloader ChatRoot JSON with embedded emote images (see
+        kick_chat.embedded_data).
         """
-        kick_chat = entry.pop("kick_chat", None)
-        if kick_chat is None or not kick_chat.get("messages"):
+        state = entry.pop("kick_chat", None)
+        if state is None:
+            return
+        writer = state["writer"]
+        if writer.comments == 0:
+            writer.discard()
             return
         try:
             duration_s = time.monotonic() - entry.get("started_at", time.monotonic())
-            root = build_chat_root(
-                kick_chat["channel"],
-                kick_bare_name(kick_chat["channel"]),
-                kick_chat.get("title"),
-                kick_chat.get("started_wall"),
-                kick_chat["messages"],
-                duration_s=duration_s,
+            trailer = chat_root_trailer(
+                state["slug"],
+                state.get("title"),
+                state["started_wall"],
+                state["start"],
+                duration_s,
+                state.get("streamer_id"),
+                state.get("streamer_username") or state["slug"],
             )
-            await embed_kick_emotes(root)
-            tmp = kick_chat["path"] + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(root, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, kick_chat["path"])
-            logger.info(
-                "[recorder] kick chat saved: %s (%d messages)",
-                kick_chat["path"],
-                len(kick_chat["messages"]),
-            )
+            embedded = await embedded_data(state.get("emote_names") or {})
+            if embedded is not None:
+                trailer["embeddedData"] = embedded
+            if writer.close(trailer):
+                logger.info(
+                    "[recorder] kick chat saved: %s (%d messages, %d emote ids skipped)",
+                    state["path"],
+                    writer.comments,
+                    state.get("emote_skipped", 0),
+                )
         except Exception as e:
             logger.error("[recorder] kick chat finalize failed: %s", e)

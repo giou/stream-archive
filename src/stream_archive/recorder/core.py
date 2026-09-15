@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -16,6 +16,7 @@ from streamlink.session.session import Streamlink
 
 from stream_archive import disk
 from stream_archive.chat_recorder import ChatRecorder
+from stream_archive.chat_writer import ChatJsonWriter
 from stream_archive.config import (
     AUDIO_ONLY_QUALITY,
     AppConfig,
@@ -25,6 +26,7 @@ from stream_archive.config import (
     is_kick_channel,
     kick_bare_name,
 )
+from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
 from stream_archive.recorder.common import sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
@@ -153,6 +155,31 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             self._locks[channel] = asyncio.Lock()
         return self._locks[channel]
 
+    def _chat_error_handler(self, channel: str, chat_path: str) -> Callable[[Exception], None]:
+        """Build the callback that a chat writer calls after a write failure.
+
+        The writer calls it once. The callback only schedules the operator
+        notification, so it can run from any context.
+        """
+
+        def handler(e: Exception) -> None:
+            with suppress(RuntimeError):  # no running loop: the writer already logged the failure
+                asyncio.create_task(self._notify_chat_error(channel, chat_path, e))
+
+        return handler
+
+    async def _notify_chat_error(self, channel: str, chat_path: str, e: Exception) -> None:
+        """Tell the operator that chat capture stopped. Never raises."""
+        if self._notifier is None:
+            return
+        try:
+            await self._notifier.notify(
+                f"\u26a0\ufe0f Chat capture stopped for {channel}: {e}. "
+                f"The recording continues. Partial chat stays in {chat_path}.tmp."
+            )
+        except Exception:
+            logger.error("[recorder] chat failure notification failed for %s", channel, exc_info=True)
+
     def _start_chat_capture(
         self,
         entry: Recording,
@@ -167,28 +194,43 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         """Attach the chat capture of a new recording to its entry.
 
         Twitch chat comes from IRC, so a recorder object starts here. Kick
-        chat arrives over the webhook, so the entry only gets its buffer.
+        chat arrives over the webhook, so the entry only gets its writer and
+        the metadata for the trailer.
         """
         if self._config.record_chat and not is_kick_channel(channel):
             chat_dir = disk.chat_dir_path(self._config)
             chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
-            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
             chat_recorder = ChatRecorder(
-                bare_name(channel), chat_path, stream_title, stream_game, author=author, user_id=user_id
+                bare_name(channel),
+                chat_path,
+                stream_title,
+                stream_game,
+                author=author,
+                user_id=user_id,
+                on_error=self._chat_error_handler(channel, chat_path),
             )
             entry["chat_recorder"] = chat_recorder
             entry["chat_task"] = chat_recorder.start()
 
         if is_kick_channel(channel) and self._config.kick.record_chat:
             chat_dir = disk.chat_dir_path(self._config)
-            chat_path = os.path.join(chat_dir, "kick", kick_bare_name(channel), f"{safe_title}-{now}.chat.json")
-            os.makedirs(os.path.dirname(chat_path), exist_ok=True)
+            slug = kick_bare_name(channel)
+            chat_path = os.path.join(chat_dir, "kick", slug, f"{safe_title}-{now}.chat.json")
+            started_wall = datetime.now(ZoneInfo(self._config.timezone)).isoformat()
+            start = parse_time(started_wall)
             entry["kick_chat"] = {
                 "path": chat_path,
-                "messages": [],
+                "writer": ChatJsonWriter(chat_path, on_error=self._chat_error_handler(channel, chat_path)),
                 "title": stream_title,
                 "channel": channel,
-                "started_wall": datetime.now(ZoneInfo(self._config.timezone)).isoformat(),
+                "slug": slug,
+                "started_wall": started_wall,
+                "start": start,
+                "video_id": video_id_for(slug, start),
+                "streamer_id": None,
+                "streamer_username": slug,
+                "emote_names": {},
+                "emote_skipped": 0,
             }
 
     async def _start_unlocked(

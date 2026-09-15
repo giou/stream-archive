@@ -32,8 +32,9 @@ class KickAPIProtocol(Protocol):
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]: ...
 
 
-# Shape returned by Recorder.disk_snapshot(). Keys include dir_gb,
-# free_gb, total_fs_gb, used_fs_gb, file_count, and dir.
+# Shape returned by Recorder.disk_snapshot(). Keys include dir_gb, chat_gb,
+# archive_gb (recordings + chat, the value the cap measures), free_gb,
+# total_fs_gb, used_fs_gb, chat_count, file_count, and dir.
 DiskSnapshot = dict[str, Any]
 
 
@@ -267,11 +268,11 @@ class Monitor:
             # Refresh per start. A tick-level snapshot goes stale when
             # several channels start in one sweep.
             snapshot = await self._snapshot_if_needed(config)
-            if snapshot is not None and snapshot["dir_gb"] >= cap:
+            if snapshot is not None and snapshot["archive_gb"] >= cap:
                 if disk_cfg.delete_oldest:
                     await self.recorder.delete_oldest_to_cap()
                     snapshot = await self.recorder.disk_snapshot()
-                    if snapshot["dir_gb"] >= cap:
+                    if snapshot["archive_gb"] >= cap:
                         return f"recording archive at {cap:g} GB cap (nothing to delete)"
                 else:
                     return f"recording archive at {cap:g} GB cap"

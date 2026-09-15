@@ -24,6 +24,9 @@ class FakeRecorder:
             "used_fs_gb": 400.0,
             "dir_gb": 0.0,
             "file_count": 0,
+            "chat_gb": 0.0,
+            "chat_count": 0,
+            "archive_gb": 0.0,
             "dir": "recordings",
         }
 
@@ -1401,7 +1404,7 @@ def test_reply_text_disk_submenu_descriptions(tmp_path):
     open_storage(ctrl)
     asyncio.run(ctrl.handle_reply_text("Disk limits"))
     cases = [
-        ("Max total size", "Limits total recording size"),
+        ("Max total size", "Limits the total archive size"),
     ]
     for button, desc in cases:
         text, markup = asyncio.run(ctrl.handle_reply_text(button))

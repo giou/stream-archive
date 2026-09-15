@@ -96,7 +96,7 @@ def read_chat(tmp_path):
 
 async def wait_for_comments(cr, n, timeout=5.0):
     async def _poll():
-        while len(cr._comments) < n:
+        while cr.comments < n:
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_poll(), timeout)
@@ -310,5 +310,56 @@ def test_failure_cleanup_racing_stop_writes_once(tmp_path):
         data = read_chat(tmp_path)
         assert [c["_id"] for c in data["comments"]] == ["m1"]
         assert list(tmp_path.glob("*.tmp")) == []
+
+    asyncio.run(scenario())
+
+
+def test_comments_stream_to_tmp_before_stop(tmp_path):
+    line1 = PRIVMSG_TEMPLATE.format(msg_id="m1", ts=TS_MS, body="first")
+    line2 = PRIVMSG_TEMPLATE.format(msg_id="m2", ts=TS2_MS, body="second")
+
+    async def scenario():
+        async with FakeIRCServer([([line1, line2], True, False)]) as server:
+            cr = make_recorder(tmp_path, server)
+            cr.start()
+            await wait_for_comments(cr, 2)
+            # Both comments are already on disk while the capture runs.
+            text = (tmp_path / "chat.json.tmp").read_text()
+            assert '"m1"' in text
+            assert '"m2"' in text
+            assert not (tmp_path / "chat.json").exists()
+            await cr.stop()
+
+        data = read_chat(tmp_path)
+        assert [c["_id"] for c in data["comments"]] == ["m1", "m2"]
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    asyncio.run(scenario())
+
+
+def test_open_failure_keeps_recording_and_reports(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    errors = []
+
+    async def scenario():
+        async with FakeIRCServer([([], False, False)]) as server:
+            cr = ChatRecorder(
+                "ch",
+                str(blocker / "chat.json"),
+                "Title",
+                "Game",
+                host="127.0.0.1",
+                port=server.port,
+                use_ssl=False,
+                on_error=errors.append,
+            )
+            task = cr.start()
+            await asyncio.sleep(0.1)
+            assert await cr.stop() == 0
+            assert task.done()
+
+        assert len(errors) == 1
+        assert not (blocker / "chat.json").exists()
 
     asyncio.run(scenario())

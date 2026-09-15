@@ -30,11 +30,12 @@ Two fast paths deliver the signals:
   as `.ts`, or as `.m4a` for audio-only channels. `youtube` pipes the stream
   through ffmpeg to a YouTube broadcast. `both` runs disk and youtube together.
 - **Chat recording.** The app saves Twitch IRC chat and Kick webhook chat as
-  TwitchDownloader-compatible JSON in `chat_dir/<platform>/<channel>/`.
+  TwitchDownloader-compatible JSON in `chat_dir/<platform>/<channel>/`. It
+  writes each file while the recording runs.
   See [Chat recording](docs/chat-recording.md).
-- **Retention cleanup.** The app deletes recordings older than `retention_days`
-  at startup and then daily. An optional `disk.max_total_gb` cap deletes the
-  oldest recordings or stops new recordings.
+- **Retention cleanup.** The app deletes recordings and chat files older than
+  `retention_days` at startup and then daily. An optional `disk.max_total_gb`
+  cap deletes the oldest archive files or stops new recordings.
 - **Self-healing.** Recording tasks that die mid-stream restart on the next
   poll cycle. YouTube re-streams restart with growing delays. A rolling 24-hour
   budget of 10 broadcast creations guards the YouTube daily limit. YouTube

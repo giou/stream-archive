@@ -1,14 +1,19 @@
+import asyncio
 import base64
 import json
 
 import httpx
 
+from stream_archive import kick_chat
 from stream_archive.kick_chat import (
-    build_chat_root,
-    collect_emote_ids,
-    embed_emotes,
-    embed_kick_emotes,
+    build_comment,
+    chat_root_trailer,
+    collect_emote_names,
+    embedded_data,
     fetch_emote_images,
+    parse_time,
+    streamer_identity,
+    video_id_for,
 )
 
 
@@ -33,27 +38,19 @@ def make_msg(**kw):
     return msg
 
 
-START = "2026-08-14T10:00:00+00:00"
+START_WALL = "2026-08-14T10:00:00+00:00"
+START = parse_time(START_WALL)
+VIDEO_ID = video_id_for("xqc", START)
 
 
-def test_chat_root_structure_and_fields():
-    root = build_chat_root("kick:xqc", "xqc", "Big stream", START, [make_msg()], duration_s=3600)
+def test_comment_structure_and_fields():
+    c = build_comment(make_msg(), 123, VIDEO_ID, START)
 
-    assert root["FileInfo"]["Version"] == {"Major": 1, "Minor": 4, "Patch": 0}
-    assert root["streamer"] == {"id": 123, "name": "xqc", "login": "xqc"}
-    assert root["video"]["title"] == "Big stream"
-    assert root["video"]["created_at"] == START
-    assert root["video"]["start"] == 0.0
-    assert root["video"]["end"] == 3600.0
-    assert root["video"]["length"] == 3600.0
-    assert root["video"]["id"].startswith("kick-xqc-")
-
-    c = root["comments"][0]
     assert c["_id"] == "m1"
     assert c["created_at"] == "2026-08-14T10:00:00Z"
     assert c["channel_id"] == "123"
     assert c["content_type"] == "video"
-    assert c["content_id"] == root["video"]["id"]
+    assert c["content_id"] == VIDEO_ID
     assert c["content_offset_seconds"] == 0.0
     assert c["commenter"]["display_name"] == "viewer1"
     assert c["commenter"]["_id"] == "999"
@@ -71,13 +68,13 @@ def test_chat_root_structure_and_fields():
     assert msg["bits_spent"] == 0
 
 
-def test_chat_root_no_emotes_single_fragment():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [make_msg(emotes=None, content="just text")])
-    assert root["comments"][0]["message"]["fragments"] == [{"text": "just text"}]
-    assert root["comments"][0]["message"]["emoticons"] == []
+def test_comment_no_emotes_single_fragment():
+    c = build_comment(make_msg(emotes=None, content="just text"), 123, VIDEO_ID, START)
+    assert c["message"]["fragments"] == [{"text": "just text"}]
+    assert c["message"]["emoticons"] == []
 
 
-def test_chat_root_tokens_split_without_emotes_field():
+def test_comment_tokens_split_without_emotes_field():
     # Kick's webhook often omits or breaks the "emotes" array in live data.
     # The self-describing tokens in the body must still become emoticon
     # fragments.
@@ -86,7 +83,7 @@ def test_chat_root_tokens_split_without_emotes_field():
         emotes=None,  # the quirk under test, no emotes payload at all
         content="[emote:39265:EDMusiC][emote:5756616:DanceDance] hi",
     )
-    c = build_chat_root("kick:xqc", "xqc", "T", START, [msg])["comments"][0]
+    c = build_comment(msg, 123, VIDEO_ID, START)
     assert c["message"]["fragments"] == [
         {"text": "[emote:39265:EDMusiC]", "emoticon": {"emoticon_id": "39265"}},
         {"text": "[emote:5756616:DanceDance]", "emoticon": {"emoticon_id": "5756616"}},
@@ -98,17 +95,17 @@ def test_chat_root_tokens_split_without_emotes_field():
     ]
 
 
-def test_chat_root_bad_positions_ignored_tokens_win():
+def test_comment_bad_positions_ignored_tokens_win():
     # Bogus or out-of-bounds positions in the emotes array must not break splitting.
     msg = make_msg(content="abc [emote:37226:KEKW]", emotes=[{"emote_id": "37226", "positions": [{"s": 99, "e": 120}]}])
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [msg])
-    assert root["comments"][0]["message"]["fragments"] == [
+    c = build_comment(msg, 123, VIDEO_ID, START)
+    assert c["message"]["fragments"] == [
         {"text": "abc "},
         {"text": "[emote:37226:KEKW]", "emoticon": {"emoticon_id": "37226"}},
     ]
 
 
-def test_chat_root_multiple_emotes_split_order():
+def test_comment_multiple_emotes_split_order():
     msg = make_msg(
         content="[emote:1:AAA] mid [emote:2:BBB] end",
         emotes=[
@@ -116,7 +113,7 @@ def test_chat_root_multiple_emotes_split_order():
             {"emote_id": "2", "positions": [{"s": 18, "e": 30}]},
         ],
     )
-    fragments = build_chat_root("kick:xqc", "xqc", "T", START, [msg])["comments"][0]["message"]["fragments"]
+    fragments = build_comment(msg, 123, VIDEO_ID, START)["message"]["fragments"]
     assert fragments == [
         {"text": "[emote:1:AAA]", "emoticon": {"emoticon_id": "1"}},
         {"text": " mid "},
@@ -125,7 +122,7 @@ def test_chat_root_multiple_emotes_split_order():
     ]
 
 
-def test_chat_root_offsets_and_missing_fields():
+def test_comment_offsets_and_missing_fields():
     msg = make_msg(
         created_at="2026-08-14T10:05:30Z",
         message_id=None,
@@ -133,47 +130,74 @@ def test_chat_root_offsets_and_missing_fields():
         badges=None,
         broadcaster={},
     )
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [msg])
+    c = build_comment(msg, None, VIDEO_ID, START)
 
-    c = root["comments"][0]
     assert c["content_offset_seconds"] == 330.0
     assert c["_id"] == "None-2026-08-14T10:05:30Z"  # fallback id
+    assert c["channel_id"] == ""  # no broadcaster id known yet
     assert c["commenter"]["name"] == "anonymous"
     assert c["commenter"]["_id"] == ""
     assert c["message"]["user_badges"] == []
-    assert root["streamer"] == {"name": "xqc", "login": "xqc"}  # no id
-    assert c["channel_id"] == ""
 
 
-def test_chat_root_no_start_time_zero_offsets():
-    root = build_chat_root("kick:xqc", "xqc", "T", None, [make_msg()])
-    assert root["comments"][0]["content_offset_seconds"] == 0.0
-    assert "created_at" not in root["video"]  # TD DateTime field omitted, never ""
+def test_comment_no_start_time_zero_offsets():
+    c = build_comment(make_msg(), None, "kick-xqc-0", None)
+    assert c["content_offset_seconds"] == 0.0
 
 
-def test_chat_root_empty_messages():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [])
-    assert root["comments"] == []
-    assert "id" not in root["streamer"]
+def test_comment_unicode_emoji_roundtrip():
+    c = build_comment(make_msg(content="\U0001f525\U0001f389"), 123, VIDEO_ID, START)
+    assert c["message"]["body"] == "\U0001f525\U0001f389"
 
 
-def test_chat_root_unicode_emoji_roundtrip():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [make_msg(content="\U0001f525\U0001f389")])
-    assert root["comments"][0]["message"]["body"] == "\U0001f525\U0001f389"
+def test_streamer_identity_from_broadcaster():
+    assert streamer_identity(make_msg(), "xqc") == (123, "xqc")
+    assert streamer_identity(make_msg(broadcaster={}), "xqc") == (None, "xqc")
 
 
-def test_collect_emote_ids_unique_in_order():
-    root = build_chat_root(
-        "kick:xqc",
-        "xqc",
-        "T",
-        START,
-        [
-            make_msg(message_id="a", content="[emote:1:AAA]"),
-            make_msg(message_id="b", content="[emote:2:BBB] [emote:1:AAA]"),
-        ],
-    )
-    assert collect_emote_ids(root) == ["1", "2"]
+def test_video_id_for_uses_start_time():
+    assert video_id_for("xqc", START) == f"kick-xqc-{int(START.timestamp())}"
+    assert video_id_for("xqc", None) == "kick-xqc-0"
+
+
+def test_trailer_structure_and_fields():
+    trailer = chat_root_trailer("xqc", "Big stream", START_WALL, START, 3600.0, 123, "xqc")
+
+    assert trailer["FileInfo"]["Version"] == {"Major": 1, "Minor": 4, "Patch": 0}
+    assert trailer["streamer"] == {"id": 123, "name": "xqc", "login": "xqc"}
+    assert trailer["video"]["title"] == "Big stream"
+    assert trailer["video"]["created_at"] == START_WALL
+    assert trailer["video"]["start"] == 0.0
+    assert trailer["video"]["end"] == 3600.0
+    assert trailer["video"]["length"] == 3600.0
+    assert trailer["video"]["id"] == f"kick-xqc-{int(START.timestamp())}"
+
+
+def test_trailer_without_streamer_id_or_start():
+    trailer = chat_root_trailer("xqc", "T", None, None, 0.0, None, "xqc")
+
+    assert trailer["streamer"] == {"name": "xqc", "login": "xqc"}
+    assert "created_at" not in trailer["video"]  # TD DateTime field omitted, never ""
+    assert trailer["video"]["id"] == "kick-xqc-0"
+
+
+def test_collect_emote_names_first_use_order():
+    names = {}
+    assert collect_emote_names(names, "[emote:1:AAA] hi [emote:2:BBB]") == 0
+    assert names == {"1": "AAA", "2": "BBB"}
+    # A repeated id keeps the first name, a new id appends.
+    assert collect_emote_names(names, "[emote:1:AAA] [emote:3:CCC]") == 0
+    assert list(names) == ["1", "2", "3"]
+
+
+def test_collect_emote_names_reports_limit_skips(monkeypatch):
+    monkeypatch.setattr(kick_chat, "MAX_EMOTES_PER_RECORDING", 2)
+    names = {"1": "AAA", "2": "BBB"}
+
+    skipped = collect_emote_names(names, "[emote:3:CCC][emote:4:DDD][emote:1:AAA]")
+
+    assert skipped == 2
+    assert names == {"1": "AAA", "2": "BBB"}
 
 
 def test_fetch_emote_images_with_mock_transport():
@@ -187,49 +211,93 @@ def test_fetch_emote_images_with_mock_transport():
             images = await fetch_emote_images(["37226", "missing"], client)
         assert images == {"37226": b"PNGDATA"}  # 404 skipped silently
 
-    import asyncio
-
     asyncio.run(scenario())
 
 
-def test_embed_emotes_fills_first_party_base64():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [make_msg()])
-    embed_emotes(root, {"37226": b"\x89PNG-fake"})
+def test_fetch_emote_images_count_limit():
+    names = []
 
-    first = root["embeddedData"]["firstParty"]
-    assert first == [
-        {
-            "id": "37226",
-            "imageScale": 2,
-            "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
-            "name": "KEKW",  # parsed from the [emote:id:NAME] token
-        }
-    ]
-    # TwitchDownloader can deserialize the result. FileInfo versions above
-    # 1.2.2 gate this modern shape.
-    json.dumps(root)
-
-
-def test_embed_emotes_missing_images_noop():
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [make_msg()])
-    embed_emotes(root, {})
-    assert "embeddedData" not in root
-
-
-def test_embed_kick_emotes_orchestrates(monkeypatch):
-    import asyncio
-
-    root = build_chat_root("kick:xqc", "xqc", "T", START, [make_msg()])
-
-    async def fake_fetch(ids, client=None):
-        return {i: b"IMG" for i in ids}
-
-    monkeypatch.setattr("stream_archive.kick_chat.fetch_emote_images", fake_fetch)
+    def handler(request):
+        names.append(request.url.path)
+        return httpx.Response(200, content=b"IMG")
 
     async def scenario():
-        await embed_kick_emotes(root, client="unused")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            images = await fetch_emote_images(["1", "2", "3", "4"], client, max_emotes=2)
+        assert len(images) == 2
+        assert len(names) == 2  # the limit stops the requests, not only the result
 
     asyncio.run(scenario())
 
-    assert root["embeddedData"]["firstParty"][0]["id"] == "37226"
-    assert root["embeddedData"]["firstParty"][0]["data"] == base64.b64encode(b"IMG").decode("ascii")
+
+def test_fetch_emote_images_per_image_limit():
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 64)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            images = await fetch_emote_images(["1"], client, max_bytes_each=16)
+        assert images == {}  # an oversized image is skipped, the capture continues
+
+    asyncio.run(scenario())
+
+
+def test_fetch_emote_images_total_limit():
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 4)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            images = await fetch_emote_images(["1", "2", "3", "4", "5"], client, max_total_bytes=8)
+        assert sum(len(v) for v in images.values()) <= 8
+
+    asyncio.run(scenario())
+
+
+def test_embedded_data_base64_and_name():
+    def handler(request):
+        if request.url.path.endswith("/37226/fullsize"):
+            return httpx.Response(200, content=b"\x89PNG-fake")
+        return httpx.Response(404)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            embedded = await embedded_data({"37226": "KEKW", "404": "MISSING"}, client)
+        assert embedded == {
+            "firstParty": [
+                {
+                    "id": "37226",
+                    "imageScale": 2,
+                    "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
+                    "name": "KEKW",  # parsed from the [emote:id:NAME] token
+                }
+            ]
+        }
+        # TwitchDownloader can deserialize the result. FileInfo versions above
+        # 1.2.2 gate this modern shape.
+        json.dumps(embedded)
+
+    asyncio.run(scenario())
+
+
+def test_embedded_data_without_images_or_names():
+    assert asyncio.run(embedded_data({})) is None
+
+    def handler(request):
+        return httpx.Response(404)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await embedded_data({"1": "AAA"}, client) is None
+
+    asyncio.run(scenario())
+
+
+def test_embedded_data_never_raises(monkeypatch):
+    async def boom(ids, client=None):
+        msg = "network down"
+        raise httpx.ConnectError(msg)
+
+    monkeypatch.setattr(kick_chat, "fetch_emote_images", boom)
+
+    assert asyncio.run(embedded_data({"1": "AAA"})) is None

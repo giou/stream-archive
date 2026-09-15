@@ -22,11 +22,28 @@ TwitchDownloaderCLI chatrender -i out.chat.json -o chat.mp4
 ## Behavior
 
 StreamArchive writes the JSON only. It does no rendering (no ffmpeg, no HTML or
-MP4 generation). The app holds chat in memory during the stream and writes the
-file atomically on stop. Every termination path (stream offline, disk watchdog
-abort, task failure, restart, `SIGTERM`/`SIGINT`) finalizes the file, so a crash
-cannot corrupt an existing `.chat.json`. The `retention_days` cleanup also
-removes old `*.chat.json` files together with the recordings.
+MP4 generation).
+
+The app writes chat to disk while the recording runs, so process memory stays
+flat when chat volume is high. The comments land in `<name>.chat.json.tmp`
+first. Every termination path (stream offline, disk watchdog abort, task
+failure, restart, `SIGTERM`/`SIGINT`) writes the closing keys and renames the
+file into place. A crash cannot corrupt an existing `.chat.json`. A crash
+leaves a partial `.tmp` file, and the `retention_days` cleanup removes stale
+`.tmp` files together with the recordings.
+
+The Kick emote step is bounded per recording: 1024 distinct emote ids, 512 KiB
+for one image, and 16 MiB in total. An over-limit emote keeps its text token,
+so TwitchDownloader renders plain text there.
+
+Chat files count toward `disk.max_total_gb` together with the recordings. The
+disk watchdog measures the total of both. When the total is over the cap and
+`disk.delete_oldest` is true, the app deletes the oldest archive files,
+including chat files. It never deletes a file that a recording still writes.
+
+If a chat write fails (for example, the disk is full), chat capture stops for
+that recording and the app sends a Telegram notification. The video keeps
+recording. The partial chat stays in the `.tmp` file.
 
 ## Related guides
 

@@ -375,8 +375,8 @@ async def _text_disk_maxsize(ctrl: TelegramController, state: MenuState) -> str:
     d = ctrl._config.disk
     return (
         f"Max total size: {d.max_total_gb:g} GB (0 = disabled)\n"
-        "Limits total recording size. When the limit is reached, the oldest recordings are "
-        "deleted (or recording stops). Choose:"
+        "Limits the total archive size (recordings and chat). When the limit is reached, the "
+        "oldest archive files are deleted (or recording stops). Choose:"
     )
 
 

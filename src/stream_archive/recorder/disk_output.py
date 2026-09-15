@@ -3,7 +3,7 @@ import contextlib
 import logging
 import os
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,14 @@ from stream_archive.recorder.common import _redact_credentials
 from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
+
+
+def _archive_files(recording_base: Path, chat_base: Path) -> Iterator[Path]:
+    """Yield every deletable archive file: recordings and chat files."""
+    if recording_base.exists():
+        yield from disk.iter_recordings(recording_base)
+    if chat_base.exists():
+        yield from disk.iter_chat_files(chat_base)
 
 
 class DiskOutputMixin:
@@ -81,11 +89,11 @@ class DiskOutputMixin:
                     return
                 snap = await disk.disk_snapshot(self._config)
                 cap = cfg.max_total_gb
-                if cap > 0 and snap["dir_gb"] >= cap:
+                if cap > 0 and snap["archive_gb"] >= cap:
                     if cfg.delete_oldest:
                         await self.delete_oldest_to_cap()
                         snap = await disk.disk_snapshot(self._config)
-                    if snap["dir_gb"] >= cap:
+                    if snap["archive_gb"] >= cap:
                         await self._abort(channel, f"recording archive at {cap:g} GB cap")
                         return
         except asyncio.CancelledError:
@@ -93,54 +101,76 @@ class DiskOutputMixin:
         except Exception as e:
             logger.error("[recorder] [%s] watchdog error: %s", channel, e)
 
-    async def delete_oldest_to_cap(self) -> tuple[int, int]:
-        """Delete the oldest recordings until under disk.max_total_gb.
+    def _active_paths(self) -> set[str]:
+        """Real paths that live captures hold open.
 
-        Returns (files_removed, freed_gb).
+        A deletion pass must never unlink a file that a recording writes
+        through an open handle. That covers the recording file, the chat
+        file, and the in-progress chat `.tmp` file.
+        """
+        active: set[str] = set()
+        for e in self._recordings.values():
+            filepath = e.get("filepath")
+            if filepath:
+                active.add(os.path.realpath(filepath))
+            chat_recorder = e.get("chat_recorder")
+            if chat_recorder is not None:
+                active.add(os.path.realpath(chat_recorder.chat_path))
+                active.add(os.path.realpath(chat_recorder.chat_path + ".tmp"))
+            state = e.get("kick_chat")
+            if state is not None:
+                active.add(os.path.realpath(state["path"]))
+                writer = state.get("writer")
+                if writer is not None:
+                    active.add(os.path.realpath(writer.tmp_path))
+        return active
+
+    async def delete_oldest_to_cap(self) -> tuple[int, int]:
+        """Delete the oldest archive files until under disk.max_total_gb.
+
+        The candidates are the recordings and the chat files. A live capture
+        (recording file, chat file, or in-progress chat `.tmp` file) is never
+        a candidate. Returns (files_removed, freed_gb).
         """
         cap = self._config.disk.max_total_gb
         if cap <= 0:
             return (0, 0)
         loop = asyncio.get_running_loop()
-
-        # Never unlink a recording that ffmpeg is still writing. The space
-        # behind its open fd is reclaimed only at teardown, so deletion here
-        # cannot touch the live capture.
-        active = {os.path.realpath(fp) for e in self._recordings.values() if (fp := e.get("filepath"))}
+        active = self._active_paths()
 
         def _delete_oldest() -> tuple[int, int]:
             base = disk.resolve_recording_dir(self._config)
-            if not base.exists():
-                return (0, 0)
+            chat_base = disk.chat_dir_path(self._config)
             stats = []
-            for p in disk.iter_recordings(base):
+            for path in _archive_files(base, chat_base):
                 try:
-                    st = p.stat()
+                    st = path.stat()
                 except OSError:
                     continue  # retention cleanup can race us mid-scan
-                stats.append((st.st_mtime, st.st_size, p))
+                stats.append((st.st_mtime, st.st_size, path))
             stats.sort(key=lambda t: t[0])
             total = sum(size for _, size, _ in stats)
             cap_bytes = int(cap * 1024**3)
             removed = freed = 0
-            for _, size, p in stats:
+            for _, size, path in stats:
                 if total < cap_bytes:
                     break
-                if os.path.realpath(p) in active:
+                if os.path.realpath(path) in active:
                     continue
-                p.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
                 total -= size
                 removed += 1
                 freed += size
-                logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, p)
+                logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, path)
             return removed, freed
 
         return await loop.run_in_executor(None, _delete_oldest)
 
     async def cleanup_old_recordings(self, retention_days: float) -> int:
-        """Delete recordings (.ts/.m4a) and .chat.json files older than retention_days days.
+        """Delete recordings and chat files older than retention_days days.
 
-        Returns the number of files removed.
+        The chat scan includes stale `.tmp` files, so a chat capture that
+        ended in a crash does not linger. Returns the number of files removed.
         """
         if retention_days <= 0:
             return 0
@@ -152,27 +182,20 @@ class DiskOutputMixin:
         loop = asyncio.get_running_loop()
         # A stalled feed can sit past retention_days while still writing.
         # Never unlink that in-flight file. Its fd stays open, and removal
-        # would cut off the live capture mid-write.
-        active = {os.path.realpath(fp) for e in self._recordings.values() if (fp := e.get("filepath"))}
+        # would cut off the live capture mid-write. The same rule covers the
+        # chat files and their in-progress `.tmp` files.
+        active = self._active_paths()
 
         def _scan() -> list[Path]:
             found: list[Path] = []
-            if base.exists():
-                for path in disk.iter_recordings(base):
-                    if os.path.realpath(path) in active:
-                        continue
-                    try:
-                        if path.stat().st_mtime < cutoff:
-                            found.append(path)
-                    except OSError:
-                        continue
-            if chat_base.exists():
-                for path in chat_base.rglob("*.chat.json"):
-                    try:
-                        if path.stat().st_mtime < cutoff:
-                            found.append(path)
-                    except OSError:
-                        continue
+            for path in _archive_files(base, chat_base):
+                if os.path.realpath(path) in active:
+                    continue
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        found.append(path)
+                except OSError:
+                    continue
             return found
 
         removed = 0
