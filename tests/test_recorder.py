@@ -1,4 +1,6 @@
 import asyncio
+import builtins
+import contextlib
 import inspect
 import io
 import json
@@ -778,6 +780,55 @@ def test_stop_chat_platform_twitch_keeps_kick_buffer(tmp_path, monkeypatch):
         assert [c["message"]["body"] for c in comments] == ["kept"]
 
     asyncio.run(scenario())
+
+
+def test_cancelled_recording_closes_the_output_file(tmp_path, monkeypatch):
+    """A cancelled disk recording must close the file it opened.
+
+    An output file that stays open makes the garbage collector report an
+    unraisable error during a later test. The patched open holds the call,
+    so the cancel arrives while the file is created.
+    """
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    recording_dir = str(tmp_path / "recordings")
+    opened = []
+    entered = []
+    real_open = builtins.open
+
+    def holding_open(file, *args, **kwargs):
+        if not (isinstance(file, str) and file.startswith(recording_dir)):
+            return real_open(file, *args, **kwargs)
+        entered.append(True)
+        handle = real_open(file, *args, **kwargs)
+        opened.append(handle)
+        time.sleep(0.2)  # hold the open, so the cancel lands inside it
+        return handle
+
+    monkeypatch.setattr(builtins, "open", holding_open)
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        task = rec._recordings["ch"]["tasks"][0]
+        for _ in range(200):
+            if entered:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    # The thread of a cancelled executor call can create the file late.
+    deadline = time.monotonic() + 5
+    while not opened and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert opened, "the recording never opened an output file"
+    assert all(handle.closed for handle in opened), "a cancelled recording left its output file open"
 
 
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):

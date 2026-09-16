@@ -50,10 +50,11 @@ class DiskOutputMixin:
         f: Any = None
         try:
             fd = await loop.run_in_executor(None, stream.open)
-            # The archive volume can be slow or network-backed. Open and
-            # write on the executor, like the reads, so the event loop keeps
-            # running.
-            f = await loop.run_in_executor(None, open, filepath, "wb")
+            # Open on the loop thread. A cancellation between an executor
+            # call and its return drops the file object, and the garbage
+            # collector then reports an open handle. One open() call costs
+            # little, and the copy loop below stays on the executor.
+            f = open(filepath, "wb")  # noqa: SIM115
             while True:
                 data = await loop.run_in_executor(None, fd.read, 65536)
                 if not data:
