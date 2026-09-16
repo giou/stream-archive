@@ -32,15 +32,20 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# twitch.py plugin (2bc4/streamlink-ttvlol) pinned release + sha256 from the
-# release API so image builds are reproducible. Bump both when vendoring a new
-# plugin release. The bot's update check reports when upstream is ahead.
-ARG TTVLOL_PLUGIN_VERSION=8.3.0-20260701
-ARG TTVLOL_PLUGIN_SHA256=4d465380159ec59f7caef6cb6a28368bbbbd3abcf80886138182184c30f2fad0
+# twitch.py plugin (2bc4/streamlink-ttvlol). The build fetches the release in
+# TTVLOL_PLUGIN_VERSION. The default "latest" resolves at build time, so a
+# rebuilt image contains the newest plugin release. The publish workflow
+# passes the resolved tag. That tag also keys the layer cache: a new plugin
+# release fetches the file again, and an unchanged release keeps the cached
+# copy.
+ARG TTVLOL_PLUGIN_VERSION=latest
 RUN mkdir -p /app/plugins \
- && curl -fsSL "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TTVLOL_PLUGIN_VERSION}/twitch.py" -o /tmp/twitch.py \
- && echo "${TTVLOL_PLUGIN_SHA256}  /tmp/twitch.py" | sha256sum -c - \
- && mv /tmp/twitch.py /app/plugins/twitch.py
+ && if [ "${TTVLOL_PLUGIN_VERSION}" = "latest" ]; then \
+      URL="https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py"; \
+    else \
+      URL="https://github.com/2bc4/streamlink-ttvlol/releases/download/${TTVLOL_PLUGIN_VERSION}/twitch.py"; \
+    fi \
+ && curl -fsSL "$URL" -o /app/plugins/twitch.py
 
 # Two-stage dependency install so source edits do not invalidate the dep layer.
 # Stage 1 resolves and installs third-party deps only. Build caches it until

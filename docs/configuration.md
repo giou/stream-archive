@@ -56,11 +56,8 @@ file with placeholders is safe to commit or to share.
 | `disk.max_total_gb` | no | `0` | Delete the oldest archive files (recordings and chat) when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no | `60` | Seconds between disk watchdog checks |
 | `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |
-| `update_check.enabled` | no | `true` | Periodic checks for app, streamlink, and plugin updates, with a Telegram notification when one is available |
+| `update_check.enabled` | no | `true` | Periodic check for a newer app release, with a Telegram notification when one is available |
 | `update_check.interval_hours` | no | `24` | Hours between update checks |
-| `update_check.check_app` | no | `true` | Check GitHub releases for a newer release of this app |
-| `update_check.check_streamlink` | no | `true` | Check PyPI for a newer `streamlink` release |
-| `update_check.check_plugin` | no | `true` | Check the `streamlink-ttvlol` GitHub releases for a newer `twitch.py`. Plugin updates ship in a future image |
 | `youtube.client_secrets_file` | no | `client_secret.json` | Path to the Google OAuth client file. Only the YouTube authorization flow reads this file |
 | `youtube.privacy_status` | no | `unlisted` | Privacy of created YouTube broadcasts: `public`, `unlisted`, or `private` |
 | `youtube.hold_seconds` | no | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast (no quota cost). A bundled "Reconnecting..." clip feeds the broadcast during the wait. `0` ends the broadcast immediately |
@@ -68,6 +65,10 @@ file with placeholders is safe to commit or to share.
 
 ¹ Required when the channel list contains a `kick:` entry.
 ² Required when the endpoint is enabled.
+
+Streamlink and the `twitch.py` plugin are not part of the update check. The
+image build fetches the newest plugin release, and Dependabot opens the
+streamlink updates as pull requests. Both ship in a new image.
 
 Older files keep the listener, the public URL, and the tunnel keys under
 `kick.webhook`, for example `kick.webhook.listen_host`. The app moves these

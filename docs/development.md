@@ -27,7 +27,7 @@ src/stream_archive/
   notifier.py            # Telegram messages
   telegram/              # admin-only Telegram bot commands (/add /remove /mode …) + settings menus
   config.py              # typed config (Pydantic) + ${ENV_VAR} interpolation
-  updater.py             # periodic update checks (app / streamlink / plugin)
+  updater.py             # periodic app release check (GitHub releases) and /update
   disk.py                # disk-size watchdog (max_total_gb)
 docs/                    # user guides (configuration, running, control API, …)
 plugins/twitch.py        # dev-only: fetched from streamlink-ttvlol releases (baked into the image at build)
@@ -59,13 +59,22 @@ each update:
   visible to Dependabot.
 - `github-actions`: the workflows in `.github/workflows`.
 
-CI runs the five release gates on every pull request, so a merge cannot break
-the lockfile or the tests. The vendored streamlink-ttvlol plugin stays pinned
-to a release plus sha256 on purpose. The pin is the verification that the image
-runs the code that a maintainer reviewed, and Dependabot cannot watch a release
-asset. The bot reports newer plugin releases in `/update`. A maintainer bumps
-the two `ARG` lines together with the image release. Users of the image pull
-that release and edit no Dockerfile.
+CI runs the five release gates on every pull request. Thus a merge cannot
+break the lockfile or the tests.
+
+The streamlink-ttvlol plugin is not pinned. Each image build fetches the
+newest plugin release, so a rebuilt image carries the current plugin. The
+publish workflow resolves the release tag and passes it as
+`TTVLOL_PLUGIN_VERSION`. Dependabot cannot watch a release asset, and the tag
+in the build log shows which release an image contains. To pin a plugin
+release for a reproducible build, pass the tag yourself:
+
+```sh
+docker build --build-arg TTVLOL_PLUGIN_VERSION=8.3.0-20260701 .
+```
+
+Users of the image pull a new release and change no file. The bot reports app
+releases only in `/update`.
 
 ## Plugin override
 
@@ -79,6 +88,5 @@ services:
       - ./plugins:/app/plugins   # hosts twitch.py; overrides the copy in the image
 ```
 
-The overlay holds the code that the recorder runs, so the image sha256 check
-does not cover it. Remove the mount to return to the pinned plugin that ships
-with the image.
+The overlay holds the code that the recorder runs. Remove the mount to return
+to the plugin that ships with the image.

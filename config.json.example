@@ -57,10 +57,7 @@
     },
     "update_check": {
         "enabled": true,
-        "interval_hours": 24,
-        "check_app": true,
-        "check_streamlink": true,
-        "check_plugin": true
+        "interval_hours": 24
     },
     "youtube": {
         "privacy_status": "unlisted",

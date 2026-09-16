@@ -153,11 +153,8 @@ class UpdateCheckConfig(BaseModel):
 
     enabled: bool = True
     interval_hours: float = Field(24, gt=0)
-    check_app: bool = True
-    check_streamlink: bool = True
-    check_plugin: bool = True
 
-    @field_validator("enabled", "check_app", "check_streamlink", "check_plugin", mode="before")
+    @field_validator("enabled", mode="before")
     @classmethod
     def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
         return _require_bool(v, f"update_check.{info.field_name}")

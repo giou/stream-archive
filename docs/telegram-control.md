@@ -35,7 +35,7 @@ untouched.
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode`, or a per-channel override. `default` clears the override. Applies to new recordings |
 | `/reload` | Re-read `config.json` from disk, then re-apply the endpoint and API state and re-sync the webhook and EventSub subscriptions |
 | `/restart` | Gracefully restart the app |
-| `/update` | Check for updates now (app, streamlink, plugin). Check-only: the app downloads and applies nothing. Apply an app update with `docker compose pull && docker compose up -d` |
+| `/update` | Check for a new app release now. Check-only: the app downloads and applies nothing. Apply an update with `docker compose pull && docker compose up -d` |
 | `/quality [channel] <value\|default>` | Show the preferred quality, or set it globally or for one channel (`best`, `1080p`, `720p`, …, `audio_only`). `default` clears the per-channel override |
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |

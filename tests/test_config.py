@@ -48,9 +48,6 @@ def test_valid_config_passes_and_sets_defaults():
     assert config.channel_preferred_qualities == {}
     assert config.update_check.enabled is True
     assert config.update_check.interval_hours == 24
-    assert config.update_check.check_app is True
-    assert config.update_check.check_streamlink is True
-    assert config.update_check.check_plugin is True
     assert config.preferred_quality == "best"
     assert config.max_concurrent_recordings == 0
     assert config.max_concurrent_youtube_streams == 0
@@ -220,8 +217,6 @@ def test_channel_output_modes_non_dict_raises():
         lambda c: c.__setitem__("update_check", {"enabled": "yes"}),
         lambda c: c.__setitem__("update_check", {"interval_hours": 0}),
         lambda c: c.__setitem__("update_check", {"interval_hours": -1}),
-        lambda c: c.__setitem__("update_check", {"check_app": "x"}),
-        lambda c: c.__setitem__("update_check", {"check_plugin": 1}),
         lambda c: c.__setitem__("update_check", []),
     ],
 )
@@ -233,17 +228,23 @@ def test_invalid_update_check_raises(mutate):
 
 
 def test_valid_update_check_values_pass():
-    config = build(
-        update_check={
-            "enabled": False,
-            "interval_hours": 6.5,
-            "check_app": False,
-            "check_streamlink": False,
-            "check_plugin": False,
-        }
-    )
+    config = build(update_check={"enabled": False, "interval_hours": 6.5})
     assert config.update_check.enabled is False
     assert config.update_check.interval_hours == 6.5
+
+
+def test_legacy_update_check_keys_still_load():
+    """Config files from older releases hold the removed check_* keys."""
+    config = build(
+        update_check={
+            "enabled": True,
+            "interval_hours": 12,
+            "check_app": True,
+            "check_streamlink": True,
+            "check_plugin": True,
+        }
+    )
+    assert config.update_check.interval_hours == 12
 
 
 def test_eventsub_disabled_passes():

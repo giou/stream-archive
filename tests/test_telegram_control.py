@@ -654,8 +654,6 @@ def test_update_app_available_shows_pull_command(tmp_path):
             "latest": "1.1.0",
             "changelog": ["Add retention cleanup", "Fix proxy retry loop"],
         },
-        "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
-        "plugin": {"status": "up_to_date", "current": "8.3.0-20260701", "latest": "8.3.0-20260701"},
     }
     fake = FakeUpdater(report)
     _, ctrl, _, _, eventsub = make_controller(tmp_path)
@@ -674,32 +672,8 @@ def test_update_app_available_shows_pull_command(tmp_path):
     assert fake.check_calls == [False]
 
 
-def test_update_plugin_only_ships_in_future_image(tmp_path):
-    report = {
-        "app": {"status": "up_to_date", "current": "1.0.0", "latest": "1.0.0"},
-        "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
-        "plugin": {"status": "update", "current": "8.3.0-20260701", "latest": "9.0.0-20260801", "changelog": []},
-    }
-    fake = FakeUpdater(report)
-    _, ctrl, _, _, eventsub = make_controller(tmp_path)
-    ctrl._updater = fake
-
-    async def scenario():
-        text = await ctrl.handle_update()
-        assert "\U0001f4e6 Updates available" in text
-        assert "• streamlink-ttvlol: 8.3.0-20260701 → 9.0.0-20260801 (ships in a future image)" in text
-        assert "No action needed — plugin/streamlink updates ship in a future image release." in text
-        assert "docker compose pull" not in text
-
-    asyncio.run(scenario())
-
-
 def test_update_up_to_date_lists_current_versions(tmp_path):
-    report = {
-        "app": {"status": "up_to_date", "current": "1.0.0", "latest": "1.0.0"},
-        "streamlink": {"status": "up_to_date", "current": "8.4.0", "latest": "8.4.0"},
-        "plugin": {"status": "up_to_date", "current": "8.3.0-20260701", "latest": "8.3.0-20260701"},
-    }
+    report = {"app": {"status": "up_to_date", "current": "1.0.0", "latest": "1.0.0"}}
     fake = FakeUpdater(report)
     _, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl._updater = fake
@@ -708,19 +682,14 @@ def test_update_up_to_date_lists_current_versions(tmp_path):
         text = await ctrl.handle_update()
         assert "\u2705 Up to date" in text
         assert "• stream-archive: v1.0.0" in text
-        assert "• streamlink: 8.4.0" in text
-        assert "• streamlink-ttvlol: 8.3.0-20260701" in text
+        assert "streamlink" not in text
 
     asyncio.run(scenario())
     assert fake.check_calls == [False]
 
 
 def test_update_all_unknown_fails(tmp_path):
-    report = {
-        "app": {"status": "unknown", "current": None, "latest": None},
-        "streamlink": {"status": "unknown", "current": None, "latest": None},
-        "plugin": {"status": "unknown", "current": None, "latest": None},
-    }
+    report = {"app": {"status": "unknown", "current": None, "latest": None}}
     fake = FakeUpdater(report)
     _, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl._updater = fake

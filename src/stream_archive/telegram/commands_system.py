@@ -108,43 +108,19 @@ class SystemCommands:
         if self._updater is None:
             return "Update checks are not configured"
         report = await self._updater.check(notify=False)
-        names = {"app": "stream-archive", "streamlink": "streamlink", "plugin": "streamlink-ttvlol"}
-        lines = []
-        any_update = False
-        app_update = False
-        for source in ("app", "streamlink", "plugin"):
-            data = report.get(source) or {}
-            status = data.get("status")
-            if status == "update":
-                any_update = True
-                if source == "app":
-                    app_update = True
-                    lines.append(f"• stream-archive: v{data.get('current')} → v{data.get('latest')}")
-                elif source == "streamlink":
-                    lines.append(
-                        f"• streamlink: {data.get('current')} → {data.get('latest')} (ships in a future image)"
-                    )
-                else:
-                    lines.append(
-                        f"• streamlink-ttvlol: {data.get('current')} → {data.get('latest')} (ships in a future image)"
-                    )
-                cl = data.get("changelog") or []
-                if cl:
-                    lines.append("  Changelog:")
-                    lines.extend(f"  • {ln}" for ln in cl)
-            elif status == "up_to_date":
-                cur = data.get("current")
-                if source == "app":
-                    lines.append(f"• stream-archive: v{cur}")
-                else:
-                    lines.append(f"• {names[source]}: {cur}")
-        if not any_update:
-            if not lines:
-                return "❌ Update check failed — try again later."
-            return "✅ Up to date\n" + "\n".join(lines)
-        footer = (
-            "Apply by running:\ndocker compose pull && docker compose up -d"
-            if app_update
-            else "No action needed — plugin/streamlink updates ship in a future image release."
+        data = report.get("app") or {}
+        status = data.get("status")
+        if status == "up_to_date":
+            return f"✅ Up to date\n• stream-archive: v{data.get('current')}"
+        if status != "update":
+            return "❌ Update check failed — try again later."
+        lines = [f"• stream-archive: v{data.get('current')} → v{data.get('latest')}"]
+        cl = data.get("changelog") or []
+        if cl:
+            lines.append("  Changelog:")
+            lines.extend(f"  • {ln}" for ln in cl)
+        return (
+            "📦 Updates available\n"
+            + "\n".join(lines)
+            + "\n\nApply by running:\ndocker compose pull && docker compose up -d"
         )
-        return "📦 Updates available\n" + "\n".join(lines) + "\n\n" + footer

@@ -38,11 +38,24 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the newest streamlink-ttvlol release
+        id: ttvlol
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release view --repo 2bc4/streamlink-ttvlol --json tagName --jq .tagName || true)
+          if [ -z "$TAG" ]; then
+            echo "cannot resolve the streamlink-ttvlol tag; the build resolves latest" >&2
+            TAG=latest
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            TTVLOL_PLUGIN_VERSION=${{ steps.ttvlol.outputs.tag }}
           tags: |
             ghcr.io/giou/stream-archive:${{ github.ref_name }}
             ghcr.io/giou/stream-archive:latest
