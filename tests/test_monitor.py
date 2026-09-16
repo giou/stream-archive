@@ -6,6 +6,7 @@ import httpx
 from stream_archive import monitor as monitor_module
 from stream_archive.config import AppConfig
 from stream_archive.monitor import Monitor
+from stream_archive.recorder import Recorder
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 
 
@@ -48,8 +49,10 @@ class FakeKickAPI:
     def __init__(self, statuses=None, error=None):
         self.statuses = statuses
         self.error = error
+        self.slugs = []
 
     async def get_channel_statuses(self, slugs):
+        self.slugs.append(list(slugs))
         if self.error:
             raise self.error
         return self.statuses or {}
@@ -333,7 +336,7 @@ def test_block_when_cap_reached_and_nothing_to_delete():
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
     assert rec.started == []
-    assert any("cap" in m for m in notifier.messages)
+    assert any("nothing to delete" in m for m in notifier.messages)
 
 
 def test_concurrency_limit_records_first_n():
@@ -370,15 +373,20 @@ def test_youtube_limit_blocks_restreams():
 
 
 def test_reservation_blocks_second_channel():
-    rec = FakeRecorder(max_recordings=1)
+    """The reservation admits one channel at a time and frees the slot on release."""
+    config = make_config(max_concurrent_recordings=1)
+    rec = Recorder(config)
+    limit = config.max_concurrent_recordings
+    blocked = f"concurrent recording limit reached ({limit}/{limit})"
 
-    assert asyncio.run(rec.reserve_start("twitch:a")) is None  # first slot reserved
-    assert (
-        asyncio.run(rec.reserve_start("twitch:b"))  # second go-live while first is mid-start
-        == "concurrent recording limit reached (1/1)"
-    )
-    rec.release_start("twitch:a")
-    assert asyncio.run(rec.reserve_start("twitch:b")) is None  # released slot frees capacity
+    async def scenario():
+        assert await rec.reserve_start("twitch:a") is None  # first slot reserved
+        # second go-live while the first is mid-start
+        assert await rec.reserve_start("twitch:b") == blocked
+        rec.release_start("twitch:a")
+        assert await rec.reserve_start("twitch:b") is None  # released slot frees capacity
+
+    asyncio.run(scenario())
 
 
 def test_handle_online_starts_recording():
@@ -464,7 +472,7 @@ def test_recorder_backoff_blocks_restart():
     async def scenario():
         await mon.handle_online("twitch:ch", "T", "G", "u1", config)
         assert rec.started == []
-        assert any("restarting in" in m for m in notifier.messages)
+        assert any("short recording, YouTube quota guard" in m for m in notifier.messages)
 
     asyncio.run(scenario())
 
@@ -495,21 +503,47 @@ def test_handle_offline_ignores_when_not_live():
 
 
 def test_poll_and_event_lock_same_channel():
-    rec = FakeRecorder()
+    """A poll sweep and a stream.online event must not start the channel twice.
+
+    The fake start() holds open like a real start() that awaits stream
+    resolution, so the webhook path enters the channel while the poll is
+    still inside start().
+    """
+    rec = FakeRecorder(max_recordings=1)
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
-    mon = make_monitor(recorder=rec)
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
     config = make_config()
+    in_start = asyncio.Event()
+    release = asyncio.Event()
+    plain_start = rec.start
 
-    async def concurrent():
-        await asyncio.gather(
-            mon.check_channels(api, FakeKickAPI(), config),
-            mon.handle_online("twitch:ch", "T", "G", "u1", config),
-        )
+    async def gated_start(channel, title=None, game=None, user_id=None):
+        in_start.set()
+        await release.wait()
+        return await plain_start(channel, title=title, game=game, user_id=user_id)
 
-    asyncio.run(concurrent())
+    rec.start = gated_start
+
+    async def scenario():
+        poll = asyncio.create_task(mon.check_channels(api, FakeKickAPI(), config))
+        await in_start.wait()
+        webhook = asyncio.create_task(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+        # Wait until the webhook path is blocked by the reservation. The bound
+        # fails the test instead of hanging it when the guard regresses.
+        for _ in range(100):
+            if notifier.messages:
+                break
+            await asyncio.sleep(0)
+        assert notifier.messages, "the webhook path was not blocked"
+        release.set()
+        await asyncio.gather(poll, webhook)
+
+    asyncio.run(scenario())
 
     assert rec.started == ["twitch:ch"]
     assert rec.stopped == []
+    assert any("concurrent recording limit reached" in m for m in notifier.messages)
 
 
 KICK_STATUS_LIVE = {
@@ -526,9 +560,12 @@ def test_kick_live_starts_with_title_game_and_no_user_id():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
     config = make_config(channels=["kick:xqc"])
+    kick = FakeKickAPI(statuses=KICK_STATUS_LIVE)
 
-    asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(statuses=KICK_STATUS_LIVE), config))
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), kick, config))
 
+    # The status lookup uses the bare slug, never the prefixed channel name.
+    assert kick.slugs == [["xqc"]]
     assert rec.started == ["kick:xqc"]
     assert rec.started_kwargs == [
         {

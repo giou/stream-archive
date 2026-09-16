@@ -44,7 +44,7 @@ class Monitor:
         self.notifier: Notifier = notifier
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
-        self._last_disk_notify = -float(DISK_NOTIFY_INTERVAL)
+        self._last_disk_notify: dict[str, float] = {}  # blocked-start alerts, per channel
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
         self._kick_api_error_logged = False
@@ -129,8 +129,9 @@ class Monitor:
                             logger.warning("[monitor] fail-closed policy: unknown kick slug counts as offline: %s", ch)
                         if ch in self._live_channels:
                             await self._ensure_stopped(ch, config)
-                    elif status["is_live"]:
-                        await self._ensure_recording(ch, status["title"], status["game"], None, config)
+                    elif status.get("is_live"):
+                        # Fail-closed. A payload without is_live counts as offline.
+                        await self._ensure_recording(ch, status.get("title"), status.get("game"), None, config)
                     elif ch in self._live_channels:
                         await self._ensure_stopped(ch, config)
 
@@ -174,17 +175,15 @@ class Monitor:
             # because it does network I/O.
             reason = await self._start_blocked_reason(channel, config)
         if reason is not None:
+            # The blocked setter alerts on its own. A start-failure alert here
+            # would be a second, wrong message and would consume the budget.
             logger.warning("[monitor] %s not started: %s", channel, reason)
             await self._notify_blocked(channel, reason)
-            async with self._lock_for(channel):
-                await self._handle_start_failure(channel)
             return
         reserve_reason = await self.recorder.reserve_start(channel)
         if reserve_reason is not None:
             logger.warning("[monitor] %s not started: %s", channel, reserve_reason)
             await self._notify_blocked(channel, reserve_reason)
-            async with self._lock_for(channel):
-                await self._handle_start_failure(channel)
             return
         try:
             ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
@@ -245,7 +244,15 @@ class Monitor:
         """Drop per-channel state so a removed channel leaves no locks behind."""
         self._locks.pop(channel, None)
         self._last_failure_notify.pop(channel, None)
-        self._warned_unknown_kick.discard(kick_bare_name(channel))
+        self._last_disk_notify.pop(channel, None)
+        # kick_bare_name strips the twitch: prefix too, so a Twitch channel
+        # must not evict the entry that belongs to kick:<name>.
+        if is_kick_channel(channel):
+            self._warned_unknown_kick.discard(kick_bare_name(channel))
+
+    def is_live(self, channel: str) -> bool:
+        """True when the monitor holds live state for the channel."""
+        return channel in self._live_channels
 
     def remove_channel(self, channel: str) -> None:
         self._live_channels.discard(channel)
@@ -284,12 +291,15 @@ class Monitor:
 
     async def _notify_blocked(self, channel: str, reason: str) -> None:
         now = time.monotonic()
-        if now - self._last_disk_notify < DISK_NOTIFY_INTERVAL:
+        if now - self._last_disk_notify.get(channel, -DISK_NOTIFY_INTERVAL) < DISK_NOTIFY_INTERVAL:
             return
-        self._last_disk_notify = now
+        # Stamp before the send: concurrent callers must not each send the
+        # same alert. A failed send must retry, so the stamp goes away then.
+        self._last_disk_notify[channel] = now
         try:
             await self.notifier.notify(f"\u26a0\ufe0f Not recording {channel}: {reason}")
         except Exception:
+            self._last_disk_notify.pop(channel, None)
             logger.error("[monitor] blocked notification failed for %s", channel, exc_info=True)
 
     async def _handle_start_failure(self, channel: str) -> None:

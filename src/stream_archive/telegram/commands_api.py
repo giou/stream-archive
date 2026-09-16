@@ -6,10 +6,13 @@ through ``KickWebhook.apply_state``. The key lives in ``api.key`` in
 config.json and is generated on the first enable.
 """
 
+import logging
 import secrets
 from typing import Any
 
 from stream_archive.config import AppConfig, api_base_url
+
+logger = logging.getLogger(__name__)
 
 
 class ApiCommands:
@@ -31,7 +34,10 @@ class ApiCommands:
         if not lines:
             return
         body = "\n".join(f"\u2022 {line}" for line in lines)
-        await self._send_admin(f"\U0001f310 Control API\n{body}")
+        try:
+            await self._send_admin(f"\U0001f310 Control API\n{body}")
+        except Exception:
+            logger.warning("[telegram] Failed to notify the admin about API changes", exc_info=True)
 
     def _api_key_text(self) -> str:
         """The current API key, or a hint when the API was never enabled."""
@@ -60,14 +66,23 @@ class ApiCommands:
         result: str = self._apply(mutate, lambda c: f"Control API {'enabled' if enabled else 'disabled'}", chat_id)
         if result.startswith("\u274c"):
             return result
-        if self._kick_webhook is not None:
-            await self._kick_webhook.apply_state()
         lines = [result]
-        base = api_base_url(self._config)
-        if base:
-            lines.append(f"Base URL: {base}")
-        else:
-            lines.append("No public URL yet \u2014 set up a tunnel under Kick webhook to reach the API from outside.")
+        if self._kick_webhook is not None:
+            try:
+                await self._kick_webhook.apply_state()
+            except Exception:
+                logger.warning("[telegram] Failed to reconcile the webhook listener", exc_info=True)
+                lines.append("\u26a0\ufe0f The listener could not be reconfigured \u2014 check the logs.")
+        if enabled:
+            # The base URL guides the setup of an enabled API. It is
+            # noise on the disable path, where no reachability matters.
+            base = api_base_url(self._config)
+            if base:
+                lines.append(f"Base URL: {base}")
+            else:
+                lines.append(
+                    "No public URL yet \u2014 set up a tunnel under Kick webhook to reach the API from outside."
+                )
         if created:
             lines.append(f"API key (keep it secret \u2014 Show key shows it again):\n{key}")
         return "\n\n".join(lines)

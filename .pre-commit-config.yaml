@@ -6,20 +6,18 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        entry: uv run ruff check --force-exclude
+        entry: uv run --frozen ruff check --force-exclude
         args: [--fix]
         language: system
         types_or: [python, pyi, jupyter]
-        require_serial: true
       - id: ruff-format
         name: ruff format
-        entry: uv run ruff format --force-exclude
+        entry: uv run --frozen ruff format --force-exclude
         language: system
         types_or: [python, pyi, jupyter, markdown]
-        require_serial: true
       - id: mypy
         name: mypy
-        entry: uv run mypy
+        entry: uv run --frozen mypy
         language: system
         pass_filenames: false
         args: ["src/stream_archive"]

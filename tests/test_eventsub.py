@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 
+import httpx
+
 from stream_archive.config import AppConfig
 from stream_archive.eventsub import EventSubClient
 
@@ -82,6 +84,9 @@ class StubMonitor:
     async def handle_offline(self, channel, config):
         self.offline_calls.append(channel)
 
+    def is_live(self, channel):
+        return channel in self._live_channels
+
 
 def make_client(api=None, monitor=None, config=None):
     return EventSubClient(
@@ -92,14 +97,17 @@ def make_client(api=None, monitor=None, config=None):
 
 
 async def handle_message(client, msg):
-    """Dispatch a message and wait for any task it spawned."""
+    """Dispatch a message and wait for the tasks it spawned."""
     await client._handle_message(msg)
-    await asyncio.gather(*(t for t in asyncio.all_tasks() if t is not asyncio.current_task()))
+    await asyncio.gather(*client._dispatch_tasks)
 
 
-def notification(user_id, sub_type):
+def notification(user_id, sub_type, message_id=None):
+    metadata = {"message_type": "notification", "subscription_type": sub_type}
+    if message_id is not None:
+        metadata["message_id"] = message_id
     return {
-        "metadata": {"message_type": "notification", "subscription_type": sub_type},
+        "metadata": metadata,
         "payload": {"event": {"broadcaster_user_id": user_id}},
     }
 
@@ -257,7 +265,7 @@ def _make_closing_ws(code):
     return FakeWebsockets()
 
 
-def _run_close_code(client, code):
+def _run_close_code(client):
     return asyncio.run(client._connect_and_listen())
 
 
@@ -269,7 +277,7 @@ def test_close_code_4007_logged_as_info(caplog, monkeypatch):
     monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(4007))
 
     with caplog.at_level("INFO", logger="stream_archive.eventsub"):
-        _run_close_code(client, 4007)
+        _run_close_code(client)
 
     assert any("reconnect requested by Twitch" in r.getMessage() for r in caplog.records)
     assert not [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -282,7 +290,7 @@ def test_close_code_1006_logged_as_warning(caplog, monkeypatch):
     monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1006))
 
     with caplog.at_level("WARNING", logger="stream_archive.eventsub"):
-        _run_close_code(client, 1006)
+        _run_close_code(client)
 
     assert any("abnormally" in r.getMessage() for r in caplog.records)
     assert not [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -295,7 +303,7 @@ def test_close_code_other_logged_as_error(caplog, monkeypatch):
     monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1011))
 
     with caplog.at_level("ERROR", logger="stream_archive.eventsub"):
-        _run_close_code(client, 1011)
+        _run_close_code(client)
 
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
@@ -319,12 +327,12 @@ def test_add_channel_creates_subs_and_maps():
     client._conduit_id = "c1"
     client._session_id = "s1"
 
-    asyncio.run(client.add_channel("ch"))
+    asyncio.run(client.add_channel("twitch:ch"))
 
     assert len(api.subscription_creates) == 2
-    assert client._subs["ch"] == {"online": "sub-1", "offline": "sub-2"}
-    assert client._user_ids == {"ch": "uch"}
-    assert client._id_to_channel == {"uch": "ch"}
+    assert client._subs["twitch:ch"] == {"online": "sub-1", "offline": "sub-2"}
+    assert client._user_ids == {"twitch:ch": "uch"}
+    assert client._id_to_channel == {"uch": "twitch:ch"}
 
 
 def test_remove_channel_deletes_subs():
@@ -361,12 +369,96 @@ def test_sync_channels_removes_stale_and_adds_new():
     client = make_client(api=api, config=make_config(channels=["ch1", "ch2"]))
     client._conduit_id = "c1"
     client._session_id = "s1"
-    client._subs = {"ch1": {"online": "s1"}, "stale": {"online": "s2"}}
-    client._user_ids = {"ch1": "u1", "stale": "u9"}
-    client._id_to_channel = {"u1": "ch1", "u9": "stale"}
+    client._subs = {"twitch:ch1": {"online": "s1"}, "twitch:stale": {"online": "s2"}}
+    client._user_ids = {"twitch:ch1": "u1", "twitch:stale": "u9"}
+    client._id_to_channel = {"u1": "twitch:ch1", "u9": "twitch:stale"}
 
-    asyncio.run(client.sync_channels(["ch1", "ch2"]))
+    asyncio.run(client.sync_channels(["twitch:ch1", "twitch:ch2"]))
 
     assert api.subscription_deletes == ["s2"]
-    assert "ch2" in client._subs
-    assert "stale" not in client._subs
+    assert "twitch:ch2" in client._subs
+    assert "twitch:stale" not in client._subs
+
+
+class FlakyStreamAPI(FakeTwitchAPI):
+    """Fails the stream lookup until ``healthy`` is set."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.healthy = False
+
+    async def get_stream(self, user_id):
+        if not self.healthy:
+            msg = "stream lookup failed"
+            raise httpx.HTTPError(msg)
+        return await super().get_stream(user_id)
+
+
+class BlockingStreamAPI(FakeTwitchAPI):
+    """Holds the stream lookup until ``release`` is set."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.lookup_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_stream(self, user_id):
+        self.lookup_started.set()
+        await self.release.wait()
+        return await super().get_stream(user_id)
+
+
+def test_duplicate_message_id_dispatches_once():
+    """The same message id within the dedup window reaches the monitor once."""
+    api = FakeTwitchAPI(user_ids={"ch": "u1"}, streams={"u1": {"title": "T", "game_name": "G"}})
+    mon = StubMonitor()
+    client = make_client(api=api, monitor=mon)
+    client._id_to_channel = {"u1": "twitch:ch"}
+    msg = notification("u1", "stream.online", message_id="m1")
+
+    asyncio.run(handle_message(client, msg))
+    asyncio.run(handle_message(client, msg))
+
+    assert len(mon.online_calls) == 1
+    assert "m1" in client._seen_ids
+
+
+def test_failed_dispatch_forgets_the_message_id():
+    """A dispatch that fails must let a redelivery of the message dispatch again."""
+    api = FlakyStreamAPI(user_ids={"ch": "u1"}, streams={"u1": {"title": "T", "game_name": "G"}})
+    mon = StubMonitor()
+    client = make_client(api=api, monitor=mon)
+    client._id_to_channel = {"u1": "twitch:ch"}
+    msg = notification("u1", "stream.online", message_id="m1")
+
+    asyncio.run(handle_message(client, msg))
+
+    assert "m1" not in client._seen_ids
+    assert mon.online_calls == []
+
+    api.healthy = True
+    asyncio.run(handle_message(client, msg))
+
+    assert mon.online_calls == [("twitch:ch", "T", "G", "u1")]
+
+
+def test_close_cancels_an_in_flight_dispatch():
+    """close() cancels and awaits a dispatch that still runs."""
+    api = BlockingStreamAPI(user_ids={"ch": "u1"})
+    mon = StubMonitor()
+    client = make_client(api=api, monitor=mon)
+    client._id_to_channel = {"u1": "twitch:ch"}
+
+    async def scenario():
+        await client._handle_message(notification("u1", "stream.online", message_id="m1"))
+        async with asyncio.timeout(5):
+            await api.lookup_started.wait()
+        dispatch = next(iter(client._dispatch_tasks))
+
+        await client.close()
+
+        assert client._dispatch_tasks == set()
+        assert dispatch.cancelled()
+
+    asyncio.run(scenario())
+    assert mon.online_calls == []

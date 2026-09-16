@@ -4,6 +4,21 @@ from typing import Any
 from stream_archive import disk
 from stream_archive.config import AppConfig
 
+#: Most entries one /status list shows before it counts the rest.
+_STATUS_LIST_LIMIT = 20
+
+
+def _status_list(items: list[str]) -> str:
+    """Join one /status list. A long list counts the rest instead of listing it.
+
+    Telegram rejects a message longer than 4096 characters, so the channel
+    and override lists of /status must not grow without a bound.
+    """
+    if len(items) <= _STATUS_LIST_LIMIT:
+        return ", ".join(items)
+    rest = len(items) - _STATUS_LIST_LIMIT
+    return f"{', '.join(items[:_STATUS_LIST_LIMIT])} \u2026 and {rest} more"
+
 
 class SystemCommands:
     _config: AppConfig
@@ -51,13 +66,15 @@ class SystemCommands:
         per_channel = ""
         if overrides:
             per_channel = (
-                "Per-channel output: " + ", ".join(f"{k} \u2192 {v}" for k, v in sorted(overrides.items())) + "\n"
+                "Per-channel output: " + _status_list([f"{k} \u2192 {v}" for k, v in sorted(overrides.items())]) + "\n"
             )
         q_overrides = c.channel_preferred_qualities
         per_channel_q = ""
         if q_overrides:
             per_channel_q = (
-                "Per-channel quality: " + ", ".join(f"{ch} \u2192 {q}" for ch, q in sorted(q_overrides.items())) + "\n"
+                "Per-channel quality: "
+                + _status_list([f"{ch} \u2192 {q}" for ch, q in sorted(q_overrides.items())])
+                + "\n"
             )
         rec_parts = []
         for info in active:
@@ -65,7 +82,7 @@ class SystemCommands:
             if info["size_mb"] is not None:
                 part += f", {disk.format_bytes(int(info['size_mb'] * 1024 * 1024))}"
             rec_parts.append(part + ")")
-        rec_now = ", ".join(rec_parts) if rec_parts else "none"
+        rec_now = _status_list(rec_parts) if rec_parts else "none"
         max_rec = c.max_concurrent_recordings
         max_yt = c.max_concurrent_youtube_streams
         rec_limit = "unlimited" if not max_rec else f"{max_rec:g}"
@@ -79,7 +96,7 @@ class SystemCommands:
                 disk_limits.append(f"max {cap:g} GB (stop recording when over)")
         disk_limit_line = "Disk limits: " + " \u00b7 ".join(disk_limits) if disk_limits else "Disk limits: disabled"
         return (
-            f"Channels ({len(c.channels)}): {', '.join(c.channels)}\n"
+            f"Channels ({len(c.channels)}): {_status_list(c.channels)}\n"
             f"Output mode: {c.output_mode}\n"
             f"{per_channel}"
             f"{per_channel_q}"
@@ -101,7 +118,11 @@ class SystemCommands:
     def handle_restart(self) -> str:
         if self._on_restart is None:
             return "Restart is not available (no shutdown callback configured)"
-        asyncio.get_running_loop().call_later(0.5, self._on_restart)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return "Restart is not available (no running event loop)"
+        loop.call_later(0.5, self._on_restart)
         return "\U0001f504 Restarting... the service will come back in a few seconds"
 
     async def handle_update(self) -> str:

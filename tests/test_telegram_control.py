@@ -13,8 +13,9 @@ from stream_archive.tunnels import tailscale_funnel_off
 
 class FakeRecorder:
     def __init__(self, active=(), recording=()):
-        self._active = list(active)
-        self._recording = set(recording)
+        # One source of truth: recording_info(), is_recording(), stop(),
+        # restart() and active_channels() must all agree.
+        self._recording = set(active) | set(recording)
         self.stop_calls = []
         self.chat_stop_calls = []
         self.restart_calls = []
@@ -63,7 +64,7 @@ class FakeRecorder:
         return self.snapshot
 
     def recording_info(self):
-        return [{"channel": ch, "mode": "disk", "duration_s": 0, "size_mb": None} for ch in self._active]
+        return [{"channel": ch, "mode": "disk", "duration_s": 0, "size_mb": None} for ch in sorted(self._recording)]
 
 
 class FakeMonitor:
@@ -307,7 +308,9 @@ def test_remove_not_recording_does_not_stop(tmp_path):
     text = asyncio.run(ctrl.handle_remove(["twitch:ch"]))
     assert text.startswith("Removed")
     assert recorder.stop_calls == []
-    assert monitor.remove_calls == []
+    # The monitor live state is dropped for every removed channel, also when
+    # no recording runs.
+    assert monitor.remove_calls == ["twitch:ch"]
     assert "twitch:ch" not in read_file(tmp_path)["channels"]
 
 
@@ -598,13 +601,15 @@ def test_apply_now_callback_restarts(tmp_path):
     # A stale or unknown nonce is a silent no-op.
     assert asyncio.run(ctrl.handle_callback("apply_now:zzzz")) is None
     assert recorder.restart_calls == ["twitch:channel1"]
-    # Cancel keeps the current recording and restarts nothing. The entry stays
-    # pending, so a later Apply now tap on the same message still works.
+    # Cancel keeps the current recording and restarts nothing. The caller drops
+    # the inline keyboard, so the entry and its warning marker must go too.
     ctrl._pending_apply[(ADMIN_ID, "wxyz")] = ("Output mode set to youtube", ["twitch:channel1"])
+    ctrl._apply_warnings_sent.add((ADMIN_ID, "wxyz"))
     result = asyncio.run(ctrl.handle_callback("cancel:wxyz"))
     assert result == ("Cancelled \u2014 nothing changed", None)
     assert recorder.restart_calls == ["twitch:channel1"]
-    assert ctrl._pending_apply == {(ADMIN_ID, "wxyz"): ("Output mode set to youtube", ["twitch:channel1"])}
+    assert ctrl._pending_apply == {}
+    assert ctrl._apply_warnings_sent == set()
 
 
 def test_reload_picks_up_disk_edits(tmp_path):
@@ -2410,7 +2415,8 @@ def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path, monkeypatch):
     probe_ok(ctrl)
 
     async def fake_quick():
-        return "https://abc123.trycloudflare.com/kick/webhook", None  # raw tunnel output
+        # The adapter already normalizes the tunnel output to a base URL.
+        return "https://abc123.trycloudflare.com", None
 
     ctrl._cloudflared_quick_start = fake_quick
     open_remote_access(ctrl)
@@ -2422,7 +2428,7 @@ def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path, monkeypatch):
     assert "URL is reachable" in text
     w = read_file(tmp_path)["endpoint"]
     assert w["enabled"] is True
-    assert w["public_url"] == "https://abc123.trycloudflare.com/kick/webhook"
+    assert w["public_url"] == "https://abc123.trycloudflare.com"
     assert w["tunnel"] == "cloudflare"
     assert w["cloudflare_managed"] is True
     assert w["cloudflare_token"] == ""

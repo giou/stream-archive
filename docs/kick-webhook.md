@@ -14,8 +14,8 @@ public URL. It offers these options:
   bot writes the ingress configuration for a named tunnel. It creates the DNS
   record if you supply a Cloudflare API token, and it runs cloudflared.
 - **Tailscale funnel.** The bot runs `tailscale funnel <port>`. The host must
-  run tailscale. Under Docker, the app mounts the tailscaled socket into the
-  container.
+  run tailscale. Under Docker, the app mounts the host tailscale directory
+  into the container.
 - **Your own tunnel.** Paste the public URL of a tunnel that you already run.
 
 The bot probes the URL for reachability and saves its state to `config.json`.

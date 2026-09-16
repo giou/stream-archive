@@ -16,9 +16,16 @@ class Notifier:
         self.chat_id = chat_id
         self._max_retries = 3
         self._retry_delay = 2
+        #: Bound the flood-control path, so a permanently limited bot cannot
+        #: block the caller forever. The counter stops a loop of short waits,
+        #: and the budget stops a hostile or broken RetryAfter value.
+        self._max_flood_waits = 3
+        self._max_flood_wait_seconds = 300.0
 
     async def notify(self, message: str) -> None:
         attempt = 0
+        flood_waits = 0
+        flood_seconds = 0.0
         while True:
             try:
                 await self.bot.send_message(chat_id=self.chat_id, text=message)
@@ -38,6 +45,12 @@ class Notifier:
                     delay = float(retry_after)
                 else:
                     delay = float(self._retry_delay)
+                flood_waits += 1
+                flood_seconds += delay
+                if flood_waits > self._max_flood_waits or flood_seconds > self._max_flood_wait_seconds:
+                    msg = f"telegram send still flood-controlled after {flood_waits} waits ({flood_seconds:.0f}s)"
+                    logger.error("[notifier] %s", msg)
+                    raise RuntimeError(msg) from e
                 logger.warning("[notifier] Telegram flood control, waiting %ss...", delay)
                 await asyncio.sleep(delay)
                 continue

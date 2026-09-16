@@ -33,18 +33,25 @@ class YouTubeStreamer:
         self._config = config
         yt = config.youtube
         self._privacy_status = yt.privacy_status
-        self._token_path = config._workdir / "youtube_token.json"
+        self._token_path = config.workdir / "youtube_token.json"
         self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
         self._refresh_lock = asyncio.Lock()
 
-    async def _get_credentials(self) -> Credentials:
+    async def _get_credentials(self, refresh: bool = False) -> Credentials:
+        """Return usable credentials, or raise.
+
+        The method returns the cached credentials while they are valid. With
+        ``refresh`` True it refreshes the token, even when the cached token
+        still looks valid. A caller sets that flag after the API rejects a
+        cached token.
+        """
         # Single-flight: hold the lock across load+refresh so concurrent starts
         # do not double-refresh the same expired token. to_thread keeps the
         # synchronous HTTPS refresh off the event loop that feeds the ffmpeg
         # pipes.
         async with self._refresh_lock:
-            if self._credentials and self._credentials.valid:
+            if not refresh and self._credentials and self._credentials.valid:
                 return self._credentials
 
             if not self._token_path.exists():
@@ -59,11 +66,11 @@ class YouTubeStreamer:
                 raise RuntimeError(msg)
             self._credentials = creds
 
-            if not creds.valid:
-                if creds.expired and creds.refresh_token:
+            if refresh or not creds.valid:
+                if (refresh or creds.expired) and creds.refresh_token:
                     await asyncio.to_thread(creds.refresh, Request())
                     self._save_token()
-                else:
+                elif not refresh:
                     msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
                     raise RuntimeError(msg)
 
@@ -83,6 +90,12 @@ class YouTubeStreamer:
         headers["Authorization"] = f"Bearer {creds.token}"
         url = f"{_API_BASE}/{path}"
         resp = await self._client.request(method, url, headers=headers, **kwargs)
+        if resp.status_code == 401:
+            # The API can reject a cached token that still looks valid, for
+            # example after a revocation. Force a refresh and retry once.
+            creds = await self._get_credentials(refresh=True)
+            headers["Authorization"] = f"Bearer {creds.token}"
+            resp = await self._client.request(method, url, headers=headers, **kwargs)
         if resp.status_code >= 400:
             logger.error("[youtube] Request failed (%d): %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
@@ -149,9 +162,18 @@ class YouTubeStreamer:
             logger.info("[youtube] Binding broadcast %s to stream %s", broadcast_id, stream_id)
             await self._request("POST", "liveBroadcasts/bind", params=params)
         except Exception:
+            if stream_id is not None:
+                try:
+                    # An unused live stream keeps counting against the
+                    # concurrent-stream quota, so remove it.
+                    await self._request("DELETE", "liveStreams", params={"id": stream_id})
+                except Exception as cleanup_err:
+                    logger.error("[youtube] Failed to clean up stream %s: %s", stream_id, cleanup_err)
             if broadcast_id is not None:
                 try:
-                    await self.end_stream(broadcast_id)
+                    # The broadcast never went live, so complete is not a
+                    # valid transition. Delete it instead.
+                    await self._request("DELETE", "liveBroadcasts", params={"id": broadcast_id})
                 except Exception as cleanup_err:
                     logger.error("[youtube] Failed to clean up broadcast %s: %s", broadcast_id, cleanup_err)
             raise

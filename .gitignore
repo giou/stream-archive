@@ -1,10 +1,18 @@
-config.json
-youtube_token.json
+# Runtime state of a checkout deployment. The app resolves these paths against
+# the config file (config.py _find_config), so anchor them at the repo root.
+# config.json.tmp and update_state.json.tmp are the atomic-write temp files.
+/config.json
+/config.json.tmp
+/update_state.json
+/update_state.json.tmp
+/youtube_token.json
+/cloudflared/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 dist/
+build/
 *.egg-info/
 *.pyc
 *.pyo
@@ -13,9 +21,14 @@ dist/
 recordings/
 chat/
 *:Zone.Identifier
-client_secret.json
+client_secret*.json
+credentials*.json
 .venv/
-update_state.json
-plugins/*.bak
+*.bak
 .env
-cloudflared/
+.env.*
+!.env.example
+.DS_Store
+*.log
+.coverage
+htmlcov/

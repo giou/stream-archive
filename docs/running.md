@@ -42,8 +42,10 @@ README.
 A host tailscale funnel forwards to the host loopback. The compose file
 publishes the listener on `127.0.0.1:8787`. Set `endpoint.listen_host` to
 `0.0.0.0` in the settings. Then the host tunnel reaches the container. The
-image ships `cloudflared` and the tailscale CLI. The app mounts the tailscaled
-socket from the host.
+image ships `cloudflared` and the tailscale CLI. The app mounts the host
+tailscale directory (`/var/run/tailscale`) into the container. Set
+`TAILSCALE_RUN_DIR` in `.env` when the host keeps its socket elsewhere. The
+mount is optional: the stack starts without Tailscale.
 
 ## One-time YouTube OAuth
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -7,6 +8,9 @@ import httpx
 from stream_archive.config import AppConfig
 
 logger = logging.getLogger(__name__)
+
+#: Twitch accepts at most 100 entries in a query filter such as login or user_id.
+_MAX_QUERY_ITEMS = 100
 
 
 class TwitchAPI:
@@ -20,8 +24,6 @@ class TwitchAPI:
         self._token_lock = asyncio.Lock()
 
     async def _get_token(self) -> str:
-        import time
-
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
@@ -44,7 +46,8 @@ class TwitchAPI:
                 data = resp.json()
                 self._token = data["access_token"]
                 self._token_expires_at = time.time() + data.get("expires_in", 3600)
-            except httpx.HTTPStatusError as e:
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                # Transport faults and a malformed body must reach the log.
                 logger.error("[twitch_api] Token request failed: %s", e)
                 raise
             else:
@@ -53,36 +56,54 @@ class TwitchAPI:
     async def resolve_user_ids(self, usernames: list[str]) -> dict[str, str]:
         if not usernames:
             return {}
+        resolved: dict[str, str] = {}
         try:
             token = await self._get_token()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Client-Id": self._client_id,
             }
-            params = {"login": usernames}
-            resp = await self.client.get("https://api.twitch.tv/helix/users", headers=headers, params=params)
-            resp.raise_for_status()
-            return {user["login"]: user["id"] for user in resp.json()["data"]}
+            # Twitch rejects more than 100 logins in one request.
+            for start in range(0, len(usernames), _MAX_QUERY_ITEMS):
+                chunk = usernames[start : start + _MAX_QUERY_ITEMS]
+                resp = await self.client.get(
+                    "https://api.twitch.tv/helix/users", headers=headers, params={"login": chunk}
+                )
+                resp.raise_for_status()
+                # Twitch answers with the canonical lowercase login. Key the
+                # result by the name that the caller passed, so a mixed-case
+                # configured channel still matches.
+                by_login = {user["login"]: user["id"] for user in resp.json()["data"]}
+                resolved.update({name: by_login[name.lower()] for name in chunk if name.lower() in by_login})
         except httpx.HTTPStatusError as e:
             logger.error("[twitch_api] resolve_user_ids failed: %s", e)
             raise
+        return resolved
 
     async def get_live_streams(self, user_ids: dict[str, str]) -> dict[str, Any]:
         if not user_ids:
             return {}
+        streams: dict[str, Any] = {}
         try:
             token = await self._get_token()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Client-Id": self._client_id,
             }
-            params = {"user_id": list(user_ids.values())}
-            resp = await self.client.get("https://api.twitch.tv/helix/streams", headers=headers, params=params)
-            resp.raise_for_status()
-            return {stream["user_id"]: stream for stream in resp.json()["data"]}
+            ids = list(user_ids.values())
+            # Twitch rejects more than 100 user_ids in one request.
+            for start in range(0, len(ids), _MAX_QUERY_ITEMS):
+                resp = await self.client.get(
+                    "https://api.twitch.tv/helix/streams",
+                    headers=headers,
+                    params={"user_id": ids[start : start + _MAX_QUERY_ITEMS]},
+                )
+                resp.raise_for_status()
+                streams.update({stream["user_id"]: stream for stream in resp.json()["data"]})
         except httpx.HTTPStatusError as e:
             logger.error("[twitch_api] get_live_streams failed: %s", e)
             raise
+        return streams
 
     async def _eventsub_headers(self) -> dict[str, str]:
         token = await self._get_token()
@@ -139,7 +160,9 @@ class TwitchAPI:
         """Create a subscription and return (status_code, body).
 
         The method does not raise for status on 202/400/403/409. Callers
-        handle those statuses.
+        handle those statuses. Every other failing status, for example 401,
+        429, or a 5xx, raises ``httpx.HTTPStatusError``, and the caller
+        must handle it.
         """
         headers = await self._eventsub_headers()
         resp = await self.client.post(
@@ -178,6 +201,12 @@ class TwitchAPI:
             cursor = body.get("pagination", {}).get("cursor")
             if not cursor:
                 break
+        if cursor:
+            # A caller uses this list to find an existing subscription.
+            logger.warning(
+                "[twitch_api] subscription list stopped at the 10-page cap (%d items): the list is partial",
+                len(data),
+            )
         return data
 
     async def get_stream(self, user_id: str) -> Any:

@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import copy
 import json
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -11,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from stream_archive.config import AppConfig
 from stream_archive.kick_api import KickAPI
-from stream_archive.kick_webhook import KickWebhook, _RateLimiter
+from stream_archive.kick_webhook import _VERIFY_WINDOW_S, KickWebhook, _RateLimiter
 
 
 def _fresh_ts():
@@ -109,7 +111,11 @@ def enabled_config(**overrides):
 
 
 def make_webhook(config=None, monitor=None, recorder=None, api=None, notifier=None):
-    raw = config or base_config()
+    # Validate a copy. The placeholder port below must not leak into the
+    # caller's dict, which other helpers hand to more than one webhook.
+    raw = copy.deepcopy(config) if isinstance(config, dict) else config
+    if raw is None:
+        raw = base_config()
     # base_config uses listen_port 0 for an ephemeral port so bind tests never
     # collide. The config model allows only ports 1-65535, so make_webhook
     # validates with a placeholder port and re-applies 0 afterwards.
@@ -634,18 +640,42 @@ def test_reconcile_creates_missing_subscriptions():
 
 def test_reconcile_deletes_stale_subscriptions():
     deletes = []
+    channel_data = {
+        "slug": "xqc",
+        "stream_title": None,
+        "category": None,
+        "stream": {"is_live": False},
+        "broadcaster_user_id": 123,
+    }
 
     def handler(request):
         if request.url.path == "/oauth/token":
             return token_response(request)
         if request.url.path == "/public/v1/channels":
-            return httpx.Response(200, json={"data": []})
+            # The monitored channel must resolve. An unresolved slug makes the
+            # reconcile skip the cleanup pass (fail safe).
+            return httpx.Response(200, json={"data": [channel_data]})
         if request.url.path == "/public/v1/events/subscriptions":
             if request.method == "GET":
                 return httpx.Response(
                     200,
                     json={
                         "data": [
+                            # The monitored broadcaster keeps both events, so the
+                            # reconcile creates nothing.
+                            {
+                                "id": "keep-1",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 123,
+                                "events": [{"name": "livestream.status.updated"}],
+                            },
+                            {
+                                "id": "keep-2",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 123,
+                                "events": [{"name": "chat.message.sent"}],
+                            },
+                            # A broadcaster nobody monitors: both rows must go.
                             {
                                 "id": "stale-1",
                                 "app_id": "cid",
@@ -676,7 +706,8 @@ def test_reconcile_deletes_stale_subscriptions():
     asyncio.run(scenario())
 
     assert deletes == [["stale-1", "stale-2"]]
-    assert wh._subs == {}
+    # The stale channel is gone, and the surviving ids of xqc are kept.
+    assert wh._subs == {"xqc": {"keep-1", "keep-2"}}
 
 
 def test_disabled_webhook_ignores_deliveries(keypair):
@@ -923,6 +954,48 @@ def test_future_timestamp_rejected_401(keypair):
     assert monitor.online == []
 
 
+@pytest.mark.parametrize(
+    "offset",
+    [
+        -_VERIFY_WINDOW_S - 1,
+        -_VERIFY_WINDOW_S,
+        -_VERIFY_WINDOW_S + 1,
+        _VERIFY_WINDOW_S - 1,
+        _VERIFY_WINDOW_S,
+        _VERIFY_WINDOW_S + 1,
+    ],
+)
+def test_timestamp_freshness_boundary(keypair, monkeypatch, offset):
+    """The window admits |now - event_time| <= _VERIFY_WINDOW_S and rejects the rest.
+
+    The clock is frozen, so the boundary is exact. A live clock advances
+    between the request and the check and makes the boundary cases flaky.
+    """
+    private_key, public_pem = keypair
+    fixed_now = 1_700_000_000.0
+    monkeypatch.setattr(
+        "stream_archive.kick_webhook.time",
+        SimpleNamespace(time=lambda: fixed_now, monotonic=time.monotonic),
+    )
+    monitor = FakeMonitor()
+    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
+    body = live_event(is_live=True)
+    timestamp = str(int(fixed_now) + offset)
+    expected = 200 if abs(offset) <= _VERIFY_WINDOW_S else 401
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", timestamp, body, wh.EVENT_LIVE),
+            )
+            assert resp.status == expected
+
+    asyncio.run(scenario())
+    assert len(monitor.online) == (1 if expected == 200 else 0)
+
+
 def test_unparseable_timestamp_rejected_401(keypair):
     private_key, public_pem = keypair
     wh = make_webhook(api=FakeKickAPI(public_pem))
@@ -1010,8 +1083,10 @@ def test_rate_limit_returns_429(keypair):
             for _ in range(4):
                 resp = await client.post("/kick/webhook", data=b"{}")
                 statuses.append(resp.status)
-            # The bucket starts full, so max=2 admits a burst of 2. Refill
-            # drift lets the 3rd request through, and the 4th is blocked.
+            # The first request for an unseen key opens the bucket without
+            # charging a token (see _RateLimiter.allow), so the capacity-2
+            # bucket admits that request plus the next two, and the 4th is
+            # over budget.
             assert statuses == [401, 401, 401, 429]
 
     asyncio.run(scenario())

@@ -29,10 +29,23 @@ def base_config():
     }
 
 
-def make_api(handler):
-    api = KickAPI(AppConfig.model_validate(base_config()))
+_apis: list[KickAPI] = []
+
+
+def make_api(handler, config=None):
+    api = KickAPI(AppConfig.model_validate(config or base_config()))
     api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"User-Agent": _USER_AGENT})
+    _apis.append(api)
     return api
+
+
+@pytest.fixture(autouse=True)
+def _close_api_clients():
+    """Close every client the tests built. KickAPI.close() owns them."""
+    yield
+    for api in _apis:
+        asyncio.run(api.close())
+    _apis.clear()
 
 
 def token_handler(request):
@@ -63,6 +76,28 @@ def test_token_fetched_and_cached():
 
     asyncio.run(scenario())
     assert calls["tokens"] == 1
+
+
+def test_token_refetched_when_inside_the_expiry_skew():
+    """A token that expires inside the 60 s skew is stale at once."""
+    calls = {"tokens": 0}
+
+    def handler(request):
+        if request.url.path == "/oauth/token":
+            calls["tokens"] += 1
+            expires_in = 30 if calls["tokens"] == 1 else 3600
+            return httpx.Response(200, json={"access_token": f"tok-{calls['tokens']}", "expires_in": expires_in})
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+
+    async def scenario():
+        assert await api._get_token() == "tok-1"
+        assert await api._get_token() == "tok-2"  # the short-lived token is replaced
+        assert await api._get_token() == "tok-2"  # the fresh token is cached
+
+    asyncio.run(scenario())
+    assert calls["tokens"] == 2
 
 
 def test_get_channel_statuses_maps_live_offline_unknown():
@@ -147,6 +182,7 @@ def test_get_public_key_cached():
     def handler(request):
         if request.url.path == "/oauth/token":
             return token_handler(request)
+        assert request.url.path == "/public/v1/public-key"
         calls["n"] += 1
         # live API nests the PEM under data.public_key
         return httpx.Response(200, json={"data": {"public_key": pem}})
@@ -198,8 +234,7 @@ def test_list_event_subscriptions_without_client_id_returns_empty():
 
     config = base_config()
     del config["kick"]["client_id"]  # no client_id
-    api = KickAPI(AppConfig.model_validate(config))
-    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = make_api(handler, config)
 
     assert asyncio.run(api.list_event_subscriptions()) == []
 
@@ -385,6 +420,7 @@ def test_get_public_key_keeps_cache_on_malformed_response():
     def handler(request):
         if request.url.path == "/oauth/token":
             return token_handler(request)
+        assert request.url.path == "/public/v1/public-key"
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(200, json={"data": {"public_key": pem}})

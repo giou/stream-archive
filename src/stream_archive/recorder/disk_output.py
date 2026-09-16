@@ -47,36 +47,51 @@ class DiskOutputMixin:
         logger.info("[recorder] [disk] %s -> %s", channel, filepath)
         loop = asyncio.get_running_loop()
         fd: Any = None
+        f: Any = None
         try:
             fd = await loop.run_in_executor(None, stream.open)
-            with open(filepath, "wb") as f:
-                while True:
-                    data = await loop.run_in_executor(None, fd.read, 65536)
-                    if not data:
-                        break
-                    f.write(data)
+            # The archive volume can be slow or network-backed. Open and
+            # write on the executor, like the reads, so the event loop keeps
+            # running.
+            f = await loop.run_in_executor(None, open, filepath, "wb")
+            while True:
+                data = await loop.run_in_executor(None, fd.read, 65536)
+                if not data:
+                    break
+                await loop.run_in_executor(None, f.write, data)
+            # Close inside the try, on the executor, before the "finished"
+            # log. A failed final flush then reaches the handler below, which
+            # logs and re-raises it, so the recording counts as failed.
+            await loop.run_in_executor(None, f.close)
+            f = None
             logger.info("[recorder] [disk] %s finished", channel)
         except asyncio.CancelledError:
             logger.info("[recorder] [disk] %s cancelled", channel)
+            raise
         except Exception as e:
             logger.error("[recorder] [disk] %s error: %s", channel, e)
             raise
         finally:
+            # Safety net for the error paths. The success path closes f
+            # inside the try.
+            if f is not None:
+                try:
+                    f.close()
+                except OSError as e:
+                    logger.error("[recorder] [disk] %s close failed: %s", channel, e)
             with contextlib.suppress(Exception):
                 fd.close()
 
     async def _read_ffmpeg_stderr(self, channel: str, process: Any) -> None:
         if process.stderr is None:
             return
-        try:
-            async for line in process.stderr:
-                text = line.decode(errors="replace").strip()
-                if text and "Resumed reading" not in text:
-                    # ffmpeg can echo the output URL, which holds the
-                    # YouTube stream key.
-                    logger.info("[recorder] [ffmpeg:%s] %s", channel, _redact_credentials(text))
-        except asyncio.CancelledError:
-            pass
+        # Let a cancellation propagate to the awaiter.
+        async for line in process.stderr:
+            text = line.decode(errors="replace").strip()
+            if text and "Resumed reading" not in text:
+                # ffmpeg can echo the output URL, which holds the
+                # YouTube stream key.
+                logger.info("[recorder] [ffmpeg:%s] %s", channel, _redact_credentials(text))
 
     async def _watch_growth(self, channel: str) -> None:
         try:
@@ -130,15 +145,14 @@ class DiskOutputMixin:
 
         The candidates are the recordings and the chat files. A live capture
         (recording file, chat file, or in-progress chat `.tmp` file) is never
-        a candidate. Returns (files_removed, freed_gb).
+        a candidate. Returns (files_removed, freed_bytes).
         """
         cap = self._config.disk.max_total_gb
         if cap <= 0:
             return (0, 0)
         loop = asyncio.get_running_loop()
-        active = self._active_paths()
 
-        def _delete_oldest() -> tuple[int, int]:
+        def _scan() -> list[tuple[float, int, Path]]:
             base = disk.resolve_recording_dir(self._config)
             chat_base = disk.chat_dir_path(self._config)
             stats = []
@@ -149,22 +163,31 @@ class DiskOutputMixin:
                     continue  # retention cleanup can race us mid-scan
                 stats.append((st.st_mtime, st.st_size, path))
             stats.sort(key=lambda t: t[0])
-            total = sum(size for _, size, _ in stats)
-            cap_bytes = int(cap * 1024**3)
-            removed = freed = 0
-            for _, size, path in stats:
-                if total < cap_bytes:
-                    break
-                if os.path.realpath(path) in active:
-                    continue
-                path.unlink(missing_ok=True)
-                total -= size
-                removed += 1
-                freed += size
-                logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, path)
-            return removed, freed
+            return stats
 
-        return await loop.run_in_executor(None, _delete_oldest)
+        stats = await loop.run_in_executor(None, _scan)
+        # A capture can start while the scan runs in the worker thread. The
+        # loop thread starts every capture, so the active set read here stays
+        # valid for the deletion pass below.
+        active = self._active_paths()
+        total = sum(size for _, size, _ in stats)
+        cap_bytes = int(cap * 1024**3)
+        removed = freed = 0
+        for _, size, path in stats:
+            if total < cap_bytes:
+                break
+            if os.path.realpath(path) in active:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("[recorder] Failed to delete %s: %s", path, e)
+                continue
+            total -= size
+            removed += 1
+            freed += size
+            logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, path)
+        return (removed, freed)
 
     async def cleanup_old_recordings(self, retention_days: float) -> int:
         """Delete recordings and chat files older than retention_days days.
@@ -180,17 +203,10 @@ class DiskOutputMixin:
             return 0
         cutoff = time.time() - retention_days * 86400
         loop = asyncio.get_running_loop()
-        # A stalled feed can sit past retention_days while still writing.
-        # Never unlink that in-flight file. Its fd stays open, and removal
-        # would cut off the live capture mid-write. The same rule covers the
-        # chat files and their in-progress `.tmp` files.
-        active = self._active_paths()
 
         def _scan() -> list[Path]:
             found: list[Path] = []
             for path in _archive_files(base, chat_base):
-                if os.path.realpath(path) in active:
-                    continue
                 try:
                     if path.stat().st_mtime < cutoff:
                         found.append(path)
@@ -200,8 +216,22 @@ class DiskOutputMixin:
 
         removed = 0
         try:
-            for path in await loop.run_in_executor(None, _scan):
-                path.unlink(missing_ok=True)
+            expired = await loop.run_in_executor(None, _scan)
+            # A stalled feed can sit past retention_days while still writing.
+            # Never unlink that in-flight file. Its fd stays open, and removal
+            # would cut off the live capture mid-write. The same rule covers
+            # the chat files and their in-progress `.tmp` files. Read the
+            # active set here, because a capture can start while the scan
+            # runs in the worker thread.
+            active = self._active_paths()
+            for path in expired:
+                if os.path.realpath(path) in active:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning("[recorder] Failed to delete %s: %s", path, e)
+                    continue
                 removed += 1
                 logger.info("[recorder] Removed expired recording: %s", path)
         except OSError as e:

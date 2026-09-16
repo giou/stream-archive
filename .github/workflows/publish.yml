@@ -2,17 +2,29 @@ name: publish
 on:
   push:
     tags: ["v*"]
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+# Only the release job writes. The test job runs third-party install scripts,
+# so it stays read-only.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
+          # Same uv version as the image build (Dockerfile uv stage).
+          version: "0.12.13"
           python-version: "3.14"
+          enable-cache: true
+          # The cache key tracks the lockfile and the project metadata.
+          cache-dependency-glob: |
+            uv.lock
+            pyproject.toml
       - name: Install ffmpeg (runtime dep; hold/reuse tests spawn it)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: uv sync --frozen
@@ -23,11 +35,18 @@ jobs:
   release:
     needs: [test]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v7
       - name: Assert tag matches pyproject version
         run: |
-          V=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          V=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ -z "$V" ]; then
+            echo "cannot read project.version from pyproject.toml" >&2; exit 1
+          fi
           if [ "v$V" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} != v$V" >&2; exit 1
           fi
@@ -48,6 +67,9 @@ jobs:
             echo "cannot resolve the streamlink-ttvlol tag; the build resolves latest" >&2
             TAG=latest
           fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9A-Za-z._-]+$'; then
+            echo "unexpected streamlink-ttvlol tag: $TAG" >&2; exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v7
         with:
@@ -56,9 +78,11 @@ jobs:
           push: true
           build-args: |
             TTVLOL_PLUGIN_VERSION=${{ steps.ttvlol.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/giou/stream-archive:${{ github.ref_name }}
-            ghcr.io/giou/stream-archive:latest
+            ${{ !contains(github.ref_name, '-') && 'ghcr.io/giou/stream-archive:latest' || '' }}
       - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true

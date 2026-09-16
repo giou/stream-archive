@@ -26,6 +26,9 @@ def _no_network_emote_embed(monkeypatch):
         return None
 
     monkeypatch.setattr("stream_archive.recorder.chat_output.embedded_data", noop)
+    # Clear the shared instance list before every test, so no test sees the
+    # recorders of an earlier one.
+    FakeChatRecorder.instances.clear()
 
 
 def make_config(tmp_path):
@@ -114,12 +117,12 @@ class FakeNotifier:
         pass
 
 
-def testsanitize_filename_replaces_illegal_chars():
+def test_sanitize_filename_replaces_illegal_chars():
     name = 'a<b>c:d"e/f\\g|h?i*j'
     assert sanitize_filename(name) == "a_b_c_d_e_f_g_h_i_j"
 
 
-def testsanitize_filename_truncates_to_200():
+def test_sanitize_filename_truncates_to_200():
     name = "x" * 249 + "/"
     result = sanitize_filename(name)
     assert len(result) == 200
@@ -633,6 +636,7 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
         await asyncio.sleep(0.05)
         assert rec.is_recording("ch")
         assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
+        await rec.stop("ch")
 
     asyncio.run(scenario())
 
@@ -644,7 +648,6 @@ def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -672,7 +675,6 @@ def test_start_chat_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -690,7 +692,6 @@ def test_recording_failure_stops_chat(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -709,7 +710,6 @@ def test_stop_chat_stops_only_chat(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -743,7 +743,6 @@ def test_stop_chat_platform_kick_keeps_twitch_irc(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -788,7 +787,6 @@ def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("ch1") is True
@@ -1358,7 +1356,7 @@ def test_resolve_stream_kick_uses_plugin_directly(tmp_path, monkeypatch):
     assert game == "Game"
 
     # Without plugin metadata, the bare slug is the author fallback.
-    CapturingFakePlugin.author = None
+    monkeypatch.setattr(CapturingFakePlugin, "author", None)
     best, author, title, game = rec._resolve_stream("kick:xqc", None, None)
     assert author == "xqc"
 
@@ -1371,7 +1369,6 @@ def test_start_twitch_prefixed_uses_twitch_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("twitch:streamer1") is True
@@ -1392,7 +1389,6 @@ def test_start_kick_uses_kick_dir_and_chat(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
-    FakeChatRecorder.instances.clear()
 
     async def scenario():
         assert await rec.start("kick:xqc") is True

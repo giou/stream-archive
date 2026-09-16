@@ -72,6 +72,10 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
             return None
         pending_key = (chat_id, parts[1])
         ctrl._pending_audio_switch.pop(pending_key, None)  # a later confirm press is harmless
+        # The caller drops the inline keyboard after a cancel, so the
+        # Apply-now button of the same nonce is gone. Do not keep its entry.
+        ctrl._pending_apply.pop(pending_key, None)
+        ctrl._apply_warnings_sent.discard(pending_key)
         ctrl._confirm_done.add((chat_id, data))
         return "Cancelled \u2014 nothing changed", None
     if action == "confirm_remove" and len(parts) >= 3:
@@ -176,7 +180,11 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
             await ctrl._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
             ctrl._apply_warnings_sent.add(key)
         except Exception:
-            logger.warning("[telegram] Failed to send apply-now warning", exc_info=True)
+            # The entry stays pending, so every later trigger retries this
+            # send. Log the chat and the nonce to keep the repeat diagnosable.
+            logger.warning(
+                "[telegram] Failed to send apply-now warning to chat %s (nonce %s)", chat_id, nonce, exc_info=True
+            )
     for key in list(ctrl._pending_audio_switch):
         if key in ctrl._apply_warnings_sent:
             continue
@@ -198,4 +206,6 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
             await ctrl._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
             ctrl._apply_warnings_sent.add(key)
         except Exception:
-            logger.warning("[telegram] Failed to send audio-only warning", exc_info=True)
+            logger.warning(
+                "[telegram] Failed to send audio-only warning to chat %s (nonce %s)", chat_id, nonce, exc_info=True
+            )

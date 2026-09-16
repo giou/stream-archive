@@ -48,6 +48,8 @@ class SettingsCommands:
     # Maps a (chat id, nonce) pair to its quality mutation and the affected channels.
     # The admin must confirm before the change applies.
     _pending_audio_switch: dict[PendingKey, AudioSwitch]
+    # ChatStateMixin drops the oldest pending prompt past its limit.
+    _prune_pending: Any
 
     def handle_retention(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
@@ -99,7 +101,7 @@ class SettingsCommands:
             return "Usage: /channelhold <channel> <seconds|default>"
         ch = normalize_channel_name(args[0])
         if ch is None:
-            return f"\u274c Invalid channel name: {ch!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+            return f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
         if args[1] == "default":
 
             def mutate(candidate: AppConfig) -> None:
@@ -157,6 +159,7 @@ class SettingsCommands:
         nonce = secrets.token_hex(4)
         chat = chat_id if chat_id is not None else self._admin_id
         self._pending_audio_switch[(chat, nonce)] = (mutate, conflicts)
+        self._prune_pending(self._pending_audio_switch, chat)
         return f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(conflicts)}"
 
     def handle_quality(self, args: list[str], chat_id: int | None = None) -> str:
@@ -169,7 +172,7 @@ class SettingsCommands:
                 )
             return text
         if len(args) == 1:
-            q = args[0]
+            q = args[0].lower()
 
             def mutate(candidate: AppConfig) -> None:
                 candidate.preferred_quality = q

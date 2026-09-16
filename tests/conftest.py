@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import httpx
-
 from stream_archive.config import AppConfig
 
 
@@ -49,12 +47,17 @@ class FakeTwitchAPI:
 
     async def resolve_user_ids(self, channels: list[str]) -> dict[str, str]:
         self.resolve_calls.append(list(channels))
-        return self.user_ids or {c: c for c in channels}
+        if self.user_ids is None:
+            return {c: c for c in channels}
+        return dict(self.user_ids)
 
     async def get_live_streams(self, user_ids: Mapping[str, str]) -> dict[str, Any]:
         if self.error:
             raise self.error
-        return dict(self.streams or {})
+        streams = self.streams or {}
+        # user_ids maps channel login -> Twitch user id, and the streams are
+        # keyed by user id, as the real API returns them.
+        return {uid: s for uid, s in streams.items() if uid in user_ids.values()}
 
     async def get_stream(self, user_id: str) -> Any:
         streams = self.streams or {}
@@ -82,13 +85,8 @@ class FakeKickAPI:
             raise self.error
         return dict(self.statuses or {})
 
-    async def get_public_key(self) -> str:
-        return self.public_key or "test-public-key"
+    async def get_public_key(self, force: bool = False) -> str | None:
+        return self.public_key
 
     async def aclose(self) -> None:
         return None
-
-
-def make_mock_http_client(handler: Any) -> httpx.AsyncClient:
-    """Build an AsyncClient backed by an in-memory MockTransport."""
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))

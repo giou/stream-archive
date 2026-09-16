@@ -1,5 +1,5 @@
 import asyncio
-import time
+import threading
 from types import SimpleNamespace
 
 from stream_archive.config import AppConfig
@@ -33,11 +33,12 @@ class FakeCreds:
         self.expired = True
         self.refresh_token = "rt"
         self.refresh_calls = 0
+        self.refresh_thread = None
 
     def refresh(self, request):
         # Synchronous network stand-in. The streamer calls it through
-        # asyncio.to_thread.
-        time.sleep(0.05)
+        # asyncio.to_thread, so the call lands on a worker thread.
+        self.refresh_thread = threading.get_ident()
         self.refresh_calls += 1
         self.valid = True
         self.expired = False
@@ -72,21 +73,15 @@ def test_refresh_is_single_flight_and_offloop(tmp_path, monkeypatch):
         SimpleNamespace(from_authorized_user_info=lambda data, scopes: fake),
     )
     streamer = make_streamer(tmp_path)
+    caller_thread = threading.get_ident()
 
     async def scenario():
-        ticks = 0
-        done = asyncio.Event()
-
-        async def tick():
-            nonlocal ticks
-            while not done.is_set():
-                await asyncio.sleep(0.01)
-                ticks += 1
-
-        ticker = asyncio.create_task(tick())
+        # Three concurrent callers must share one refresh, and the refresh
+        # must not run on the event loop thread.
         results = await asyncio.gather(*[streamer._get_credentials() for _ in range(3)])
-        done.set()
-        await ticker
-
         assert all(r is fake for r in results)
-        assert ticks >= 2  # event loop stayed responsive while refresh ran in a thread
+
+    asyncio.run(scenario())
+
+    assert fake.refresh_calls == 1
+    assert fake.refresh_thread != caller_thread

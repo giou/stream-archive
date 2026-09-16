@@ -26,8 +26,8 @@ def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> lis
     for ln in lines:
         total += len(ln) + 1
         if total > limit:
-            if out:
-                out.append("…")
+            # Mark the cut even when the first line alone is too long.
+            out.append("…")
             break
         out.append(ln)
     return out
@@ -141,10 +141,10 @@ class UpdateChecker:
         lines: list[str] = []
         async with self._lock:
             self._load_state()
-            # Record every version that the check observed. Thus a version
+            # Record every version that the check resolved. Thus a version
             # that comes back later (for example after a rollback) notifies
-            # again.
-            if latest is not None and self._state.get("app") != latest:
+            # again. An inconclusive check must not consume the release.
+            if latest is not None and data["status"] != "unknown" and self._state.get("app") != latest:
                 if data["status"] == "update":
                     lines.append(f"• stream-archive: v{data['current']} → v{latest}")
                     cl = data.get("changelog") or []

@@ -18,7 +18,7 @@ def _resolve_dir(config: AppConfig, raw: str) -> Path:
     """
     d = Path(raw)
     if not d.is_absolute():
-        d = config._workdir / d
+        d = config.workdir / d
     return d
 
 
@@ -42,6 +42,20 @@ _RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a", "*.jsonl")
 #: Chat files, plus the in-progress `.tmp` files of the streaming writer.
 _CHAT_PATTERNS = ("*.chat.json", "*.chat.json.tmp")
 
+#: File suffixes of the pattern tuples above, for the single-pass scans.
+_RECORDING_SUFFIXES = tuple(pattern[1:] for pattern in _RECORDING_PATTERNS)
+_CHAT_SUFFIXES = tuple(pattern[1:] for pattern in _CHAT_PATTERNS)
+
+
+def _iter_suffixed(base: Path, suffixes: tuple[str, ...]) -> Iterator[Path]:
+    """Yield every file under base whose name ends with one of the suffixes.
+
+    One walk covers every suffix, so the archive is read once per scan.
+    """
+    for path in base.rglob("*"):
+        if path.name.endswith(suffixes) and path.is_file():
+            yield path
+
 
 def iter_recordings(base: Path) -> Iterator[Path]:
     """Yield every recording artifact under base.
@@ -50,8 +64,7 @@ def iter_recordings(base: Path) -> Iterator[Path]:
     and sidecar segment logs (.jsonl). Chat files (.chat.json) are not
     recording artifacts and stay with the chat cleanup pass.
     """
-    for pattern in _RECORDING_PATTERNS:
-        yield from base.rglob(pattern)
+    yield from _iter_suffixed(base, _RECORDING_SUFFIXES)
 
 
 def iter_chat_files(base: Path) -> Iterator[Path]:
@@ -60,8 +73,7 @@ def iter_chat_files(base: Path) -> Iterator[Path]:
     The writer creates `<name>.chat.json.tmp` at capture start and renames it
     to `<name>.chat.json` at stop, so both patterns are chat artifacts.
     """
-    for pattern in _CHAT_PATTERNS:
-        yield from base.rglob(pattern)
+    yield from _iter_suffixed(base, _CHAT_SUFFIXES)
 
 
 async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
@@ -75,8 +87,15 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     base = resolve_recording_dir(config)
     chat_base = chat_dir_path(config)
-    fs_dir = base if base.exists() else base.parent  # missing dir: report parent fs
-    usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
+    fs_dir = base
+    while not fs_dir.exists() and fs_dir != fs_dir.parent:
+        fs_dir = fs_dir.parent  # missing dir: report the nearest existing ancestor
+    usage = None
+    try:
+        usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
+    except OSError:
+        # An unmounted archive must not break the monitor or the recorder.
+        logger.warning("[disk] disk_usage(%s) failed", fs_dir, exc_info=True)
     dir_bytes, count = 0, 0
     if base.exists():
 
@@ -87,6 +106,7 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
                     total += p.stat().st_size
                     n += 1
                 except OSError:
+                    logger.debug("[disk] stat failed for %s", p, exc_info=True)
                     continue
             return total, n
 
@@ -101,15 +121,17 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
                     total += p.stat().st_size
                     n += 1
                 except OSError:
+                    logger.debug("[disk] stat failed for %s", p, exc_info=True)
                     continue
             return total, n
 
         chat_bytes, chat_count = await loop.run_in_executor(None, _scan_chat)
     return {
         "dir": str(base),
-        "free_gb": round(usage.free / 1024**3, 2),
-        "total_fs_gb": round(usage.total / 1024**3, 2),
-        "used_fs_gb": round(usage.used / 1024**3, 2),
+        # Unknown free space reports 0, so the callers never divide by None.
+        "free_gb": round(usage.free / 1024**3, 2) if usage else 0.0,
+        "total_fs_gb": round(usage.total / 1024**3, 2) if usage else 0.0,
+        "used_fs_gb": round(usage.used / 1024**3, 2) if usage else 0.0,
         "dir_gb": round(dir_bytes / 1024**3, 2),
         "file_count": count,
         "chat_gb": round(chat_bytes / 1024**3, 2),

@@ -1,6 +1,6 @@
 import asyncio
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 
 from stream_archive import scheduler as scheduler_module
 from stream_archive.scheduler import _HEALTH_HOST, _HEALTH_PORT, _start_health_server
@@ -16,8 +16,13 @@ def test_healthz_serves_ok():
         runner = await _start_health_server(port=0)  # ephemeral port: immune to collisions
         assert runner is not None
         try:
+            assert runner.addresses, "health server exposes no bound address"
             host, port = runner.addresses[0][:2]
-            async with ClientSession() as session, session.get(f"http://{host}:{port}/healthz") as resp:
+            # A short timeout fails the test fast when the server never answers.
+            async with (
+                ClientSession(timeout=ClientTimeout(total=5)) as session,
+                session.get(f"http://{host}:{port}/healthz") as resp,
+            ):
                 assert resp.status == 200
                 assert await resp.text() == "ok"
         finally:
@@ -34,8 +39,9 @@ def test_readyz_flips_with_ready_flag():
             runner = await _start_health_server(port=0)
             assert runner is not None
             try:
+                assert runner.addresses, "health server exposes no bound address"
                 host, port = runner.addresses[0][:2]
-                async with ClientSession() as session:
+                async with ClientSession(timeout=ClientTimeout(total=5)) as session:
                     async with session.get(f"http://{host}:{port}/readyz") as resp:
                         assert resp.status == 503
                     scheduler_module._READY = True
@@ -57,9 +63,17 @@ def test_health_bind_failure_returns_none(caplog):
 
     async def scenario():
         blocker = await _start_health_server(port=0)
+        assert blocker is not None
         try:
+            assert blocker.addresses, "health server exposes no bound address"
             occupied = blocker.addresses[0][1]
-            assert await _start_health_server(port=occupied) is None
+            second = await _start_health_server(port=occupied)
+            try:
+                assert second is None
+            finally:
+                # A failed test must not leave a second listener running.
+                if second is not None:
+                    await second.cleanup()
         finally:
             await blocker.cleanup()
 

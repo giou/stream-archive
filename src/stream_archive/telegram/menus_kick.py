@@ -48,7 +48,7 @@ async def menu_kick_webhook(ctrl: TelegramController, chat_id: ChatId, text: str
 async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the Cloudflare tunnel pick: the toggle, own URL, quick, or named."""
     state = ctrl._state_for(chat_id)
-    if re.match(r"^https?://", text):  # own tunnel already running
+    if re.match(r"(?i)https?://", text):  # own tunnel already running
         return await ctrl._apply_cloudflare_url(text, chat_id=chat_id)
     if text == "Enable Cloudflare tunnel":
         return (
@@ -65,6 +65,11 @@ async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: 
         if url is None:
             return f"\u274c {hint}", ctrl.reply_keyboard("kick_cloudflare")
         result = await ctrl._apply_endpoint_state(True, url, "cloudflare", cloudflare_managed=True, chat_id=chat_id)
+        if result.startswith("\u274c"):
+            # The apply failed, so the endpoint stays off. Stop the process
+            # and do not claim that the quick tunnel is running.
+            ctrl._cloudflared_stop()
+            return result, ctrl.reply_keyboard("kick_cloudflare")
         state.menu = "kick_cloudflare"
         note = await ctrl._reachability_note(url, "cloudflare")
         return (

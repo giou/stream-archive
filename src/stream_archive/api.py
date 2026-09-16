@@ -18,6 +18,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import secrets
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -57,6 +58,10 @@ _CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds")
 
 #: Output modes, plus 'default' to clear a per-channel override.
 _OUTPUT_MODES = ("disk", "youtube", "both", "default")
+
+#: Output modes for the global setting. 'default' clears a per-channel
+#: override, so it has no meaning here.
+_GLOBAL_OUTPUT_MODES = ("disk", "youtube", "both")
 
 
 class _ApiError(Exception):
@@ -160,6 +165,18 @@ def _mode(value: Any) -> str:
     return value.lower()
 
 
+def _global_mode(value: Any) -> str:
+    """Validated output mode for every channel without an override.
+
+    The word ``default`` clears a per-channel override. It has no meaning
+    as the global mode, so this method rejects it.
+    """
+    if not isinstance(value, str) or value.lower() not in _GLOBAL_OUTPUT_MODES:
+        msg = "output_mode must be one of disk, youtube, both"
+        raise _ApiError(400, msg)
+    return value.lower()
+
+
 def _quality(value: Any) -> str:
     """Validated quality string, or 'default' to clear a per-channel override."""
     if not isinstance(value, str) or not value.strip():
@@ -185,7 +202,15 @@ def _hold_seconds(value: Any) -> str:
     """Validated YouTube hold delay: a whole number of seconds, or 'default'."""
     if isinstance(value, str) and value.strip().lower() == "default":
         return "default"
-    if isinstance(value, bool) or not isinstance(value, int | float) or value < 0 or int(value) != value:
+    # JSON accepts NaN and Infinity, and int() raises on both. Reject them here,
+    # so the client gets a 400 instead of a 500.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or (isinstance(value, float) and not math.isfinite(value))
+        or value < 0
+        or int(value) != value
+    ):
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0, or 'default'"
         raise _ApiError(400, msg)
     return str(int(value))
@@ -333,7 +358,7 @@ class ControlAPI:
         """Apply one global setting through its Telegram command."""
         ctrl = self._ctrl
         if key == "output_mode":
-            return await self._run(ctrl.handle_mode, [_mode(value)])
+            return await self._run(ctrl.handle_mode, [_global_mode(value)])
         if key == "preferred_quality":
             return await self._run(ctrl.handle_quality, [_global_quality(value)])
         if key == "retention_days":

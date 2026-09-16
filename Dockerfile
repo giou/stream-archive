@@ -22,9 +22,13 @@ FROM python:3.14.7-slim
 # the official pkgs.tailscale.com repo with install.sh. The Alpine base was
 # considered and rejected because Tailscale publishes no official Alpine
 # packages (install.sh falls back to the community-maintained apk there).
+# install.sh goes to a file first. A plain `curl ... | sh` reports the status
+# of sh, so a failed or empty download would build an image without the CLI.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg tzdata ca-certificates curl \
- && curl -fsSL https://tailscale.com/install.sh | sh \
+ && curl -fsSL -o /tmp/tailscale-install.sh https://tailscale.com/install.sh \
+ && sh /tmp/tailscale-install.sh \
+ && rm -f /tmp/tailscale-install.sh \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
@@ -33,11 +37,14 @@ COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 
 # twitch.py plugin (2bc4/streamlink-ttvlol). The build fetches the release in
-# TTVLOL_PLUGIN_VERSION. The default "latest" resolves at build time, so a
-# rebuilt image contains the newest plugin release. The publish workflow
-# passes the resolved tag. That tag also keys the layer cache: a new plugin
-# release fetches the file again, and an unchanged release keeps the cached
-# copy.
+# TTVLOL_PLUGIN_VERSION. The default "latest" points at the newest release, but
+# it does not change the RUN command text, so a rebuilt image keeps the cached
+# layer and the old plugin copy in it. The publish workflow passes the resolved
+# tag, which changes the command text and with it the layer cache key. Use
+# --no-cache, or --build-arg TTVLOL_PLUGIN_VERSION=<tag>, to fetch the current
+# release by hand.
+# The file is fetched without a checksum on purpose (the release asset is
+# mutable). The syntax check rejects a truncated file or an HTML error page.
 ARG TTVLOL_PLUGIN_VERSION=latest
 RUN mkdir -p /app/plugins \
  && if [ "${TTVLOL_PLUGIN_VERSION}" = "latest" ]; then \
@@ -45,7 +52,8 @@ RUN mkdir -p /app/plugins \
     else \
       URL="https://github.com/2bc4/streamlink-ttvlol/releases/download/${TTVLOL_PLUGIN_VERSION}/twitch.py"; \
     fi \
- && curl -fsSL "$URL" -o /app/plugins/twitch.py
+ && curl -fsSL "$URL" -o /app/plugins/twitch.py \
+ && python -c "import ast; ast.parse(open('/app/plugins/twitch.py').read())"
 
 # Two-stage dependency install so source edits do not invalidate the dep layer.
 # Stage 1 resolves and installs third-party deps only. Build caches it until
@@ -76,7 +84,9 @@ ENV HOME=/tmp
 
 # Entrypoint adopts the data-dir owner's uid/gid (entrypoint.sh) so compose
 # deployments work on hosts whose user's uid/gid is not 1000. The container
-# starts as root and immediately drops to that identity. setpriv comes from
+# starts as root and immediately drops to that identity. A data dir owned by
+# root resolves uid 0; the entrypoint then warns on stderr and keeps root,
+# because a chown of existing data is a host decision. setpriv comes from
 # util-linux, which is essential in the slim base image.
 COPY entrypoint.sh /usr/local/bin/stream-archive-entrypoint
 RUN chmod +x /usr/local/bin/stream-archive-entrypoint
@@ -88,6 +98,9 @@ ENTRYPOINT ["stream-archive-entrypoint"]
 CMD ["stream-archive"]
 
 # Liveness for the hung-process case. The scheduler serves /healthz on the
-# loopback interface (scheduler.py _start_health_server). Compose inherits
-# this healthcheck automatically. Do not duplicate it in docker-compose.yml.
+# loopback interface (scheduler.py _start_health_server, constant
+# _HEALTH_PORT). Keep 9100 in step with that constant. Compose inherits this
+# healthcheck automatically. Do not duplicate it in docker-compose.yml. The
+# check also runs for an overridden CMD, so a one-shot setup run reports
+# "unhealthy" after it exits. Pass --no-healthcheck to skip it.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4)"]

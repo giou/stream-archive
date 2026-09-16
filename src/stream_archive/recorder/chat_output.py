@@ -37,10 +37,7 @@ class ChatOutputMixin:
         if platform in (None, "twitch"):
             chat_recorder = entry.pop("chat_recorder", None)
             if chat_recorder:
-                try:
-                    await chat_recorder.stop()
-                except Exception as e:
-                    logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+                await self._finalize_chat(channel, chat_recorder)
         if platform in (None, "kick"):
             await self._finalize_kick_chat(entry)
 
@@ -76,16 +73,21 @@ class ChatOutputMixin:
 
         The method skips entries without messages. The output file is
         TwitchDownloader ChatRoot JSON with embedded emote images (see
-        kick_chat.embedded_data).
+        kick_chat.embedded_data). The state stays in the entry until the
+        trailer is written, so a message that arrives during the emote fetch
+        still lands in the file. The finalizing flag blocks a second run.
         """
-        state = entry.pop("kick_chat", None)
-        if state is None:
+        state = entry.get("kick_chat")
+        if state is None or state.get("finalizing"):
             return
+        # Set the flag before the first await. A second finalize call for the
+        # same entry then returns instead of writing the trailer twice.
+        state["finalizing"] = True
         writer = state["writer"]
-        if writer.comments == 0:
-            writer.discard()
-            return
         try:
+            if writer.comments == 0:
+                writer.discard()
+                return
             duration_s = time.monotonic() - entry.get("started_at", time.monotonic())
             trailer = chat_root_trailer(
                 state["slug"],
@@ -108,3 +110,8 @@ class ChatOutputMixin:
                 )
         except Exception as e:
             logger.error("[recorder] kick chat finalize failed: %s", e)
+            # A write failure keeps the partial file for recovery (see
+            # chat_writer). The retention pass removes a stale .tmp file, so
+            # keep the collected comments on disk.
+        finally:
+            entry.pop("kick_chat", None)

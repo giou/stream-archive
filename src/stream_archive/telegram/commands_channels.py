@@ -61,10 +61,13 @@ class ChannelsCommands:
         result: str = self._apply(
             mutate, lambda c: f"Removed {ch} \u2014 {len(c.channels)} channel(s) monitored", chat_id
         )
-        if not result.startswith("\u274c") and self._recorder.is_recording(ch):
-            await self._recorder.stop(ch)
+        if not result.startswith("\u274c"):
+            if self._recorder.is_recording(ch):
+                await self._recorder.stop(ch)
+                result += "\nRecording stopped."
+            # The monitor keeps live state and a per-channel lock when
+            # the stop fails, so tell it about the removal either way.
             self._monitor.remove_channel(ch)
-            result += "\nRecording stopped."
         if not result.startswith("\u274c"):
             if is_kick_channel(ch):
                 if self._kick_webhook:

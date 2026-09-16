@@ -113,7 +113,9 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         ch = state.channel or ""
         quality_override = c.channel_preferred_qualities.get(ch)
         rows = _marked_rows(_rows(QUALITY_CHOICES, 3), QUALITY_CHOICES, quality_override)
-        rows.append([_mark("Global", quality_override is None), "Custom"])
+        # No Custom button here: the quality value is a fixed label list,
+        # and menu_channel_quality has no custom branch.
+        rows.append([_mark("Global", quality_override is None)])
         rows.append(["Back"])
         return _frame(rows)
     if menu == "chat":
@@ -223,7 +225,7 @@ async def _text_kick_cloudflare(ctrl: TelegramController, state: MenuState) -> s
     active = ctrl._tunnel_active("cloudflare")
     text = f"Cloudflare tunnel: {'on' if active else 'off'}\n"
     if not active and ep.tunnel == "cloudflare" and ep.public_url:
-        text += f"Saved setup: {ep.public_url}. Tap On to restore it.\n"
+        text += f"Saved setup: {ep.public_url}. Tap Enable to restore it.\n"
     return (
         f"{text}\n"
         "\u2022 Quick tunnel \u2014 no Cloudflare account needed, temporary URL.\n"
@@ -239,11 +241,11 @@ async def _text_kick_tailscale(ctrl: TelegramController, state: MenuState) -> st
     if active:
         text += f" \u00b7 {ep.public_url}"
     elif ep.tunnel == "tailscale" and ep.public_url:
-        text += f"\nSaved setup: {ep.public_url}. Tap On to restore it."
+        text += f"\nSaved setup: {ep.public_url}. Tap Enable to restore it."
     return (
         f"{text}\n\n"
-        f"On runs tailscale funnel {ep.listen_port} on this host for the endpoint. "
-        "Off stops the funnel and the endpoint."
+        f"Enable runs tailscale funnel {ep.listen_port} on this host for the endpoint. "
+        "Disable stops the funnel and the endpoint."
     )
 
 
@@ -510,8 +512,11 @@ async def menu_back(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
         parent: str | None = _custom_parent(state.custom or "")
     else:
         parent = PARENT.get(state.menu)
-    if parent is None:  # no Back button on root
-        return None
+    if parent is None:
+        if state.menu != "root":  # unknown menu: fall back to root, like dispatch_text
+            state.menu, state.channel = "root", None
+            return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root")
+        return None  # no Back button on root
     if state.menu in ("kick_cloudflare_hostname", "kick_cloudflare_dns"):
         state.cloudflare_hostname = None
     if parent == "channel":

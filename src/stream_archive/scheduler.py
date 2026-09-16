@@ -28,7 +28,7 @@ _shutdown_event: asyncio.Event | None = None
 _HEALTH_HOST = "127.0.0.1"
 _HEALTH_PORT = 9100
 
-_READY = False  # flips True once recorder and API clients exist
+_READY = False  # flips True once recorder and API clients exist; reset at the start of each run
 
 
 def _setup_signal_handlers() -> None:
@@ -75,6 +75,8 @@ async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_POR
 async def run_scheduler() -> None:
     global _shutdown_event, _READY
     _setup_signal_handlers()
+    # A new run starts unready. The clients and the bot do not exist yet.
+    _READY = False
 
     assert _shutdown_event is not None
 
@@ -89,45 +91,61 @@ async def run_scheduler() -> None:
     logger.info("Output mode: %s", output_mode)
 
     shared_http = build_shared_client()
-    twitch_api = TwitchAPI(config, http=shared_http)
-    notifier = Notifier(config.bot_telegram_api, config.telegram_user_id)
-    health_runner = await _start_health_server()
 
-    # Constructed unconditionally so a live /mode youtube|both always has a
-    # streamer available. It only stores paths and creates an httpx client.
-    # A missing youtube_token.json is handled per task in _stream_youtube.
-    youtube_streamer = YouTubeStreamer(config)
-    logger.info("YouTube streaming enabled (privacy: %s)", config.youtube.privacy_status)
+    # The guard starts before the first constructor. A constructor that
+    # raises must still release what already exists: the shared client, the
+    # updater task and the health server. Each name is None until built.
+    health_runner: web.AppRunner | None = None
+    twitch_api: TwitchAPI | None = None
+    notifier: Notifier | None = None
+    youtube_streamer: YouTubeStreamer | None = None
+    recorder: Recorder | None = None
+    kick_api: KickAPI | None = None
+    eventsub: EventSubClient | None = None
+    kick_webhook: KickWebhook | None = None
+    updater: UpdateChecker | None = None
+    updater_task: asyncio.Task[None] | None = None
+    telegram: TelegramController | None = None
 
-    recorder = Recorder(config, youtube_streamer, notifier)
-    monitor = Monitor(recorder, notifier)
-
-    kick_api = KickAPI(config, http=shared_http)
-
-    eventsub = EventSubClient(twitch_api, monitor, config)
-    kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
-
-    updater = UpdateChecker(config, notifier, http=shared_http)
-    updater_task = asyncio.create_task(updater.run_loop())
-    logger.info("[updater] Update check enabled (every %gh)", config.update_check.interval_hours)
-
-    telegram = TelegramController(
-        config,
-        recorder,
-        monitor,
-        eventsub,
-        on_restart=lambda: _shutdown_event.set(),
-        updater=updater,
-        kick_webhook=kick_webhook,
-        http=shared_http,
-    )
-    control_api = ControlAPI(config, telegram, recorder)
-    control_api.register_routes(kick_webhook)
-
-    # Every resource above exists, so a failure in this block still shuts
-    # the service down in order. A failed Telegram start, for example, must
-    # not leave a recording or a held YouTube broadcast behind.
+    # Every resource inside the try below shuts down in order. A failed
+    # Telegram start, for example, must not leave a recording or a held
+    # YouTube broadcast behind.
     try:
+        twitch_api = TwitchAPI(config, http=shared_http)
+        notifier = Notifier(config.bot_telegram_api, config.telegram_user_id)
+        health_runner = await _start_health_server()
+
+        # Constructed unconditionally so a live /mode youtube|both always has a
+        # streamer available. It only stores paths and creates an httpx client.
+        # A missing youtube_token.json is handled per task in _stream_youtube.
+        youtube_streamer = YouTubeStreamer(config)
+        logger.info("YouTube streaming enabled (privacy: %s)", config.youtube.privacy_status)
+
+        recorder = Recorder(config, youtube_streamer, notifier)
+        monitor = Monitor(recorder, notifier)
+
+        kick_api = KickAPI(config, http=shared_http)
+
+        eventsub = EventSubClient(twitch_api, monitor, config)
+        kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
+
+        updater = UpdateChecker(config, notifier, http=shared_http)
+        updater_task = asyncio.create_task(updater.run_loop())
+        logger.info("[updater] Update check enabled (every %gh)", config.update_check.interval_hours)
+
+        telegram = TelegramController(
+            config,
+            recorder,
+            monitor,
+            eventsub,
+            on_restart=lambda: _shutdown_event.set(),
+            updater=updater,
+            kick_webhook=kick_webhook,
+            http=shared_http,
+        )
+        control_api = ControlAPI(config, telegram, recorder)
+        control_api.register_routes(kick_webhook)
+
         await eventsub.start()
         await kick_webhook.apply_state()
         if kick_webhook.listening_needed():
@@ -146,7 +164,7 @@ async def run_scheduler() -> None:
         _READY = True
         await _run_loop(monitor, twitch_api, kick_api, config, recorder)
     except asyncio.CancelledError:
-        pass
+        logger.info("[scheduler] Scheduler task cancelled, shutting down")
     finally:
         await _shutdown(
             health_runner=health_runner,
@@ -178,15 +196,21 @@ async def _run_loop(
         try:
             await monitor.check_channels(twitch_api, kick_api, config)
         except Exception as e:
-            logger.error("[scheduler] Error in check_channels: %s", e)
+            logger.error("[scheduler] Error in check_channels: %s", e, exc_info=True)
             await asyncio.sleep(5)
             continue
 
         retention_days = config.retention_days
         if retention_days > 0 and (last_cleanup is None or time.monotonic() - last_cleanup >= 86400):
-            removed = await recorder.cleanup_old_recordings(retention_days)
-            logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
-            last_cleanup = time.monotonic()
+            # A failed cleanup must not kill the daemon. Log it and retry on
+            # the next iteration. last_cleanup advances only on success.
+            try:
+                removed = await recorder.cleanup_old_recordings(retention_days)
+            except Exception:
+                logger.error("[scheduler] Retention cleanup failed", exc_info=True)
+            else:
+                logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
+                last_cleanup = time.monotonic()
 
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(_shutdown_event.wait(), timeout=config.monitoring_interval)
@@ -196,30 +220,35 @@ async def _shutdown(
     *,
     health_runner: web.AppRunner | None,
     kick_webhook: KickWebhook | None,
-    eventsub: EventSubClient,
-    twitch_api: TwitchAPI,
-    kick_api: KickAPI,
-    recorder: Recorder,
-    notifier: Notifier,
-    updater: UpdateChecker,
-    updater_task: asyncio.Task[None],
-    telegram: TelegramController,
-    youtube_streamer: YouTubeStreamer,
+    eventsub: EventSubClient | None,
+    twitch_api: TwitchAPI | None,
+    kick_api: KickAPI | None,
+    recorder: Recorder | None,
+    notifier: Notifier | None,
+    updater: UpdateChecker | None,
+    updater_task: asyncio.Task[None] | None,
+    telegram: TelegramController | None,
+    youtube_streamer: YouTubeStreamer | None,
     shared_http: Any,
 ) -> None:
-    """Close everything in order. Each close has its own guard, so one failure never skips the rest."""
+    """Close everything in order. Each close has its own guard, so one failure never skips the rest.
+
+    A resource that never got built is None. This method skips it.
+    """
     global _READY
     _READY = False
     logger.info("[scheduler] Shutting down, stopping all recordings...")
-    try:
-        await notifier.notify_shutdown()
-    except Exception:
-        logger.error("[scheduler] notify_shutdown failed", exc_info=True)
-    try:
-        updater_task.cancel()
-        await asyncio.gather(updater_task, return_exceptions=True)
-    except Exception:
-        logger.error("[scheduler] updater task cancel failed", exc_info=True)
+    if notifier is not None:
+        try:
+            await notifier.notify_shutdown()
+        except Exception:
+            logger.error("[scheduler] notify_shutdown failed", exc_info=True)
+    if updater_task is not None:
+        try:
+            updater_task.cancel()
+            await asyncio.gather(updater_task, return_exceptions=True)
+        except Exception:
+            logger.error("[scheduler] updater task cancel failed", exc_info=True)
     if health_runner is not None:
         try:
             await health_runner.cleanup()
@@ -231,38 +260,46 @@ async def _shutdown(
             await kick_webhook.close()
         except Exception:
             logger.error("[scheduler] kick webhook close failed", exc_info=True)
-    try:
-        await eventsub.close()
-    except Exception:
-        logger.error("[scheduler] eventsub close failed", exc_info=True)
-    try:
-        await twitch_api.close()
-    except Exception:
-        logger.error("[scheduler] twitch api close failed", exc_info=True)
-    try:
-        await kick_api.close()
-    except Exception:
-        logger.error("[scheduler] kick api close failed", exc_info=True)
-    try:
-        await recorder.close()
-    except Exception:
-        logger.error("[scheduler] recorder close failed", exc_info=True)
-    try:
-        await telegram.stop()
-    except Exception:
-        logger.error("[scheduler] telegram stop failed", exc_info=True)
-    try:
-        await youtube_streamer.close()
-    except Exception:
-        logger.error("[scheduler] youtube streamer close failed", exc_info=True)
-    try:
-        await notifier.close()
-    except Exception:
-        logger.error("[scheduler] notifier close failed", exc_info=True)
-    try:
-        await updater.close()
-    except Exception:
-        logger.error("[scheduler] updater close failed", exc_info=True)
+    if eventsub is not None:
+        try:
+            await eventsub.close()
+        except Exception:
+            logger.error("[scheduler] eventsub close failed", exc_info=True)
+    if twitch_api is not None:
+        try:
+            await twitch_api.close()
+        except Exception:
+            logger.error("[scheduler] twitch api close failed", exc_info=True)
+    if kick_api is not None:
+        try:
+            await kick_api.close()
+        except Exception:
+            logger.error("[scheduler] kick api close failed", exc_info=True)
+    if recorder is not None:
+        try:
+            await recorder.close()
+        except Exception:
+            logger.error("[scheduler] recorder close failed", exc_info=True)
+    if telegram is not None:
+        try:
+            await telegram.stop()
+        except Exception:
+            logger.error("[scheduler] telegram stop failed", exc_info=True)
+    if youtube_streamer is not None:
+        try:
+            await youtube_streamer.close()
+        except Exception:
+            logger.error("[scheduler] youtube streamer close failed", exc_info=True)
+    if notifier is not None:
+        try:
+            await notifier.close()
+        except Exception:
+            logger.error("[scheduler] notifier close failed", exc_info=True)
+    if updater is not None:
+        try:
+            await updater.close()
+        except Exception:
+            logger.error("[scheduler] updater close failed", exc_info=True)
     try:
         await shared_http.aclose()
     except Exception:

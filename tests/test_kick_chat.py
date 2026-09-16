@@ -249,7 +249,8 @@ def test_fetch_emote_images_total_limit():
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             images = await fetch_emote_images(["1", "2", "3", "4", "5"], client, max_total_bytes=8)
-        assert sum(len(v) for v in images.values()) <= 8
+        assert sum(len(v) for v in images.values()) == 8  # 4-byte images fill the cap exactly
+        assert images
 
     asyncio.run(scenario())
 

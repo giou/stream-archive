@@ -117,6 +117,10 @@ class YoutubeOutputMixin:
             return f"restarting in {backoff - now:.0f}s (short recording, YouTube quota guard)"
         now_wall = time.time()
         self._youtube_starts = [t for t in self._youtube_starts if t > now_wall - self._limits.budget_window_s]
+        if self._limits.daily_budget <= 0:
+            # A zero budget blocks every create. Guard it here: the line
+            # below would index an empty list.
+            return "YouTube daily broadcast limit reached (0/0 in the last 24h)"
         if len(self._youtube_starts) >= self._limits.daily_budget:
             wait = self._youtube_starts[0] + self._limits.budget_window_s - now_wall
             return (
@@ -184,8 +188,9 @@ class YoutubeOutputMixin:
                 stderr=asyncio.subprocess.DEVNULL,
             )
         except asyncio.CancelledError:
-            if proc is not None:
-                proc.terminate()
+            # The await was cancelled, so no handle exists yet. A child that
+            # was already spawned cannot be reaped here: make it traceable.
+            logger.warning("[recorder] [youtube] keep-alive spawn cancelled; an ffmpeg may be orphaned")
             raise
         except Exception as e:
             logger.warning("[recorder] [youtube] keep-alive spawn failed (hold without keep-alive): %s", e)
@@ -249,6 +254,7 @@ class YoutubeOutputMixin:
                     self._held.pop(channel, None)
                 await self._stop_keepalive(keepalive)
                 logger.warning("[recorder] [youtube] %s keep-alive feed stopped early, ending broadcast", channel)
+                sleep_task.cancel()  # the hold is over; do not leave the timer pending
                 await self._end_broadcast(channel, hold["youtube_info"]["broadcast_id"])
                 return
             if ka_task is not None:

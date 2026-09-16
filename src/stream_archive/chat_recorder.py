@@ -77,7 +77,8 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
             continue
         # ChatRoot.Emoticon.emoticon_id is a string in TwitchDownloader's schema
         fragments.append({"text": emote_text, "emoticon": {"emoticon_id": emote_id}})
-        emoticons.append({"_id": emote_id, "begin": begin, "end": begin + len(emote_text) + 1})
+        # begin/end are the exclusive end of the emote text, like kick_chat.py.
+        emoticons.append({"_id": emote_id, "begin": begin, "end": begin + len(emote_text)})
         pos = begin + len(emote_text)
     if pos < len(body):
         fragments.append({"text": body[pos:]})
@@ -184,7 +185,12 @@ class ChatRecorder:
                     await writer.drain()
                     continue
 
-                rest = text.split(" ", 1)[1] if text.startswith("@") else text
+                if text.startswith("@"):
+                    _, sep, rest = text.partition(" ")
+                    if not sep:
+                        continue  # malformed tagged line
+                else:
+                    rest = text
                 header = rest.split(" :", 1)[0]
                 parts = header.split()
                 cmd = parts[1] if len(parts) > 1 else None
@@ -198,8 +204,8 @@ class ChatRecorder:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[chat:%s] error closing IRC socket: %s", self.channel, e)
 
     def _parse_message(self, text: str, kind: str) -> dict[str, Any] | None:
         """Parse one tagged PRIVMSG/USERNOTICE into a TwitchDownloader comment dict."""

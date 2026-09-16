@@ -50,10 +50,11 @@ def decode_token(token: str) -> dict[str, Any] | None:
     padded = token + "=" * (-len(token) % 4)
     for decoder in (base64.b64decode, base64.urlsafe_b64decode):
         try:
-            payload: dict[str, Any] | None = json.loads(decoder(padded))
+            payload: Any = json.loads(decoder(padded))
         except Exception:
             continue
-        return payload
+        if isinstance(payload, dict):
+            return payload
     return None
 
 
@@ -94,14 +95,22 @@ def parse_public_hostname(text: str) -> str | None:
 
 
 def write_ingress_config(workdir: Path, host: str, port: int, token: str) -> Path:
-    """Write the local ingress config of a named tunnel and return its path."""
+    """Write the local ingress config of a named tunnel and return its path.
+
+    The function rejects a host that is not a plain hostname, so the value
+    cannot inject extra YAML into the ingress file.
+    """
+    if not _HOSTNAME_RE.match(host):
+        msg = f"invalid hostname for ingress config: {host!r}"
+        raise ValueError(msg)
     data = decode_token(token)
     tunnel_id = safe_tunnel_id((data or {}).get("t"))
     directory = workdir / "cloudflared"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{tunnel_id}.yml"
     path.write_text(
-        f"ingress:\n  - hostname: {host}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n"
+        f"ingress:\n  - hostname: {host}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n",
+        encoding="utf-8",
     )
     return path
 
@@ -155,16 +164,17 @@ class CloudflaredTunnel:
                 "cloudflared is not installed in this container.\n"
                 "Rebuild the image (docker compose up -d --build) after adding cloudflared."
             )
+        self._proc = proc  # publish now: a concurrent stop must reach the process
         try:
             url, tail = await asyncio.wait_for(self._wait_url(proc), timeout=_CLOUDFLARED_QUICK_TIMEOUT)
         except TimeoutError:
-            await _kill_proc(proc)
+            await self._kill(proc)
             return None, (
                 "cloudflared did not publish a trycloudflare URL within "
                 f"{_CLOUDFLARED_QUICK_TIMEOUT}s \u2014 tap Quick tunnel again."
             )
         if url is None:
-            await _kill_proc(proc)
+            await self._kill(proc)
             return None, "cloudflared exited before publishing a URL:\n" + "\n".join(tail[-8:])
         self._adopt(proc)
         return url, None
@@ -193,19 +203,26 @@ class CloudflaredTunnel:
                 "cloudflared is not installed in this container.\n"
                 "Rebuild the image (docker compose up -d --build) after adding cloudflared."
             )
+        self._proc = proc  # publish now: a concurrent stop must reach the process
         try:
             registered, tail = await asyncio.wait_for(self._wait_registered(proc), timeout=_CLOUDFLARED_RUN_TIMEOUT)
         except TimeoutError:
             if proc.returncode is None:  # still running: the tunnel registered
                 self._adopt(proc)
                 return True, None
-            await _kill_proc(proc)
+            await self._kill(proc)
             return False, "cloudflared exited during startup."
         if not registered:
-            await _kill_proc(proc)
+            await self._kill(proc)
             return False, "cloudflared exited:\n" + "\n".join(tail[-8:])
         self._adopt(proc)
         return True, None
+
+    async def _kill(self, proc: Any) -> None:
+        """Kill a process that failed to start and forget it while it is the managed one."""
+        await _kill_proc(proc)
+        if self._proc is proc:
+            self._proc = None
 
     def stop(self) -> None:
         """Stop the managed process and its drain task. Idempotent."""
@@ -219,8 +236,15 @@ class CloudflaredTunnel:
             proc.kill()
 
     def _adopt(self, proc: Any) -> None:
-        """Keep a running process as the managed tunnel."""
-        self._proc = proc
+        """Keep a running process as the managed tunnel.
+
+        A newer start can replace the process while it starts up. Kill the
+        older process in that case instead of adopting it.
+        """
+        if self._proc is not proc:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            return
         self._drain = asyncio.create_task(self._drain_output(proc))
 
     async def _drain_output(self, proc: Any) -> None:
@@ -279,15 +303,17 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_STATUS_TIMEOUT)
+    except TimeoutError:
+        await _kill_proc(proc)
+        return None, "tailscale status timed out \u2014 is the tailscale daemon running on the host?"
     except FileNotFoundError:
         return None, (
             "Tailscale is not installed in this container.\n"
             "Install it on the host: curl -fsSL https://tailscale.com/install.sh | sh\n"
             "then log in: tailscale up"
         )
-    except TimeoutError:
-        await _kill_proc(proc)
-        return None, "tailscale status timed out \u2014 is the tailscale daemon running on the host?"
+    except OSError as exc:
+        return None, f"tailscale status could not run: {exc}"
     if proc.returncode != 0:
         return None, (
             "tailscale status failed (daemon not running or not logged in): "
@@ -323,6 +349,8 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
             "tailscale funnel timed out (first enable provisions HTTPS certificates and can take "
             "a minute) \u2014 tap Tailscale funnel again in a moment."
         )
+    except OSError as exc:
+        return None, f"tailscale funnel could not run: {exc}"
     if proc.returncode != 0:
         stderr_text = stderr.decode(errors="replace").strip()
         # The funnel can already exist: a previous attempt finished after its
@@ -335,6 +363,7 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
 
 async def tailscale_funnel_serving(port: int) -> bool:
     """True when a foreground tailscale funnel proxies / to 127.0.0.1:<port>."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "tailscale",
@@ -345,7 +374,10 @@ async def tailscale_funnel_serving(port: int) -> bool:
             stderr=asyncio.subprocess.DEVNULL,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_STATUS_TIMEOUT)
-    except TimeoutError, FileNotFoundError, OSError:
+    except TimeoutError:
+        await _kill_proc(proc)
+        return False
+    except FileNotFoundError, OSError:
         return False
     if proc.returncode != 0:
         return False

@@ -22,6 +22,9 @@ _USER_AGENT = "stream-archive"
 # (429/5xx) and rate limiting. Auth and parameter errors (401/400/403)
 # stay immediate.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Retry only methods where a repeat cannot create a second resource. A
+# repeated POST (for example a subscription create) can duplicate it.
+_RETRY_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 _MAX_ATTEMPTS = 3
 _RETRY_DELAYS = (1.0, 3.0)
 
@@ -56,17 +59,29 @@ class KickAPI:
 
         Retries only transient statuses (429/5xx, see ``_RETRY_STATUSES``)
         and transport errors. Auth and parameter errors fail immediately,
-        so caller error paths fire without delay.
+        so caller error paths fire without delay. Only repeat-safe methods
+        retry (see ``_RETRY_METHODS``), and the OAuth token POST retries
+        too. A repeated subscription create could duplicate it.
         """
         for attempt in range(_MAX_ATTEMPTS):
+            # The token POST is repeat-safe: it only issues another token.
+            retryable = attempt < _MAX_ATTEMPTS - 1 and (method in _RETRY_METHODS or url == self.TOKEN_URL)
             try:
                 resp = await self.client.request(method, url, **kwargs)
             except httpx.TransportError:
-                if attempt == _MAX_ATTEMPTS - 1:
+                if not retryable:
                     raise
                 resp = None
-            if resp is not None and (resp.status_code not in _RETRY_STATUSES or attempt == _MAX_ATTEMPTS - 1):
+            if resp is not None and (not retryable or resp.status_code not in _RETRY_STATUSES):
                 return resp
+            logger.warning(
+                "[kick_api] retrying %s %s (attempt %d/%d): %s",
+                method,
+                url,
+                attempt + 1,
+                _MAX_ATTEMPTS,
+                resp.status_code if resp is not None else "transport error",
+            )
             await asyncio.sleep(_RETRY_DELAYS[attempt])
         msg = "unreachable"
         raise RuntimeError(msg)
@@ -117,7 +132,8 @@ class KickAPI:
                 params=[("slug", s) for s in chunk],
             )
             resp.raise_for_status()
-            for item in resp.json()["data"]:
+            payload = resp.json() or {}
+            for item in payload.get("data") or []:
                 out[item["slug"]] = {
                     "title": item.get("stream_title") or "",
                     "game": (item.get("category") or {}).get("name") or "",
@@ -157,12 +173,13 @@ class KickAPI:
         app's subscriptions. Without a configured client_id, nothing is
         managed.
         """
+        if not self._client_id:
+            # Nothing can be managed without a client_id, so skip the call.
+            return []
         resp = await self._request("GET", self.EVENTS_SUBS_URL, headers=await self._headers())
         resp.raise_for_status()
-        data = resp.json()["data"]
-        if not self._client_id:
-            return []
-        return [s for s in data if s.get("app_id") == self._client_id]
+        payload = resp.json() or {}
+        return [s for s in payload.get("data") or [] if s.get("app_id") == self._client_id]
 
     async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]:
         """Create webhook subscriptions. Returns created items with subscription_id."""
@@ -177,7 +194,8 @@ class KickAPI:
             },
         )
         resp.raise_for_status()
-        items: list[dict[str, Any]] = resp.json()["data"]
+        payload = resp.json() or {}
+        items: list[dict[str, Any]] = payload.get("data") or []
         return items
 
     async def delete_event_subscriptions(self, ids: list[str]) -> None:

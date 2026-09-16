@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -296,14 +297,14 @@ def test_kick_channel_without_creds_raises():
         AppConfig.model_validate(config)
 
 
-@pytest.mark.parametrize("ch", ["kick:", "kick:bad name", "kick:.dot", "kick:", "kick:a" * 26])
+@pytest.mark.parametrize("ch", ["kick:", "kick:bad name", "kick:.dot", "kick:" + "a" * 26])
 def test_invalid_kick_channel_raises(ch):
     config = kick_config([ch])
     with pytest.raises(ValueError):
         AppConfig.model_validate(config)
 
 
-def test_twitch_prefix_normalized_to_bare():
+def test_twitch_prefix_is_preserved():
     config = build(channels=["twitch:foo"])
     assert config.channels == ["twitch:foo"]
 
@@ -548,7 +549,8 @@ def test_missing_env_var_at_save_restores_placeholder(monkeypatch, tmp_path):
     assert "${MY_TOK}" in raw
 
 
-def test_env_interpolation_missing_var_raises(tmp_path):
+def test_env_interpolation_missing_var_raises(monkeypatch, tmp_path):
+    monkeypatch.delenv("TEST_BOT_TOKEN", raising=False)
     data = valid_config()
     data["bot_telegram_api"] = "${TEST_BOT_TOKEN}"
     (tmp_path / "config.json").write_text(json.dumps(data))
@@ -684,9 +686,15 @@ def test_save_removes_the_tmp_copy_when_the_write_fails(monkeypatch, tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(valid_config()))
     cfg = get_config(path)
+    real_replace = os.replace
 
-    def no_space(*args, **kwargs):
-        raise OSError(28, "No space left on device")
+    def no_space(src, dst, *args, **kwargs):
+        # Fail only for the config file. Every other caller of os.replace
+        # keeps working while this test runs.
+        if str(dst) != str(path):
+            return real_replace(src, dst, *args, **kwargs)
+        msg = "No space left on device"
+        raise OSError(28, msg)
 
     monkeypatch.setattr("stream_archive.config.os.replace", no_space)
 

@@ -90,11 +90,8 @@ def test_write_failure_keeps_partial_file(tmp_path):
             msg = "No space left on device"
             raise OSError(msg)
 
-        def flush(self):
-            pass
-
-        def close(self):
-            real.close()
+        def __getattr__(self, name):
+            return getattr(real, name)
 
     writer._fh = FailingHandle()
 
@@ -105,6 +102,7 @@ def test_write_failure_keeps_partial_file(tmp_path):
     assert len(errors) == 1  # the handler runs exactly once, not per message
     # The partial file stays for recovery. The target path stays untouched.
     assert (tmp_path / "chat.json.tmp").exists()
+    assert '"m1"' in (tmp_path / "chat.json.tmp").read_text()
     assert not (tmp_path / "chat.json").exists()
 
 

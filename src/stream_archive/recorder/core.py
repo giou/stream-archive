@@ -70,6 +70,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _limits: YouTubeLimits
     _reserve_lock: asyncio.Lock
     _reserved_channels: dict[str, str]
+    _bg_tasks: set[asyncio.Task[Any]]
 
     def __init__(
         self,
@@ -102,6 +103,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
         self._reserve_lock = asyncio.Lock()
         self._reserved_channels = {}  # channel -> output mode, reserved but not yet started
+        # Fire-and-forget finalize tasks. The set holds a reference, so the
+        # event loop cannot garbage-collect a task in flight, and close()
+        # can drain the tasks.
+        self._bg_tasks = set()
 
     async def start(
         self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
@@ -380,6 +385,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             chat_task = entry.get("chat_task")
             if chat_task is not None:
                 to_cancel.append(chat_task)
+            watchdog = entry.get("watchdog")
+            if watchdog is not None:
+                to_cancel.append(watchdog)
             for t in to_cancel:
                 t.cancel()
             self._recordings.pop(channel, None)
@@ -464,12 +472,34 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     async def close(self) -> None:
         await self.stop_all()
         for ch, held in list(self._held.items()):
-            end_task = held.get("end_task")
-            if end_task is not None:
-                end_task.cancel()
-            await self._stop_keepalive(held.get("keepalive"))
-            self._held.pop(ch, None)
-            await self._end_broadcast(ch, held["youtube_info"]["broadcast_id"])
+            # One bad entry must not skip the rest: every remaining
+            # keep-alive process and broadcast needs its own teardown.
+            try:
+                end_task = held.get("end_task")
+                if end_task is not None:
+                    end_task.cancel()
+                await self._stop_keepalive(held.get("keepalive"))
+                self._held.pop(ch, None)
+                youtube_info = held.get("youtube_info") or {}
+                broadcast_id = youtube_info.get("broadcast_id")
+                if broadcast_id:
+                    await self._end_broadcast(ch, broadcast_id)
+            except Exception:
+                logger.error("[recorder] held broadcast cleanup failed for %s", ch, exc_info=True)
+        self._reserved_channels.clear()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+
+    def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Run a finalize coroutine in the background, with a held reference.
+
+        The event loop keeps only a weak reference, so a bare task can be
+        garbage-collected in flight and its exception never retrieved. The
+        set holds the task, and close() drains it.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _track(self, channel: str, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -497,11 +527,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             return  # other recording tasks (for example the disk fallback) still running
         chat_recorder = entry.pop("chat_recorder", None)
         if chat_recorder:
-            asyncio.create_task(self._finalize_chat(channel, chat_recorder))
-        asyncio.create_task(self._finalize_kick_chat(entry))
+            self._spawn_bg(self._finalize_chat(channel, chat_recorder))
+        self._spawn_bg(self._finalize_kick_chat(entry))
         youtube_info = entry.get("youtube_info")
         if youtube_info:
-            asyncio.create_task(self._release_broadcast(channel, youtube_info, entry))
+            self._spawn_bg(self._release_broadcast(channel, youtube_info, entry))
         if entry.get("mode") in ("youtube", "both"):
             self._note_youtube_end(channel, entry)
         # Remember that the stream ended on its own, not through a task failure.
@@ -529,15 +559,17 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             await self._abort_unlocked(channel, reason)
 
     async def _abort_unlocked(self, channel: str, reason: str) -> None:
+        # Pop first. A stale abort (the entry already went away through
+        # _on_task_finished or an earlier abort) must not alert the operator.
+        entry = self._recordings.pop(channel, None)
+        if entry is None:
+            return
         logger.warning("[recorder] [%s] Stopping recording: %s", channel, reason)
         if self._notifier:
             try:
                 await self._notifier.notify(f"\u26d4 Stopped recording {channel}: {reason}")
             except Exception:
                 logger.error("[recorder] stop notification failed for %s", channel, exc_info=True)
-        entry = self._recordings.pop(channel, None)
-        if entry is None:
-            return
         wd = entry.pop("watchdog", None)
         if wd:
             wd.cancel()
@@ -635,7 +667,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                         break
 
                     if file_handle:
-                        file_handle.write(data)
+                        # The archive volume can be slow. Write on the
+                        # executor, like the reads.
+                        await loop.run_in_executor(None, file_handle.write, data)
 
                     process.stdin.write(data)
                     await process.stdin.drain()

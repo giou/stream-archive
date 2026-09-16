@@ -185,6 +185,7 @@ class TelegramController(
         if affected:
             chat = chat_id if chat_id is not None else self._admin_id
             self._pending_apply[(chat, secrets.token_hex(4))] = (ok_text(candidate), affected)
+            self._prune_pending(self._pending_apply, chat)
         return ok_text(candidate)
 
     def _confirm_keyboard(self, action: str, value: str) -> Any:
@@ -226,6 +227,10 @@ class TelegramController(
             await query.edit_message_text(text, reply_markup=None)
         except BadRequest:  # message vanished mid-flight -> resend
             await context.bot.send_message(chat_id=query.from_user.id, text=text)
+        # A callback can apply a change that defers onto a running
+        # recording (the audio-only confirm). Send its prompt now, as the
+        # text paths do, instead of waiting for the next typed message.
+        await self._maybe_send_apply_warnings()
         await self._send_menu(context, self._callback_chat_of(update))
 
     async def _send_menu(self, context: Any, chat_id: ChatId) -> None:

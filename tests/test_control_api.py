@@ -46,12 +46,6 @@ class FakeRecorder:
         self.stop_calls.append(channel)
         self._recording.discard(channel)
 
-    async def restart(self, channel):
-        return True
-
-    async def stop_chat(self, channel, platform=None):
-        return None
-
 
 class FakeMonitor:
     def __init__(self):
@@ -77,12 +71,12 @@ class FakeKickWebhook:
     """The controller's view of the listener owner."""
 
     def __init__(self):
-        self.applied = []
         self.added = []
         self.removed = []
 
-    async def apply_state(self):
-        self.applied.append(1)
+    async def apply_state(self) -> None:
+        # The listener never starts in these tests, so a reconcile is a no-op.
+        return None
 
     async def add_channel(self, channel):
         self.added.append(channel)
@@ -129,7 +123,7 @@ def make_api(tmp_path, *, enabled=True, recording=(), channels=("twitch:channel1
     wh = KickWebhook(config, None, None, None, None)
     api = ControlAPI(config, ctrl, recorder)
     api.register_routes(wh)
-    return config, ctrl, recorder, eventsub, wh
+    return config, ctrl, recorder, eventsub, wh, monitor
 
 
 def auth(token=KEY):
@@ -142,7 +136,7 @@ def sent_messages(ctrl):
 
 
 def test_disabled_api_answers_404(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path, enabled=False)
+    _, _, _, _, wh, _ = make_api(tmp_path, enabled=False)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -160,7 +154,7 @@ def test_disabled_api_answers_404(tmp_path):
 
 
 def test_missing_and_bad_key_are_401(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -172,7 +166,7 @@ def test_missing_and_bad_key_are_401(tmp_path):
 
 
 def test_bearer_and_api_key_headers_authenticate(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -184,7 +178,7 @@ def test_bearer_and_api_key_headers_authenticate(tmp_path):
 
 
 def test_settings_response_holds_no_secrets(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -194,6 +188,22 @@ def test_settings_response_holds_no_secrets(tmp_path):
     status, body = asyncio.run(scenario())
     assert status == 200
     settings = json.loads(body)
+    # Every key is reviewed, so a new field cannot leak a secret silently.
+    assert set(settings) == {
+        "output_mode",
+        "preferred_quality",
+        "retention_days",
+        "max_concurrent_recordings",
+        "max_concurrent_youtube_streams",
+        "record_chat",
+        "kick_record_chat",
+        "youtube",
+        "disk",
+        "endpoint",
+        "kick_webhook",
+        "api",
+        "monitoring_interval_s",
+    }
     assert settings["output_mode"] == "disk"
     assert settings["api"]["enabled"] is True
     for secret in (KEY, "bot_token", "client_secret", "user:pass"):
@@ -201,7 +211,7 @@ def test_settings_response_holds_no_secrets(tmp_path):
 
 
 def test_status_reports_active_recordings(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path, recording=["twitch:channel1"])
+    _, _, _, _, wh, _ = make_api(tmp_path, recording=["twitch:channel1"])
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -214,7 +224,7 @@ def test_status_reports_active_recordings(tmp_path):
 
 
 def test_patch_settings_applies_and_persists(tmp_path):
-    config, ctrl, _, _, wh = make_api(tmp_path)
+    config, ctrl, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -241,7 +251,7 @@ def test_patch_settings_applies_and_persists(tmp_path):
 
 
 def test_patch_settings_keeps_good_keys_when_one_fails(tmp_path):
-    _, ctrl, _, _, wh = make_api(tmp_path)
+    _, ctrl, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -263,7 +273,7 @@ def test_patch_settings_keeps_good_keys_when_one_fails(tmp_path):
 
 def test_patch_settings_rejects_default_as_the_global_quality(tmp_path):
     """'default' clears a per-channel override, so it is not a global quality."""
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -277,7 +287,7 @@ def test_patch_settings_rejects_default_as_the_global_quality(tmp_path):
 
 
 def test_patch_settings_accepts_a_real_global_quality(tmp_path):
-    config, _, _, _, wh = make_api(tmp_path)
+    config, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -291,7 +301,7 @@ def test_patch_settings_accepts_a_real_global_quality(tmp_path):
 
 
 def test_patch_settings_rejects_unknown_keys(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -304,7 +314,7 @@ def test_patch_settings_rejects_unknown_keys(tmp_path):
 
 
 def test_patch_settings_rejects_a_non_object_body(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -316,7 +326,7 @@ def test_patch_settings_rejects_a_non_object_body(tmp_path):
 
 
 def test_patch_settings_rejects_an_oversized_body(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -329,7 +339,7 @@ def test_patch_settings_rejects_an_oversized_body(tmp_path):
 
 
 def test_add_channel_subscribes_and_rejects_duplicates(tmp_path):
-    config, ctrl, _, _, wh = make_api(tmp_path, channels=("twitch:channel1", "kick:xqc"))
+    config, ctrl, _, _, wh, _ = make_api(tmp_path, channels=("twitch:channel1", "kick:xqc"))
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -350,7 +360,7 @@ def test_add_channel_subscribes_and_rejects_duplicates(tmp_path):
 
 
 def test_add_kick_channel_uses_the_webhook_subscription(tmp_path):
-    _, ctrl, _, eventsub, wh = make_api(tmp_path, channels=("kick:xqc",))
+    _, ctrl, _, eventsub, wh, _ = make_api(tmp_path, channels=("kick:xqc",))
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -362,7 +372,7 @@ def test_add_kick_channel_uses_the_webhook_subscription(tmp_path):
 
 
 def test_add_channel_rejects_a_bad_name(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -375,7 +385,9 @@ def test_add_channel_rejects_a_bad_name(tmp_path):
 
 
 def test_remove_channel_stops_recording_and_unsubscribes(tmp_path):
-    config, ctrl, recorder, _, wh = make_api(tmp_path, channels=("kick:xqc", "twitch:channel1"), recording=["kick:xqc"])
+    config, ctrl, recorder, _, wh, monitor = make_api(
+        tmp_path, channels=("kick:xqc", "twitch:channel1"), recording=["kick:xqc"]
+    )
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -388,6 +400,7 @@ def test_remove_channel_stops_recording_and_unsubscribes(tmp_path):
     assert "Removed kick:xqc" in body["message"]
     assert body["channels"] == ["twitch:channel1"]
     assert recorder.stop_calls == ["kick:xqc"]
+    assert monitor.remove_calls == ["kick:xqc"]  # no stale monitor state
     assert ctrl._kick_webhook.removed == ["kick:xqc"]
     assert read_file(tmp_path)["channels"] == ["twitch:channel1"]
     assert again_status == 404
@@ -396,9 +409,23 @@ def test_remove_channel_stops_recording_and_unsubscribes(tmp_path):
     )
 
 
+def test_remove_twitch_channel_unsubscribes_eventsub(tmp_path):
+    _, ctrl, _, eventsub, wh, _ = make_api(tmp_path, channels=("twitch:channel1", "kick:xqc"))
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            return await client.delete("/api/v1/channels/twitch:channel1", headers=auth())
+
+    resp = asyncio.run(scenario())
+    assert resp.status == 200
+    # A Twitch channel is left through EventSub, never through the Kick listener.
+    assert eventsub.removed == ["twitch:channel1"]
+    assert ctrl._kick_webhook.removed == []
+
+
 def test_removing_the_last_channel_is_rejected(tmp_path):
     # The config model requires at least one channel, exactly as /remove does.
-    _, _, _, _, wh = make_api(tmp_path, channels=("twitch:channel1",))
+    _, _, _, _, wh, _ = make_api(tmp_path, channels=("twitch:channel1",))
     before = read_file(tmp_path)
 
     async def scenario():
@@ -413,7 +440,7 @@ def test_removing_the_last_channel_is_rejected(tmp_path):
 
 
 def test_channels_list_shows_effective_settings_and_overrides(tmp_path):
-    config, ctrl, recorder, _, wh = make_api(tmp_path, channels=("twitch:channel1",), recording=["twitch:channel1"])
+    config, ctrl, recorder, _, wh, _ = make_api(tmp_path, channels=("twitch:channel1",), recording=["twitch:channel1"])
     config.channel_output_modes["twitch:channel1"] = "youtube"
 
     async def scenario():
@@ -435,7 +462,7 @@ def test_channels_list_shows_effective_settings_and_overrides(tmp_path):
 
 
 def test_patch_channel_sets_and_clears_overrides(tmp_path):
-    config, ctrl, _, _, wh = make_api(tmp_path, channels=("twitch:channel1",))
+    config, ctrl, _, _, wh, _ = make_api(tmp_path, channels=("twitch:channel1",))
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -477,7 +504,7 @@ def test_patch_channel_sets_and_clears_overrides(tmp_path):
 
 
 def test_patch_channel_rejects_an_audio_only_youtube_conflict(tmp_path):
-    config, _, _, _, wh = make_api(tmp_path, channels=("twitch:channel1",))
+    config, _, _, _, wh, _ = make_api(tmp_path, channels=("twitch:channel1",))
     config.output_mode = "youtube"
     before = read_file(tmp_path)
 
@@ -495,7 +522,7 @@ def test_patch_channel_rejects_an_audio_only_youtube_conflict(tmp_path):
 
 
 def test_rotating_the_key_invalidates_the_old_one(tmp_path):
-    _, ctrl, _, _, wh = make_api(tmp_path)
+    _, ctrl, _, _, wh, _ = make_api(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -512,7 +539,7 @@ def test_rotating_the_key_invalidates_the_old_one(tmp_path):
 
 
 def test_webhook_route_still_guards_itself_next_to_the_api(tmp_path):
-    _, _, _, _, wh = make_api(tmp_path)
+    _, _, _, _, wh, _ = make_api(tmp_path)
     wh._config.kick.webhook.enabled = True  # the receiver answers only while the feature is on
 
     async def scenario():
@@ -524,12 +551,32 @@ def test_webhook_route_still_guards_itself_next_to_the_api(tmp_path):
     assert asyncio.run(scenario()) == (401, 200)
 
 
+def test_non_utf8_header_bytes_answer_401(tmp_path):
+    """The real listener decodes header bytes that are not UTF-8. The key
+    comparison must reject them and answer 401, not raise."""
+    _, _, _, _, wh, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            reader, writer = await asyncio.open_connection("127.0.0.1", client.server.port)
+            # 0xFF is not valid UTF-8. aiohttp passes such bytes through.
+            writer.write(
+                b"GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-API-Key: \xff\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            data = await reader.read()
+            writer.close()
+            return data.split(b"\r\n", 1)[0]
+
+    assert asyncio.run(scenario()) == b"HTTP/1.1 401 Unauthorized"
+
+
 def test_a_header_that_is_not_ascii_answers_401(tmp_path):
     """A header can carry bytes that are not UTF-8. The key comparison must
     reject them and never raise."""
     from stream_archive.api import _ApiError
 
-    config, ctrl, recorder, _, _ = make_api(tmp_path)
+    config, ctrl, recorder, _, _, _ = make_api(tmp_path)
     api = ControlAPI(config, ctrl, recorder)
 
     class Request:

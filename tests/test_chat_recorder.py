@@ -28,6 +28,9 @@ class FakeIRCServer:
         self.received = []
         self.accepted = 0
         self.handler_tasks = []
+        #: Handler faults. __aexit__ surfaces them, because the gather there
+        #: retrieves and discards the exception of a handler task.
+        self.failures = []
 
     async def __aenter__(self):
         self.server = await asyncio.start_server(self._handler, "127.0.0.1", 0)
@@ -40,12 +43,22 @@ class FakeIRCServer:
             t.cancel()
         await asyncio.gather(*self.handler_tasks, return_exceptions=True)
         await self.server.wait_closed()
+        if exc[0] is None:
+            # Keep a fault of the test body. It must win over a fault here.
+            assert not self.failures, self.failures
 
     async def _handler(self, reader, writer):
         self.handler_tasks.append(asyncio.current_task())
         idx = self.accepted
         self.accepted += 1
-        lines, hold, expect_reply = self.specs[min(idx, len(self.specs) - 1)]
+        if idx >= len(self.specs):
+            msg = f"unexpected connection #{idx} (only {len(self.specs)} spec(s) scripted)"
+            self.failures.append(msg)
+            # No try/finally runs on this path, so close the socket here.
+            # An open socket makes the wait_closed() above block.
+            writer.close()
+            raise AssertionError(msg)
+        lines, hold, expect_reply = self.specs[idx]
         try:
             while True:  # registration until JOIN
                 line = await reader.readline()
@@ -136,7 +149,7 @@ def test_privmsg_with_emotes_badges_color(tmp_path):
                 ],
                 "user_badges": [{"_id": "subscriber", "version": "12"}],
                 "user_color": "#FF0000",
-                "emoticons": [{"_id": "25", "begin": 6, "end": 12}],
+                "emoticons": [{"_id": "25", "begin": 6, "end": 11}],
             },
         }
         offset = comment.pop("content_offset_seconds")
@@ -160,7 +173,9 @@ def test_ping_gets_pong(tmp_path):
         async with FakeIRCServer([(["PING :tmi.twitch.tv"], False, True)]) as server:
             cr = make_recorder(tmp_path, server)
             cr.start()
-            await asyncio.sleep(0.2)
+            async with asyncio.timeout(5):
+                while "PONG :tmi.twitch.tv" not in server.received:
+                    await asyncio.sleep(0.01)
             await cr.stop()
         assert "PONG :tmi.twitch.tv" in server.received
 
@@ -297,19 +312,27 @@ def test_cancel_mid_stream_writes_complete_json(tmp_path):
     asyncio.run(scenario())
 
 
-def test_failure_cleanup_racing_stop_writes_once(tmp_path):
+def test_failure_cleanup_racing_stop_writes_once(tmp_path, monkeypatch):
     line1 = PRIVMSG_TEMPLATE.format(msg_id="m1", ts=TS_MS, body="first")
 
+    def boom(src, dst):
+        msg = "rename failed"
+        raise OSError(msg)
+
+    monkeypatch.setattr("stream_archive.chat_writer.os.replace", boom)
+
     async def scenario():
+        errors = []
         async with FakeIRCServer([([line1], True, False)]) as server:
-            cr = make_recorder(tmp_path, server)
+            cr = make_recorder(tmp_path, server, on_error=errors.append)
             cr.start()
             await wait_for_comments(cr, 1)
+            # The finalize rename fails while two stop() calls race.
             await asyncio.gather(cr.stop(), cr.stop())
 
-        data = read_chat(tmp_path)
-        assert [c["_id"] for c in data["comments"]] == ["m1"]
-        assert list(tmp_path.glob("*.tmp")) == []
+        assert len(errors) == 1  # the failure is reported exactly once
+        assert '"m1"' in (tmp_path / "chat.json.tmp").read_text()
+        assert not (tmp_path / "chat.json").exists()
 
     asyncio.run(scenario())
 
@@ -355,7 +378,8 @@ def test_open_failure_keeps_recording_and_reports(tmp_path):
                 on_error=errors.append,
             )
             task = cr.start()
-            await asyncio.sleep(0.1)
+            # The writer reports the open failure in its constructor, so the
+            # capture needs no time to reach the failure.
             assert await cr.stop() == 0
             assert task.done()
 

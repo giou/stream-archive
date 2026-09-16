@@ -17,12 +17,27 @@ SCOPES = ["https://www.googleapis.com/auth/youtube"]
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Serves the OAuth redirect and stores the code on server.auth_code."""
+    """Serves the OAuth redirect and stores the code on server.auth_code.
+
+    The handler accepts a code only when its ``state`` matches the value on
+    ``server.auth_state``. A caller that does not set the state accepts any
+    state, so a bare test server keeps working.
+    """
+
+    def _state_accepted(self, query: dict[str, list[str]]) -> bool:
+        """True when the callback carries the expected OAuth ``state``."""
+        expected: str | None = getattr(self.server, "auth_state", None)
+        if expected is None:
+            return True
+        return (query.get("state") or [""])[0] == expected
 
     def do_GET(self) -> None:
         query = parse_qs(urlparse(self.path).query)
-        if query.get("code"):
+        if query.get("code") and self._state_accepted(query):
             self.server.auth_code = query["code"][0]  # type: ignore[attr-defined]
+            event = getattr(self.server, "auth_event", None)
+            if event is not None:
+                event.set()
             body = (
                 b"<html><body><h2>Authorization successful!</h2>"
                 b"<p>You can close this tab and return to the terminal.</p></body></html>"
@@ -31,7 +46,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         else:
             body = (
                 b"<html><body><h2>Authorization failed</h2>"
-                b"<p>No code was received. Close this tab and try again.</p></body></html>"
+                b"<p>No valid code was received. Close this tab and try again.</p></body></html>"
             )
             self.send_response(400)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -75,14 +90,19 @@ def main() -> None:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
 
-    # When the browser can reach localhost, the callback server captures
-    # the code automatically. Otherwise the user pastes the redirect URL.
+    # When the browser can reach the loopback address, the callback server
+    # captures the code automatically. Otherwise the user pastes the
+    # redirect URL. The bind address and the redirect URI must match, so
+    # both use 127.0.0.1.
     server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)  # port 0 -> free port
     server.auth_code = None  # type: ignore[attr-defined]
-    flow.redirect_uri = f"http://localhost:{server.server_address[1]}/"
+    server.auth_state = None  # type: ignore[attr-defined]
+    server.auth_event = threading.Event()  # type: ignore[attr-defined]
+    flow.redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
+    server.auth_state = state  # type: ignore[attr-defined]
     print("1. Open this URL in your browser (trying to open it automatically):")
     print(f"   {auth_url}")
     with contextlib.suppress(Exception):
@@ -97,10 +117,14 @@ def main() -> None:
     for _ in range(3):
         pasted = input("   Press Enter after authorizing, or paste the redirect URL: ").strip()
         try:
-            candidate = server.auth_code or extract_code(pasted)  # type: ignore[attr-defined]
+            candidate = extract_code(pasted) or server.auth_code  # type: ignore[attr-defined]
         except ValueError as exc:
             print(f"   {exc}")
             continue
+        if not candidate:
+            # The browser callback can land just after the user pressed Enter.
+            server.auth_event.wait(timeout=1.0)  # type: ignore[attr-defined]
+            candidate = server.auth_code  # type: ignore[attr-defined]
         if not candidate:
             print("   No code found — wait for the success page, or paste the full redirect URL.")
             continue
@@ -108,6 +132,19 @@ def main() -> None:
             flow.fetch_token(code=candidate)
             break
         except Exception as exc:
+            detail = str(exc)
+            if "invalid_client" in detail or "unauthorized_client" in detail:
+                print(
+                    f"ERROR: Google rejected the OAuth client ({detail}).\n"
+                    "Check client_secret.json and create a desktop OAuth client again.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # Drop the stale code: the next attempt must use the fresh URL.
+            server.auth_code = None  # type: ignore[attr-defined]
+            # Clear the event too, so the one-second grace below applies to
+            # the retry that follows this failed exchange.
+            server.auth_event.clear()  # type: ignore[attr-defined]
             print(f"   Could not exchange the code ({exc}); paste the full URL from the address bar.")
     else:
         print("ERROR: no valid token after 3 attempts. Re-run the script.", file=sys.stderr)

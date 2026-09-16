@@ -72,7 +72,10 @@ async def menu_limits(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
     state = ctrl._state_for(chat_id)
     menu = state.menu
     if text in COUNT_CHOICES:
-        handler = ctrl.handle_maxrecordings if menu == "maxrec" else ctrl.handle_maxyoutube
+        handlers = {"maxrec": ctrl.handle_maxrecordings, "maxyt": ctrl.handle_maxyoutube}
+        handler = handlers.get(menu)
+        if handler is None:  # unknown limits menu: never guess a setting
+            return None
         result = handler([COUNT_CHOICES[text]], chat_id=chat_id)
         state.menu = "storage"
         return result, ctrl.reply_keyboard("storage")
@@ -139,8 +142,10 @@ async def menu_custom(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
         result = ctrl.handle_maxyoutube([text], chat_id=chat_id)
     elif setting == "channel_hold":
         result = ctrl.handle_channel_hold([state.channel or "", text], chat_id=chat_id)
-    else:
+    elif setting == "disk_maxsize":
         result = ctrl.handle_disk(["maxsize", text], chat_id=chat_id)
+    else:  # unknown custom setting: never write it into another setting
+        return None
     if result.startswith("\u274c") or result.startswith("Usage"):
         return result, ctrl.reply_keyboard("custom")
     parent = (
@@ -149,4 +154,6 @@ async def menu_custom(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
         else ("storage" if setting in ("retention", "maxrec", "maxyt") else "disk")
     )
     state.menu = parent
-    return result, ctrl.reply_keyboard(parent)
+    # The channel menu marks the overrides of the selected channel, so it
+    # needs the channel. Other parent menus are global.
+    return result, ctrl.reply_keyboard(parent, state.channel if parent == "channel" else None)

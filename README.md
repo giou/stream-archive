@@ -83,7 +83,7 @@ See [Development](docs/development.md) for the module map.
   or `both`. See [YouTube setup](docs/youtube-setup.md).
 - `cloudflared` or Tailscale for the Kick webhook tunnel. Both ship in the
   image. The Tailscale funnel option also needs tailscale on the host. The app
-  mounts the tailscaled socket into the container.
+  mounts the host tailscale directory into the container.
 
 ## Quick start
 

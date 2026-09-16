@@ -46,26 +46,36 @@ class ChatJsonWriter:
         self.failed = False
         self._on_error = on_error
         self._fh: TextIO | None = None
+        self._good_offset = 0  # end of the last complete comment
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             # The handle stays open until close(): comments land in the file
             # while the recording runs, not inside one with-block.
             self._fh = open(self.tmp_path, "w", encoding="utf-8")  # noqa: SIM115
             self._fh.write('{"comments": [')
+            self._good_offset = self._fh.tell()
         except OSError as e:
             self._fail(e)
 
     def add_comment(self, comment: dict[str, Any]) -> bool:
         """Append one comment and flush it. True when the comment is on disk."""
-        if self._fh is None:
+        fh = self._fh
+        if fh is None:
             return False
         try:
             text = json.dumps(comment, ensure_ascii=False, indent=2).replace("\n", "\n  ")
-            self._fh.write((",\n  " if self.comments else "\n  ") + text)
-            self._fh.flush()
-        except OSError as e:
+            fh.write((",\n  " if self.comments else "\n  ") + text)
+            fh.flush()
+        except (OSError, TypeError, ValueError) as e:
+            # A failed write can leave a torn comment in the tmp file. Cut the
+            # file back to the last complete comment. This rollback is best
+            # effort, so its own failure must not mask the write error.
+            with contextlib.suppress(Exception):
+                fh.seek(self._good_offset)
+                fh.truncate()
             self._fail(e)
             return False
+        self._good_offset = fh.tell()
         self.comments += 1
         return True
 
@@ -89,7 +99,7 @@ class ChatJsonWriter:
             fh.close()
             self._fh = None
             os.replace(self.tmp_path, self.path)
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
             self._fail(e)
             return False
         return True

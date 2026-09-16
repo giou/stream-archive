@@ -26,6 +26,10 @@ AudioSwitch = tuple[Callable[[AppConfig], Any], list[str]]
 #: What one menu press returns: reply text plus keyboard, or None to ignore.
 MenuResult = tuple[str, ReplyKeyboardMarkup | InlineKeyboardMarkup] | None
 
+#: Most unanswered prompts one chat keeps. Without a bound a very old
+#: prompt stays a valid key and re-applies its stale change.
+_PENDING_LIMIT = 8
+
 
 @dataclass
 class MenuState:
@@ -67,6 +71,16 @@ class ChatStateMixin:
             self._states[chat_id] = state
         return state
 
+    def _prune_pending(self, store: dict[PendingKey, Any], chat_id: ChatId) -> None:
+        """Drop the oldest prompts of ``chat_id`` beyond ``_PENDING_LIMIT``.
+
+        A dropped prompt is unreachable, so its guard marker goes too.
+        """
+        keys = [key for key in store if key[0] == chat_id]
+        for key in keys[:-_PENDING_LIMIT]:
+            del store[key]
+            self._apply_warnings_sent.discard(key)
+
     def _chat_of(self, update: Any) -> ChatId:
         """Chat id of an update, defaulting to the admin chat."""
         chat = getattr(update, "effective_chat", None)
@@ -76,23 +90,25 @@ class ChatStateMixin:
         return self._admin_id
 
     def _callback_chat_of(self, update: Any) -> ChatId:
-        """Chat id of a callback query, defaulting to the admin chat."""
+        """Chat id of a callback query, defaulting to the admin chat.
+
+        The guard keys use chat ids, so the fallback must be a chat id
+        too. A user id would miss the stored key in a group chat.
+        """
         query = update.callback_query
         message = getattr(query, "message", None)
         chat = getattr(message, "chat", None) if message is not None else None
         if chat is not None and getattr(chat, "id", None) is not None:
             cid: int = chat.id
             return cid
-        user = getattr(query, "from_user", None) or getattr(update, "effective_user", None)
-        if user is not None and getattr(user, "id", None) is not None:
-            uid: int = user.id
-            return uid
         return self._admin_id
 
     def _show_root(self, chat_id: ChatId) -> MenuState:
-        """Reset one chat to the root menu."""
+        """Reset one chat to the root menu and drop its per-flow fields."""
         state = self._state_for(chat_id)
         state.menu, state.channel = "root", None
+        state.custom = None
+        state.cloudflare_hostname = None
         return state
 
     @property

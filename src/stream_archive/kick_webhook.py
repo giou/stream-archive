@@ -154,6 +154,7 @@ class KickWebhook:
         self._notifier = notifier
         self._runner: Any = None
         self._site: Any = None
+        self._bound: tuple[str, int] | None = None  # (host, port) of the live listener
         self._sync_task: asyncio.Task[Any] | None = None
         self._sync_failed_notified = False
         self._sync_failing_since: float | None = None  # monotonic start of current failure episode
@@ -192,8 +193,15 @@ class KickWebhook:
             await self._stop_sync()
             await self._unbind()
             return
+        ep = self._config.endpoint
+        if self._runner is not None and self._bound != (ep.listen_host, ep.listen_port):
+            # A reload can change the listen address. Rebind, so the listener
+            # and the webhook URL point at the same address. Stop the sync
+            # loop first: it exits once the runner is gone, and a stopped loop
+            # is recreated below.
+            await self._stop_sync()
+            await self._unbind()
         if self._runner is None:
-            ep = self._config.endpoint
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
             try:
@@ -202,6 +210,7 @@ class KickWebhook:
             except OSError:
                 await self._unbind()  # a failed bind leaves no half-built runner
                 raise
+            self._bound = (ep.listen_host, ep.listen_port)
             logger.info(
                 "[kick_webhook] listening on http://%s:%s (public: %s)",
                 ep.listen_host,
@@ -243,6 +252,7 @@ class KickWebhook:
     async def _unbind(self) -> None:
         site = self._site
         self._site = None
+        self._bound = None
         if site is not None:
             with contextlib.suppress(Exception):
                 await site.stop()
@@ -523,7 +533,14 @@ class KickWebhook:
 
         # Create missing subscriptions for monitored channels.
         for bare, uid in desired.items():
-            existing_events = {e.get("name") for s in by_user.get(uid, []) for e in (s.get("events") or [])}
+            subs_for_user = by_user.get(uid, [])
+            existing_events = {e.get("name") for s in subs_for_user for e in (s.get("events") or [])}
+            # Record the ids of the subscriptions that already exist at Kick.
+            # A restart starts with an empty _subs, and the cleanup paths
+            # delete subscriptions by id.
+            known_ids = {s.get("id") for s in subs_for_user if s.get("id")}
+            if known_ids:
+                self._subs.setdefault(bare, set()).update(known_ids)
             missing = [ev for ev in (self.EVENT_LIVE, self.EVENT_CHAT) if ev not in existing_events]
             if missing:
                 created = await self._api.create_event_subscriptions(uid, missing)
@@ -531,7 +548,16 @@ class KickWebhook:
                     item["subscription_id"] for item in created if item.get("subscription_id")
                 )
 
-        # Delete subscriptions for broadcasters no longer monitored.
+        # Delete subscriptions for broadcasters no longer monitored. A slug
+        # that did not resolve above has no uid, so this pass cannot tell its
+        # channel apart from an unmonitored one. Skip the whole pass then: a
+        # missed deletion is harmless, a wrong deletion kills event delivery.
+        unresolved = {kick_bare_name(c) for c in kick_channels} - set(desired)
+        if unresolved:
+            logger.warning(
+                "[kick_webhook] %d kick channel(s) unresolved, skipping subscription cleanup", len(unresolved)
+            )
+            return len(desired)
         desired_ids = set(desired.values())
         for uid, subs in by_user.items():
             if uid in desired_ids:
@@ -565,7 +591,9 @@ class KickWebhook:
             if self._notifier:
                 await self._notifier.notify("\u2705 Kick webhook is working \u2014 first event received from Kick.")
             wh.setup_notified = True
-            save_config(self._config)
+            # save_config writes and fsyncs the file, so keep it off the event
+            # loop. This handler serves every webhook request.
+            await asyncio.to_thread(save_config, self._config)
         except Exception as e:
             logger.error("[kick_webhook] setup confirmation failed: %s", e)
 

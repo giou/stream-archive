@@ -157,9 +157,6 @@ class StreamlinkMixin:
         with self._plugin_lock:
             if self._plugin_loaded:
                 return
-            # Set the flag first. A second thread then resolves with the
-            # plugins that are already in the session.
-            self._plugin_loaded = True
             plugin_dir = self._config.plugin_dir
             path = plugin_dir if os.path.isabs(plugin_dir) else str(self._config._workdir / plugin_dir)
             try:
@@ -168,6 +165,11 @@ class StreamlinkMixin:
                 logger.error("[recorder] Cannot load plugins from %s: %s", path, e)
             else:
                 logger.info("[recorder] Loaded plugins from %s", path)
+            finally:
+                # Set the flag after the load finishes. A second thread then
+                # waits on the lock instead of resolving with the built-in
+                # plugin while load_path() still mutates the registry.
+                self._plugin_loaded = True
 
     def _resolve_stream(self, channel: str, title: str | None, game: str | None) -> tuple[Any, str, str, str]:
         # The ad-block plugin lives in plugin_dir. Without this call, the
@@ -201,8 +203,11 @@ class StreamlinkMixin:
                 except (PluginError, OSError) as err:
                     # Mirror the plugin's own proxy loop. Skip the failing
                     # proxy, and raise NoStreamsError after the last one.
-                    if len(proxies) <= 1:
-                        raise NoStreamsError from None
+                    if not proxies:
+                        # No proxy to rotate: surface the real plugin error.
+                        raise
+                    if len(proxies) == 1:
+                        raise NoStreamsError from err
                     logger.warning(
                         "[recorder] [%s] proxy '%s' failed (%s); trying next proxy",
                         channel,

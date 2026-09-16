@@ -44,6 +44,9 @@ class EventSubClient:
         self._subs: dict[str, dict[str, str]] = {}  # channel -> {"online": sub_id, "offline": sub_id}
         self._user_ids: dict[str, str] = {}  # channel -> helix user id
         self._id_to_channel: dict[str, str] = {}  # helix user id -> channel
+        # The connection loop and the external callers (Telegram, control API)
+        # both mutate the three maps above. This lock serializes them.
+        self._subs_lock = asyncio.Lock()
         self._reconnect_url: str | None = None
         self._ready = asyncio.Event()
         self._stop = asyncio.Event()
@@ -79,6 +82,15 @@ class EventSubClient:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        # Dispatches already in flight still call the monitor. Cancel and
+        # await them, so no handler touches a recording after shutdown starts.
+        pending = list(self._dispatch_tasks)
+        for dispatch in pending:
+            dispatch.cancel()
+        if pending:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._dispatch_tasks.clear()
         ws = self._ws
         self._ws = None
         if ws is not None:
@@ -95,6 +107,10 @@ class EventSubClient:
         return f"EventSub: connected via conduit ({len(self._subs)} channels subscribed)"
 
     async def add_channel(self, channel: str) -> None:
+        async with self._subs_lock:
+            await self._add_channel(channel)
+
+    async def _add_channel(self, channel: str) -> None:
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not subscribing %s", channel)
             return
@@ -113,6 +129,10 @@ class EventSubClient:
         await self._create_channel_subs(channel, uid)
 
     async def remove_channel(self, channel: str) -> None:
+        async with self._subs_lock:
+            await self._remove_channel(channel)
+
+    async def _remove_channel(self, channel: str) -> None:
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not unsubscribing %s", channel)
             return
@@ -126,13 +146,14 @@ class EventSubClient:
             self._id_to_channel.pop(uid, None)
 
     async def sync_channels(self, channels: list[str]) -> None:
-        channels = [c for c in channels if not is_kick_channel(c)]
-        for ch in list(self._subs):
-            if ch not in channels:
-                await self.remove_channel(ch)
-        for ch in channels:
-            if ch not in self._subs:
-                await self.add_channel(ch)
+        async with self._subs_lock:
+            channels = [c for c in channels if not is_kick_channel(c)]
+            for ch in list(self._subs):
+                if ch not in channels:
+                    await self._remove_channel(ch)
+            for ch in channels:
+                if ch not in self._subs:
+                    await self._add_channel(ch)
 
     async def _run(self) -> None:
         backoff = 5.0
@@ -241,14 +262,15 @@ class EventSubClient:
             resolved = {}
         identity_by_bare = {bare_name(c): c for c in channels}
         user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
-        self._user_ids = user_ids
-        self._id_to_channel = {uid: ch for ch, uid in user_ids.items()}
-        for channel in channels:
-            uid = user_ids.get(channel)
-            if uid is None:
-                logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
-                continue
-            await self._create_channel_subs(channel, uid)
+        async with self._subs_lock:
+            self._user_ids = user_ids
+            self._id_to_channel = {uid: ch for ch, uid in user_ids.items()}
+            for channel in channels:
+                uid = user_ids.get(channel)
+                if uid is None:
+                    logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
+                    continue
+                await self._create_channel_subs(channel, uid)
         if len(self._subs) < len(channels):
             poll_only = [ch for ch in channels if ch not in self._subs]
             logger.info("[eventsub] polling only for: %s", ", ".join(poll_only))
@@ -334,6 +356,16 @@ class EventSubClient:
         seen[message_id] = now + _DEDUP_WINDOW_S
         return True
 
+    def _forget_id(self, msg: dict[str, Any]) -> None:
+        """Drop the dedup marker after a failed dispatch.
+
+        The marker is set before the dispatch runs. A failed dispatch must
+        not suppress a redelivery for the rest of the dedup window.
+        """
+        message_id = msg.get("metadata", {}).get("message_id")
+        if message_id:
+            self._seen_ids.pop(message_id, None)
+
     async def _bounded_dispatch(self, msg: dict[str, Any]) -> None:
         """Run one dispatch under the concurrency bound and a timeout.
 
@@ -344,29 +376,37 @@ class EventSubClient:
                 await asyncio.wait_for(self._dispatch(msg), timeout=_DISPATCH_TIMEOUT_S)
         except TimeoutError:
             logger.warning("[eventsub] dispatch timed out, keeping connection")
+            self._forget_id(msg)
         except Exception:
             logger.error("[eventsub] bounded dispatch failed", exc_info=True)
+            self._forget_id(msg)
 
     async def _handle_revocation(self, msg: dict[str, Any]) -> None:
         sub = msg.get("payload", {}).get("subscription", {})
         sub_id = sub.get("id")
         logger.warning("[eventsub] subscription revoked: %s (%s)", sub.get("type"), sub_id)
-        for channel, kinds in list(self._subs.items()):
-            for kind, sid in list(kinds.items()):
-                if sid == sub_id:
-                    del self._subs[channel][kind]
-                    # Recreate at once through the normal subscribe path.
-                    # The surviving kind answers 409 and re-resolves its id.
-                    # A 400/403 keeps the existing polling fallback log.
-                    uid = self._user_ids.get(channel)
-                    if uid is None:
-                        logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
+        async with self._subs_lock:
+            for channel, kinds in list(self._subs.items()):
+                for kind, sid in list(kinds.items()):
+                    if sid == sub_id:
+                        del self._subs[channel][kind]
+                        if not self._subs[channel]:
+                            # add_channel and sync_channels read key presence
+                            # as the subscribed test. An empty entry that stays
+                            # here would never be retried.
+                            del self._subs[channel]
+                        # Recreate at once through the normal subscribe path.
+                        # The surviving kind answers 409 and re-resolves its id.
+                        # A 400/403 keeps the existing polling fallback log.
+                        uid = self._user_ids.get(channel)
+                        if uid is None:
+                            logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
+                            return
+                        try:
+                            await self._create_channel_subs(channel, uid)
+                        except Exception as e:
+                            logger.error("[eventsub] resubscribe failed for %s: %s", channel, e, exc_info=True)
                         return
-                    try:
-                        await self._create_channel_subs(channel, uid)
-                    except Exception as e:
-                        logger.error("[eventsub] resubscribe failed for %s: %s", channel, e, exc_info=True)
-                    return
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         try:
@@ -378,7 +418,7 @@ class EventSubClient:
                 logger.debug("[eventsub] event for unknown channel %s, ignoring", user_id)
                 return
             if sub_type == "stream.online":
-                if channel in self._monitor._live_channels:
+                if self._monitor.is_live(channel):
                     logger.debug("[eventsub] %s already handled as live, ignoring", channel)
                     return
                 stream = await self._api.get_stream(user_id)
@@ -394,3 +434,4 @@ class EventSubClient:
                 logger.debug("[eventsub] ignoring event type %s", sub_type)
         except (httpx.HTTPError, TimeoutError, ValueError, KeyError) as e:
             logger.error("[eventsub] dispatch failed: %s", e, exc_info=True)
+            self._forget_id(msg)

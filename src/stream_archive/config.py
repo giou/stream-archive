@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -54,7 +55,9 @@ WEBHOOK_PATH = "/kick/webhook"
 API_PATH = "/api/v1"
 
 
-_CONFIG_LOCK = threading.Lock()
+#: Guards every read and write of the shared config. Reentrant, because
+#: ``apply_config_change`` holds it across the nested ``save_config`` call.
+_CONFIG_LOCK = threading.RLock()
 
 
 def is_kick_channel(channel: str) -> bool:
@@ -310,8 +313,8 @@ class AppConfig(BaseModel):
 
     _workdir: Path = PrivateAttr()
     _config_path: Path = PrivateAttr()
-    #: Config path -> (placeholder text, value that the environment gave at load time).
-    _env_placeholders: dict[tuple[Any, ...], tuple[str, str]] = PrivateAttr(default_factory=dict)
+    #: Config path -> (placeholder text, value at load time, after validation).
+    _env_placeholders: dict[tuple[Any, ...], tuple[str, Any]] = PrivateAttr(default_factory=dict)
 
     @property
     def workdir(self) -> Path:
@@ -467,7 +470,7 @@ def _bind(
     cfg: AppConfig,
     workdir: Path,
     config_path: Path,
-    placeholders: dict[tuple[Any, ...], tuple[str, str]],
+    placeholders: dict[tuple[Any, ...], tuple[str, Any]],
 ) -> None:
     """Attach file locations and env placeholders to a validated config."""
     cfg._workdir = workdir
@@ -562,15 +565,38 @@ def get_config(path: Path | None = None) -> AppConfig:
     # Absolutize so relative settings (recordings/, chat/, tokens, state)
     # resolve against the config directory regardless of the process cwd.
     # In Docker the config lives inside the mounted data dir.
-    _bind(cfg, config_path.parent.resolve(), config_path.resolve(), placeholders)
+    _bind(cfg, config_path.parent.resolve(), config_path.resolve(), _validated_placeholders(cfg, placeholders))
     return cfg
+
+
+def _validated_placeholders(
+    cfg: AppConfig, placeholders: dict[tuple[Any, ...], tuple[str, str]]
+) -> dict[tuple[Any, ...], tuple[str, Any]]:
+    """Pair each placeholder with its value after validation.
+
+    Pydantic can coerce or normalize an interpolated value: ``"60"`` becomes
+    ``60.0``, and ``["${CH}"]`` becomes ``["twitch:foo"]``. ``save_config``
+    compares the live value against the value in this map. A value that only
+    changed form then stays masked. A key that pydantic dropped keeps its
+    load-time text, and ``save_config`` drops its entry later.
+    """
+    dumped = cfg.model_dump()
+    out: dict[tuple[Any, ...], tuple[str, Any]] = {}
+    for key_path, (raw_text, loaded) in placeholders.items():
+        try:
+            value = _get_at(dumped, key_path)
+        except KeyError, IndexError, TypeError:
+            out[key_path] = (raw_text, loaded)
+            continue
+        out[key_path] = (raw_text, value)
+    return out
 
 
 def save_config(config: AppConfig) -> None:
     """Validate the config and atomically write it to its source file.
 
     A value from an environment placeholder stays masked. The comparison
-    uses the value that the environment gave at load time, not the current
+    uses the load-time value in its validated form, not the current
     environment. Thus a rotated variable keeps its ``${VAR}`` reference and
     takes effect on the next start. Only a value that a program changed
     becomes a literal.
@@ -602,7 +628,11 @@ def save_config(config: AppConfig) -> None:
             existing_mode: int | None = config_path.stat().st_mode & 0o777
         except FileNotFoundError:
             existing_mode = None  # new file: use a private mode
-        mode = 0o600 if existing_mode is None else existing_mode
+        if existing_mode is not None and existing_mode & 0o077:
+            logger.warning("config.json is readable by other users (mode %o), tightening it to 0600", existing_mode)
+        # Always write 0600. An existing file can carry a permissive mode from
+        # a bind mount or an older version, and this write adds secrets to it.
+        mode = 0o600
         try:
             # Create the temporary file with its final mode. The file holds the
             # same secrets as config.json, so no other user may read it, not
@@ -662,12 +692,15 @@ def apply_config_change(config: AppConfig, mutate: Callable[[AppConfig], None]) 
     config and config.json untouched. ``save_config`` validates the copy
     again and writes it atomically. On success the live config takes the
     candidate's state, keeping its identity for the modules that hold it.
+    One lock covers the whole sequence, so two callers cannot interleave
+    and leave the memory state and the file state apart.
     """
-    candidate = config.model_copy(deep=True)
-    mutate(candidate)
-    save_config(candidate)
-    _replace_in_place(config, candidate)
-    return candidate
+    with _CONFIG_LOCK:
+        candidate = config.model_copy(deep=True)
+        mutate(candidate)
+        save_config(candidate)
+        _replace_in_place(config, candidate)
+        return candidate
 
 
 def reload_config(config: AppConfig) -> None:
@@ -692,10 +725,15 @@ def _replace_in_place(target: AppConfig, source: AppConfig) -> None:
 
 
 def _copy_state(target: AppConfig, source: AppConfig) -> None:
-    """Copy validated state between configs. Callers hold _CONFIG_LOCK."""
+    """Copy validated state between configs. Callers hold _CONFIG_LOCK.
+
+    Every mutable value is deep-copied, so neither config shares a list,
+    a dict, or the placeholder tracker with the other. A later change to
+    one of them then never changes the other.
+    """
     for name in type(target).model_fields:
-        object.__setattr__(target, name, getattr(source, name))
-    object.__setattr__(target, "__pydantic_private__", dict(source.__pydantic_private__ or {}))
+        object.__setattr__(target, name, copy.deepcopy(getattr(source, name)))
+    object.__setattr__(target, "__pydantic_private__", copy.deepcopy(source.__pydantic_private__ or {}))
 
 
 def _find_config() -> Path:

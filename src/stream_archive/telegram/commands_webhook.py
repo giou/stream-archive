@@ -1,7 +1,6 @@
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -10,6 +9,7 @@ from stream_archive.telegram.menu_state import ChatId, MenuState
 from stream_archive.tunnels import (
     CloudflaredTunnel,
     decode_token,
+    parse_public_hostname,
     tailscale_funnel_off,
     tailscale_funnel_url,
     token_from_input,
@@ -94,8 +94,15 @@ class WebhookCommands:
         """
         ep = self._config.endpoint
         if ep.cloudflare_token:
-            host = urlsplit(ep.public_url or "").hostname
-            cfg = await self._write_cloudflared_config(host) if host else None
+            host = parse_public_hostname(ep.public_url or "")
+            if host is None:
+                # The saved URL holds no plain hostname, so no ingress config
+                # can point at this listener. Report it, do not raise.
+                return None, (
+                    "The saved public URL has no usable hostname. "
+                    "Send the hostname again, for example kick.example.com."
+                )
+            cfg = await self._write_cloudflared_config(host)
             ok, hint = await self._cloudflared_named_start(ep.cloudflare_token, config_path=cfg)
             return (normalize_endpoint_url(ep.public_url), None) if ok else (None, hint)
         url, hint = await self._cloudflared_quick_start()
@@ -224,10 +231,12 @@ class WebhookCommands:
             )
         except (httpx.HTTPError, ValueError) as e:
             return False, f"\u274c Cloudflare API request failed: {e}"
+        if existing_resp.status_code != 200:
+            # A 403, 429, or 5xx is not an empty result. Treat the lookup
+            # as failed instead of posting a second record.
+            return False, "\u274c The token can't read DNS records \u2014 it needs Zone\u2192DNS edit rights."
         try:
-            existing: list[dict[str, Any]] = (
-                (existing_resp.json().get("result") or []) if existing_resp.status_code == 200 else []
-            )
+            existing: list[dict[str, Any]] = existing_resp.json().get("result") or []
         except ValueError as e:
             return False, f"\u274c Cloudflare API request failed: {e}"
         if existing:
@@ -274,6 +283,9 @@ class WebhookCommands:
             True, url, "cloudflare", cloudflare_token=token, cloudflare_managed=True, chat_id=chat
         )
         if result.startswith("\u274c"):
+            # The apply failed, so the endpoint stays off. Stop the
+            # cloudflared process that nothing points at.
+            self._cloudflared_stop()
             return result, self.reply_keyboard("kick_cloudflare")
         if dns_note is None:
             data = decode_token(token)
@@ -299,7 +311,11 @@ class WebhookCommands:
         chat = chat_id if chat_id is not None else self._admin_id
         state = self._state_for(chat)
         url = normalize_endpoint_url(text)
-        result = await self._apply_endpoint_state(True, url, "cloudflare", chat_id=chat)
+        # Pass the stored token back: the pasted URL replaces the public
+        # URL only, so a later named-tunnel switch keeps the saved token.
+        result = await self._apply_endpoint_state(
+            True, url, "cloudflare", cloudflare_token=self._config.endpoint.cloudflare_token, chat_id=chat
+        )
         if result.startswith("\u274c"):
             return result, self.reply_keyboard(state.menu)
         note = await self._reachability_note(url, "cloudflare")
@@ -359,8 +375,16 @@ class WebhookCommands:
         url, hint = await self._tailscale_webhook_url()
         if url is None:
             return False, f"{hint}\n\nFix tailscale and tap On again, or use Cloudflare tunnel instead."
-        result: str = await self._apply_endpoint_state(True, url, "tailscale", chat_id=chat_id)
+        # Pass the stored token back: a switch to tailscale must not
+        # discard the saved named-tunnel setup.
+        result: str = await self._apply_endpoint_state(
+            True, url, "tailscale", cloudflare_token=self._config.endpoint.cloudflare_token, chat_id=chat_id
+        )
         if result.startswith("\u274c"):
+            # The funnel above is already on. The apply failed, so the
+            # endpoint stays off and the funnel would keep publishing the
+            # listener port. Turn it off again.
+            await self._teardown_tunnel("tailscale")
             return False, result
         note = await self._reachability_note(url, "tailscale")
         return True, (
@@ -382,7 +406,7 @@ class WebhookCommands:
             return result
         saved = self._config.endpoint
         where = f"{saved.tunnel} \u00b7 {saved.public_url}" if saved.tunnel else saved.public_url
-        return f"{result}\n\nYour setup is saved ({where}). Tap On to restore it."
+        return f"{result}\n\nYour setup is saved ({where}). Tap Enable to restore it."
 
     async def _set_webhook_enabled(self, enabled: bool, chat_id: int | None = None) -> str:
         """Turn the Kick webhook feature on or off. The endpoint is untouched."""
@@ -429,10 +453,12 @@ class WebhookCommands:
             _ok, message = await self._tailscale_enable(chat_id=chat_id)
             return message
         tunnel = ep.tunnel
+        started_cloudflared = False
         if tunnel == "cloudflare" and ep.cloudflare_managed:
             url, hint = await self._start_cloudflare_tunnel()
             if url is None:
                 return f"\u274c {hint}"
+            started_cloudflared = True
         else:
             url = ep.public_url
         result: str = await self._apply_endpoint_state(
@@ -444,6 +470,10 @@ class WebhookCommands:
             chat_id=chat_id,
         )
         if result.startswith("\u274c"):
+            if started_cloudflared:
+                # The apply failed, so the endpoint stays off. Stop the
+                # cloudflared process that nothing points at.
+                self._cloudflared_stop()
             return result
         note = await self._reachability_note(url, tunnel)
         return f"{result}\n\n{public_url_note(self._config)}{note}"

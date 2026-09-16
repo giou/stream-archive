@@ -178,8 +178,10 @@ def test_changelog_lines_truncates_long_body():
 
     body = "line1\n" + "word " * 300
     lines = _changelog_lines(body)
+    assert lines[0] == "line1"
     assert lines[-1] == "…"
-    assert len(" ".join(lines)) <= 620
+    # Only the short first line and the ellipsis marker survive the limit.
+    assert len(lines) == 2
 
 
 def test_default_client_follows_redirects(tmp_path):
@@ -193,6 +195,8 @@ def test_default_client_follows_redirects(tmp_path):
 
 def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch):
     config = make_config(tmp_path)
+    # A non-default interval proves the loop reads the config, not a constant.
+    config.update_check.interval_hours = 0.5
     u = UpdateChecker(config, FakeNotifier(), http=FakeHttp({}))
     checks = []
     orig = u.check
@@ -212,12 +216,13 @@ def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(u.run_loop())
     assert checks == [True]
-    assert slept == [24 * 3600]
+    assert slept == [0.5 * 3600]
 
 
 def test_run_loop_disabled_never_checks(tmp_path, monkeypatch):
     config = make_config(tmp_path)
     config.update_check.enabled = False
+    config.update_check.interval_hours = 0.5
     u = UpdateChecker(config, FakeNotifier(), http=FakeHttp({}))
     checks = []
     orig = u.check
@@ -237,7 +242,7 @@ def test_run_loop_disabled_never_checks(tmp_path, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(u.run_loop())
     assert checks == []
-    assert slept == [24 * 3600]
+    assert slept == [0.5 * 3600]
 
 
 def test_state_file_holding_a_list_starts_fresh(tmp_path, set_app_version):

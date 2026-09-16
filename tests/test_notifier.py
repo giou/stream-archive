@@ -17,6 +17,7 @@ class FakeBot:
         self.fail_with = fail_with or TimedOut
         self.retry_after = retry_after
         self.attempts = 0
+        self.shutdown_calls = 0
 
     async def send_message(self, chat_id, text):
         self.attempts += 1
@@ -30,13 +31,16 @@ class FakeBot:
         self.calls.append((chat_id, text))
 
     async def shutdown(self):
-        pass
+        self.shutdown_calls += 1
 
 
-def make_notifier(fail_times=0, fail_with=None):
+def make_notifier(fail_times=0, fail_with=None, max_retries=3):
     n = Notifier("token", 123)
     n.bot = FakeBot(fail_times=fail_times, fail_with=fail_with)
+    # Pin both retry knobs, so the tests do not depend on the defaults of
+    # Notifier.__init__.
     n._retry_delay = 0
+    n._max_retries = max_retries
     return n
 
 
@@ -57,8 +61,7 @@ def test_notify_retries_then_succeeds(monkeypatch):
 
 def test_notify_retry_after_does_not_count_attempt(monkeypatch):
     monkeypatch.setattr(notifier, "Bot", FakeBot)
-    n = make_notifier(fail_times=1, fail_with=RetryAfter)
-    n._max_retries = 1
+    n = make_notifier(fail_times=1, fail_with=RetryAfter, max_retries=1)
     # Flood control sleeps retry_after (0 here) and retries without
     # counting the attempt, so the single retry still succeeds.
     asyncio.run(n.notify("hello"))
@@ -68,7 +71,7 @@ def test_notify_retry_after_does_not_count_attempt(monkeypatch):
 
 def test_notify_raises_after_final_failure(monkeypatch):
     monkeypatch.setattr(notifier, "Bot", FakeBot)
-    n = make_notifier(fail_times=10)
+    n = make_notifier(fail_times=10, max_retries=3)
     with pytest.raises(RuntimeError, match="telegram send failed after 3 retries"):
         asyncio.run(n.notify("hello"))
     assert n.bot.attempts == 3
@@ -132,11 +135,17 @@ def test_notify_shutdown_sends_message(monkeypatch):
     assert n.bot.calls == [(123, "⏹ StreamArchive stopping")]
 
 
+def test_close_shuts_down_the_bot(monkeypatch):
+    monkeypatch.setattr(notifier, "Bot", FakeBot)
+    n = make_notifier()
+    asyncio.run(n.close())
+    assert n.bot.shutdown_calls == 1
+
+
 def test_notify_retry_after_accepts_a_timedelta(monkeypatch):
     """PTB returns a timedelta with PTB_TIMEDELTA=1, the form the image uses."""
     monkeypatch.setattr(notifier, "Bot", FakeBot)
-    n = make_notifier(fail_times=1, fail_with=RetryAfter)
-    n._max_retries = 1
+    n = make_notifier(fail_times=1, fail_with=RetryAfter, max_retries=1)
     n.bot.retry_after = timedelta(seconds=7)
     delays = []
 

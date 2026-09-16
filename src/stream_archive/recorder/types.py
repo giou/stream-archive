@@ -1,8 +1,11 @@
 """Typed state for the recorder.
 
-Recording and HoldState replace the bare dict[str, Any] entries the
-Recorder used to keep. Both use total=False where entries grow key by
-key during start, so readers must use .get() for keys set later.
+Recording and KickChatState replace the bare dict[str, Any] entries the
+Recorder used to keep. Recording uses total=False because its entries grow
+key by key during start, so readers must use .get() for keys set later.
+KickChatState uses total=False for its finalize flag, which is set after
+the first write. HoldState is built complete in one place, so every one of
+its keys is required.
 """
 
 import asyncio
@@ -16,9 +19,13 @@ class KickChatState(TypedDict, total=False):
     """Streaming Kick chat state for one active recording.
 
     Comments land in the file as webhook events arrive, so the state holds the
-    writer, the metadata for the trailer, and the emote ids seen so far.
+    writer, the metadata for the trailer, and the emote ids seen so far. The
+    state stays in the entry until the trailer is written, so a message that
+    arrives during the emote fetch still lands in the file. The finalizing
+    flag marks that finalize run and blocks a second one.
     """
 
+    finalizing: bool
     path: str
     writer: ChatJsonWriter
     title: str | None

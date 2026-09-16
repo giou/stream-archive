@@ -1,10 +1,11 @@
 [build-system]
-requires = ["hatchling"]
+# hatchling >= 1.27 accepts the SPDX string form of `license` (PEP 639).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "stream-archive"
-version = "1.2.1"
+version = "1.2.2"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
@@ -31,7 +32,13 @@ packages = ["src/stream_archive"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Third-party deprecations on a new interpreter floor. These stay visible
+    # in the ignore list, so a new warning from our own modules still fails.
+    "ignore::DeprecationWarning:telegram.*",
+    "ignore::DeprecationWarning:google.*",
+]
 
 [tool.ruff]
 line-length = 120
@@ -65,7 +72,7 @@ module = ["google.*"]
 ignore_errors = true           # google-auth ships partial stubs with untyped methods
 
 [[tool.mypy.overrides]]
-module = ["google_auth_oauthlib.flow"]
+module = ["google_auth_oauthlib.*"]
 ignore_missing_imports = true  # no stubs or py.typed marker upstream
 
 [dependency-groups]

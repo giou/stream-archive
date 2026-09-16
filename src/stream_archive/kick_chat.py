@@ -79,8 +79,6 @@ def _fragments(content: str) -> list[dict[str, Any]]:
         pos = m.end()
     if pos < len(content):
         parts.append({"text": content[pos:]})
-    if not parts:
-        parts.append({"text": content})
     return parts
 
 
@@ -216,7 +214,8 @@ async def fetch_emote_images(
 
     A failed download is skipped, so the returned dict can be partial. The
     function stops at max_emotes ids, drops one image larger than
-    max_bytes_each, and returns at most max_total_bytes of image data.
+    max_bytes_each, and returns at most max_total_bytes of image data. It
+    also drops a body whose content type is not an image.
     """
     out: dict[str, bytes] = {}
     selected = ids[:max_emotes]
@@ -237,6 +236,16 @@ async def fetch_emote_images(
             try:
                 async with http.stream("GET", EMOTE_URL.format(id=eid)) as resp:
                     resp.raise_for_status()
+                    # An error page or JSON error body is 200 and small, but it
+                    # is not an image. TwitchDownloader cannot decode it. Reject
+                    # it here and keep the text token instead. A response with
+                    # no content type passes.
+                    content_type = resp.headers.get("content-type", "")
+                    if content_type and not content_type.lower().startswith("image/"):
+                        logger.warning(
+                            "[kick_chat] emote %s skipped: content type %r is not an image", eid, content_type
+                        )
+                        return
                     body = bytearray()
                     oversized = False
                     async for chunk in resp.aiter_bytes():

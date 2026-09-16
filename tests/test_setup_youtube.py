@@ -25,7 +25,8 @@ def test_extract_code_passthrough_bare_code():
 
 
 def test_extract_code_from_full_redirect_url():
-    url = "http://localhost:53421/?code=4/0AX4XfGc&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
+    # Google percent-encodes the slash in the code, as a real redirect does.
+    url = "http://localhost:53421/?code=4%2F0AX4XfGc&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
     assert extract_code(url) == "4/0AX4XfGc"
 
 
@@ -39,8 +40,45 @@ def test_callback_captures_code_and_renders_success_page():
     try:
         resp = httpx.get(f"http://127.0.0.1:{server.server_address[1]}/?code=abc123")
         assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
         assert b"Authorization successful" in resp.content
         assert server.auth_code == "abc123"
+    finally:
+        _stop_server(server)
+
+
+@pytest.mark.parametrize("query", ["code=abc123&state=other", "code=abc123"])
+def test_callback_rejects_bad_state(query):
+    """A missing or mismatched state answers 400 and stores no code."""
+    server = _start_server()
+    server.auth_state = "expected"
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{server.server_address[1]}/?{query}")
+        assert resp.status_code == 400
+        assert server.auth_code is None
+    finally:
+        _stop_server(server)
+
+
+def test_callback_accepts_matching_state():
+    """A callback that carries the expected state stores the code."""
+    server = _start_server()
+    server.auth_state = "expected"
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{server.server_address[1]}/?code=abc123&state=expected")
+        assert resp.status_code == 200
+        assert server.auth_code == "abc123"
+    finally:
+        _stop_server(server)
+
+
+def test_callback_rejects_error_redirect():
+    """An error redirect renders the failure page and stores no code."""
+    server = _start_server()
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{server.server_address[1]}/?error=access_denied")
+        assert resp.status_code == 400
+        assert server.auth_code is None
     finally:
         _stop_server(server)
 

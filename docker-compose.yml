@@ -12,9 +12,29 @@ services:
       # tokens, update_state.json. The default is the folder containing this
       # compose file. Override it with STREAM_ARCHIVE_DATA in .env.
       - ${STREAM_ARCHIVE_DATA:-.}:/data
-      # Host tailscaled socket. It lets the bot run `tailscale funnel` for the
-      # kick webhook tunnel. Tailscale must be installed on the docker host.
-      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+      # Host tailscale runtime directory. It lets the bot run `tailscale
+      # funnel` for the kick webhook tunnel. The mount is optional: the stack
+      # boots when tailscale is absent, because compose creates an empty
+      # directory. An empty directory is what tailscaled creates too. Set
+      # TAILSCALE_RUN_DIR when the host uses another path.
+      # The mount is read-write: a unix socket needs write access to connect,
+      # and the container can change the host tailnet (funnel/serve config,
+      # routes). Trust the container as the host user. The socket is usually
+      # root:root mode 0600, so set USER_UID/USER_GID to a user that may write
+      # to it, or run
+      # `sudo chmod 0660 /var/run/tailscale/tailscaled.sock` on the host.
+      - ${TAILSCALE_RUN_DIR:-/var/run/tailscale}:/var/run/tailscale
+      # /tmp is the only scratch space (HOME and the streamlink plugin cache
+      # too), so cap it: without a limit a leaked file can consume half of the
+      # host RAM. The size is in bytes. Write the mode as an octal literal
+      # (0o1777) to keep /tmp world-writable for the dropped uid: compose
+      # passes a plain number to the kernel as an octal string, so `mode: 1777`
+      # gives mode 3361 instead.
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 1073741824
+          mode: 0o1777
     ports:
       # Kick webhook receiver and control API (/api/v1, same listener). The
       # host's tailscale funnel forwards to the host loopback, so we publish
@@ -28,10 +48,8 @@ services:
       - USER_UID=${USER_UID:-}
       - USER_GID=${USER_GID:-}
     # The image owns all code. The rootfs is read-only, and only the data dir
-    # and /tmp (tmpfs) are writable.
+    # and /tmp (tmpfs, above) are writable.
     read_only: true
-    tmpfs:
-      - /tmp
     logging:
       driver: json-file
       options:
