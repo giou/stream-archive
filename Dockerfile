@@ -5,7 +5,7 @@ FROM cloudflare/cloudflared:2026.9.1 AS cloudflared
 
 # Pinned uv version used to build the image. A separate stage keeps the tag
 # visible to Dependabot.
-FROM ghcr.io/astral-sh/uv:0.12.13 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.15 AS uv
 
 FROM python:3.14.7-slim
 
