@@ -32,7 +32,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
-COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -45,20 +44,32 @@ WORKDIR /app
 # release by hand.
 # The file is fetched without a checksum on purpose (the release asset is
 # mutable). The syntax check rejects a truncated file or an HTML error page.
+# The build resolves "latest" through the GitHub redirect and prints the
+# release tag, so the log names the plugin an image contains.
 ARG TTVLOL_PLUGIN_VERSION=latest
 RUN mkdir -p /app/plugins \
  && if [ "${TTVLOL_PLUGIN_VERSION}" = "latest" ]; then \
-      URL="https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py"; \
+      RELEASE_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+        https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py)"; \
+      TAG="${RELEASE_URL%/*}"; \
+      TAG="${TAG##*/}"; \
     else \
-      URL="https://github.com/2bc4/streamlink-ttvlol/releases/download/${TTVLOL_PLUGIN_VERSION}/twitch.py"; \
+      TAG="${TTVLOL_PLUGIN_VERSION}"; \
     fi \
- && curl -fsSL "$URL" -o /app/plugins/twitch.py \
+ && if [ -z "${TAG}" ]; then \
+      echo "cannot resolve the streamlink-ttvlol release" >&2; exit 1; \
+    fi \
+ && echo "TTVLOL plugin release: ${TAG}" \
+ && curl -fsSL -o /app/plugins/twitch.py \
+      "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py" \
  && python -c "import ast; ast.parse(open('/app/plugins/twitch.py').read())"
 
 # Two-stage dependency install so source edits do not invalidate the dep layer.
 # Stage 1 resolves and installs third-party deps only. Build caches it until
 # uv.lock or project metadata changes. Stage 2 adds the project itself from
-# src/.
+# src/. Both stages mount the uv binary instead of copying it: nothing at
+# runtime runs uv, and the mount keeps the binary out of the image. Each stage
+# drops the uv cache it writes, so the layers hold /opt/venv only.
 COPY pyproject.toml uv.lock README.md ./
 
 # Venv lives outside /app so the read-only rootfs never blocks it.
@@ -70,9 +81,13 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PTB_TIMEDELTA=1
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    uv sync --frozen --no-dev --no-install-project \
+ && rm -rf /root/.cache/uv
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    uv sync --frozen --no-dev \
+ && rm -rf /root/.cache/uv
 
 # HOME must be writable by the (non-root) runtime user. Streamlink's plugin
 # cache defaults to $HOME/.cache. /tmp is a tmpfs under compose and world-
@@ -88,6 +103,10 @@ ENV HOME=/tmp
 # root resolves uid 0; the entrypoint then warns on stderr and keeps root,
 # because a chown of existing data is a host decision. setpriv comes from
 # util-linux, which is essential in the slim base image.
+# The dropped identity also drives the tailscale CLI. tailscaled denies a
+# state-changing command (funnel, serve, up) to a uid that is neither root nor
+# the configured operator, so register that uid on the host when the bot must
+# manage the funnel: `tailscale set --operator=<uid>`.
 COPY entrypoint.sh /usr/local/bin/stream-archive-entrypoint
 RUN chmod +x /usr/local/bin/stream-archive-entrypoint
 ENTRYPOINT ["stream-archive-entrypoint"]
@@ -101,6 +120,8 @@ CMD ["stream-archive"]
 # loopback interface (scheduler.py _start_health_server, constant
 # _HEALTH_PORT). Keep 9100 in step with that constant. Compose inherits this
 # healthcheck automatically. Do not duplicate it in docker-compose.yml. The
-# check also runs for an overridden CMD, so a one-shot setup run reports
+# inner 2s timeout leaves room for the interpreter start and the imports inside
+# the 5s healthcheck timeout, so a loaded host still reports a healthy process.
+# The check also runs for an overridden CMD, so a one-shot setup run reports
 # "unhealthy" after it exits. Pass --no-healthcheck to skip it.
-HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=4)"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=2)"]

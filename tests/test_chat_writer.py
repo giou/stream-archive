@@ -1,4 +1,5 @@
 import json
+import os
 
 from stream_archive.chat_writer import ChatJsonWriter, file_info
 
@@ -53,6 +54,20 @@ def test_close_without_comments_writes_empty_array(tmp_path):
     assert data["FileInfo"]["CreatedAt"].endswith("Z")
 
 
+def test_trailer_comments_key_is_skipped(tmp_path, caplog):
+    path = str(tmp_path / "chat.json")
+    writer = ChatJsonWriter(path)
+    writer.add_comment(comment(1))
+
+    with caplog.at_level("ERROR", logger="stream_archive.chat_writer"):
+        assert writer.close({"comments": [comment(9)], "FileInfo": file_info()}) is True
+
+    with open(path) as f:
+        data = json.load(f)
+    assert [c["_id"] for c in data["comments"]] == ["m1"]  # the trailer copy stays out
+    assert any("collides" in r.getMessage() for r in caplog.records)
+
+
 def test_discard_removes_tmp_and_leaves_no_file(tmp_path):
     path = str(tmp_path / "chat.json")
     writer = ChatJsonWriter(path)
@@ -73,8 +88,10 @@ def test_open_failure_reports_once_and_never_writes(tmp_path):
 
     assert writer.failed is True
     assert len(errors) == 1
+    assert isinstance(errors[0], FileExistsError)  # the makedirs failure itself
     assert writer.add_comment(comment(1)) is False
     assert writer.close({"FileInfo": file_info()}) is False
+    assert len(errors) == 1  # neither call reports again
     assert not (blocker / "chat.json").exists()
 
 
@@ -98,6 +115,8 @@ def test_write_failure_keeps_partial_file(tmp_path):
     assert writer.add_comment(comment(2)) is False
     assert writer.failed is True
     assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "No space left on device" in str(errors[0])
     assert writer.add_comment(comment(3)) is False
     assert len(errors) == 1  # the handler runs exactly once, not per message
     # The partial file stays for recovery. The target path stays untouched.
@@ -106,12 +125,41 @@ def test_write_failure_keeps_partial_file(tmp_path):
     assert not (tmp_path / "chat.json").exists()
 
 
+def test_tell_failure_marks_the_writer_failed(tmp_path):
+    path = str(tmp_path / "chat.json")
+    errors = []
+    writer = ChatJsonWriter(path, on_error=errors.append)
+    real = writer._fh
+
+    class BadTellHandle:
+        def tell(self):
+            msg = "tell failed"
+            raise OSError(msg)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    writer._fh = BadTellHandle()
+
+    assert writer.add_comment(comment(1)) is False  # a tell() fault must not raise
+    assert writer.failed is True
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "tell failed" in str(errors[0])
+
+
 def test_close_failure_keeps_tmp_and_no_target(tmp_path, monkeypatch):
     path = str(tmp_path / "chat.json")
-    writer = ChatJsonWriter(path)
+    errors = []
+    writer = ChatJsonWriter(path, on_error=errors.append)
     writer.add_comment(comment(1))
 
+    real_replace = os.replace
+
     def boom(src, dst):
+        # Fail only the writer rename, so unrelated renames keep working.
+        if src != writer.tmp_path:
+            return real_replace(src, dst)
         msg = "rename failed"
         raise OSError(msg)
 
@@ -119,5 +167,8 @@ def test_close_failure_keeps_tmp_and_no_target(tmp_path, monkeypatch):
 
     assert writer.close({"FileInfo": file_info()}) is False
     assert writer.failed is True
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert "rename failed" in str(errors[0])
     assert (tmp_path / "chat.json.tmp").exists()
     assert not (tmp_path / "chat.json").exists()

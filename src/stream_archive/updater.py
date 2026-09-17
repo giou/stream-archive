@@ -75,7 +75,7 @@ class UpdateChecker:
         except FileNotFoundError:
             self._state = {}
             return
-        except json.JSONDecodeError:
+        except json.JSONDecodeError, UnicodeDecodeError:
             logger.warning("[updater] update_state.json corrupt; starting fresh")
             self._state = {}
             return
@@ -139,8 +139,11 @@ class UpdateChecker:
         data = report["app"]
         latest = data.get("latest")
         lines: list[str] = []
+        record = False
+        # The state file is small, but the read and the write are blocking
+        # I/O. Keep them off the event loop.
         async with self._lock:
-            self._load_state()
+            await asyncio.to_thread(self._load_state)
             # Record every version that the check resolved. Thus a version
             # that comes back later (for example after a rollback) notifies
             # again. An inconclusive check must not consume the release.
@@ -151,8 +154,8 @@ class UpdateChecker:
                     if cl:
                         lines.append("  Changelog:")
                         lines.extend(f"  • {ln}" for ln in cl)
-                self._state["app"] = latest
-                self._save_state()
+                record = True
+            previous = self._state.get("app")
 
         if lines:
             text = (
@@ -163,7 +166,18 @@ class UpdateChecker:
             try:
                 await self._notifier.notify(text)
             except Exception:
+                # Keep the release unrecorded. A failed send must retry on the
+                # next check, or the alert for this release is lost.
                 logger.error("[updater] update notification failed", exc_info=True)
+                return report
+
+        if record:
+            async with self._lock:
+                await asyncio.to_thread(self._load_state)
+                # Another check can have recorded a newer release meanwhile.
+                if self._state.get("app") == previous:
+                    self._state["app"] = latest
+                    await asyncio.to_thread(self._save_state)
         return report
 
     # ---- loop / lifecycle --------------------------------------------------

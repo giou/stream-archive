@@ -76,7 +76,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         # Apply-now button of the same nonce is gone. Do not keep its entry.
         ctrl._pending_apply.pop(pending_key, None)
         ctrl._apply_warnings_sent.discard(pending_key)
-        ctrl._confirm_done.add((chat_id, data))
+        ctrl._mark_confirm_done(chat_id, data)
         return "Cancelled \u2014 nothing changed", None
     if action == "confirm_remove" and len(parts) >= 3:
         if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
@@ -86,14 +86,14 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         value = ":".join(parts[1:-1])
         if value not in ctrl._config.channels:
             return f"{value} is no longer monitored", None  # stale confirm message
-        ctrl._confirm_done.add((chat_id, data))
+        ctrl._mark_confirm_done(chat_id, data)
         result = await ctrl.handle_remove([value], chat_id=chat_id)  # stops recording + eventsub, clears override
         state.menu, state.channel = "channels", None
         return result, None
     if action == "confirm_delete_oldest" and len(parts) == 3 and parts[1] == "on":
         if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
             return None
-        ctrl._confirm_done.add((chat_id, data))
+        ctrl._mark_confirm_done(chat_id, data)
         result = ctrl.handle_disk(["delete_oldest", "on"], chat_id=chat_id)
         state.menu = "disk"
         return result, None
@@ -105,13 +105,23 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         if pending is None:
             return None  # stale message: the bot restarted or handled it
         ctrl._apply_warnings_sent.discard(key)
-        ctrl._confirm_done.add((chat_id, data))
+        ctrl._mark_confirm_done(chat_id, data)
         summary, channels = pending
         lines = []
+        failed = False
         for ch in channels:
-            ok = await ctrl._recorder.restart(ch)
+            try:
+                ok = await ctrl._recorder.restart(ch)
+            except Exception:
+                # One failed restart must not discard the other channels of the
+                # prompt, and must not escape as a plain "Unexpected error".
+                logger.exception("[telegram] Failed to restart the recording of %s", ch)
+                lines.append(f"{ch}: restart failed \u2014 see logs")
+                failed = True
+                continue
             lines.append(f"{ch}: {'restarted with the new settings' if ok else 'no longer recording'}")
-        return f"\u2705 Applied: {summary}\n" + "\n".join(lines), None
+        head = "\u26a0\ufe0f Applied with errors" if failed else "\u2705 Applied"
+        return f"{head}: {summary}\n" + "\n".join(lines), None
     if action == "audio_confirm" and len(parts) == 2:
         if (chat_id, data) in ctrl._confirm_done:
             return None
@@ -119,7 +129,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         audio_pending = ctrl._pending_audio_switch.pop(key, None)
         if audio_pending is None:
             return None  # the message is stale: the bot handled it or restarted
-        ctrl._confirm_done.add((chat_id, data))
+        ctrl._mark_confirm_done(chat_id, data)
         ctrl._apply_warnings_sent.discard(key)
         quality_mutate, channels = audio_pending
 
@@ -130,11 +140,17 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
                 if ch in live:
                     candidate.channel_output_modes[ch] = "disk"
 
-        result = ctrl._apply(
-            combined,
-            lambda c: f"Quality set to audio_only; output mode disk for {', '.join(channels)}",
-            chat_id,
-        )
+        try:
+            result = ctrl._apply(
+                combined,
+                lambda c: f"Quality set to audio_only; output mode disk for {', '.join(channels)}",
+                chat_id,
+            )
+        except Exception:
+            # The press is already marked handled, so report the failure
+            # instead of escaping with a generic error and no explanation.
+            logger.exception("[telegram] Failed to apply the audio-only switch")
+            return "\u274c The change failed \u2014 see logs", None
         return result, None
     return None
 
@@ -152,13 +168,18 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
     """
     for key in list(ctrl._pending_apply):
         chat_id, nonce = key
-        summary, channels = ctrl._pending_apply[key]
+        # A cancel or apply-now press can pop the entry during the awaits
+        # of this loop, so read it and never raise on a missing key.
+        entry = ctrl._pending_apply.get(key)
+        if entry is None:
+            continue
+        summary, channels = entry
         channels = [ch for ch in channels if ctrl._recorder.is_recording(ch)]
         if not channels:
             # Every affected recording already ended (the channel was
             # removed or the stream finished). Nothing can be applied
             # to a running recording, so drop the stale prompt.
-            del ctrl._pending_apply[key]
+            ctrl._pending_apply.pop(key, None)
             ctrl._apply_warnings_sent.discard(key)
             continue
         if key in ctrl._apply_warnings_sent:
@@ -189,7 +210,12 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
         if key in ctrl._apply_warnings_sent:
             continue
         chat_id, nonce = key
-        _mutate, channels = ctrl._pending_audio_switch[key]
+        # A cancel or confirm press can pop the entry during the awaits of
+        # this loop, so read it and never raise on a missing key.
+        audio_entry = ctrl._pending_audio_switch.get(key)
+        if audio_entry is None:
+            continue
+        _mutate, channels = audio_entry
         text = (
             f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(channels)}\n"
             "Audio-only cannot be restreamed to YouTube."

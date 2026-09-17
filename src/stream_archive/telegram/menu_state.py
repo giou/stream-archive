@@ -26,9 +26,30 @@ AudioSwitch = tuple[Callable[[AppConfig], Any], list[str]]
 #: What one menu press returns: reply text plus keyboard, or None to ignore.
 MenuResult = tuple[str, ReplyKeyboardMarkup | InlineKeyboardMarkup] | None
 
+#: Prefix of the channel buttons in the channel list. The renderer of the
+#: keyboard and the router of its presses must use the same value.
+CHANNEL_BUTTON_PREFIX = "\u2022 "
+
+#: Prefix of every failure reply that a handler returns.
+_ERROR_PREFIX = "\u274c"
+
 #: Most unanswered prompts one chat keeps. Without a bound a very old
 #: prompt stays a valid key and re-applies its stale change.
 _PENDING_LIMIT = 8
+
+#: Most handled presses one chat remembers. The guard only matters while
+#: the inline keyboard of its message is still tappable.
+_CONFIRM_DONE_LIMIT = 32
+
+
+def is_error(result: str) -> bool:
+    """True when a handler result is a failure reply, not a success message.
+
+    Every handler reports a failure with one shape, so callers that run
+    cleanup after a change must branch through this helper. A plain check
+    of the prefix would silently skip the cleanup after a change of shape.
+    """
+    return result.startswith(_ERROR_PREFIX)
 
 
 @dataclass
@@ -51,17 +72,31 @@ class ChatStateMixin:
 
     _admin_id: int
     _states: dict[ChatId, MenuState]
-    _confirm_done: set[tuple[ChatId, str]]
+    _confirm_done: dict[PendingKey, None]
     _pending_apply: dict[PendingKey, tuple[str, list[str]]]
     _pending_audio_switch: dict[PendingKey, AudioSwitch]
     _apply_warnings_sent: set[PendingKey]
 
     def _init_chat_state(self) -> None:
         self._states = {}  # chat id -> reply-keyboard menu, one per chat
-        self._confirm_done = set()  # (chat id, callback data) already confirmed
+        # (chat id, callback data) -> None. An ordered set: the value is
+        # unused, and the oldest marker is the first key.
+        self._confirm_done = {}
         self._pending_apply = {}  # (chat id, nonce) -> (summary, channels) awaiting apply-now
         self._pending_audio_switch = {}  # (chat id, nonce) -> (quality change, channels) awaiting confirm
         self._apply_warnings_sent = set()  # pending keys already messaged
+
+    def _mark_confirm_done(self, chat_id: ChatId, data: str) -> None:
+        """Remember one handled press. Keep only the newest markers of the chat.
+
+        The key holds the nonce of one prompt, so a marker can never match a
+        later press. The bound stops the store from growing for the whole
+        process lifetime.
+        """
+        self._confirm_done[(chat_id, data)] = None
+        keys = [key for key in self._confirm_done if key[0] == chat_id]
+        for key in keys[:-_CONFIRM_DONE_LIMIT]:
+            del self._confirm_done[key]
 
     def _state_for(self, chat_id: ChatId) -> MenuState:
         """Return the menu of ``chat_id``, creating the root menu on first use."""

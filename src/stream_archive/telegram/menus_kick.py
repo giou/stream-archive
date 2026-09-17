@@ -10,7 +10,7 @@ import re
 from typing import TYPE_CHECKING
 
 from stream_archive.telegram.commands_webhook import public_url_note
-from stream_archive.telegram.menu_state import ChatId, MenuResult
+from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error
 from stream_archive.tunnels import parse_public_hostname
 
 if TYPE_CHECKING:
@@ -24,6 +24,9 @@ async def menu_remote_access(ctrl: TelegramController, chat_id: ChatId, text: st
         return await ctrl._enable_endpoint(chat_id=chat_id), ctrl.reply_keyboard("remote_access", chat_id=chat_id)
     if text == "Disable endpoint":
         return await ctrl._disable_endpoint(chat_id=chat_id), ctrl.reply_keyboard("remote_access", chat_id=chat_id)
+    if re.match(r"(?i)https?://", text.strip()):  # own tunnel already running
+        # The enable prompt asks for a pasted URL, so take it here too.
+        return await ctrl._apply_cloudflare_url(text, chat_id=chat_id)
     new_menu = {
         "Cloudflare tunnel": "kick_cloudflare",
         "Tailscale funnel": "kick_tailscale",
@@ -52,7 +55,7 @@ async def menu_kick_webhook(ctrl: TelegramController, chat_id: ChatId, text: str
 async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the Cloudflare tunnel pick: the toggle, own URL, quick, or named."""
     state = ctrl._state_for(chat_id)
-    if re.match(r"(?i)https?://", text):  # own tunnel already running
+    if re.match(r"(?i)https?://", text.strip()):  # own tunnel already running
         return await ctrl._apply_cloudflare_url(text, chat_id=chat_id)
     if text == "Enable Cloudflare tunnel":
         return (
@@ -69,7 +72,7 @@ async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: 
         if url is None:
             return f"\u274c {hint}", ctrl.reply_keyboard("kick_cloudflare", chat_id=chat_id)
         result = await ctrl._apply_endpoint_state(True, url, "cloudflare", cloudflare_managed=True, chat_id=chat_id)
-        if result.startswith("\u274c"):
+        if is_error(result):
             # The apply failed, so the endpoint stays off. Stop the process
             # and do not claim that the quick tunnel is running.
             ctrl._cloudflared_stop()

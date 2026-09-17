@@ -28,8 +28,8 @@ class FakeIRCServer:
         self.received = []
         self.accepted = 0
         self.handler_tasks = []
-        #: Handler faults. __aexit__ surfaces them, because the gather there
-        #: retrieves and discards the exception of a handler task.
+        #: Handler faults. __aexit__ collects the exceptions of the handler
+        #: tasks. The teardown cancel() results stay out.
         self.failures = []
 
     async def __aenter__(self):
@@ -41,7 +41,12 @@ class FakeIRCServer:
         self.server.close()
         for t in self.handler_tasks:
             t.cancel()
-        await asyncio.gather(*self.handler_tasks, return_exceptions=True)
+        results = await asyncio.gather(*self.handler_tasks, return_exceptions=True)
+        self.failures.extend(
+            f"handler task failed: {r!r}"
+            for r in results
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)
+        )
         await self.server.wait_closed()
         if exc[0] is None:
             # Keep a fault of the test body. It must win over a fault here.
@@ -226,6 +231,43 @@ def test_user_notice_records_system_message(tmp_path):
     asyncio.run(scenario())
 
 
+def test_out_of_range_timestamp_falls_back_to_the_local_clock(tmp_path):
+    """An out-of-range tmi-sent-ts must not kill the read loop."""
+    line = PRIVMSG_TEMPLATE.format(msg_id="m1", ts=10**30, body="first")
+
+    async def scenario():
+        async with FakeIRCServer([([line], False, False)]) as server:
+            cr = make_recorder(tmp_path, server)
+            cr.start()
+            await wait_for_comments(cr, 1)
+            await cr.stop()
+
+        comment = read_chat(tmp_path)["comments"][0]
+        assert comment["_id"] == "m1"
+        created = datetime.strptime(comment["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        assert abs((datetime.now(UTC) - created).total_seconds()) < 60
+
+    asyncio.run(scenario())
+
+
+def test_inverted_emote_range_keeps_one_text_fragment(tmp_path):
+    """An inverted range must drop the emote, never duplicate the text."""
+    line = PRIVMSG_TEMPLATE.format(msg_id="m1", ts=TS_MS, body="Hello").replace("emotes=25:6-10", "emotes=25:4-2", 1)
+
+    async def scenario():
+        async with FakeIRCServer([([line], False, False)]) as server:
+            cr = make_recorder(tmp_path, server)
+            cr.start()
+            await wait_for_comments(cr, 1)
+            await cr.stop()
+
+        message = read_chat(tmp_path)["comments"][0]["message"]
+        assert message["fragments"] == [{"text": "Hello"}]
+        assert message["emoticons"] == []
+
+    asyncio.run(scenario())
+
+
 def test_reconnects_after_disconnect(tmp_path):
     line1 = PRIVMSG_TEMPLATE.format(msg_id="m1", ts=TS_MS, body="first")
     line2 = PRIVMSG_TEMPLATE.format(msg_id="m2", ts=TS2_MS, body="second")
@@ -245,7 +287,8 @@ def test_reconnects_after_disconnect(tmp_path):
 
         data = read_chat(tmp_path)
         assert [c["_id"] for c in data["comments"]] == ["m1", "m2"]
-        assert cr._connected_once
+        # The second comment can only arrive over a second connection.
+        assert server.accepted == 2
 
     asyncio.run(scenario())
 
@@ -378,8 +421,12 @@ def test_open_failure_keeps_recording_and_reports(tmp_path):
                 on_error=errors.append,
             )
             task = cr.start()
-            # The writer reports the open failure in its constructor, so the
-            # capture needs no time to reach the failure.
+            # Wait until the capture is connected. The writer reports the
+            # open failure in its constructor, so no reconnect is due yet.
+            async with asyncio.timeout(5):
+                while not server.accepted:
+                    await asyncio.sleep(0.01)
+            assert not task.done()  # the capture keeps running after the failure
             assert await cr.stop() == 0
             assert task.done()
 

@@ -18,6 +18,10 @@ from stream_archive.chat_writer import ChatJsonWriter, file_info
 
 logger = logging.getLogger(__name__)
 
+#: Longest wait for one IRC line. Twitch sends a PING about every 5 minutes,
+#: so a longer silence means the link died without a close.
+_READ_TIMEOUT_S = 300.0
+
 _TAG_ESCAPES = {"s": " ", ":": ";", "\\": "\\", "r": "\r", "n": "\n"}
 
 
@@ -44,8 +48,8 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
     """Split body into TwitchDownloader fragments/emoticons from an `emotes` tag value.
 
     Tag format: `25:0-4,12-16/1902:8-15`. Character ranges are inclusive.
-    The return value is ([fragments], [emoticons]). The parser drops malformed
-    and overlapping ranges.
+    The return value is ([fragments], [emoticons]). The parser drops
+    malformed, inverted and overlapping ranges.
     """
     if not emotes_tag:
         return [{"text": body}], []
@@ -68,8 +72,8 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
     emoticons: list[dict[str, Any]] = []
     pos = 0
     for begin, end, emote_id in ranges:
-        if begin >= len(body) or begin < pos:
-            continue  # malformed or overlapping — drop
+        if begin >= len(body) or begin < pos or end < begin:
+            continue  # malformed, inverted or overlapping — drop
         if begin > pos:
             fragments.append({"text": body[pos:begin]})
         emote_text = body[begin : min(end + 1, len(body))]
@@ -124,7 +128,6 @@ class ChatRecorder:
         self._start_mono = time.monotonic()
         self._start_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._task: asyncio.Task[Any] | None = None
-        self._connected_once = False
         self._finalized = False
 
     @property
@@ -174,7 +177,13 @@ class ChatRecorder:
             await writer.drain()
 
             while True:
-                line = await reader.readline()
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=_READ_TIMEOUT_S)
+                except TimeoutError:
+                    # The peer stopped answering without a close, for example
+                    # after a route change. Reconnect instead of blocking on
+                    # a dead socket for the rest of the recording.
+                    return read_any
                 if not line:
                     return read_any  # disconnected
                 read_any = True
@@ -198,7 +207,6 @@ class ChatRecorder:
                     comment = self._parse_message(text, cmd)
                     if comment is not None and self._writer.add_comment(comment):
                         self._last_offset = comment["content_offset_seconds"]
-                        self._connected_once = True
                 # ignore everything else (001/353/366/NOTICE/ROOMSTATE)
         finally:
             try:
@@ -239,7 +247,12 @@ class ChatRecorder:
         except ValueError:
             ts = 0
         if ts:
-            created_at = datetime.fromtimestamp(ts / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                created_at = datetime.fromtimestamp(ts / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except ValueError, OverflowError, OSError:
+                # "tmi-sent-ts" can be out of range. A bad tag must not kill
+                # the read loop, so fall back to the local clock.
+                created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         else:
             created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 

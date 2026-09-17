@@ -14,7 +14,8 @@ class Notifier:
     def __init__(self, bot_token: str, chat_id: int):
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
-        self._max_retries = 3
+        #: Total send attempts, the first one included.
+        self._max_attempts = 3
         self._retry_delay = 2
         #: Bound the flood-control path, so a permanently limited bot cannot
         #: block the caller forever. The counter stops a loop of short waits,
@@ -45,25 +46,27 @@ class Notifier:
                     delay = float(retry_after)
                 else:
                     delay = float(self._retry_delay)
-                flood_waits += 1
-                flood_seconds += delay
-                if flood_waits > self._max_flood_waits or flood_seconds > self._max_flood_wait_seconds:
+                # Check the budget before the counters grow. The message then
+                # reports the waits that really happened.
+                if flood_waits >= self._max_flood_waits or flood_seconds + delay > self._max_flood_wait_seconds:
                     msg = f"telegram send still flood-controlled after {flood_waits} waits ({flood_seconds:.0f}s)"
                     logger.error("[notifier] %s", msg)
                     raise RuntimeError(msg) from e
+                flood_waits += 1
+                flood_seconds += delay
                 logger.warning("[notifier] Telegram flood control, waiting %ss...", delay)
                 await asyncio.sleep(delay)
                 continue
             except (TimedOut, NetworkError) as e:
                 attempt += 1
-                if attempt >= self._max_retries:
-                    msg = f"telegram send failed after {self._max_retries} retries"
-                    logger.error("[notifier] Error sending Telegram message after %d retries: %s", self._max_retries, e)
+                if attempt >= self._max_attempts:
+                    msg = f"telegram send failed after {self._max_attempts} attempts"
+                    logger.error("[notifier] %s: %s", msg, e)
                     raise RuntimeError(msg) from e
                 logger.warning(
                     "[notifier] Telegram send failed (attempt %d/%d), retrying in %ds...",
                     attempt,
-                    self._max_retries,
+                    self._max_attempts,
                     self._retry_delay,
                 )
                 await asyncio.sleep(self._retry_delay)

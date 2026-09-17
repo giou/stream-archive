@@ -27,7 +27,13 @@ def make_config(**overrides: Any) -> AppConfig:
         "recording_dir": "recordings",
         "kick": {"client_id": "cid", "client_secret": "cs"},
     }
-    data.update(overrides)
+    for key, value in overrides.items():
+        default = data.get(key)
+        if isinstance(default, dict) and isinstance(value, dict):
+            # Merge nested mappings, so a partial override keeps the defaults.
+            data[key] = {**default, **value}
+        else:
+            data[key] = value
     return AppConfig.model_validate(data)
 
 
@@ -44,6 +50,7 @@ class FakeTwitchAPI:
         self.error = error
         self.user_ids = user_ids
         self.resolve_calls: list[list[str]] = []
+        self.stream_calls: list[str] = []
 
     async def resolve_user_ids(self, channels: list[str]) -> dict[str, str]:
         self.resolve_calls.append(list(channels))
@@ -60,6 +67,9 @@ class FakeTwitchAPI:
         return {uid: s for uid, s in streams.items() if uid in user_ids.values()}
 
     async def get_stream(self, user_id: str) -> Any:
+        self.stream_calls.append(user_id)
+        if self.error:
+            raise self.error
         streams = self.streams or {}
         return streams.get(user_id)
 
@@ -79,6 +89,7 @@ class FakeKickAPI:
         self.statuses = statuses
         self.error = error
         self.public_key = public_key
+        self.public_key_calls: list[bool] = []
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, Any]:
         if self.error:
@@ -86,6 +97,9 @@ class FakeKickAPI:
         return dict(self.statuses or {})
 
     async def get_public_key(self, force: bool = False) -> str | None:
+        self.public_key_calls.append(force)
+        if self.error and (force or self.public_key is None):
+            raise self.error
         return self.public_key
 
     async def aclose(self) -> None:

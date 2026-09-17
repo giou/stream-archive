@@ -95,8 +95,10 @@ def normalize_channel_name(name: str) -> str | None:
 
     Accepts bare names, platform-prefixed names, and profile URLs. The
     canonical form carries a platform prefix. bare, twitch:<x>, and
-    https://twitch.tv/x map to twitch:<x>. kick:<x> and
-    https://kick.com/x map to kick:<x.lower()>."""
+    https://twitch.tv/x map to twitch:<x.lower()>. kick:<x> and
+    https://kick.com/x map to kick:<x.lower()>. Twitch and Kick treat
+    their logins as case-insensitive, so the lower case form keeps one
+    channel from entering the config twice."""
     name = name.strip()
     if name.startswith(("http://", "https://")):
         try:
@@ -106,7 +108,7 @@ def normalize_channel_name(name: str) -> str | None:
         host = (parts.hostname or "").lower()
         path = parts.path.strip("/")
         if host in ("twitch.tv", "www.twitch.tv"):
-            return f"twitch:{path}" if _CHANNEL_RE.match(path) else None
+            return f"twitch:{path.lower()}" if _CHANNEL_RE.match(path) else None
         if host in ("kick.com", "www.kick.com"):
             return f"kick:{path.lower()}" if _KICK_CHANNEL_RE.match(path) else None
         return None
@@ -116,8 +118,8 @@ def normalize_channel_name(name: str) -> str | None:
         return f"kick:{bare.lower()}" if _KICK_CHANNEL_RE.match(bare) else None
     if lower.startswith("twitch:"):
         bare = name[len(TWITCH_PREFIX) :]
-        return f"twitch:{bare}" if _CHANNEL_RE.match(bare) else None
-    return f"twitch:{name}" if _CHANNEL_RE.match(name) else None
+        return f"twitch:{bare.lower()}" if _CHANNEL_RE.match(bare) else None
+    return f"twitch:{name.lower()}" if _CHANNEL_RE.match(name) else None
 
 
 def _require_bool(v: object, label: str) -> bool:
@@ -557,6 +559,34 @@ def _get_at(data: Any, path: tuple[Any, ...]) -> Any:
     return node[path[-1]]
 
 
+def _locate_value(data: Any, path: tuple[Any, ...], loaded: Any) -> tuple[Any, ...] | None:
+    """Path of the load-time value in the saved copy, or None.
+
+    A placeholder inside a list is tracked by index. If the list changed
+    before the save, that index points at another element. Search the list
+    for the load-time value then, so the mask still lands on its element
+    and the environment value never reaches disk. None means that the copy
+    holds no such value: the key is gone, or a program replaced the value.
+    """
+    try:
+        if _get_at(data, path) == loaded:
+            return path
+    except KeyError, IndexError, TypeError:
+        pass
+    if not path or not isinstance(path[-1], int):
+        return None
+    try:
+        siblings = _get_at(data, path[:-1])
+    except KeyError, IndexError, TypeError:
+        return None
+    if not isinstance(siblings, list):
+        return None
+    for index, value in enumerate(siblings):
+        if value == loaded:
+            return (*path[:-1], index)
+    return None
+
+
 def get_config(path: Path | None = None) -> AppConfig:
     config_path = path or _find_config()
     raw = _load_json_file(config_path)
@@ -599,30 +629,31 @@ def save_config(config: AppConfig) -> None:
     uses the load-time value in its validated form, not the current
     environment. Thus a rotated variable keeps its ``${VAR}`` reference and
     takes effect on the next start. Only a value that a program changed
-    becomes a literal.
+    becomes a literal. A placeholder inside a list is found by its value,
+    so a list that changed before the save keeps its mask.
     """
     with _CONFIG_LOCK:
         config_path = _bound_config_path(config)
         validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
         data = validated.model_dump()
+        # Tracker entries to remove. The write below can fail, and the file
+        # then keeps its ${VAR} text. An entry lost before that would write
+        # the resolved value as a literal on every later save.
+        drop: list[tuple[Any, ...]] = []
         for key_path, (raw, loaded) in list(config._env_placeholders.items()):
-            try:
-                current = _get_at(data, key_path)
-            except KeyError, IndexError, TypeError:
-                # Pydantic dropped the key (extra='ignore'), so the output has
-                # no value left to mask. Drop the tracker entry instead of
-                # failing this save and every later save.
-                del config._env_placeholders[key_path]
+            found = _locate_value(data, key_path, loaded)
+            if found is None:
+                # The output holds no value equal to the load-time value.
+                # Pydantic dropped the key (extra='ignore'), or a program
+                # replaced the value. No environment value is left to mask
+                # then, and the entry must not mask a later value.
+                logger.debug("config: dropping the env placeholder at %s, no value matches it", key_path)
+                drop.append(key_path)
                 continue
-            if current == loaded:
-                # The value did not change since load. Write the placeholder
-                # back, so the secret never reaches disk. A rotated
-                # environment variable then takes effect on the next start.
-                _set_at(data, key_path, raw)
-            else:
-                # Deliberate bot-persisted literal: write it and drop the tracker
-                # so later saves keep this value instead of reverting it to ${VAR}.
-                del config._env_placeholders[key_path]
+            # The value did not change since load. Write the placeholder
+            # back, so the secret never reaches disk. A rotated
+            # environment variable then takes effect on the next start.
+            _set_at(data, found, raw)
         tmp = Path(str(config_path) + ".tmp")
         try:
             existing_mode: int | None = config_path.stat().st_mode & 0o777
@@ -638,13 +669,18 @@ def save_config(config: AppConfig) -> None:
             # same secrets as config.json, so no other user may read it, not
             # even during the write.
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            # os.open applies its mode only when it creates the file, and the
+            # umask clears bits of that mode. A temporary file left by a
+            # crashed run keeps its old permissions without this call.
+            os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.chmod(tmp, mode)  # the umask can clear bits of the open() mode
             os.replace(tmp, config_path)
+            for key_path in drop:
+                config._env_placeholders.pop(key_path, None)
         except OSError as e:
             # Remove the partial copy: it holds plaintext secrets. A full disk
             # raises OSError too, and every caller expects ValueError.

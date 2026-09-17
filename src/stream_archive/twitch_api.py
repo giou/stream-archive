@@ -169,7 +169,14 @@ class TwitchAPI:
             "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, json=payload
         )
         if resp.status_code in (202, 400, 403, 409):
-            return resp.status_code, resp.json()
+            # A proxy, a WAF, or a CDN can answer with a page that is not
+            # JSON. The callers read the status, so the parse must not raise.
+            try:
+                body = resp.json()
+            except ValueError:
+                logger.error("[twitch_api] non-JSON body for status %s", resp.status_code)
+                body = {}
+            return resp.status_code, body
         resp.raise_for_status()
         return resp.status_code, resp.json()
 

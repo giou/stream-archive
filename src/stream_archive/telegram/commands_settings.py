@@ -11,7 +11,7 @@ from stream_archive.config import (
     normalize_channel_name,
     reload_config,
 )
-from stream_archive.telegram.menu_state import AudioSwitch, PendingKey
+from stream_archive.telegram.menu_state import AudioSwitch, PendingKey, is_error
 
 #: Button labels for the settings menus. Each table maps a label to its config
 #: value. The keyboards mark the label of the current value, the handlers turn
@@ -36,6 +36,14 @@ RETENTION_CHOICES: dict[str, str] = {
 COUNT_CHOICES: dict[str, str] = {"Unlimited": "0", "1": "1", "2": "2", "3": "3", "5": "5"}
 DISK_SIZE_CHOICES: dict[str, str] = {"Unlimited": "0", "25": "25", "50": "50", "100": "100", "200": "200"}
 HOLD_CHOICES: dict[str, str] = {"Off": "0", "30s": "30", "60s": "60", "120s": "120", "300s": "300", "600s": "600"}
+
+
+def _not_monitored(channel: str) -> str:
+    """Reply for a per-channel setting of a channel that is not monitored.
+
+    A typo would otherwise store an override that can never take effect.
+    """
+    return f"\u274c {channel} is not in the monitored list (add it with /add first)"
 
 
 class SettingsCommands:
@@ -79,6 +87,8 @@ class SettingsCommands:
             if normalized is None:
                 return f"\u274c Invalid channel name: {ch!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
             ch = normalized
+            if ch not in self._config.channels:
+                return _not_monitored(ch)
             if m == "default":
 
                 def mutate(candidate: AppConfig) -> None:
@@ -102,6 +112,8 @@ class SettingsCommands:
         ch = normalize_channel_name(args[0])
         if ch is None:
             return f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+        if ch not in self._config.channels:
+            return _not_monitored(ch)
         if args[1] == "default":
 
             def mutate(candidate: AppConfig) -> None:
@@ -191,6 +203,8 @@ class SettingsCommands:
                     f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
                 )
             ch, q = normalized, args[1].lower()
+            if ch not in self._config.channels:
+                return _not_monitored(ch)
             if q == "default":
 
                 def mutate(candidate: AppConfig) -> None:
@@ -325,7 +339,7 @@ class SettingsCommands:
                 lambda candidate: f"Chat recording {'enabled' if enabled else 'disabled'}",
                 chat_id,
             )
-            if not enabled and not text.startswith("\u274c"):
+            if not enabled and not is_error(text):
                 for channel in self._recorder.active_channels():
                     await self._recorder.stop_chat(channel)
             return text
@@ -345,7 +359,7 @@ class SettingsCommands:
                 lambda candidate: f"{label} {'enabled' if enabled else 'disabled'}",
                 chat_id,
             )
-            if not enabled and not text.startswith("\u274c"):
+            if not enabled and not is_error(text):
                 for channel in self._recorder.active_channels():
                     if platform == "twitch" and not is_kick_channel(channel):
                         await self._recorder.stop_chat(channel, "twitch")
@@ -359,11 +373,16 @@ class SettingsCommands:
             reload_config(self._config)
         except ValueError as e:
             return f"\u274c Reload failed: {e}"
-        await self._eventsub.sync_channels(self._config.channels)
-        if self._kick_webhook:
-            # The listener serves the endpoint and the control API. This call
-            # applies a changed endpoint or webhook state, a listener address,
-            # and a changed API state from the reloaded file.
-            await self._kick_webhook.apply_state()
-            await self._kick_webhook.sync_channels(self._config.channels)
+        try:
+            await self._eventsub.sync_channels(self._config.channels)
+            if self._kick_webhook:
+                # The listener serves the endpoint and the control API. This call
+                # applies a changed endpoint or webhook state, a listener address,
+                # and a changed API state from the reloaded file.
+                await self._kick_webhook.apply_state()
+                await self._kick_webhook.sync_channels(self._config.channels)
+        except Exception as e:
+            # The file is reloaded already, so report the failure instead of
+            # leaving the admin without a reply and the state out of sync.
+            return f"\u26a0\ufe0f Config reloaded, but applying it failed: {e}"
         return "\u2705 Config reloaded from config.json"

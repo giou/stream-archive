@@ -17,6 +17,12 @@ The bot generates the API key and shows it with the base URL. Tap
 rotated key stops the old key at once. Disabling the API keeps the key, so
 a later enable uses the same key.
 
+The bot shows the key in the private chat with the admin only. In a group
+chat the bot answers with a pointer to that chat, because every member of
+the group can read the reply.
+
+The bot sends the key as code text. Tap the key to put it on the clipboard.
+
 ## Base URL
 
 | Item | Value |

@@ -17,6 +17,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from stream_archive.config import (
+    AUDIO_ONLY_QUALITY,
     AppConfig,
     apply_config_change,
     effective_quality,
@@ -54,8 +55,12 @@ def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, 
     for ch, rec in recordings.items():
         if ch not in new.channels:
             continue
+        expected_mode = new.channel_output_modes.get(ch, new.output_mode)
+        if expected_mode != "disk" and effective_quality(new, ch) == AUDIO_ONLY_QUALITY:
+            # Mirror Recorder._effective_mode: audio-only always records to disk.
+            expected_mode = "disk"
         if (
-            rec.get("output_mode") != new.channel_output_modes.get(ch, new.output_mode)
+            rec.get("output_mode") != expected_mode
             or rec.get("preferred_quality") != effective_quality(new, ch)
             or (not is_kick_channel(ch) and new.record_chat and not rec.get("record_chat"))
             or (is_kick_channel(ch) and new.kick.record_chat and not rec.get("kick_record_chat"))
@@ -78,6 +83,7 @@ class TelegramController(
     _app: Application[Any, Any, Any, Any, Any, Any]
     _admin_id: int
     _cloudflared: CloudflaredTunnel
+    _restore_task: asyncio.Task[None] | None
 
     def __init__(
         self,
@@ -107,6 +113,7 @@ class TelegramController(
         self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
         self._cloudflared = CloudflaredTunnel()
+        self._restore_task = None
 
     def command_handlers(self) -> list[Any]:
         """Handlers of the admin commands, the reply text, and the buttons.
@@ -162,15 +169,39 @@ class TelegramController(
             logger.warning("[telegram] Failed to re-send settings menu after restart", exc_info=True)
         ep = self._config.endpoint
         if ep.enabled and ep.tunnel == "cloudflare" and ep.cloudflare_managed:
-            asyncio.create_task(self._restore_cloudflared())
+            # Keep the reference: stop() cancels and awaits this task, and a
+            # task without a reference can be collected mid-flight.
+            self._restore_task = asyncio.create_task(self._restore_cloudflared())
 
     async def stop(self) -> None:
+        """Stop the tunnel, the bot, and the owned HTTP session.
+
+        Every step runs, even when an earlier one fails: the updater raises
+        when it never started, and the owned session must still close. A
+        failure is logged and does not stop the remaining steps.
+        """
+        # A restore task that still runs can start a cloudflared process
+        # after this teardown, so cancel it and wait for it first.
+        if self._restore_task is not None:
+            self._restore_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._restore_task
+            self._restore_task = None
         self._cloudflared_stop()
         updater = self._app.updater
         if updater is not None:
-            await updater.stop()
-        await self._app.stop()
-        await self._app.shutdown()
+            try:
+                await updater.stop()
+            except Exception:
+                logger.warning("[telegram] Failed to stop the updater", exc_info=True)
+        try:
+            await self._app.stop()
+        except Exception:
+            logger.warning("[telegram] Failed to stop the bot", exc_info=True)
+        try:
+            await self._app.shutdown()
+        except Exception:
+            logger.warning("[telegram] Failed to shut down the bot", exc_info=True)
         if self._owns_http:
             await self._http.aclose()
 

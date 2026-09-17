@@ -14,12 +14,12 @@ repos:
         name: ruff format
         entry: uv run --frozen ruff format --force-exclude
         language: system
-        types_or: [python, pyi, jupyter, markdown]
+        types_or: [python, pyi, jupyter]
       - id: mypy
         name: mypy
+        # The scope comes from [tool.mypy] files in pyproject.toml.
         entry: uv run --frozen mypy
         language: system
         pass_filenames: false
-        args: ["src/stream_archive"]
         types_or: [python, pyi]
         require_serial: true

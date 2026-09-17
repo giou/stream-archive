@@ -33,19 +33,26 @@ _apis: list[KickAPI] = []
 
 
 def make_api(handler, config=None):
-    api = KickAPI(AppConfig.model_validate(config or base_config()))
-    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"User-Agent": _USER_AGENT})
+    """Build a KickAPI on an injected mock-transport client.
+
+    The constructor path also sets ``_owns_client`` False, so the fixture
+    closes the injected client itself.
+    """
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"User-Agent": _USER_AGENT})
+    api = KickAPI(AppConfig.model_validate(config or base_config()), http=client)
     _apis.append(api)
     return api
 
 
 @pytest.fixture(autouse=True)
 def _close_api_clients():
-    """Close every client the tests built. KickAPI.close() owns them."""
+    """Close every client the tests built, even on failure."""
     yield
-    for api in _apis:
-        asyncio.run(api.close())
-    _apis.clear()
+    try:
+        for api in _apis:
+            asyncio.run(api.client.aclose())
+    finally:
+        _apis.clear()
 
 
 def token_handler(request):
@@ -159,9 +166,10 @@ def test_get_channel_statuses_chunks_over_50_slugs():
                         "stream_title": None,
                         "category": None,
                         "stream": {"is_live": False},
-                        "broadcaster_user_id": i,
+                        # A per-slug identity shows a wrong slug mapping.
+                        "broadcaster_user_id": int(s[4:]),
                     }
-                    for i, s in enumerate(slugs)
+                    for s in slugs
                 ]
             },
         )
@@ -172,7 +180,10 @@ def test_get_channel_statuses_chunks_over_50_slugs():
 
     assert len(requests) == 3
     assert [len(r) for r in requests] == [50, 50, 10]
-    assert len(result) == 110
+    assert set(result) == set(slugs)
+    assert result["user100"]["broadcaster_user_id"] == 100  # first slug of the last chunk
+    assert result["user109"]["broadcaster_user_id"] == 109  # last slug of the last chunk
+    assert result["user000"]["broadcaster_user_id"] == 0  # first slug of the first chunk
 
 
 def test_get_public_key_cached():

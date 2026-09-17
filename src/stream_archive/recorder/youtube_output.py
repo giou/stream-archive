@@ -70,6 +70,7 @@ class YoutubeOutputMixin:
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
+    _youtube_budget_lock: asyncio.Lock
     # Set by sibling mixins and Recorder (core.py). Exact call shapes so
     # a signature drift fails type checks instead of failing at runtime.
     _track: Callable[[str, Coroutine[Any, Any, Any]], asyncio.Task[Any]]
@@ -115,6 +116,10 @@ class YoutubeOutputMixin:
         backoff = self._backoff_until.get(channel, 0.0)
         if backoff > now:
             return f"restarting in {backoff - now:.0f}s (short recording, YouTube quota guard)"
+        return self._youtube_budget_blocked_reason()
+
+    def _youtube_budget_blocked_reason(self) -> str | None:
+        """Return why the rolling 24-hour budget blocks a create now, or None."""
         now_wall = time.time()
         self._youtube_starts = [t for t in self._youtube_starts if t > now_wall - self._limits.budget_window_s]
         if self._limits.daily_budget <= 0:
@@ -133,6 +138,17 @@ class YoutubeOutputMixin:
     def _record_youtube_start(self) -> None:
         """Record one broadcast creation against the rolling 24-hour budget."""
         self._youtube_starts.append(time.time())
+
+    def _require_budget_slot(self) -> None:
+        """Raise when the rolling 24-hour budget blocks a new broadcast.
+
+        A caller holds `_youtube_budget_lock`, so the check and the matching
+        `_record_youtube_start()` cannot interleave with another start.
+        """
+        blocked = self._youtube_budget_blocked_reason()
+        if blocked is not None:
+            msg = blocked
+            raise RuntimeError(msg)
 
     async def _end_broadcast(self, channel: str, broadcast_id: str) -> None:
         """Move a YouTube broadcast to the complete state. Never raises."""
@@ -202,8 +218,10 @@ class YoutubeOutputMixin:
         """Stop the keep-alive feed. Safe to call more than once."""
         if proc is None or proc.returncode is not None:
             return
-        proc.terminate()
         try:
+            # terminate() raises ProcessLookupError when the child already
+            # exited, so it belongs inside the guard.
+            proc.terminate()
             await asyncio.wait_for(proc.wait(), timeout=10)
         except TimeoutError, ProcessLookupError:
             try:
@@ -307,8 +325,13 @@ class YoutubeOutputMixin:
 
             try:
                 youtube = _require_streamer()
-                youtube_info = await youtube.create_stream(author, title, channel, game)
-                self._record_youtube_start()  # count quota for fresh creates only
+                # Hold the lock across the check, the create and the record.
+                # Concurrent starts otherwise all pass the check before any
+                # of them records its slot, and the daily budget overflows.
+                async with self._youtube_budget_lock:
+                    self._require_budget_slot()
+                    youtube_info = await youtube.create_stream(author, title, channel, game)
+                    self._record_youtube_start()  # count quota for fresh creates only
             except Exception as e:
                 logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
                 if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():

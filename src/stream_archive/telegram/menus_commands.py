@@ -47,7 +47,7 @@ class CommandsMixin:
             BotCommand("mode", "Set output mode (disk, youtube, both)"),
             BotCommand("reload", "Re-read config.json from disk"),
             BotCommand("restart", "Restart the service"),
-            BotCommand("update", "Check for and apply updates"),
+            BotCommand("update", "Check for available updates"),
             BotCommand("quality", "Show or set quality (global or per-channel)"),
             BotCommand("maxrecordings", "Set concurrent recording limit"),
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),

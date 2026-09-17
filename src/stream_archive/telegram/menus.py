@@ -26,7 +26,7 @@ from stream_archive.telegram.commands_settings import (
     QUALITY_CHOICES,
     RETENTION_CHOICES,
 )
-from stream_archive.telegram.menu_state import ChatId, MenuResult, MenuState
+from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult, MenuState
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -98,7 +98,7 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
     c = ctrl._config
     if menu == "channels":
         # Back stays in the first row: a long channel list would push it out of view.
-        return _frame([["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in c.channels)])
+        return _frame([["Back"], ["Add channel"], *([f"{CHANNEL_BUTTON_PREFIX}{ch}"] for ch in c.channels)])
     if menu == "channel":
         return _frame([["Mode", "Quality"], ["Hold delay", "Remove channel"], ["Back"]])
     if menu == "channel_mode":
@@ -218,7 +218,7 @@ async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
     base = api_base_url(ctrl._config)
     url_line = f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Remote access."
     text = f"Control API: on\n{url_line}\nTap Show key to display the key. Changes apply on the next cycle."
-    if not ctrl._config.kick.webhook.enabled:
+    if not ctrl._config.endpoint.enabled:
         text += "\nThe public URL needs remote access. Turn it on to reach the API from outside."
     return text
 

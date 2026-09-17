@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from stream_archive.config import AppConfig
-from stream_archive.twitch_api import TwitchAPI
+from stream_archive.twitch_api import _MAX_QUERY_ITEMS, TwitchAPI
 
 
 def base_config():
@@ -22,10 +22,30 @@ def base_config():
     }
 
 
-def make_api(handler):
+class YieldingTransport(httpx.AsyncBaseTransport):
+    """A transport that turns the event loop before it answers.
+
+    MockTransport calls its handler straight from the await, so a burst of
+    callers can never overlap and the single-flight test would pass without a
+    lock. The yields give the other callers a turn while the request is in
+    flight.
+    """
+
+    def __init__(self, handler, yields=20):
+        self._handler = handler
+        self._yields = yields
+
+    async def handle_async_request(self, request):
+        for _ in range(self._yields):
+            await asyncio.sleep(0)
+        return self._handler(request)
+
+
+def make_api(handler, transport=None):
     # Inject the mock client through the constructor: TwitchAPI owns the
     # client only when it creates it, so the tests close this one themselves.
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = httpx.MockTransport(handler) if transport is None else transport(handler)
+    client = httpx.AsyncClient(transport=transport)
     return TwitchAPI(AppConfig.model_validate(base_config()), http=client)
 
 
@@ -39,14 +59,19 @@ def token_handler(request):
     return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
 
 
+def assert_auth_headers(request):
+    """The Helix calls must carry the token and the client id of the app."""
+    assert request.headers["Authorization"] == "Bearer tok-1"
+    assert request.headers["Client-Id"] == "client_id"
+
+
 def test_token_fetched_and_cached():
     calls = {"tokens": 0}
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            calls["tokens"] += 1
-            return token_handler(request)
-        return httpx.Response(200, json={"data": []})
+        # token_handler asserts the path, so any other request fails clearly.
+        calls["tokens"] += 1
+        return token_handler(request)
 
     api = make_api(handler)
 
@@ -69,7 +94,7 @@ def test_concurrent_token_refresh_is_single_flight():
         calls["tokens"] += 1
         return token_handler(request)
 
-    api = make_api(handler)
+    api = make_api(handler, transport=YieldingTransport)
 
     async def scenario():
         try:
@@ -127,15 +152,44 @@ def test_short_lived_token_is_refetched_after_expiry():
     assert asyncio.run(scenario()) == ["tok-1", "tok-2"]
 
 
-def test_resolve_user_ids_splits_over_100_names_into_chunks():
-    """105 names need two GETs. The merged map keeps the caller's own names."""
-    logins = [f"user{i}" for i in range(104)] + ["MixedCase"]
+def test_resolve_user_ids_keeps_max_items_in_one_request():
+    """Exactly _MAX_QUERY_ITEMS names still fit in one GET."""
+    logins = [f"user{i}" for i in range(_MAX_QUERY_ITEMS)]
     chunks = []
 
     def handler(request):
         if request.url.path == "/oauth2/token":
             return token_handler(request)
         assert request.url.path == "/helix/users"
+        assert_auth_headers(request)
+        chunk = request.url.params.get_list("login")
+        chunks.append(chunk)
+        return httpx.Response(200, json={"data": [{"login": n, "id": f"id-{n}"} for n in chunk]})
+
+    api = make_api(handler)
+
+    async def scenario():
+        try:
+            return await api.resolve_user_ids(logins)
+        finally:
+            await api.client.aclose()
+
+    resolved = asyncio.run(scenario())
+
+    assert [len(chunk) for chunk in chunks] == [_MAX_QUERY_ITEMS]
+    assert resolved == {name: f"id-{name}" for name in logins}
+
+
+def test_resolve_user_ids_splits_over_max_items_into_chunks():
+    """The names past the limit need a second GET. The map keeps the caller's names."""
+    logins = [f"user{i}" for i in range(_MAX_QUERY_ITEMS + 4)] + ["MixedCase"]
+    chunks = []
+
+    def handler(request):
+        if request.url.path == "/oauth2/token":
+            return token_handler(request)
+        assert request.url.path == "/helix/users"
+        assert_auth_headers(request)
         chunk = request.url.params.get_list("login")
         chunks.append(chunk)
         # Twitch answers with the canonical lowercase login.
@@ -151,8 +205,8 @@ def test_resolve_user_ids_splits_over_100_names_into_chunks():
 
     resolved = asyncio.run(scenario())
 
-    # One GET per chunk: 100 names, then the trailing 5.
-    assert [len(chunk) for chunk in chunks] == [100, 5]
+    # One GET per chunk: the first _MAX_QUERY_ITEMS names, then the rest.
+    assert [len(chunk) for chunk in chunks] == [_MAX_QUERY_ITEMS, 5]
     assert [name for chunk in chunks for name in chunk] == logins
     assert resolved == {name: f"id-{name.lower()}" for name in logins}
     # A mixed-case configured name is a key of the result, not the canonical
@@ -160,15 +214,16 @@ def test_resolve_user_ids_splits_over_100_names_into_chunks():
     assert resolved["MixedCase"] == "id-mixedcase"
 
 
-def test_get_live_streams_splits_over_100_ids_into_chunks():
-    """105 user ids need two GETs. The merged map holds every live stream."""
-    user_ids = {f"ch{i}": f"u{i}" for i in range(105)}
+def test_get_live_streams_splits_over_max_items_into_chunks():
+    """The ids past the limit need a second GET. The map holds every live stream."""
+    user_ids = {f"ch{i}": f"u{i}" for i in range(_MAX_QUERY_ITEMS + 5)}
     chunks = []
 
     def handler(request):
         if request.url.path == "/oauth2/token":
             return token_handler(request)
         assert request.url.path == "/helix/streams"
+        assert_auth_headers(request)
         chunk = request.url.params.get_list("user_id")
         chunks.append(chunk)
         return httpx.Response(200, json={"data": [{"user_id": uid, "title": f"T-{uid}"} for uid in chunk]})
@@ -183,7 +238,73 @@ def test_get_live_streams_splits_over_100_ids_into_chunks():
 
     streams = asyncio.run(scenario())
 
-    assert [len(chunk) for chunk in chunks] == [100, 5]
-    assert set(streams) == {f"u{i}" for i in range(105)}
+    assert [len(chunk) for chunk in chunks] == [_MAX_QUERY_ITEMS, 5]
+    assert set(streams) == {f"u{i}" for i in range(_MAX_QUERY_ITEMS + 5)}
     # The stream of the trailing chunk is keyed by its user id.
-    assert streams["u104"]["title"] == "T-u104"
+    assert streams[f"u{_MAX_QUERY_ITEMS + 4}"]["title"] == f"T-u{_MAX_QUERY_ITEMS + 4}"
+
+
+def test_empty_input_asks_the_api_for_nothing():
+    """An empty input needs no token and no request."""
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        pytest.fail(f"unexpected request: {request.method} {request.url}")
+
+    api = make_api(handler)
+
+    async def scenario():
+        try:
+            assert await api.resolve_user_ids([]) == {}
+            assert await api.get_live_streams({}) == {}
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())
+    assert requests == []
+
+
+def test_create_eventsub_subscription_answers_a_non_json_body_with_an_empty_dict():
+    """A handled status with a non-JSON body must not raise a parse error."""
+
+    def handler(request):
+        if request.url.path == "/oauth2/token":
+            return token_handler(request)
+        assert request.url.path == "/helix/eventsub/subscriptions"
+        assert_auth_headers(request)
+        # A proxy or a WAF can answer a handled status with an HTML page.
+        return httpx.Response(409, content=b"<html>conflict</html>")
+
+    api = make_api(handler)
+    payload = {"type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": "1"}}
+
+    async def scenario():
+        try:
+            return await api.create_eventsub_subscription(payload)
+        finally:
+            await api.client.aclose()
+
+    assert asyncio.run(scenario()) == (409, {})
+
+
+def test_create_eventsub_subscription_raises_for_an_unhandled_status():
+    """A status that the callers do not handle must raise."""
+
+    def handler(request):
+        if request.url.path == "/oauth2/token":
+            return token_handler(request)
+        assert request.url.path == "/helix/eventsub/subscriptions"
+        return httpx.Response(401, json={"message": "invalid token"})
+
+    api = make_api(handler)
+    payload = {"type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": "1"}}
+
+    async def scenario():
+        try:
+            with pytest.raises(httpx.HTTPStatusError):
+                await api.create_eventsub_subscription(payload)
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())

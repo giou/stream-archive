@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any
@@ -76,6 +77,11 @@ class ChatOutputMixin:
         kick_chat.embedded_data). The state stays in the entry until the
         trailer is written, so a message that arrives during the emote fetch
         still lands in the file. The finalizing flag blocks a second run.
+
+        The writer never stays open: every path either writes the trailer,
+        discards the file, or reports the failure that closed it. A cancelled
+        emote fetch still writes the trailer, because the entry drops the
+        state here and no other call can close the writer.
         """
         state = entry.get("kick_chat")
         if state is None or state.get("finalizing"):
@@ -98,7 +104,16 @@ class ChatOutputMixin:
                 state.get("streamer_id"),
                 state.get("streamer_username") or state["slug"],
             )
-            embedded = await embedded_data(state.get("emote_names") or {})
+            try:
+                embedded = await embedded_data(state.get("emote_names") or {})
+            except asyncio.CancelledError:
+                # Write the trailer now, without the emote images. The
+                # comments must not stay in an open, unusable tmp file.
+                writer.close(trailer)
+                raise
+            except Exception as e:
+                logger.warning("[recorder] kick chat emote fetch failed: %s", e)
+                embedded = None
             if embedded is not None:
                 trailer["embeddedData"] = embedded
             if writer.close(trailer):

@@ -159,7 +159,8 @@ class CloudflaredTunnel:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-        except OSError:
+        except OSError as e:
+            logger.error("[tunnels] cloudflared is not available: %s", e)
             return None, (
                 "cloudflared is not installed in this container.\n"
                 "Rebuild the image (docker compose up -d --build) after adding cloudflared."
@@ -169,14 +170,19 @@ class CloudflaredTunnel:
             url, tail = await asyncio.wait_for(self._wait_url(proc), timeout=_CLOUDFLARED_QUICK_TIMEOUT)
         except TimeoutError:
             await self._kill(proc)
+            logger.warning(
+                "[tunnels] cloudflared published no trycloudflare URL within %ss", _CLOUDFLARED_QUICK_TIMEOUT
+            )
             return None, (
                 "cloudflared did not publish a trycloudflare URL within "
                 f"{_CLOUDFLARED_QUICK_TIMEOUT}s \u2014 tap Quick tunnel again."
             )
         if url is None:
             await self._kill(proc)
+            logger.warning("[tunnels] cloudflared exited before publishing a URL:\n%s", "\n".join(tail[-8:]))
             return None, "cloudflared exited before publishing a URL:\n" + "\n".join(tail[-8:])
-        self._adopt(proc)
+        if not self._adopt(proc):
+            return None, "a newer tunnel start replaced this one \u2014 tap Quick tunnel again."
         return url, None
 
     async def start_named(self, token: str, config_path: Path | None = None) -> tuple[bool, str | None]:
@@ -198,7 +204,8 @@ class CloudflaredTunnel:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-        except OSError:
+        except OSError as e:
+            logger.error("[tunnels] cloudflared is not available: %s", e)
             return False, (
                 "cloudflared is not installed in this container.\n"
                 "Rebuild the image (docker compose up -d --build) after adding cloudflared."
@@ -208,14 +215,18 @@ class CloudflaredTunnel:
             registered, tail = await asyncio.wait_for(self._wait_registered(proc), timeout=_CLOUDFLARED_RUN_TIMEOUT)
         except TimeoutError:
             if proc.returncode is None:  # still running: the tunnel registered
-                self._adopt(proc)
+                if not self._adopt(proc):
+                    return False, "a newer tunnel start replaced this one \u2014 start the named tunnel again."
                 return True, None
             await self._kill(proc)
+            logger.warning("[tunnels] cloudflared exited during startup (exit %s)", proc.returncode)
             return False, "cloudflared exited during startup."
         if not registered:
             await self._kill(proc)
+            logger.warning("[tunnels] cloudflared exited before registering:\n%s", "\n".join(tail[-8:]))
             return False, "cloudflared exited:\n" + "\n".join(tail[-8:])
-        self._adopt(proc)
+        if not self._adopt(proc):
+            return False, "a newer tunnel start replaced this one \u2014 start the named tunnel again."
         return True, None
 
     async def _kill(self, proc: Any) -> None:
@@ -235,25 +246,28 @@ class CloudflaredTunnel:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
 
-    def _adopt(self, proc: Any) -> None:
+    def _adopt(self, proc: Any) -> bool:
         """Keep a running process as the managed tunnel.
 
-        A newer start can replace the process while it starts up. Kill the
-        older process in that case instead of adopting it.
+        Return False when a newer start replaced the process while this one
+        started. The method kills the older process in that case, and the
+        caller must report a failed start.
         """
         if self._proc is not proc:
+            logger.warning("[tunnels] a newer start replaced cloudflared (pid %s); killing it", proc.pid)
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-            return
+            return False
         self._drain = asyncio.create_task(self._drain_output(proc))
+        return True
 
     async def _drain_output(self, proc: Any) -> None:
         """Discard cloudflared output so its pipe never fills and blocks the tunnel."""
         try:
             while await proc.stdout.readline():
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[tunnels] cloudflared output drain stopped: %s", e, exc_info=True)
 
     async def _wait_url(self, proc: Any) -> tuple[str | None, list[str]]:
         """Read cloudflared output until the trycloudflare URL appears or EOF.
@@ -305,26 +319,30 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_STATUS_TIMEOUT)
     except TimeoutError:
         await _kill_proc(proc)
+        logger.warning("[tunnels] tailscale status timed out after %ss", _TAILSCALE_STATUS_TIMEOUT)
         return None, "tailscale status timed out \u2014 is the tailscale daemon running on the host?"
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        logger.error("[tunnels] tailscale is not available: %s", exc)
         return None, (
             "Tailscale is not installed in this container.\n"
             "Install it on the host: curl -fsSL https://tailscale.com/install.sh | sh\n"
             "then log in: tailscale up"
         )
     except OSError as exc:
+        logger.error("[tunnels] tailscale status could not run: %s", exc)
         return None, f"tailscale status could not run: {exc}"
     if proc.returncode != 0:
-        return None, (
-            "tailscale status failed (daemon not running or not logged in): "
-            + (stderr.decode(errors="replace").strip() or f"exit {proc.returncode}")
-        )
+        detail = stderr.decode(errors="replace").strip() or f"exit {proc.returncode}"
+        logger.warning("[tunnels] tailscale status failed: %s", detail)
+        return None, "tailscale status failed (daemon not running or not logged in): " + detail
     try:
         data = json.loads(stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("[tunnels] tailscale status returned unparseable output: %s", exc)
         return None, "tailscale status returned unparseable output"
     dns_name = ((data.get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
     if not dns_name:
+        logger.warning("[tunnels] tailscale status shows no machine DNS name")
         return None, "tailscale status shows no machine DNS name \u2014 is this machine in a tailnet?"
     proc = None
     try:
@@ -342,17 +360,23 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_FUNNEL_TIMEOUT)
     except FileNotFoundError:
+        logger.error("[tunnels] tailscale is not available for the funnel")
         return None, "Tailscale is not installed in this container."
     except TimeoutError:
         await _kill_proc(proc)
+        logger.warning("[tunnels] tailscale funnel timed out after %ss", _TAILSCALE_FUNNEL_TIMEOUT)
         return None, (
             "tailscale funnel timed out (first enable provisions HTTPS certificates and can take "
             "a minute) \u2014 tap Tailscale funnel again in a moment."
         )
     except OSError as exc:
+        logger.error("[tunnels] tailscale funnel could not run: %s", exc)
         return None, f"tailscale funnel could not run: {exc}"
     if proc.returncode != 0:
         stderr_text = stderr.decode(errors="replace").strip()
+        logger.warning(
+            "[tunnels] tailscale funnel %s exited %s: %s", port, proc.returncode, stderr_text or "(no output)"
+        )
         # The funnel can already exist: a previous attempt finished after its
         # timeout, or the user tapped the menu again. Make sure that the
         # funnel really serves our port before this call reports success.
@@ -376,14 +400,18 @@ async def tailscale_funnel_serving(port: int) -> bool:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=_TAILSCALE_STATUS_TIMEOUT)
     except TimeoutError:
         await _kill_proc(proc)
+        logger.debug("[tunnels] tailscale serve status timed out")
         return False
     except FileNotFoundError, OSError:
+        logger.debug("[tunnels] tailscale serve status is not available")
         return False
     if proc.returncode != 0:
+        logger.debug("[tunnels] tailscale serve status exited %s", proc.returncode)
         return False
     try:
         data = json.loads(stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.debug("[tunnels] tailscale serve status returned unparseable output: %s", exc)
         return False
     target = f"http://127.0.0.1:{port}"
     for fg in (data.get("Foreground") or {}).values():
@@ -411,5 +439,9 @@ async def tailscale_funnel_off() -> bool:
         )
         await asyncio.wait_for(proc.wait(), timeout=_TAILSCALE_STATUS_TIMEOUT)
     except TimeoutError, FileNotFoundError, OSError:
+        logger.warning("[tunnels] tailscale funnel off could not run")
         return False
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        logger.warning("[tunnels] tailscale funnel off exited %s", proc.returncode)
+        return False
+    return True

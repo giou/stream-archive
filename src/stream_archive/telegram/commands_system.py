@@ -7,17 +7,26 @@ from stream_archive.config import AppConfig
 #: Most entries one /status list shows before it counts the rest.
 _STATUS_LIST_LIMIT = 20
 
+#: Character budget for one /status list. Four lists plus the fixed lines
+#: must stay below the 4096-character limit of Telegram.
+_STATUS_LIST_CHARS = 600
+
 
 def _status_list(items: list[str]) -> str:
     """Join one /status list. A long list counts the rest instead of listing it.
 
     Telegram rejects a message longer than 4096 characters, so the channel
-    and override lists of /status must not grow without a bound.
+    and override lists of /status must not grow without a bound. The
+    helper limits the entry count and the length of the joined text.
     """
-    if len(items) <= _STATUS_LIST_LIMIT:
-        return ", ".join(items)
-    rest = len(items) - _STATUS_LIST_LIMIT
-    return f"{', '.join(items[:_STATUS_LIST_LIMIT])} \u2026 and {rest} more"
+    shown = items[:_STATUS_LIST_LIMIT]
+    while shown and len(", ".join(shown)) > _STATUS_LIST_CHARS:
+        shown.pop()
+    if len(shown) == len(items):
+        return ", ".join(shown)
+    rest = len(items) - len(shown)
+    head = ", ".join(shown)
+    return f"{head} \u2026 and {rest} more" if head else f"\u2026 and {rest} more"
 
 
 class SystemCommands:
@@ -35,7 +44,7 @@ class SystemCommands:
             "/status - current settings\n"
             "/channels - monitored channels\n"
             "/add <channel|twitch:<channel>|kick:<channel>|url> - start monitoring a channel (twitch:<name>, kick:<name>, or a twitch.tv/kick.com profile URL)\n"
-            "/remove <channel|kick:<channel>|url> - stop monitoring a channel\n"
+            "/remove <channel|twitch:<channel>|kick:<channel>|url> - stop monitoring a channel\n"
             "/retention <days> - recording retention\n"
             "/mode [channel] <disk|youtube|both|default> - output mode (per-channel override when a channel is given)\n"
             "/reload - re-read config.json\n"
@@ -95,6 +104,15 @@ class SystemCommands:
             else:
                 disk_limits.append(f"max {cap:g} GB (stop recording when over)")
         disk_limit_line = "Disk limits: " + " \u00b7 ".join(disk_limits) if disk_limits else "Disk limits: disabled"
+        if disk_snap.get("usage_ok", True):
+            disk_line = (
+                f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB "
+                f"\u00b7 archive: {disk_snap['archive_gb']:.1f} GB"
+            )
+        else:
+            # The probe failed, so every filesystem number is 0.0 GB. Say
+            # unknown instead of reporting a full disk.
+            disk_line = f"Disk: usage unknown \u00b7 archive: {disk_snap['archive_gb']:.1f} GB"
         return (
             f"Channels ({len(c.channels)}): {_status_list(c.channels)}\n"
             f"Output mode: {c.output_mode}\n"
@@ -109,7 +127,7 @@ class SystemCommands:
             f"Simultaneous recordings: {rec_limit}\n"
             f"YouTube re-streams: {yt_limit}\n"
             f"Recording now: {rec_now}\n"
-            f"Disk: {disk_snap['free_gb']:.1f} GB free of {disk_snap['total_fs_gb']:.1f} GB \u00b7 archive: {disk_snap['archive_gb']:.1f} GB\n"
+            f"{disk_line}\n"
             f"{disk_limit_line}\n"
             f"Update check: {'enabled' if c.update_check.enabled else 'disabled'} "
             f"(every {c.update_check.interval_hours:g}h)"

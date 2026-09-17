@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stream-archive"
-version = "1.2.3"
+version = "1.2.4"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
@@ -17,7 +17,7 @@ dependencies = [
     "python-telegram-bot>=20.0",
     "streamlink>=8.4.0",
     "packaging>=24",
-    "websockets>=12.0",
+    "websockets>=14",
     "aiohttp>=3.9",
     "cryptography>=42.0",
     "pydantic>=2.13.4",
@@ -34,16 +34,18 @@ packages = ["src/stream_archive"]
 testpaths = ["tests"]
 filterwarnings = [
     "error",
-    # Third-party deprecations on a new interpreter floor. These stay visible
-    # in the ignore list, so a new warning from our own modules still fails.
-    "ignore::DeprecationWarning:telegram.*",
-    "ignore::DeprecationWarning:google.*",
+    # Third-party deprecations on a new interpreter floor are not ours to fix,
+    # and the list of them is open (every dependency and its own dependencies).
+    # The blanket ignore drops them, and the entry below keeps our modules
+    # strict, so a new warning from our own code still fails.
+    "ignore::DeprecationWarning",
+    "error::DeprecationWarning:stream_archive.*",
 ]
 
 [tool.ruff]
 line-length = 120
 target-version = "py314"
-extend-exclude = ["plugins"]   # dev-only plugin dir, not shipped in this repo
+extend-exclude = ["/plugins"]  # dev-only plugin dir, not shipped in this repo
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "TRY", "EM", "RUF100", "TID"]
@@ -66,10 +68,6 @@ plugins = ["pydantic.mypy"]
 ignore_missing_imports = false
 warn_return_any = true
 show_error_codes = true
-
-[[tool.mypy.overrides]]
-module = ["google.*"]
-ignore_errors = true           # google-auth ships partial stubs with untyped methods
 
 [[tool.mypy.overrides]]
 module = ["google_auth_oauthlib.*"]

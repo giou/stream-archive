@@ -146,7 +146,19 @@ def _scalar(value: Any, key: str) -> str:
     if isinstance(value, bool) or not isinstance(value, str | int | float):
         msg = f"{key} must be a string or a number"
         raise _ApiError(400, msg)
-    return str(value)
+    text = str(value)
+    # The command layer parses the text again. JSON accepts the NaN and
+    # Infinity literals, and the perfect number 1e999 parses to inf. The
+    # setting would then persist as the non-standard Infinity token, which
+    # strict JSON clients cannot read.
+    try:
+        number = float(text)
+    except ValueError:
+        return text  # not a number at all, so the command layer decides
+    if not math.isfinite(number):
+        msg = f"{key} must be a finite number"
+        raise _ApiError(400, msg)
+    return text
 
 
 def _switch(value: Any, key: str) -> str:
@@ -287,7 +299,9 @@ class ControlAPI:
             raise _ApiError(400, msg)
         try:
             payload = json.loads(raw)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # json.loads decodes the bytes itself, so invalid UTF-8 raises
+            # UnicodeDecodeError, not JSONDecodeError. Both mean a bad body.
             msg = f"invalid JSON body: {e}"
             raise _ApiError(400, msg) from e
         if not isinstance(payload, dict):

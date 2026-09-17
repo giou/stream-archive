@@ -34,7 +34,8 @@ class KickAPIProtocol(Protocol):
 
 # Shape returned by Recorder.disk_snapshot(). Keys include dir_gb, chat_gb,
 # archive_gb (recordings + chat, the value the cap measures), free_gb,
-# total_fs_gb, used_fs_gb, chat_count, file_count, and dir.
+# total_fs_gb, used_fs_gb, chat_count, file_count, dir, and usage_ok. The last
+# key is False when the free-space probe failed.
 DiskSnapshot = dict[str, Any]
 
 
@@ -190,11 +191,12 @@ class Monitor:
         finally:
             self.recorder.release_start(channel)
         removed = False
+        stopped_while_starting = False
+        start_failed = False
         async with self._lock_for(channel):
             if not ok:
-                await self._handle_start_failure(channel)
-                return
-            if channel not in config.channels:
+                start_failed = True
+            elif channel not in config.channels:
                 # The channel was removed while start() ran outside the lock.
                 # The remove path saw no recording yet, so this method stops
                 # the new recording. Every stop path reads config.channels,
@@ -202,10 +204,11 @@ class Monitor:
                 removed = True
             elif already_live and channel not in self._live_channels:
                 # The channel stopped or was removed while start() ran
-                # outside the lock. Leave it stopped instead of registering
-                # a recording nobody asked for.
-                logger.info("[monitor] %s stopped while starting, not registering", channel)
-                return
+                # outside the lock. The concurrent stop can run before
+                # start() registers the entry, so stop the new recording
+                # here. Otherwise it runs with no stop path until the
+                # channel goes live again.
+                stopped_while_starting = True
             else:
                 self._live_channels.add(channel)
                 self._last_failure_notify.pop(channel, None)
@@ -213,12 +216,22 @@ class Monitor:
                     logger.info("[monitor] %s recording restarted", channel)
                 else:
                     logger.info("[monitor] %s is LIVE", channel)
+        # The sends below are network I/O, so they run outside the lock.
+        if start_failed:
+            await self._handle_start_failure(channel)
+            return
         if removed:
             logger.warning("[monitor] %s was removed while starting, stopping the recording", channel)
             try:
                 await self.recorder.stop(channel)
             except Exception:
                 logger.error("[monitor] stop failed for removed channel %s", channel, exc_info=True)
+        elif stopped_while_starting:
+            logger.info("[monitor] %s stopped while starting, stopping the new recording", channel)
+            try:
+                await self.recorder.stop(channel)
+            except Exception:
+                logger.error("[monitor] stop failed for %s after it stopped while starting", channel, exc_info=True)
 
     async def _ensure_stopped(self, channel: str, config: AppConfig) -> None:
         """Stop the recording for a channel that is no longer live."""
@@ -234,15 +247,21 @@ class Monitor:
             file_info = result.get("file_info") if result else None
             yt_info = result.get("youtube_info") if result else None
             youtube_url = yt_info["youtube_url"] if yt_info else None
-            try:
-                await self.notifier.notify_offline(channel, file_info, youtube_url)
-            except Exception:
-                logger.error("[monitor] offline notification failed for %s", channel, exc_info=True)
-            logger.info("[monitor] %s is OFFLINE", channel)
+        logger.info("[monitor] %s is OFFLINE", channel)
+        # The send is network I/O. Keep it out of the per-channel critical
+        # section, so a slow Telegram call cannot stall start/stop handling.
+        try:
+            await self.notifier.notify_offline(channel, file_info, youtube_url)
+        except Exception:
+            logger.error("[monitor] offline notification failed for %s", channel, exc_info=True)
 
     def _evict(self, channel: str) -> None:
-        """Drop per-channel state so a removed channel leaves no locks behind."""
-        self._locks.pop(channel, None)
+        """Drop per-channel state for a removed channel.
+
+        The per-channel lock stays: a task can still hold or await it, and a
+        popped lock lets the next caller build a second lock for the same
+        channel, which breaks mutual exclusion.
+        """
         self._last_failure_notify.pop(channel, None)
         self._last_disk_notify.pop(channel, None)
         # kick_bare_name strips the twitch: prefix too, so a Twitch channel
@@ -312,4 +331,5 @@ class Monitor:
                 f"\u26a0\ufe0f Failed to start recording for {channel}. Will retry automatically on the next check."
             )
         except Exception:
+            self._last_failure_notify.pop(channel, None)
             logger.error("[monitor] start-failure notification failed for %s", channel, exc_info=True)

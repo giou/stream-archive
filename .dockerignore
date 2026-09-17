@@ -1,5 +1,8 @@
-.git
-.venv
+# Build context for the image. Docker anchors a slash-less pattern to the
+# context root (unlike .gitignore), so depth-independent patterns below carry
+# a "**/" prefix.
+**/.git
+**/.venv
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/
@@ -8,17 +11,27 @@
 **/tests/
 **/recordings/
 **/chat/
-**/config*.json
+# Runtime secrets: config, tokens, cloud credentials. The trailing "*" also
+# covers the atomic-write temp files (config.json.tmp, update_state.json.tmp)
+# and config.json.example, which the image does not need.
+**/config*.json*
 **/client_secret*.json
 **/credentials*.json
 **/youtube_token*.json
-**/update_state*.json
+**/update_state*.json*
+# Key material: tunnel state, service-account keys, PEM files.
+**/*.pem
+**/*.key
+**/*.p12
 **/.env*
+# .tz: nothing in this repo reads these files. The filter covers host tooling
+# that writes them next to a checkout.
 .tz
 **/cloudflared/
+# ":Zone.Identifier" is the Windows download marker.
 **/*:Zone.Identifier
-build/
-dist/
-*.egg-info/
-*.log
-.DS_Store
+**/build/
+**/dist/
+**/*.egg-info/
+**/*.log
+**/.DS_Store

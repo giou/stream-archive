@@ -28,6 +28,11 @@ _shutdown_event: asyncio.Event | None = None
 _HEALTH_HOST = "127.0.0.1"
 _HEALTH_PORT = 9100
 
+#: Interval between retention sweeps of the archive.
+_CLEANUP_INTERVAL_SECONDS = 86400.0
+#: Retry delay after a failed retention sweep.
+_CLEANUP_RETRY_SECONDS = 3600.0
+
 _READY = False  # flips True once recorder and API clients exist; reset at the start of each run
 
 
@@ -35,12 +40,16 @@ def _setup_signal_handlers() -> None:
     global _shutdown_event
     _shutdown_event = asyncio.Event()
 
-    def handle_signal(signum: int, frame: Any) -> None:
+    def handle_signal(signum: int) -> None:
         logger.info("[scheduler] Received signal %s, initiating shutdown...", signum)
         _shutdown_event.set()
 
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    # A loop signal handler runs as a loop callback. A plain signal.signal
+    # handler can set the event between the value check and the waiter of
+    # Event.wait(), and the poll loop then misses the wakeup.
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, handle_signal, signal.SIGTERM)
+    loop.add_signal_handler(signal.SIGINT, handle_signal, signal.SIGINT)
 
 
 async def _healthz(request: web.Request) -> web.Response:
@@ -131,7 +140,10 @@ async def run_scheduler() -> None:
 
         updater = UpdateChecker(config, notifier, http=shared_http)
         updater_task = asyncio.create_task(updater.run_loop())
-        logger.info("[updater] Update check enabled (every %gh)", config.update_check.interval_hours)
+        if config.update_check.enabled:
+            logger.info("[updater] Update check enabled (every %gh)", config.update_check.interval_hours)
+        else:
+            logger.info("[updater] Update check disabled")
 
         telegram = TelegramController(
             config,
@@ -191,7 +203,7 @@ async def _run_loop(
 ) -> None:
     """Poll channels until shutdown. Keeps the 5s poll and 86400s restart constants."""
     assert _shutdown_event is not None
-    last_cleanup: float | None = None
+    next_cleanup: float | None = None
     while not _shutdown_event.is_set():
         try:
             await monitor.check_channels(twitch_api, kick_api, config)
@@ -201,16 +213,32 @@ async def _run_loop(
             continue
 
         retention_days = config.retention_days
-        if retention_days > 0 and (last_cleanup is None or time.monotonic() - last_cleanup >= 86400):
-            # A failed cleanup must not kill the daemon. Log it and retry on
-            # the next iteration. last_cleanup advances only on success.
-            try:
-                removed = await recorder.cleanup_old_recordings(retention_days)
-            except Exception:
-                logger.error("[scheduler] Retention cleanup failed", exc_info=True)
+        if retention_days > 0 and (next_cleanup is None or time.monotonic() >= next_cleanup):
+            # A failed cleanup must not kill the daemon. Log it and retry after
+            # a backoff, so a broken tree cannot re-walk the archive on every
+            # poll tick.
+            cleanup_task: asyncio.Task[int] = asyncio.create_task(recorder.cleanup_old_recordings(retention_days))
+            shutdown_task: asyncio.Task[bool] = asyncio.create_task(_shutdown_event.wait())
+            # The sweep can walk a large archive. Race it against shutdown, so
+            # a signal does not wait for the whole sweep and the rest of the
+            # teardown fits in the container grace period.
+            done, _ = await asyncio.wait({cleanup_task, shutdown_task}, return_when=asyncio.FIRST_COMPLETED)
+            if cleanup_task in done:
+                shutdown_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_task
+                try:
+                    removed = cleanup_task.result()
+                except Exception:
+                    logger.error("[scheduler] Retention cleanup failed", exc_info=True)
+                    next_cleanup = time.monotonic() + _CLEANUP_RETRY_SECONDS
+                else:
+                    logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
+                    next_cleanup = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
             else:
-                logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
-                last_cleanup = time.monotonic()
+                # Shutdown won. Do not cancel the sweep in the middle of a
+                # deletion. It ends on its own while the teardown runs.
+                logger.info("[scheduler] Shutdown during retention cleanup")
 
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(_shutdown_event.wait(), timeout=config.monitoring_interval)
@@ -249,6 +277,14 @@ async def _shutdown(
             await asyncio.gather(updater_task, return_exceptions=True)
         except Exception:
             logger.error("[scheduler] updater task cancel failed", exc_info=True)
+    # Telegram drives every component that closes below. Stop the bot first,
+    # or a command that arrives during the teardown window runs against a
+    # closed recorder or API client.
+    if telegram is not None:
+        try:
+            await telegram.stop()
+        except Exception:
+            logger.error("[scheduler] telegram stop failed", exc_info=True)
     if health_runner is not None:
         try:
             await health_runner.cleanup()
@@ -280,11 +316,6 @@ async def _shutdown(
             await recorder.close()
         except Exception:
             logger.error("[scheduler] recorder close failed", exc_info=True)
-    if telegram is not None:
-        try:
-            await telegram.stop()
-        except Exception:
-            logger.error("[scheduler] telegram stop failed", exc_info=True)
     if youtube_streamer is not None:
         try:
             await youtube_streamer.close()

@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -87,28 +88,35 @@ def test_obsolete_disk_keys_are_dropped():
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    "mutate,match",
     [
-        lambda c: c.__setitem__("preferred_quality", ""),
-        lambda c: c.__setitem__("max_concurrent_recordings", -1),
-        lambda c: c.__setitem__("max_concurrent_youtube_streams", -1),
-        lambda c: c.__setitem__("disk", []),
-        lambda c: c.__setitem__("disk", {"max_total_gb": -1}),
-        lambda c: c.__setitem__("disk", {"check_interval_s": 0}),
-        lambda c: c.__setitem__("disk", {"check_interval_s": -5}),
-        lambda c: c.__setitem__("disk", {"delete_oldest": "yes"}),
-        lambda c: c.__setitem__("record_chat", "yes"),
-        lambda c: c.__setitem__("chat_dir", ""),
-        lambda c: c.__setitem__("eventsub", {"enabled": "yes"}),
-        lambda c: c.__setitem__("eventsub", 5),
-        lambda c: c.__setitem__("channel_preferred_qualities", {"bad!name": "720p"}),
-        lambda c: c.__setitem__("channel_preferred_qualities", {"kick:x": ""}),
+        (lambda c: c.__setitem__("preferred_quality", ""), "preferred_quality"),
+        (lambda c: c.__setitem__("max_concurrent_recordings", -1), "max_concurrent_recordings"),
+        (lambda c: c.__setitem__("max_concurrent_youtube_streams", -1), "max_concurrent_youtube_streams"),
+        (lambda c: c.__setitem__("disk", []), "disk"),
+        (lambda c: c.__setitem__("disk", {"max_total_gb": -1}), r"disk\.max_total_gb"),
+        (lambda c: c.__setitem__("disk", {"check_interval_s": 0}), r"disk\.check_interval_s"),
+        (lambda c: c.__setitem__("disk", {"check_interval_s": -5}), r"disk\.check_interval_s"),
+        (lambda c: c.__setitem__("disk", {"delete_oldest": "yes"}), r"disk\.delete_oldest"),
+        (lambda c: c.__setitem__("record_chat", "yes"), "record_chat"),
+        (lambda c: c.__setitem__("chat_dir", ""), "chat_dir"),
+        (lambda c: c.__setitem__("eventsub", {"enabled": "yes"}), r"eventsub\.enabled"),
+        (lambda c: c.__setitem__("eventsub", 5), "eventsub"),
+        (
+            lambda c: c.__setitem__("channel_preferred_qualities", {"bad!name": "720p"}),
+            "Invalid channel name in channel_preferred_qualities",
+        ),
+        (
+            lambda c: c.__setitem__("channel_preferred_qualities", {"kick:x": ""}),
+            r"channel_preferred_qualities\.kick:x must be a non-empty quality string",
+        ),
     ],
 )
-def test_invalid_new_settings_raise(mutate):
+def test_invalid_new_settings_raise(mutate, match):
+    """Each case pins its own rule, not just some ValueError."""
     config = valid_config()
     mutate(config)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         AppConfig.model_validate(config)
 
 
@@ -255,7 +263,8 @@ def test_eventsub_disabled_passes():
 
 def kick_config(channels=None):
     config = valid_config()
-    config["channels"] = channels or ["kick:xqc"]
+    # An explicit None check keeps an empty list an empty list.
+    config["channels"] = ["kick:xqc"] if channels is None else channels
     config["endpoint"] = {
         "enabled": False,
         "listen_host": "127.0.0.1",
@@ -309,6 +318,14 @@ def test_twitch_prefix_is_preserved():
     assert config.channels == ["twitch:foo"]
 
 
+def test_two_spellings_of_one_twitch_channel_raise():
+    """Names are lowercased first, so both spellings are the same channel."""
+    config = valid_config()
+    config["channels"] = ["twitch:Foo", "FOO"]
+    with pytest.raises(ValueError, match="Duplicate channel: 'twitch:foo'"):
+        AppConfig.model_validate(config)
+
+
 def test_kick_channel_output_modes_key_passes():
     config = kick_config()
     config["channel_output_modes"] = {"kick:xqc": "youtube"}
@@ -344,23 +361,23 @@ def test_kick_record_chat_non_bool_raises():
 def test_endpoint_invalid_values_raise():
     config = kick_config()
     config["endpoint"]["listen_port"] = 0
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"endpoint\.listen_port"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["endpoint"]["listen_port"] = 70000
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"endpoint\.listen_port"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["endpoint"]["listen_port"] = "8787"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"endpoint\.listen_port"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["endpoint"]["listen_host"] = ""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"endpoint\.listen_host"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["endpoint"]["enabled"] = "yes"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"endpoint\.enabled"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["endpoint"]["tunnel"] = "wireguard"
@@ -379,11 +396,11 @@ def test_endpoint_invalid_values_raise():
 def test_webhook_feature_invalid_values_raise():
     config = kick_config()
     config["kick"]["webhook"]["enabled"] = "yes"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"kick\.webhook\.enabled"):
         AppConfig.model_validate(config)
     config = kick_config()
     config["kick"]["webhook"]["setup_notified"] = "yes"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"kick\.webhook\.setup_notified"):
         AppConfig.model_validate(config)
 
 
@@ -412,12 +429,35 @@ def test_legacy_webhook_config_migrates_to_the_endpoint():
     # The old file used one flag for both features: keep both on.
     assert parsed.kick.webhook.enabled is True
     assert parsed.kick.webhook.setup_notified is True
-    # The endpoint section wins when a file already has one.
-    config["endpoint"] = {"enabled": False}
-    config["kick"]["webhook"]["enabled"] = False
+
+
+def test_endpoint_section_wins_over_a_legacy_webhook():
+    """A file with an endpoint section must keep its own endpoint values."""
+    config = kick_config()
+    config["kick"]["webhook"] = {
+        "enabled": True,
+        "listen_host": "0.0.0.0",
+        "listen_port": 9000,
+        "public_url": "https://kick.example.com/kick/webhook",
+        "tunnel": "cloudflare",
+        "cloudflare_token": "tok",
+    }
+    config["endpoint"] = {
+        "enabled": False,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8787,
+        "public_url": "",
+    }
+
     parsed = AppConfig.model_validate(config)
+
+    # Nothing may be copied from the legacy webhook over the endpoint section.
     assert parsed.endpoint.enabled is False
-    assert parsed.kick.webhook.enabled is False
+    assert parsed.endpoint.listen_host == "127.0.0.1"
+    assert parsed.endpoint.listen_port == 8787
+    assert parsed.endpoint.public_url == ""
+    assert parsed.endpoint.tunnel == ""
+    assert parsed.kick.webhook.enabled is True
 
 
 def test_bare_channels_valid_without_kick_section():
@@ -640,10 +680,10 @@ def test_apply_config_change_rejects_a_bad_change_and_writes_nothing(tmp_path):
     assert path.read_text() == before
 
 
-def test_save_preserves_file_mode(tmp_path):
+def test_save_tightens_a_mode_other_than_the_default(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(valid_config()))
-    path.chmod(0o600)
+    path.chmod(0o644)  # differs from the 0o600 every save writes
     cfg = get_config(path)
 
     save_config(cfg)
@@ -693,6 +733,9 @@ def test_save_removes_the_tmp_copy_when_the_write_fails(monkeypatch, tmp_path):
         # keeps working while this test runs.
         if str(dst) != str(path):
             return real_replace(src, dst, *args, **kwargs)
+        # The temporary copy holds the same secrets, so it must never become
+        # readable by another user, not even when the write fails.
+        assert stat.S_IMODE(os.stat(src).st_mode) == 0o600
         msg = "No space left on device"
         raise OSError(28, msg)
 
@@ -707,19 +750,19 @@ def test_save_removes_the_tmp_copy_when_the_write_fails(monkeypatch, tmp_path):
 
 
 def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
-    monkeypatch.delenv("DEFINITELY_UNSET_VAR_12345", raising=False)
+    monkeypatch.setenv("DEFINITELY_UNSET_VAR_12345", "resolved-at-load")
     data = valid_config()
+    # An unknown key still gets interpolated, then pydantic drops it
+    # (extra='ignore') and leaves an orphaned placeholder behind.
+    data["bogus"] = "${DEFINITELY_UNSET_VAR_12345}"
     (tmp_path / "config.json").write_text(json.dumps(data))
     cfg = get_config(tmp_path / "config.json")
-    # A ${VAR} can survive in _env_placeholders under a key that pydantic
-    # dropped (extra='ignore'). Then nothing in the saved output matches it.
-    cfg._env_placeholders[("bogus",)] = ("${DEFINITELY_UNSET_VAR_12345}", "resolved-at-load")
+    monkeypatch.delenv("DEFINITELY_UNSET_VAR_12345", raising=False)
 
     save_config(cfg)  # must not raise
 
     rewritten = json.loads((tmp_path / "config.json").read_text())
     assert rewritten["bot_telegram_api"] == data["bot_telegram_api"]
     assert "bogus" not in rewritten
-    assert ("bogus",) not in cfg._env_placeholders
     save_config(cfg)  # later saves keep working
     assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == data["bot_telegram_api"]

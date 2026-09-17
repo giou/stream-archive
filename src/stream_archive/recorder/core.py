@@ -28,7 +28,7 @@ from stream_archive.config import (
 )
 from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
-from stream_archive.recorder.common import sanitize_filename
+from stream_archive.recorder.common import _close_late_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, Recording
@@ -66,6 +66,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
+    _youtube_budget_lock: asyncio.Lock
     _held: dict[str, HoldState]
     _limits: YouTubeLimits
     _reserve_lock: asyncio.Lock
@@ -99,6 +100,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._quick_ends = {}  # channel -> consecutive short YouTube recordings
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
         self._youtube_starts = []
+        # Serializes the budget check, the broadcast create and the budget
+        # record, so concurrent starts cannot all pass the check.
+        self._youtube_budget_lock = asyncio.Lock()
         self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
         self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
         self._reserve_lock = asyncio.Lock()
@@ -169,7 +173,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         def handler(e: Exception) -> None:
             with suppress(RuntimeError):  # no running loop: the writer already logged the failure
-                asyncio.create_task(self._notify_chat_error(channel, chat_path, e))
+                self._spawn_bg(self._notify_chat_error(channel, chat_path, e))
 
         return handler
 
@@ -292,6 +296,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             logger.error("[recorder] Unexpected error resolving %s: %s", channel, e)
             return False
 
+        # Bind the task list before the try below. The failure handler reads
+        # it, and a fault between the registration and the first append must
+        # not turn into an UnboundLocalError that masks the real error.
+        tasks: list[asyncio.Task[Any]] = []
         try:
             entry: Recording = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
             entry["started_at"] = time.monotonic()
@@ -301,7 +309,6 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             entry["game"] = game
             entry["user_id"] = user_id
             entry["quality"] = effective_quality(self._config, channel)
-            tasks = []
             live_url = channel_url(channel)
 
             now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
@@ -390,6 +397,13 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 to_cancel.append(watchdog)
             for t in to_cancel:
                 t.cancel()
+            state = entry.get("kick_chat")
+            if state is not None:
+                # The entry drops the state below, so nothing else can close
+                # the writer. A start that failed keeps no chat, so the tmp
+                # file goes too.
+                state["writer"].discard()
+                entry.pop("kick_chat", None)
             self._recordings.pop(channel, None)
             if not isinstance(e, Exception):
                 # CancelledError and the like: the caller does not want a
@@ -467,7 +481,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
     async def stop_all(self) -> None:
         for channel in list(self._recordings):
-            await self.stop(channel)
+            # One failing channel must not keep the others running: their
+            # streamlink and ffmpeg children would survive shutdown.
+            try:
+                await self.stop(channel)
+            except Exception:
+                logger.error("[recorder] stop failed for %s", channel, exc_info=True)
 
     async def close(self) -> None:
         await self.stop_all()
@@ -534,6 +553,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             self._spawn_bg(self._release_broadcast(channel, youtube_info, entry))
         if entry.get("mode") in ("youtube", "both"):
             self._note_youtube_end(channel, entry)
+        # Cancel the watchdog here too, like the stop and abort paths. It only
+        # stops once it sees no entry for the channel, and a restart inside
+        # that window would leave a second, untracked watchdog behind.
+        wd = entry.pop("watchdog", None)
+        if wd is not None:
+            wd.cancel()
         # Remember that the stream ended on its own, not through a task failure.
         # The monitor then skips restart attempts until the offline event catches
         # up. Otherwise a dead stream just resolves to a 404.
@@ -646,7 +671,14 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         loop = asyncio.get_running_loop()
         clean = False
         try:
-            fd = await loop.run_in_executor(None, stream.open)
+            # Shield the open, like the disk path: the worker thread keeps
+            # running after a cancellation, and its handle needs a close.
+            open_future = asyncio.ensure_future(loop.run_in_executor(None, stream.open))
+            try:
+                fd = await asyncio.shield(open_future)
+            except asyncio.CancelledError:
+                open_future.add_done_callback(_close_late_stream)
+                raise
         except Exception as e:
             logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
             return False

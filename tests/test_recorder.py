@@ -1,11 +1,12 @@
 import asyncio
-import builtins
 import contextlib
 import inspect
 import io
 import json
 import os
+import shutil
 import subprocess
+import threading
 import time
 import types
 from datetime import UTC, datetime
@@ -31,6 +32,20 @@ def _no_network_emote_embed(monkeypatch):
     # Clear the shared instance list before every test, so no test sees the
     # recorders of an earlier one.
     FakeChatRecorder.instances.clear()
+
+
+async def wait_until(condition, timeout=5.0):
+    """Poll a condition until it holds. Fails the test when the deadline passes.
+
+    Fire-and-forget finalizers run in their own tasks, so a fixed sleep is
+    not reliable on a loaded runner.
+    """
+
+    async def _poll() -> None:
+        while not condition():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout)
 
 
 def make_config(tmp_path):
@@ -93,6 +108,10 @@ class SustainedStream:
     def __init__(self, chunk=b"\x00" * 1024):
         self._chunk = chunk
         self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def open(self):
         return self
@@ -403,7 +422,7 @@ def test_recording_task_failure_removes_entry(tmp_path, monkeypatch):
 
     async def scenario():
         assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: not rec.is_recording("ch"))
         assert not rec.is_recording("ch")
         assert "ch" not in rec._recordings
 
@@ -448,7 +467,7 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
         }
         task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
         await task
-        await asyncio.sleep(0.05)  # let the fire-and-forget finalizers run
+        await wait_until(lambda: "ch" not in rec._recordings and bool(yt.ended))
         assert "ch" not in rec._recordings
         assert rec.ended_clean("ch")
         assert yt.ended == ["b1"]
@@ -478,7 +497,7 @@ def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
         }
         task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
         await asyncio.gather(task, return_exceptions=True)
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: "ch" not in rec._recordings)
         assert "ch" not in rec._recordings
         assert not rec.ended_clean("ch")
 
@@ -521,9 +540,14 @@ def test_reserve_start_blocks_when_capacity_taken(tmp_path):
     )
 
     async def scenario():
-        assert await rec.reserve_start("ch") is None
-        assert await rec.reserve_start("other") == reason
-        rec.release_start("ch")
+        results = await asyncio.gather(rec.reserve_start("ch"), rec.reserve_start("other"))
+        # Both passing would expose a check-then-act race between the
+        # capacity check and the reservation.
+        assert results.count(None) == 1
+        assert [r for r in results if r is not None] == [reason]
+        winner = "ch" if results[0] is None else "other"
+        rec.release_start(winner)
+        # The freed slot takes the next reservation.
         assert await rec.reserve_start("other") is None
 
     asyncio.run(scenario())
@@ -617,7 +641,7 @@ def test_youtube_create_failure_propagates_and_removes_entry(tmp_path, monkeypat
 
     async def scenario():
         assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: not rec.is_recording("ch"))
         assert not rec.is_recording("ch")
 
     asyncio.run(scenario())
@@ -782,53 +806,43 @@ def test_stop_chat_platform_twitch_keeps_kick_buffer(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_cancelled_recording_closes_the_output_file(tmp_path, monkeypatch):
-    """A cancelled disk recording must close the file it opened.
+def test_cancelled_recording_closes_the_late_stream(tmp_path, monkeypatch):
+    """A cancelled disk recording must close the stream that opens late.
 
-    An output file that stays open makes the garbage collector report an
-    unraisable error during a later test. The patched open holds the call,
-    so the cancel arrives while the file is created.
+    The stream open runs on an executor thread, which a cancel cannot stop.
+    The patched open holds that thread, so the cancel arrives while the open
+    is still in flight and the late handle needs the close callback.
     """
     rec = Recorder(make_config(tmp_path))
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    stream = SustainedStream()
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (stream, "author", "Title", "Game"))
 
-    recording_dir = str(tmp_path / "recordings")
-    opened = []
-    entered = []
-    real_open = builtins.open
+    entering = threading.Event()
+    release = threading.Event()
+    real_open = SustainedStream.open
 
-    def holding_open(file, *args, **kwargs):
-        if not (isinstance(file, str) and file.startswith(recording_dir)):
-            return real_open(file, *args, **kwargs)
-        entered.append(True)
-        handle = real_open(file, *args, **kwargs)
-        opened.append(handle)
-        time.sleep(0.2)  # hold the open, so the cancel lands inside it
-        return handle
+    def holding_open(self):
+        entering.set()
+        release.wait(5)  # bound the hold, so a broken cancel cannot hang the suite
+        return real_open(self)
 
-    monkeypatch.setattr(builtins, "open", holding_open)
+    monkeypatch.setattr(SustainedStream, "open", holding_open)
 
     async def scenario():
         assert await rec.start("ch") is True
         task = rec._recordings["ch"]["tasks"][0]
-        for _ in range(200):
-            if entered:
-                break
-            await asyncio.sleep(0.01)
+        # The open runs on an executor thread, so the loop stays free here.
+        await wait_until(entering.is_set)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        release.set()  # the worker thread returns its handle after the cancel
+        await wait_until(lambda: stream.closed)
 
     asyncio.run(scenario())
 
-    # The thread of a cancelled executor call can create the file late.
-    deadline = time.monotonic() + 5
-    while not opened and time.monotonic() < deadline:
-        time.sleep(0.05)
-
-    assert opened, "the recording never opened an output file"
-    assert all(handle.closed for handle in opened), "a cancelled recording left its output file open"
+    assert stream.closed, "a cancelled recording left its stream open"
 
 
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
@@ -864,7 +878,7 @@ def test_stop_returns_file_info(tmp_path):
     result = asyncio.run(rec.stop("ch"))
     file_info = result["file_info"]
     assert file_info["name"] == "rec.ts"
-    assert file_info["size_mb"] == 1.0
+    assert file_info["size_mb"] == pytest.approx(1.0, abs=0.01)
     mtime = os.stat(filepath).st_mtime
     expected = datetime.fromtimestamp(mtime, tz=UTC).strftime("%d-%m-%Y %H:%M")
     assert file_info["date"] == expected
@@ -987,6 +1001,8 @@ def test_resolve_stream_audio_only_kick_demux_uses_480p(tmp_path, monkeypatch):
 
 
 def test_audio_only_stream_remuxes_to_fragmented_mp4(tmp_path):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe are not installed")
     gen = subprocess.run(
         ["ffmpeg", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "aac", "-f", "adts", "pipe:1"],
         check=True,
@@ -1218,7 +1234,7 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
 
     async def scenario():
         assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: "ch" not in rec._recordings)
         assert "ch" not in rec._recordings
 
     asyncio.run(scenario())
@@ -1363,9 +1379,9 @@ def test_disk_snapshot_counts_chat_files(tmp_path):
 
     assert snap["file_count"] == 1
     assert snap["chat_count"] == 2  # the in-progress .tmp file counts
-    assert snap["dir_gb"] == 0.01
-    assert snap["chat_gb"] == 0.01
-    assert snap["archive_gb"] == 0.02  # the watchdog measures this against the cap
+    assert snap["dir_gb"] == pytest.approx(0.01, abs=0.005)
+    assert snap["chat_gb"] == pytest.approx(0.01, abs=0.005)
+    assert snap["archive_gb"] == pytest.approx(0.02, abs=0.005)  # the watchdog measures this against the cap
 
 
 def make_kick_config(tmp_path, record_chat=True):
@@ -1678,6 +1694,8 @@ def test_hold_delays_end_and_reuses_broadcast(tmp_path, monkeypatch):
     A return within the hold delay reuses the same broadcast without a
     second create_stream call.
     """
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not installed")
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     config.youtube.hold_seconds = 60

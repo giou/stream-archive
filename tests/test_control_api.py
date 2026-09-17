@@ -9,7 +9,6 @@ directly, like the webhook tests do.
 import asyncio
 import json
 
-import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from stream_archive.api import ControlAPI
@@ -137,6 +136,7 @@ def sent_messages(ctrl):
 
 def test_disabled_api_answers_404(tmp_path):
     _, _, _, _, wh, _ = make_api(tmp_path, enabled=False)
+    before = read_file(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -150,7 +150,7 @@ def test_disabled_api_answers_404(tmp_path):
             return await (await client.patch("/api/v1/settings", json={"retention_days": 3}, headers=auth())).json()
 
     assert asyncio.run(scenario()) == {"error": "not found"}
-    assert read_file(tmp_path).get("retention_days", 0) == 0
+    assert read_file(tmp_path) == before  # a disabled API writes nothing at all
 
 
 def test_missing_and_bad_key_are_401(tmp_path):
@@ -336,6 +336,38 @@ def test_patch_settings_rejects_an_oversized_body(tmp_path):
             return resp.status
 
     assert asyncio.run(scenario()) == 413
+
+
+def test_patch_settings_rejects_a_non_finite_number(tmp_path):
+    """inf and nan reach the API as a JSON literal or as a string."""
+    _, _, _, _, wh, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            # A hand-written body can carry the Infinity literal.
+            literal = await client.patch("/api/v1/settings", data=b'{"retention_days": Infinity}', headers=auth())
+            text = await client.patch("/api/v1/settings", data=b'{"retention_days": "nan"}', headers=auth())
+            return literal.status, await literal.json(), text.status, await text.json()
+
+    status, body, text_status, text_body = asyncio.run(scenario())
+    assert status == 400
+    assert "must be a finite number" in body["errors"]["retention_days"]
+    assert text_status == 400
+    assert "must be a finite number" in text_body["errors"]["retention_days"]
+    assert text_body["settings"]["retention_days"] == 0  # nothing was written
+
+
+def test_patch_settings_rejects_a_body_that_is_not_utf8(tmp_path):
+    _, _, _, _, wh, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch("/api/v1/settings", data=b'{"retention_days": \xff}', headers=auth())
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 400
+    assert "invalid JSON body" in body["error"]
 
 
 def test_add_channel_subscribes_and_rejects_duplicates(tmp_path):
@@ -564,26 +596,8 @@ def test_non_utf8_header_bytes_answer_401(tmp_path):
                 b"GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-API-Key: \xff\r\nConnection: close\r\n\r\n"
             )
             await writer.drain()
-            data = await reader.read()
+            status_line = await asyncio.wait_for(reader.readline(), timeout=5)
             writer.close()
-            return data.split(b"\r\n", 1)[0]
+            return status_line.split(b"\r\n", 1)[0]
 
     assert asyncio.run(scenario()) == b"HTTP/1.1 401 Unauthorized"
-
-
-def test_a_header_that_is_not_ascii_answers_401(tmp_path):
-    """A header can carry bytes that are not UTF-8. The key comparison must
-    reject them and never raise."""
-    from stream_archive.api import _ApiError
-
-    config, ctrl, recorder, _, _, _ = make_api(tmp_path)
-    api = ControlAPI(config, ctrl, recorder)
-
-    class Request:
-        remote = "127.0.0.1"
-        # aiohttp decodes header bytes that are not UTF-8 like this.
-        headers = {"X-API-Key": "\udcff"}
-
-    with pytest.raises(_ApiError) as err:
-        api._check_key(Request())
-    assert err.value.status == 401

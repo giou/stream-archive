@@ -58,16 +58,25 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # keep the OAuth prompt clean
 
 
-def extract_code(text: str) -> str:
-    """Return the code from a pasted redirect URL, or the text itself if it is already a code."""
+def extract_code_and_state(text: str) -> tuple[str, str | None]:
+    """Return the OAuth code and state of a pasted redirect URL.
+
+    A bare code gives ``(text, None)``, because it carries no state.
+    """
     if "code=" not in text and "error=" not in text:
-        return text
+        return text, None
     query = parse_qs(urlparse(text).query)
     if "error" in query:
         msg = f"Authorization failed: {query['error'][0]}"
         raise ValueError(msg)
     codes = query.get("code", [])
-    return codes[0] if codes else ""
+    states = query.get("state", [])
+    return (codes[0] if codes else ""), (states[0] if states else None)
+
+
+def extract_code(text: str) -> str:
+    """Return the code from a pasted redirect URL, or the text itself if it is already a code."""
+    return extract_code_and_state(text)[0]
 
 
 def main() -> None:
@@ -99,10 +108,12 @@ def main() -> None:
     server.auth_state = None  # type: ignore[attr-defined]
     server.auth_event = threading.Event()  # type: ignore[attr-defined]
     flow.redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
-    threading.Thread(target=server.serve_forever, daemon=True).start()
 
     auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
     server.auth_state = state  # type: ignore[attr-defined]
+    # Serve only now. The handler accepts any state while auth_state is None,
+    # so a request in the window before this line would bypass the check.
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     print("1. Open this URL in your browser (trying to open it automatically):")
     print(f"   {auth_url}")
     with contextlib.suppress(Exception):
@@ -117,9 +128,14 @@ def main() -> None:
     for _ in range(3):
         pasted = input("   Press Enter after authorizing, or paste the redirect URL: ").strip()
         try:
-            candidate = extract_code(pasted) or server.auth_code  # type: ignore[attr-defined]
+            candidate, pasted_state = extract_code_and_state(pasted)
         except ValueError as exc:
             print(f"   {exc}")
+            continue
+        # A pasted URL carries the state of its own authorization request.
+        # Reject a URL from an older attempt before the exchange.
+        if pasted_state is not None and pasted_state != server.auth_state:  # type: ignore[attr-defined]
+            print("   That redirect URL belongs to an earlier attempt. Paste the URL of the page you just opened.")
             continue
         if not candidate:
             # The browser callback can land just after the user pressed Enter.
@@ -140,11 +156,19 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            # Drop the stale code: the next attempt must use the fresh URL.
-            server.auth_code = None  # type: ignore[attr-defined]
-            # Clear the event too, so the one-second grace below applies to
-            # the retry that follows this failed exchange.
-            server.auth_event.clear()  # type: ignore[attr-defined]
+            if "invalid_grant" not in detail:
+                # A network or server problem is not a stale code. Keep the
+                # code and the callback event for the next attempt.
+                print(f"   The token exchange failed ({exc}). Press Enter to try again.")
+                continue
+            # Google refused the code: it is stale, used, or belongs to an
+            # older attempt. Drop it, but only while it is still the code of
+            # this attempt. A newer callback can have stored a fresh one.
+            if server.auth_code == candidate:  # type: ignore[attr-defined]
+                server.auth_code = None  # type: ignore[attr-defined]
+                # Clear the event too, so the one-second grace below applies
+                # to the retry that follows this failed exchange.
+                server.auth_event.clear()  # type: ignore[attr-defined]
             print(f"   Could not exchange the code ({exc}); paste the full URL from the address bar.")
     else:
         print("ERROR: no valid token after 3 attempts. Re-run the script.", file=sys.stderr)

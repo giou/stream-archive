@@ -3,6 +3,8 @@ import json
 import logging
 
 import httpx
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import Close
 
 from stream_archive.config import AppConfig
 from stream_archive.eventsub import EventSubClient
@@ -230,13 +232,12 @@ def test_409_resolves_existing_subscription_id():
     assert client._subs["twitch:ch"] == {"online": "existing-online", "offline": "existing-offline"}
 
 
-class _FakeClosed(Exception):
-    def __init__(self, code):
-        self.code = code
-
-
 def _make_closing_ws(code):
-    """Fake websocket: delivers a welcome, then closes with ``code``."""
+    """Fake connect(): delivers a welcome, then closes with ``code``.
+
+    The socket raises a real ``ConnectionClosed``, because the client catches
+    that type. The returned callable replaces ``eventsub.connect``.
+    """
 
     class FakeWS:
         def __init__(self):
@@ -251,22 +252,24 @@ def _make_closing_ws(code):
                         "payload": {"session": {"id": "s1", "keepalive_timeout_seconds": 60}},
                     }
                 )
-            raise _FakeClosed(code)
+            raise ConnectionClosed(Close(code, ""), None)
 
         async def close(self):
             pass
 
-    class FakeWebsockets:
-        ConnectionClosed = _FakeClosed
+    async def fake_connect(url):
+        return FakeWS()
 
-        async def connect(self, url):
-            return FakeWS()
-
-    return FakeWebsockets()
+    return fake_connect
 
 
 def _run_close_code(client):
-    return asyncio.run(client._connect_and_listen())
+    """Run one connect/listen pass under a deadline.
+
+    The fake socket raises the close code again on every read. Without the
+    deadline a regression that retries inside the method spins forever.
+    """
+    return asyncio.run(asyncio.wait_for(client._connect_and_listen(), timeout=5))
 
 
 def test_close_code_4007_logged_as_info(caplog, monkeypatch):
@@ -274,7 +277,7 @@ def test_close_code_4007_logged_as_info(caplog, monkeypatch):
     client = make_client()
     client._conduit_id = "c1"
     client._subscribed = True
-    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(4007))
+    monkeypatch.setattr("stream_archive.eventsub.connect", _make_closing_ws(4007))
 
     with caplog.at_level("INFO", logger="stream_archive.eventsub"):
         _run_close_code(client)
@@ -287,7 +290,7 @@ def test_close_code_1006_logged_as_warning(caplog, monkeypatch):
     client = make_client()
     client._conduit_id = "c1"
     client._subscribed = True
-    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1006))
+    monkeypatch.setattr("stream_archive.eventsub.connect", _make_closing_ws(1006))
 
     with caplog.at_level("WARNING", logger="stream_archive.eventsub"):
         _run_close_code(client)
@@ -300,7 +303,7 @@ def test_close_code_other_logged_as_error(caplog, monkeypatch):
     client = make_client()
     client._conduit_id = "c1"
     client._subscribed = True
-    monkeypatch.setattr("stream_archive.eventsub.websockets", _make_closing_ws(1011))
+    monkeypatch.setattr("stream_archive.eventsub.connect", _make_closing_ws(1011))
 
     with caplog.at_level("ERROR", logger="stream_archive.eventsub"):
         _run_close_code(client)
@@ -340,11 +343,13 @@ def test_remove_channel_deletes_subs():
     client = make_client(api=api, config=make_config(channels=["ch"]))
     client._conduit_id = "c1"
     client._session_id = "s1"
-    client._subs = {"ch": {"online": "s1", "offline": "s2"}}
-    client._user_ids = {"ch": "u1"}
+    # AppConfig normalizes channels, so production keys the maps by the
+    # prefixed name. The seed mirrors that shape.
+    client._subs = {"twitch:ch": {"online": "s1", "offline": "s2"}}
+    client._user_ids = {"twitch:ch": "u1"}
     client._id_to_channel = {"u1": "twitch:ch"}
 
-    asyncio.run(client.remove_channel("ch"))
+    asyncio.run(client.remove_channel("twitch:ch"))
 
     assert sorted(api.subscription_deletes) == ["s1", "s2"]
     assert client._subs == {}
@@ -419,8 +424,27 @@ def test_duplicate_message_id_dispatches_once():
     asyncio.run(handle_message(client, msg))
     asyncio.run(handle_message(client, msg))
 
-    assert len(mon.online_calls) == 1
-    assert "m1" in client._seen_ids
+    assert mon.online_calls == [("twitch:ch", "T", "G", "u1")]
+
+
+def test_expired_message_id_dispatches_again(monkeypatch):
+    """A marker that aged past the dedup window must not suppress a redelivery."""
+    api = FakeTwitchAPI(user_ids={"ch": "u1"}, streams={"u1": {"title": "T", "game_name": "G"}})
+    mon = StubMonitor()
+    client = make_client(api=api, monitor=mon)
+    client._id_to_channel = {"u1": "twitch:ch"}
+    msg = notification("u1", "stream.online", message_id="m1")
+    # A zero window makes every marker expire at once, so the second delivery
+    # is a redelivery after the window instead of a replay inside it.
+    monkeypatch.setattr("stream_archive.eventsub._DEDUP_WINDOW_S", 0)
+
+    asyncio.run(handle_message(client, msg))
+    asyncio.run(handle_message(client, msg))
+
+    assert mon.online_calls == [
+        ("twitch:ch", "T", "G", "u1"),
+        ("twitch:ch", "T", "G", "u1"),
+    ]
 
 
 def test_failed_dispatch_forgets_the_message_id():
@@ -453,12 +477,12 @@ def test_close_cancels_an_in_flight_dispatch():
         await client._handle_message(notification("u1", "stream.online", message_id="m1"))
         async with asyncio.timeout(5):
             await api.lookup_started.wait()
-        dispatch = next(iter(client._dispatch_tasks))
+            dispatch = next(iter(client._dispatch_tasks))
 
-        await client.close()
+            await client.close()
 
-        assert client._dispatch_tasks == set()
-        assert dispatch.cancelled()
+            assert client._dispatch_tasks == set()
+            assert dispatch.cancelled()
 
     asyncio.run(scenario())
     assert mon.online_calls == []

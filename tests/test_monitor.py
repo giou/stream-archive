@@ -6,7 +6,6 @@ import httpx
 from stream_archive import monitor as monitor_module
 from stream_archive.config import AppConfig
 from stream_archive.monitor import Monitor
-from stream_archive.recorder import Recorder
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 
 
@@ -67,7 +66,8 @@ class FakeRecorder:
         self.started = []
         self.started_kwargs = []
         self.stopped = []
-        self._recording = True
+        # live recordings, keyed by channel like Recorder._recordings.
+        self._recording = {}
         self._ended_clean = {}  # channel -> monotonic end time (mirrors Recorder)
         self.snapshot = {
             "free_gb": 100.0,
@@ -86,21 +86,25 @@ class FakeRecorder:
     async def start(self, channel, title=None, game=None, user_id=None):
         self.started.append(channel)
         self.started_kwargs.append({"channel": channel, "title": title, "game": game, "user_id": user_id})
+        if self.ok:
+            self._recording[channel] = True
         return self.ok
 
     async def stop(self, channel):
         self.stopped.append(channel)
+        self._recording.pop(channel, None)
         return {}
 
     def is_recording(self, channel):
-        return self._recording
+        # Liveness is per recording, like Recorder.is_recording.
+        return self._recording.get(channel, False)
 
     def ended_clean(self, channel):
         ts = self._ended_clean.get(channel)
         return ts is not None and time.monotonic() - ts < _ENDED_CLEAN_GRACE_S
 
     def active_channels(self):
-        return list(self.started)
+        return sorted(self._recording)
 
     async def disk_snapshot(self):
         return self.snapshot
@@ -112,19 +116,27 @@ class FakeRecorder:
         return (0, 0.0)
 
     def youtube_active_count(self):
-        return len(self.started) if self.mode in ("youtube", "both") else 0
+        # Only recordings that are still live hold an uplink slot, like the
+        # real Recorder. A stopped channel frees its slot.
+        if self.mode not in ("youtube", "both"):
+            return 0
+        return len(self._recording)
 
     def youtube_restart_blocked_reason(self, channel):
         return None
 
     async def reserve_start(self, channel):
         mode = self.mode
-        if self.max_recordings is not None and len(self.started) + len(self._reserved) >= self.max_recordings:
-            return f"concurrent recording limit reached ({self.max_recordings}/{self.max_recordings})"
-        if self.max_youtube is not None and mode in ("youtube", "both"):
+        # Mirror Recorder.reserve_start: active recordings plus reservations,
+        # and a limit of 0 means unlimited.
+        max_rec = self.max_recordings or 0
+        if max_rec > 0 and len(self._recording) + len(self._reserved) >= max_rec:
+            return f"concurrent recording limit reached ({max_rec}/{max_rec})"
+        max_yt = self.max_youtube or 0
+        if max_yt > 0 and mode in ("youtube", "both"):
             yt_busy = self.youtube_active_count() + sum(1 for m in self._reserved.values() if m in ("youtube", "both"))
-            if yt_busy >= self.max_youtube:
-                return f"YouTube re-stream limit reached ({self.max_youtube}/{self.max_youtube})"
+            if yt_busy >= max_yt:
+                return f"YouTube re-stream limit reached ({max_yt}/{max_yt})"
         self._reserved[channel] = mode
         return None
 
@@ -217,16 +229,35 @@ def test_recording_death_triggers_restart():
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     assert rec.started == ["twitch:ch"]
 
-    rec._recording = False
+    rec._recording["twitch:ch"] = False  # the recording task died
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
     assert rec.started == ["twitch:ch", "twitch:ch"]
     assert rec.stopped == []
 
 
+def test_recording_death_of_another_channel_does_not_restart_this_one():
+    """Liveness is per channel: a dead recording elsewhere must not hide it."""
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(
+        streams={"u1": {"title": "T", "game_name": "G"}, "u2": {"title": "T", "game_name": "G"}},
+        user_ids={"a": "u1", "b": "u2"},
+    )
+    mon = make_monitor(recorder=rec)
+    config = make_config(channels=["a", "b"])
+    mon._live_channels.update(["twitch:a", "twitch:b"])
+    rec._recording["twitch:a"] = True
+    rec._recording["twitch:b"] = False
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    # Only the dead channel restarts. A global liveness flag would skip it.
+    assert rec.started == ["twitch:b"]
+
+
 def test_clean_end_skips_restart_until_offline(caplog):
     rec = FakeRecorder()
-    rec._recording = False
+    rec._recording["kick:xqc"] = False  # the capture ended and did not restart
     rec._ended_clean["kick:xqc"] = time.monotonic()
     mon = make_monitor(recorder=rec)
     config = make_config(channels=["kick:xqc"])
@@ -249,7 +280,7 @@ def test_clean_end_skips_restart_until_offline(caplog):
 
 def test_expired_clean_end_allows_restart():
     rec = FakeRecorder()
-    rec._recording = False
+    rec._recording["twitch:ch"] = False
     rec._ended_clean["twitch:ch"] = time.monotonic() - _ENDED_CLEAN_GRACE_S - 1
     mon = make_monitor(recorder=rec)
     config = make_config()
@@ -372,23 +403,6 @@ def test_youtube_limit_blocks_restreams():
     assert any("YouTube re-stream limit reached" in m for m in notifier.messages)
 
 
-def test_reservation_blocks_second_channel():
-    """The reservation admits one channel at a time and frees the slot on release."""
-    config = make_config(max_concurrent_recordings=1)
-    rec = Recorder(config)
-    limit = config.max_concurrent_recordings
-    blocked = f"concurrent recording limit reached ({limit}/{limit})"
-
-    async def scenario():
-        assert await rec.reserve_start("twitch:a") is None  # first slot reserved
-        # second go-live while the first is mid-start
-        assert await rec.reserve_start("twitch:b") == blocked
-        rec.release_start("twitch:a")
-        assert await rec.reserve_start("twitch:b") is None  # released slot frees capacity
-
-    asyncio.run(scenario())
-
-
 def test_handle_online_starts_recording():
     rec = FakeRecorder()
     mon = make_monitor(recorder=rec)
@@ -417,7 +431,7 @@ def test_handle_online_restarts_dead_recording():
     config = make_config()
 
     asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
-    rec._recording = False
+    rec._recording["twitch:ch"] = False  # the recording task died
     asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
 
     assert rec.started == ["twitch:ch", "twitch:ch"]
@@ -527,7 +541,7 @@ def test_poll_and_event_lock_same_channel():
 
     async def scenario():
         poll = asyncio.create_task(mon.check_channels(api, FakeKickAPI(), config))
-        await in_start.wait()
+        await asyncio.wait_for(in_start.wait(), timeout=5)  # bounded, so a stall fails fast
         webhook = asyncio.create_task(mon.handle_online("twitch:ch", "T", "G", "u1", config))
         # Wait until the webhook path is blocked by the reservation. The bound
         # fails the test instead of hanging it when the guard regresses.

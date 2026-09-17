@@ -8,11 +8,16 @@ the first write. HoldState is built complete in one place, so every one of
 its keys is required.
 """
 
+from __future__ import annotations
+
 import asyncio
 from datetime import datetime
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from stream_archive.chat_writer import ChatJsonWriter
+
+if TYPE_CHECKING:
+    from stream_archive.chat_recorder import ChatRecorder
 
 
 class KickChatState(TypedDict, total=False):
@@ -52,10 +57,10 @@ class Recording(TypedDict, total=False):
     youtube_info: dict[str, Any] | None
     started_at: float
     tasks: list[asyncio.Task[Any]]
-    # streamlink ships no type stubs, so handles fed by its stream
-    # objects stay Any.
-    process: Any  # ffmpeg child fed from a streamlink stream
-    chat_recorder: Any  # Twitch IRC recorder tied to the same capture
+    # streamlink ships no type stubs, so the stream objects that feed these
+    # handles stay Any. The handles themselves have known types.
+    process: asyncio.subprocess.Process | None  # ffmpeg child fed from a streamlink stream
+    chat_recorder: ChatRecorder | None  # Twitch IRC recorder tied to the same capture
     chat_task: asyncio.Task[Any] | None
     kick_chat: KickChatState | None
     watchdog: asyncio.Task[Any] | None

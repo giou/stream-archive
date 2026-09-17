@@ -23,6 +23,18 @@ class FakeNotifier:
         self.calls.append(message)
 
 
+class RaisingNotifier:
+    """A notifier whose Telegram send fails."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def notify(self, message):
+        self.calls += 1
+        msg = "telegram is down"
+        raise RuntimeError(msg)
+
+
 class FakeResponse:
     def __init__(self, status, json_data=None, content=b""):
         self.status_code = status
@@ -126,8 +138,13 @@ def test_app_update_notifies_once_then_dedups(tmp_path, set_app_version):
     assert "Apply: docker compose pull && docker compose up -d" in text
     state = json.loads((tmp_path / "update_state.json").read_text())
     assert state["app"] == APP_LATEST
-    asyncio.run(u.check(notify=True))
-    assert len(notifier.calls) == 1
+    # A fresh instance simulates a container restart: the dedup must come from
+    # update_state.json, not from memory.
+    restart_notifier = FakeNotifier()
+    u2 = UpdateChecker(config, restart_notifier, http=app_http(app_tag=APP_LATEST))
+    second = asyncio.run(u2.check(notify=True))
+    assert second["app"]["status"] == "update"
+    assert restart_notifier.calls == []
 
 
 def test_check_notify_false_neither_notifies_nor_writes_state(tmp_path, set_app_version):
@@ -184,6 +201,50 @@ def test_changelog_lines_truncates_long_body():
     assert len(lines) == 2
 
 
+def test_changelog_lines_of_a_missing_or_empty_body_is_empty():
+    from stream_archive.updater import _changelog_lines
+
+    assert _changelog_lines(None) == []
+    assert _changelog_lines("") == []
+    assert _changelog_lines("\n  \n") == []
+
+
+def test_app_update_without_release_notes_has_no_changelog(tmp_path, set_app_version):
+    """A release without notes gives the version bullet and no changelog block."""
+    config = make_config(tmp_path)
+    notifier = FakeNotifier()
+    u = UpdateChecker(config, notifier, http=app_http(app_tag=APP_LATEST))
+
+    report = asyncio.run(u.check(notify=True))
+
+    assert report["app"]["status"] == "update"
+    assert report["app"]["changelog"] == []
+    assert len(notifier.calls) == 1
+    text = notifier.calls[0]
+    assert f"• stream-archive: v{APP_CURRENT} → v{APP_LATEST}" in text
+    assert "Changelog:" not in text
+    assert json.loads((tmp_path / "update_state.json").read_text())["app"] == APP_LATEST
+
+
+def test_notify_failure_keeps_the_release_unrecorded(tmp_path, set_app_version):
+    """A failed send must not consume the release: the next check notifies again."""
+    config = make_config(tmp_path)
+    notifier = RaisingNotifier()
+    u = UpdateChecker(config, notifier, http=app_http(app_tag=APP_LATEST))
+
+    # The failure of the send must not escape to the run loop.
+    report = asyncio.run(u.check(notify=True))
+
+    assert report["app"]["status"] == "update"
+    assert notifier.calls == 1
+    assert not (tmp_path / "update_state.json").exists()
+
+    second = FakeNotifier()
+    u2 = UpdateChecker(config, second, http=app_http(app_tag=APP_LATEST))
+    asyncio.run(u2.check(notify=True))
+    assert len(second.calls) == 1  # the release was still unrecorded
+
+
 def test_default_client_follows_redirects(tmp_path):
     # GitHub answers 301 when a repository is renamed, so the default client
     # must follow redirects.
@@ -193,11 +254,13 @@ def test_default_client_follows_redirects(tmp_path):
     asyncio.run(u.close())
 
 
-def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch):
+def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch, set_app_version):
     config = make_config(tmp_path)
     # A non-default interval proves the loop reads the config, not a constant.
     config.update_check.interval_hours = 0.5
-    u = UpdateChecker(config, FakeNotifier(), http=FakeHttp({}))
+    notifier = FakeNotifier()
+    # A valid route makes the first iteration a real success path.
+    u = UpdateChecker(config, notifier, http=app_http(app_tag=APP_CURRENT))
     checks = []
     orig = u.check
 
@@ -217,6 +280,9 @@ def test_run_loop_checks_immediately_then_sleeps(tmp_path, monkeypatch):
         asyncio.run(u.run_loop())
     assert checks == [True]
     assert slept == [0.5 * 3600]
+    # The first check ran: it reported the up-to-date state and recorded it.
+    assert notifier.calls == []
+    assert json.loads((tmp_path / "update_state.json").read_text())["app"] == APP_CURRENT
 
 
 def test_run_loop_disabled_never_checks(tmp_path, monkeypatch):

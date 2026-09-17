@@ -23,7 +23,7 @@ import asyncio
 import base64
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -125,6 +125,11 @@ def build_comment(
     msg_time = parse_time(created_at)
     offset = 0.0
     if msg_time and start:
+        if msg_time.tzinfo is None:
+            # Kick can send an offset-less timestamp. datetime.fromisoformat
+            # returns a naive datetime then, and the subtraction below would
+            # raise TypeError and lose the message.
+            msg_time = msg_time.replace(tzinfo=UTC)
         offset = max(0.0, (msg_time - start).total_seconds())
 
     user_badges = []
@@ -196,7 +201,9 @@ def chat_root_trailer(
         "end": round(duration_s, 3),
         "length": round(duration_s, 3),
     }
-    if start:
+    if start and started_wall:
+        # TwitchDownloader maps created_at to a non-nullable DateTime, so
+        # the key needs a value.
         video["created_at"] = started_wall
 
     return {"FileInfo": file_info(), "streamer": streamer, "video": video}

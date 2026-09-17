@@ -1,8 +1,10 @@
 version: 2
 updates:
   # The app and its tools ship in the image, so every ecosystem below feeds
-  # the same release. CI validates each pull request: uv sync --frozen,
-  # ruff format --check, ruff check, mypy, pytest.
+  # the same release. CI gates each pull request on the uv and github-actions
+  # ecosystems (uv sync --locked, ruff format --check, ruff check, mypy,
+  # pytest). It does not build the image: publish.yml builds it on a v* tag,
+  # so review a docker bump by eye.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -29,3 +31,7 @@ updates:
     groups:
       uv:
         patterns: ["*"]
+        # Majors arrive as their own pull request. Dependabot rebuilds a group
+        # as a whole, so one broken major would hold back every other update of
+        # the ecosystem.
+        update-types: ["minor", "patch"]

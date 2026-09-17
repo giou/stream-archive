@@ -30,7 +30,6 @@ def build_video_description(author: str, channel: str, game: str) -> str:
 
 class YouTubeStreamer:
     def __init__(self, config: AppConfig):
-        self._config = config
         yt = config.youtube
         self._privacy_status = yt.privacy_status
         self._token_path = config.workdir / "youtube_token.json"
@@ -70,7 +69,7 @@ class YouTubeStreamer:
                 if (refresh or creds.expired) and creds.refresh_token:
                     await asyncio.to_thread(creds.refresh, Request())
                     self._save_token()
-                elif not refresh:
+                elif not refresh or not creds.refresh_token:
                     msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
                     raise RuntimeError(msg)
 
@@ -99,6 +98,9 @@ class YouTubeStreamer:
         if resp.status_code >= 400:
             logger.error("[youtube] Request failed (%d): %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            # A delete answers 204 with no body, so there is no JSON to read.
+            return None
         return resp.json()
 
     async def create_stream(self, author: str, title: str, channel: str, game: str) -> dict[str, Any]:

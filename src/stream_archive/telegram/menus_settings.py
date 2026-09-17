@@ -13,7 +13,7 @@ from stream_archive.telegram.commands_settings import (
     QUALITY_CHOICES,
     RETENTION_CHOICES,
 )
-from stream_archive.telegram.menu_state import ChatId, MenuResult
+from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -127,7 +127,7 @@ async def menu_disk_maxsize(ctrl: TelegramController, chat_id: ChatId, text: str
         state.menu = "disk"
         return result, ctrl.reply_keyboard("disk", chat_id=chat_id)
     if text == "Custom":
-        state.custom, state.menu = state.menu, "custom"
+        state.custom, state.menu = "disk_maxsize", "custom"
         return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
     return None
 
@@ -148,7 +148,7 @@ async def menu_custom(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
         result = ctrl.handle_disk(["maxsize", text], chat_id=chat_id)
     else:  # unknown custom setting: never write it into another setting
         return None
-    if result.startswith("\u274c") or result.startswith("Usage"):
+    if is_error(result) or result.startswith("Usage"):
         return result, ctrl.reply_keyboard("custom", chat_id=chat_id)
     parent = (
         "channel"

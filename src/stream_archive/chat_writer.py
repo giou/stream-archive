@@ -66,6 +66,9 @@ class ChatJsonWriter:
             text = json.dumps(comment, ensure_ascii=False, indent=2).replace("\n", "\n  ")
             fh.write((",\n  " if self.comments else "\n  ") + text)
             fh.flush()
+            # tell() can raise too, and the rollback below needs the offset
+            # of the last complete comment.
+            self._good_offset = fh.tell()
         except (OSError, TypeError, ValueError) as e:
             # A failed write can leave a torn comment in the tmp file. Cut the
             # file back to the last complete comment. This rollback is best
@@ -75,12 +78,15 @@ class ChatJsonWriter:
                 fh.truncate()
             self._fail(e)
             return False
-        self._good_offset = fh.tell()
         self.comments += 1
         return True
 
     def close(self, trailer: dict[str, Any]) -> bool:
         """Write the trailer keys, then rename the file into place.
+
+        A "comments" key in ``trailer`` is skipped: the comments array is
+        already in the file, and a second top-level key of that name would
+        replace it in JSON readers that keep the last occurrence.
 
         True when the file is in place. False when the capture already failed,
         so callers can log the outcome.
@@ -91,6 +97,9 @@ class ChatJsonWriter:
         try:
             fh.write("]" if not self.comments else "\n]")
             for key, value in trailer.items():
+                if key == "comments":
+                    logger.error("[chat_writer] trailer key 'comments' collides with the comment array; skipped")
+                    continue
                 text = json.dumps(value, ensure_ascii=False, indent=2).replace("\n", "\n  ")
                 fh.write(",\n  " + json.dumps(key) + ": " + text)
             fh.write("\n}\n")

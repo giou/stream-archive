@@ -76,12 +76,20 @@ class _AudioOnlyStream:
         def pump() -> None:
             try:
                 while True:
-                    chunk = src.read(65536)
+                    try:
+                        chunk = src.read(65536)
+                    except (OSError, ValueError) as err:
+                        # The source itself failed (for example a network
+                        # drop). Log it: the recording ends truncated, and
+                        # that must not look like an orderly end of stream.
+                        logger.warning("[recorder] [audio-filter] source read failed: %s", err)
+                        break
                     if not chunk:
                         break
-                    stdin.write(chunk)
-            except BrokenPipeError, OSError, ValueError:
-                pass  # ffmpeg died. The consumer sees stdout EOF.
+                    try:
+                        stdin.write(chunk)
+                    except BrokenPipeError, OSError, ValueError:
+                        break  # ffmpeg died. The consumer sees stdout EOF.
             finally:
                 with suppress(BaseException):
                     stdin.close()
@@ -102,8 +110,19 @@ class _AudioOnlyStream:
                 with suppress(BaseException):
                     err.close()
 
-        threading.Thread(target=pump, daemon=True, name="audio-filter-pump").start()
-        threading.Thread(target=drain_stderr, daemon=True, name="audio-filter-stderr").start()
+        try:
+            threading.Thread(target=pump, daemon=True, name="audio-filter-pump").start()
+            threading.Thread(target=drain_stderr, daemon=True, name="audio-filter-stderr").start()
+        except BaseException:
+            # A failed start (for example "can't start new thread") would
+            # leave ffmpeg and the source unreachable. Clean up, then report.
+            with suppress(BaseException):
+                src.close()
+            with suppress(BaseException):
+                proc.kill()
+            with suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+            raise
         return _PipedFd(proc)
 
 
@@ -158,7 +177,7 @@ class StreamlinkMixin:
             if self._plugin_loaded:
                 return
             plugin_dir = self._config.plugin_dir
-            path = plugin_dir if os.path.isabs(plugin_dir) else str(self._config._workdir / plugin_dir)
+            path = plugin_dir if os.path.isabs(plugin_dir) else str(self._config.workdir / plugin_dir)
             try:
                 self._session.plugins.load_path(path)
             except Exception as e:
@@ -179,12 +198,12 @@ class StreamlinkMixin:
             # No proxy loop or ad-block workarounds. The built-in kick plugin
             # talks to the kick API itself and solves the JS challenge through
             # a browser when one is installed.
-            plugin_name, plugin_class, resolved_url = self._session.resolve_url(channel_url(channel))
+            _, plugin_class, resolved_url = self._session.resolve_url(channel_url(channel))
             plugin = plugin_class(self._session, resolved_url, options={})
             streams = plugin.streams()
         else:
             url = channel_url(channel)
-            plugin_name, plugin_class, resolved_url = self._session.resolve_url(url)
+            _, plugin_class, resolved_url = self._session.resolve_url(url)
             proxies = list(self._config.proxy_list)
             while True:
                 plugin = plugin_class(

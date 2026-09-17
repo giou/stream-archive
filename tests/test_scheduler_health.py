@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from aiohttp import ClientSession, ClientTimeout
 
@@ -31,29 +32,28 @@ def test_healthz_serves_ok():
     asyncio.run(scenario())
 
 
-def test_readyz_flips_with_ready_flag():
+def test_readyz_flips_with_ready_flag(monkeypatch):
+    # monkeypatch restores the process-wide flag at teardown, so the false
+    # readiness of this test cannot leak into another test.
+    monkeypatch.setattr(scheduler_module, "_READY", False)
+
     async def scenario():
-        old = scheduler_module._READY
-        scheduler_module._READY = False
+        runner = await _start_health_server(port=0)
+        assert runner is not None
         try:
-            runner = await _start_health_server(port=0)
-            assert runner is not None
-            try:
-                assert runner.addresses, "health server exposes no bound address"
-                host, port = runner.addresses[0][:2]
-                async with ClientSession(timeout=ClientTimeout(total=5)) as session:
-                    async with session.get(f"http://{host}:{port}/readyz") as resp:
-                        assert resp.status == 503
-                    scheduler_module._READY = True
-                    async with session.get(f"http://{host}:{port}/readyz") as resp:
-                        assert resp.status == 200
-                        assert await resp.text() == "ready"
-                    async with session.get(f"http://{host}:{port}/healthz") as resp:
-                        assert resp.status == 200
-            finally:
-                await runner.cleanup()
+            assert runner.addresses, "health server exposes no bound address"
+            host, port = runner.addresses[0][:2]
+            async with ClientSession(timeout=ClientTimeout(total=5)) as session:
+                async with session.get(f"http://{host}:{port}/readyz") as resp:
+                    assert resp.status == 503
+                scheduler_module._READY = True
+                async with session.get(f"http://{host}:{port}/readyz") as resp:
+                    assert resp.status == 200
+                    assert await resp.text() == "ready"
+                async with session.get(f"http://{host}:{port}/healthz") as resp:
+                    assert resp.status == 200
         finally:
-            scheduler_module._READY = old
+            await runner.cleanup()
 
     asyncio.run(scenario())
 
@@ -80,4 +80,5 @@ def test_health_bind_failure_returns_none(caplog):
     with caplog.at_level("WARNING", logger="stream_archive.scheduler"):
         asyncio.run(scenario())
 
-    assert any("health endpoint unavailable" in r.message for r in caplog.records)
+    warnings = [r for r in caplog.records if r.name == "stream_archive.scheduler" and r.levelno == logging.WARNING]
+    assert any("health endpoint unavailable" in r.getMessage() for r in warnings)

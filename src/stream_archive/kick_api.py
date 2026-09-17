@@ -50,7 +50,7 @@ class KickAPI:
         self._client_id = kick.client_id
         self._client_secret = kick.client_secret
         self._token: str | None = None
-        self._token_expires_at = 0
+        self._token_expires_at: float = 0
         self._public_key: str | None = None
         self._token_lock = asyncio.Lock()
 
@@ -82,7 +82,7 @@ class KickAPI:
                 _MAX_ATTEMPTS,
                 resp.status_code if resp is not None else "transport error",
             )
-            await asyncio.sleep(_RETRY_DELAYS[attempt])
+            await asyncio.sleep(_RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)])
         msg = "unreachable"
         raise RuntimeError(msg)
 
@@ -90,14 +90,16 @@ class KickAPI:
         return {"Authorization": f"Bearer {await self._get_token()}"}
 
     async def _get_token(self) -> str:
-        now = time.time()
+        # Monotonic time, so a clock adjustment cannot make a dead token
+        # look valid.
+        now = time.monotonic()
         if self._token and now < self._token_expires_at - 60:
             return self._token
         # Single-flight: concurrent callers must not each POST
         # client_credentials. Double-check the cache inside the lock
         # because the winner of the race already refreshed it.
         async with self._token_lock:
-            if self._token and time.time() < self._token_expires_at - 60:
+            if self._token and time.monotonic() < self._token_expires_at - 60:
                 return self._token
             resp = await self._request(
                 "POST",
@@ -110,8 +112,12 @@ class KickAPI:
             )
             resp.raise_for_status()
             data = resp.json()
-            self._token = data["access_token"]
-            self._token_expires_at = time.time() + data.get("expires_in", 3600)
+            token = data.get("access_token")
+            if not token:
+                msg = f"token response missing access_token (status {resp.status_code})"
+                raise RuntimeError(msg)
+            self._token = token
+            self._token_expires_at = time.monotonic() + float(data.get("expires_in", 3600))
             return self._token
 
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]:
@@ -134,7 +140,13 @@ class KickAPI:
             resp.raise_for_status()
             payload = resp.json() or {}
             for item in payload.get("data") or []:
-                out[item["slug"]] = {
+                slug = item.get("slug")
+                if not slug:
+                    # One malformed item must not discard the statuses that
+                    # the earlier chunks and items of this call collected.
+                    logger.warning("[kick_api] channel item without slug: %r", item)
+                    continue
+                out[slug] = {
                     "title": item.get("stream_title") or "",
                     "game": (item.get("category") or {}).get("name") or "",
                     "is_live": bool((item.get("stream") or {}).get("is_live")),

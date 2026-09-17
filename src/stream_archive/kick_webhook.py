@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Protocol
@@ -43,6 +44,11 @@ _KEY_REFETCH_INTERVAL_S = 60
 _RATE_LIMIT_PER_IP = 1200  # requests per window
 _RATE_LIMIT_WINDOW_S = 60
 _MAX_RATE_LIMIT_IPS = 10_000
+# Cap on unseen client addresses that enter the bucket table in one window.
+# Every request that arrives through the tunnel shares the tunnel address,
+# so normal traffic needs one key. The cap limits a flood that uses many
+# distinct addresses, which the table size alone does not.
+_MAX_NEW_RATE_LIMIT_IPS = 100
 # Cap on concurrent in-flight webhook requests. This blunts request floods.
 _MAX_CONCURRENT = 16
 # Kick-side sync failures (5xx) alert only after they persist this long, so
@@ -61,27 +67,48 @@ def _is_server_error(exc: Exception) -> bool:
 
 
 class _RateLimiter:
-    """Token bucket keyed by client IP, with a bounded bucket table."""
+    """Token bucket keyed by client IP, with a bounded bucket table.
 
-    def __init__(self, max_requests: int, window_s: int, max_keys: int = _MAX_RATE_LIMIT_IPS) -> None:
+    The table holds the least recently used key only up to its size, so a
+    flood of new addresses cannot push out a busy client. A new key also
+    pays for its first request, and the number of unseen keys in one window
+    is bounded.
+    """
+
+    def __init__(
+        self,
+        max_requests: int,
+        window_s: int,
+        max_keys: int = _MAX_RATE_LIMIT_IPS,
+        max_new_keys: int = _MAX_NEW_RATE_LIMIT_IPS,
+    ) -> None:
         self._max = max_requests
         self._window = window_s
         self._max_keys = max_keys
-        self._buckets: dict[str, list[float]] = {}  # key -> [tokens, last_refill (monotonic)]
+        self._max_new_keys = max_new_keys
+        self._new_keys = 0
+        self._new_keys_since = 0.0
+        # Ordered by last access, oldest first.
+        self._buckets: OrderedDict[str, list[float]] = OrderedDict()  # key -> [tokens, last_refill (monotonic)]
 
     def allow(self, key: str) -> bool:
         now = time.monotonic()
         buckets = self._buckets
         bucket = buckets.get(key)
         if bucket is None:
+            if now - self._new_keys_since >= self._window:
+                self._new_keys_since = now
+                self._new_keys = 0
+            if self._new_keys >= self._max_new_keys:
+                return False
+            self._new_keys += 1
             if len(buckets) >= self._max_keys:
-                for k, (tokens, _) in list(buckets.items()):
-                    if tokens >= self._max:  # fully refilled, so eviction loses nothing
-                        del buckets[k]
-                if len(buckets) >= self._max_keys:
-                    buckets.pop(next(iter(buckets)))
-            buckets[key] = [self._max, now]
+                buckets.popitem(last=False)  # evict by last access, not by insertion age
+            # The first request spends one token. A free first request would
+            # give a flood of distinct addresses an unbounded budget.
+            buckets[key] = [self._max - 1, now]
             return True
+        buckets.move_to_end(key)
         tokens, refill = bucket
         tokens = min(self._max, tokens + (now - refill) * (self._max / self._window))
         if tokens < 1:
@@ -190,7 +217,11 @@ class KickWebhook:
         deletes the subscriptions it created, so Kick stops the deliveries.
         """
         if not self.listening_needed():
+            # The listener is off, so Kick cannot deliver anything. Stop the
+            # sync loop, then delete the subscriptions it created. Kick then
+            # stops the deliveries to a dead URL.
             await self._stop_sync()
+            await self._drop_subscriptions()
             await self._unbind()
             return
         ep = self._config.endpoint
@@ -451,7 +482,7 @@ class KickWebhook:
         if not slug:
             logger.warning("[kick_webhook] livestream event without channel_slug, ignoring")
             return
-        channel = f"kick:{slug}"
+        channel = f"{KICK_PREFIX}{slug}"
         if channel not in self._config.channels:
             logger.debug("[kick_webhook] livestream event for unmonitored channel %s, ignoring", channel)
             return
@@ -472,7 +503,7 @@ class KickWebhook:
         slug = broadcaster.get("channel_slug")
         if not slug:
             return
-        channel = f"kick:{slug}"
+        channel = f"{KICK_PREFIX}{slug}"
         if channel not in self._config.channels:
             logger.debug("[kick_webhook] chat event for unmonitored channel %s, ignoring", channel)
             return
@@ -588,9 +619,11 @@ class KickWebhook:
             wh = self._config.kick.webhook
             if not wh.enabled or wh.setup_notified:
                 return
+            # Set the flag before the await. Two first events can arrive
+            # together, and both would pass the check above otherwise.
+            wh.setup_notified = True
             if self._notifier:
                 await self._notifier.notify("\u2705 Kick webhook is working \u2014 first event received from Kick.")
-            wh.setup_notified = True
             # save_config writes and fsyncs the file, so keep it off the event
             # loop. This handler serves every webhook request.
             await asyncio.to_thread(save_config, self._config)

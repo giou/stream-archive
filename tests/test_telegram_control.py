@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import html
 import json
+import re
 import threading
 import types
 import unittest.mock
@@ -124,7 +126,7 @@ class FakeUpdater:
         return self.report
 
 
-def base_config(tmp_path):
+def base_config():
     return {
         "telegram_user_id": 12345,
         "bot_telegram_api": "bot_token",
@@ -156,7 +158,7 @@ ADMIN_ID = 12345
 
 def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart=None):
     """Write a valid config file, then load it typed, mirroring get_config()."""
-    config = base_config(tmp_path)
+    config = base_config()
     if channels is not None:
         config["channels"] = channels
     (tmp_path / "config.json").write_text(json.dumps(config, indent=4))
@@ -412,7 +414,7 @@ def test_status_shows_per_channel_modes(tmp_path):
 
 
 def _load_config(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps(base_config(tmp_path), indent=4))
+    (tmp_path / "config.json").write_text(json.dumps(base_config(), indent=4))
     return get_config(tmp_path / "config.json")
 
 
@@ -639,8 +641,9 @@ def test_restart_schedules_callback(tmp_path):
     async def scenario():
         text = ctrl.handle_restart()
         assert "\U0001f504 Restarting..." in text
-        await asyncio.sleep(0.6)
-        assert flag.is_set()
+        # handle_restart schedules the restart about 0.5s out, so wait on the
+        # flag itself instead of sleeping for a fixed margin.
+        assert await asyncio.to_thread(flag.wait, 5.0)
 
     asyncio.run(scenario())
 
@@ -1020,6 +1023,25 @@ def kb_labels(markup):
     data = markup.to_dict()
     rows = data.get("inline_keyboard") or data.get("keyboard")
     return [b["text"] for row in rows for b in row]
+
+
+def api_sent(bot):
+    """The text, parse mode and keyboard of the last message the bot sent."""
+    assert bot.send_message.await_count >= 1
+    kwargs = bot.send_message.await_args.kwargs
+    return kwargs["text"], kwargs.get("parse_mode"), kwargs["reply_markup"]
+
+
+def visible_text(text):
+    """The text Telegram shows, with the HTML entities decoded."""
+    return html.unescape(text)
+
+
+def assert_valid_html(text):
+    """Only the code tags and HTML entities may hold '<' or '&'."""
+    for match in re.finditer(r"<(?!/?code>)|&(?!(?:amp|lt|gt|quot|#x27);)", text):
+        msg = f"unescaped {match.group()!r} at index {match.start()}: {text!r}"
+        raise AssertionError(msg)
 
 
 ROOT_LABELS = [
@@ -2325,41 +2347,82 @@ def test_reply_text_api_enable_shows_generated_key(tmp_path):
     assert kb_labels(markup) == api_labels(False)
     assert ctrl._menu == "api"
     assert config.api.key == ""  # no key before the first enable
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable API"))
-    assert "Control API enabled" in text
-    assert "No public URL yet" in text
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)  # the handler sends the reply itself
+    assert asyncio.run(ctrl.handle_reply_text("Enable API")) is None
+    sent, parse_mode, markup = api_sent(bot)
+    assert_valid_html(sent)
+    assert "Control API enabled" in visible_text(sent)
+    assert "No public URL yet" in visible_text(sent)
     key = read_file(tmp_path)["api"]["key"]
     assert key
-    assert key in text  # the first enable shows the key
+    assert f"<code>{key}</code>" in sent  # the key is a code span, so one tap copies it
+    assert parse_mode == "HTML"
+    assert kb_labels(markup) == api_labels(True)
     assert read_file(tmp_path)["api"]["enabled"] is True
     assert config.api.enabled is True
     assert ctrl._kick_webhook.applied == [1]
-    assert kb_labels(markup) == api_labels(True)
 
 
 def test_reply_text_api_shows_base_url_and_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://kick.example.com/kick/webhook"
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
     asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
-    text, _ = asyncio.run(ctrl.handle_reply_text("Enable API"))
-    assert "https://kick.example.com/api/v1/" in text
+    asyncio.run(ctrl.handle_reply_text("Enable API"))
+    sent, _, _ = api_sent(bot)
+    assert "https://kick.example.com/api/v1/" in visible_text(sent)
     asyncio.run(ctrl.handle_reply_text("Back"))  # remote_access
     text, _ = asyncio.run(ctrl.handle_reply_text("API"))
     assert "Control API: on" in text
     assert "https://kick.example.com/api/v1/" in text
-    text, _ = asyncio.run(ctrl.handle_reply_text("Show key"))
-    assert read_file(tmp_path)["api"]["key"] in text
+    assert asyncio.run(ctrl.handle_reply_text("Show key")) is None
+    sent, parse_mode, markup = api_sent(bot)
+    assert_valid_html(sent)
+    key = read_file(tmp_path)["api"]["key"]
+    assert f"<code>{key}</code>" in sent  # one tap on the key copies it
+    assert parse_mode == "HTML"
+    assert kb_labels(markup) == api_labels(True)
+
+
+def test_reply_text_api_hides_the_key_in_a_group(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    group_id = -1001234567890  # a group chat that holds the bot
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    asyncio.run(ctrl.handle_reply_text("Remote access", chat_id=group_id))
+    asyncio.run(ctrl.handle_reply_text("API", chat_id=group_id))
+    asyncio.run(ctrl.handle_reply_text("Enable API", chat_id=group_id))
+    enabled, _, _ = api_sent(bot)
+    key = read_file(tmp_path)["api"]["key"]
+    assert key  # the first enable generated the key
+    assert key not in enabled  # a group chat never sees the secret
+    assert "<code>" not in enabled  # and no code span either
+    asyncio.run(ctrl.handle_reply_text("Show key", chat_id=group_id))
+    sent, parse_mode, markup = api_sent(bot)
+    assert key not in sent  # a group chat never sees the secret
+    assert "<code>" not in sent
+    assert "private chat" in visible_text(sent)
+    assert parse_mode == "HTML"
+    assert kb_labels(markup) == api_labels(True)
 
 
 def test_reply_text_api_disable_keeps_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
     asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
     asyncio.run(ctrl.handle_reply_text("Enable API"))
     key = read_file(tmp_path)["api"]["key"]
-    text, markup = asyncio.run(ctrl.handle_reply_text("Disable API"))
-    assert "Control API disabled" in text
+    assert asyncio.run(ctrl.handle_reply_text("Disable API")) is None
+    sent, parse_mode, markup = api_sent(bot)
+    assert_valid_html(sent)
+    assert "Control API disabled" in visible_text(sent)
+    assert f"<code>{key}</code>" not in sent  # a disable never shows the key
+    assert parse_mode == "HTML"
     assert read_file(tmp_path)["api"]["enabled"] is False
     assert read_file(tmp_path)["api"]["key"] == key
     assert ctrl._kick_webhook.applied == [1, 1]
@@ -2368,18 +2431,25 @@ def test_reply_text_api_disable_keeps_key(tmp_path):
 
 def test_reply_text_api_rotate_key_replaces_it(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
     asyncio.run(ctrl.handle_reply_text("Remote access"))
     asyncio.run(ctrl.handle_reply_text("API"))
-    text, _ = asyncio.run(ctrl.handle_reply_text("Rotate key"))
-    assert "API key generated" in text  # no key existed yet
+    assert asyncio.run(ctrl.handle_reply_text("Rotate key")) is None
+    sent, parse_mode, _ = api_sent(bot)
+    assert_valid_html(sent)
+    assert "API key generated" in visible_text(sent)  # no key existed yet
     first_key = read_file(tmp_path)["api"]["key"]
-    assert first_key in text
+    assert f"<code>{first_key}</code>" in sent
+    assert parse_mode == "HTML"
     asyncio.run(ctrl.handle_reply_text("Enable API"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Rotate key"))
+    assert asyncio.run(ctrl.handle_reply_text("Rotate key")) is None
+    sent, _, markup = api_sent(bot)
     new_key = read_file(tmp_path)["api"]["key"]
     assert new_key != first_key
-    assert new_key in text
-    assert "old key stopped working" in text
+    assert f"<code>{new_key}</code>" in sent  # the code span carries the new key
+    assert f"<code>{first_key}</code>" not in sent
+    assert "old key stopped working" in visible_text(sent)
     assert ctrl._kick_webhook.applied == [1]  # rotation never touches the listener
     assert kb_labels(markup) == api_labels(True)
 
@@ -2438,7 +2508,7 @@ def test_reply_text_kick_webhook_url_normalizes_root_path(tmp_path):
     assert ctrl._menu == "kick_cloudflare"
 
 
-def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
 
@@ -2464,7 +2534,7 @@ def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path, monkeypatch):
     assert ctrl._menu == "kick_cloudflare"
 
 
-def test_reply_text_kick_webhook_quick_tunnel_failure_stays(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_quick_tunnel_failure_stays(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
 
     async def failing_quick():
@@ -2492,7 +2562,7 @@ def test_reply_text_kick_webhook_named_token_prompt(tmp_path):
     assert ctrl._menu == "kick_cloudflare_token"
 
 
-def test_reply_text_kick_webhook_named_token_accepted(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_named_token_accepted(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     started = []
@@ -2541,7 +2611,7 @@ def test_reply_text_kick_webhook_named_hostname_invalid_stays(tmp_path):
     assert read_file(tmp_path) == before
 
 
-def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
@@ -2580,7 +2650,7 @@ def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path, monkeypatch):
     assert ctrl._menu == "kick_cloudflare"
 
 
-def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
@@ -2648,7 +2718,7 @@ class _FakeCfClient:
         return _FakeCfResp(200, {"result": json})
 
 
-def make_cf_ctrl(tmp_path, monkeypatch, client):
+def make_cf_ctrl(tmp_path, client):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl._http = client
     ctrl._owns_http = False
@@ -2658,9 +2728,9 @@ def make_cf_ctrl(tmp_path, monkeypatch, client):
     return config, ctrl, token
 
 
-def test_create_cloudflare_dns_creates_record(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_creates_record(tmp_path):
     client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}])
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
@@ -2677,14 +2747,14 @@ def test_create_cloudflare_dns_creates_record(tmp_path, monkeypatch):
     ) in client.calls
 
 
-def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path):
     client = _FakeCfClient(
         zones=[
             {"id": "z1", "name": "example.com"},
             {"id": "z2", "name": "sub.example.com"},
         ]
     )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
     ctrl._cloudflare_hostname = "kick.sub.example.com"
 
     ok, _ = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
@@ -2701,12 +2771,12 @@ def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path, monkeypatch):
     ) in client.calls
 
 
-def test_create_cloudflare_dns_existing_same_target_ok(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_existing_same_target_ok(tmp_path):
     client = _FakeCfClient(
         zones=[{"id": "z1", "name": "example.com"}],
         records=[{"content": "tun-id.cfargotunnel.com"}],
     )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
@@ -2715,12 +2785,12 @@ def test_create_cloudflare_dns_existing_same_target_ok(tmp_path, monkeypatch):
     assert not any(c[0] == "post" for c in client.calls)
 
 
-def test_create_cloudflare_dns_existing_other_target_fails(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_existing_other_target_fails(tmp_path):
     client = _FakeCfClient(
         zones=[{"id": "z1", "name": "example.com"}],
         records=[{"content": "elsewhere.example.net"}],
     )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
@@ -2728,9 +2798,9 @@ def test_create_cloudflare_dns_existing_other_target_fails(tmp_path, monkeypatch
     assert "already used" in message
 
 
-def test_create_cloudflare_dns_no_zone_fails(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_no_zone_fails(tmp_path):
     client = _FakeCfClient(zones=[{"id": "z1", "name": "other.org"}])
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 
@@ -2738,11 +2808,11 @@ def test_create_cloudflare_dns_no_zone_fails(tmp_path, monkeypatch):
     assert "No Cloudflare zone matches kick.example.com" in message
 
 
-def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path):
     # cfat_ account tokens cannot pass /user/tokens/verify. The account-scoped
     # verify endpoint must be used instead.
     client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}], verify_status="account-owned")
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("cfat_..."))
 
@@ -2759,9 +2829,9 @@ def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path, monkeypatc
     ) in client.calls
 
 
-def test_create_cloudflare_dns_invalid_token_fails(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_invalid_token_fails(tmp_path):
     client = _FakeCfClient(zones=[], verify_status="expired")
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, client)
+    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("bad"))
 
@@ -2769,7 +2839,7 @@ def test_create_cloudflare_dns_invalid_token_fails(tmp_path, monkeypatch):
     assert "not valid" in message
 
 
-def test_restore_named_tunnel_uses_local_config(tmp_path, monkeypatch):
+def test_restore_named_tunnel_uses_local_config(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
     config.endpoint.public_url = "https://kick.example.com/kick/webhook"
@@ -2796,7 +2866,7 @@ def test_restore_named_tunnel_uses_local_config(tmp_path, monkeypatch):
     assert "hostname: kick.example.com" in cfg_path.read_text()
 
 
-def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
 
@@ -2821,13 +2891,14 @@ def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path, monkeypatch):
     assert ctrl._kick_webhook.applied == []
 
 
-def test_reply_text_kick_webhook_off_keeps_the_setup(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_off_keeps_the_setup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     stopped = []
 
     async def fake_quick():
-        return "https://abc123.trycloudflare.com/kick/webhook", None
+        # cloudflared prints a base URL, which the adapter normalizes.
+        return "https://abc123.trycloudflare.com", None
 
     ctrl._cloudflared_quick_start = fake_quick
     ctrl._cloudflared_stop = lambda: stopped.append(1)
@@ -2840,7 +2911,7 @@ def test_reply_text_kick_webhook_off_keeps_the_setup(tmp_path, monkeypatch):
     assert stopped == [1]  # the managed tunnel stops
     w = read_file(tmp_path)["endpoint"]
     assert w["enabled"] is False
-    assert w["public_url"] == "https://abc123.trycloudflare.com/kick/webhook"  # kept for the next On
+    assert w["public_url"] == "https://abc123.trycloudflare.com"  # kept for the next On
     assert w["tunnel"] == "cloudflare"
     assert w["cloudflare_managed"] is True
     assert ctrl._kick_webhook.applied == [1, 1]  # enable, then off reconciles the listener
@@ -2859,7 +2930,7 @@ def test_reply_text_kick_webhook_off_when_already_off(tmp_path):
     assert ctrl._menu == "kick_webhook"
 
 
-def test_reply_text_remote_access_on_restarts_a_managed_quick_tunnel(tmp_path, monkeypatch):
+def test_reply_text_remote_access_on_restarts_a_managed_quick_tunnel(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     config.endpoint.public_url = "https://old.trycloudflare.com"
@@ -2908,7 +2979,7 @@ def test_reply_text_webhook_toggle_on_and_off(tmp_path):
     assert kb_labels(markup) == webhook_labels(False)
 
 
-def test_reply_text_kick_webhook_tailscale_detected(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_tailscale_detected(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
 
@@ -2936,7 +3007,7 @@ def test_reply_text_kick_webhook_tailscale_detected(tmp_path, monkeypatch):
     assert kb_labels(markup) == tailscale_labels(True)
 
 
-def test_reply_text_kick_webhook_tailscale_fallback_to_input(tmp_path, monkeypatch):
+def test_reply_text_kick_webhook_tailscale_fallback_to_input(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
 
     async def no_tailscale():
@@ -3006,7 +3077,7 @@ def test_switch_tailscale_to_cloudflare_tears_down_funnel(tmp_path, monkeypatch)
     assert w["enabled"] is True
 
 
-def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path, monkeypatch):
+def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://abc123.trycloudflare.com/kick/webhook"
     config.endpoint.tunnel = "cloudflare"
@@ -3070,7 +3141,7 @@ def test_cloudflare_on_restores_a_saved_cloudflare_tunnel(tmp_path):
     assert kb_labels(markup) == cloudflare_labels(True)
 
 
-def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path, monkeypatch):
+def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://old.trycloudflare.com/kick/webhook"
     config.endpoint.tunnel = "cloudflare"
@@ -3097,7 +3168,7 @@ def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path, monkeypatch)
     assert "URL is reachable" in sent[0]
 
 
-def test_restore_quick_tunnel_same_url_stays_silent(tmp_path, monkeypatch):
+def test_restore_quick_tunnel_same_url_stays_silent(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://same.trycloudflare.com/kick/webhook"
     config.endpoint.tunnel = "cloudflare"
@@ -3269,7 +3340,7 @@ def test_remove_clears_hold_override(tmp_path):
     assert "twitch:channel1" not in read_file(tmp_path)["channels"]
 
 
-def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkeypatch):
+def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path):
     """A proxy 502 HTML page on token verify returns (False, message), with a
     'not valid' message, and never escapes as a JSONDecodeError during the
     setup flow."""
@@ -3292,7 +3363,7 @@ def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path, monkey
         async def get(self, url, headers=None):
             return _HtmlVerifyResp()
 
-    config, ctrl, _ = make_cf_ctrl(tmp_path, monkeypatch, _HtmlCfClient())
+    config, ctrl, _ = make_cf_ctrl(tmp_path, _HtmlCfClient())
 
     ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
 

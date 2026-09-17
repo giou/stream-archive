@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import shutil
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ def channel_recording_dir(config: AppConfig, channel_dir: str) -> Path:
     return resolve_recording_dir(config) / channel_dir
 
 
-_RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a", "*.jsonl")
+_RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a")
 
 #: Chat files, plus the in-progress `.tmp` files of the streaming writer.
 _CHAT_PATTERNS = ("*.chat.json", "*.chat.json.tmp")
@@ -45,6 +46,24 @@ _CHAT_PATTERNS = ("*.chat.json", "*.chat.json.tmp")
 #: File suffixes of the pattern tuples above, for the single-pass scans.
 _RECORDING_SUFFIXES = tuple(pattern[1:] for pattern in _RECORDING_PATTERNS)
 _CHAT_SUFFIXES = tuple(pattern[1:] for pattern in _CHAT_PATTERNS)
+
+#: Bounds for the snapshot cache lifetime. The lifetime follows the cap-check
+#: interval, so the cache never ages past the refresh of its callers.
+_SNAPSHOT_MIN_TTL_S = 1.0
+_SNAPSHOT_MAX_TTL_S = 60.0
+
+#: Timestamp and value of the last snapshot, per archive directory pair.
+_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def invalidate_snapshot() -> None:
+    """Drop the cached snapshot. Call this after a pass that deletes files."""
+    _snapshot_cache.clear()
+
+
+def _snapshot_ttl_s(config: AppConfig) -> float:
+    """Return the snapshot cache lifetime: the cap-check interval, in bounds."""
+    return min(max(config.disk.check_interval_s, _SNAPSHOT_MIN_TTL_S), _SNAPSHOT_MAX_TTL_S)
 
 
 def _iter_suffixed(base: Path, suffixes: tuple[str, ...]) -> Iterator[Path]:
@@ -60,9 +79,10 @@ def _iter_suffixed(base: Path, suffixes: tuple[str, ...]) -> Iterator[Path]:
 def iter_recordings(base: Path) -> Iterator[Path]:
     """Yield every recording artifact under base.
 
-    Covers video captures (.ts, .mp4, .mkv), audio-only captures (.m4a),
-    and sidecar segment logs (.jsonl). Chat files (.chat.json) are not
-    recording artifacts and stay with the chat cleanup pass.
+    Covers video captures (.ts, .mp4, .mkv) and audio-only captures (.m4a).
+    The recorder itself writes only .ts and .m4a. The other two suffixes
+    cover a file that an operator remuxed by hand. Chat files (.chat.json)
+    are not recording artifacts and stay with the chat cleanup pass.
     """
     yield from _iter_suffixed(base, _RECORDING_SUFFIXES)
 
@@ -83,52 +103,61 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
     recordings, `chat_gb` covers the chat files, and `archive_gb` is their
     total. The disk watchdog measures `archive_gb` against
     `disk.max_total_gb`.
+
+    The result is cached for one cap-check interval (between 1s and 60s),
+    because the monitor and every active recording watchdog ask for the same
+    totals. A pass that deletes files calls `invalidate_snapshot()`, so the
+    next call measures the smaller archive.
+
+    `usage_ok` is False when the free-space probe failed. The three
+    filesystem numbers then hold no meaning, and a caller must show them as
+    unknown rather than as zero.
     """
     loop = asyncio.get_running_loop()
     base = resolve_recording_dir(config)
     chat_base = chat_dir_path(config)
-    fs_dir = base
-    while not fs_dir.exists() and fs_dir != fs_dir.parent:
-        fs_dir = fs_dir.parent  # missing dir: report the nearest existing ancestor
+    key = f"{base}|{chat_base}"
+    cached = _snapshot_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _snapshot_ttl_s(config):
+        return dict(cached[1])
+
+    def _existing_ancestor() -> Path:
+        """Nearest existing ancestor of the recording dir, or the dir itself."""
+        fs_dir = base
+        while not fs_dir.exists() and fs_dir != fs_dir.parent:
+            fs_dir = fs_dir.parent  # missing dir: report the nearest existing ancestor
+        return fs_dir
+
+    # Every probe below runs in the executor: on a network-backed archive a
+    # single stat can block for a long time and stall the whole event loop.
+    fs_dir = await loop.run_in_executor(None, _existing_ancestor)
     usage = None
     try:
         usage = await loop.run_in_executor(None, shutil.disk_usage, fs_dir)
     except OSError:
         # An unmounted archive must not break the monitor or the recorder.
         logger.warning("[disk] disk_usage(%s) failed", fs_dir, exc_info=True)
-    dir_bytes, count = 0, 0
-    if base.exists():
 
-        def _scan() -> tuple[int, int]:
-            total, n = 0, 0
-            for p in iter_recordings(base):
-                try:
-                    total += p.stat().st_size
-                    n += 1
-                except OSError:
-                    logger.debug("[disk] stat failed for %s", p, exc_info=True)
-                    continue
-            return total, n
+    def _scan(root: Path, suffixes: tuple[str, ...]) -> tuple[int, int]:
+        """Total size and file count under root. A missing root yields zero."""
+        total, n = 0, 0
+        for p in _iter_suffixed(root, suffixes):
+            try:
+                total += p.stat().st_size
+                n += 1
+            except OSError:
+                logger.debug("[disk] stat failed for %s", p, exc_info=True)
+                continue
+        return total, n
 
-        dir_bytes, count = await loop.run_in_executor(None, _scan)
-    chat_bytes, chat_count = 0, 0
-    if chat_base.exists():
-
-        def _scan_chat() -> tuple[int, int]:
-            total, n = 0, 0
-            for p in iter_chat_files(chat_base):
-                try:
-                    total += p.stat().st_size
-                    n += 1
-                except OSError:
-                    logger.debug("[disk] stat failed for %s", p, exc_info=True)
-                    continue
-            return total, n
-
-        chat_bytes, chat_count = await loop.run_in_executor(None, _scan_chat)
-    return {
+    dir_bytes, count = await loop.run_in_executor(None, _scan, base, _RECORDING_SUFFIXES)
+    chat_bytes, chat_count = await loop.run_in_executor(None, _scan, chat_base, _CHAT_SUFFIXES)
+    result = {
         "dir": str(base),
-        # Unknown free space reports 0, so the callers never divide by None.
+        # usage_ok False: the probe failed, so the three filesystem numbers
+        # below carry no meaning. They stay 0.0 for a caller that formats
+        # them without a check.
+        "usage_ok": usage is not None,
         "free_gb": round(usage.free / 1024**3, 2) if usage else 0.0,
         "total_fs_gb": round(usage.total / 1024**3, 2) if usage else 0.0,
         "used_fs_gb": round(usage.used / 1024**3, 2) if usage else 0.0,
@@ -138,6 +167,8 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
         "chat_count": chat_count,
         "archive_gb": round((dir_bytes + chat_bytes) / 1024**3, 2),
     }
+    _snapshot_cache[key] = (time.monotonic(), result)
+    return dict(result)
 
 
 def format_bytes(n: int) -> str:

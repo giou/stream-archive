@@ -122,6 +122,15 @@ def test_comment_multiple_emotes_split_order():
     ]
 
 
+def test_comment_offset_less_timestamp_is_treated_as_utc():
+    """Kick can send no offset. The subtraction must not raise then."""
+    msg = make_msg(created_at="2026-08-14T10:05:30", emotes=None, badges=None)
+
+    c = build_comment(msg, 123, VIDEO_ID, START)
+
+    assert c["content_offset_seconds"] == 330.0
+
+
 def test_comment_offsets_and_missing_fields():
     msg = make_msg(
         created_at="2026-08-14T10:05:30Z",
@@ -156,7 +165,9 @@ def test_streamer_identity_from_broadcaster():
 
 
 def test_video_id_for_uses_start_time():
-    assert video_id_for("xqc", START) == f"kick-xqc-{int(START.timestamp())}"
+    assert VIDEO_ID == "kick-xqc-1786701600"  # 2026-08-14T10:00:00Z, pinned
+    assert video_id_for("xqc", START) == "kick-xqc-1786701600"
+    assert START is not None and START.tzinfo is not None  # parse_time keeps the UTC offset
     assert video_id_for("xqc", None) == "kick-xqc-0"
 
 
@@ -294,11 +305,18 @@ def test_embedded_data_without_images_or_names():
     asyncio.run(scenario())
 
 
-def test_embedded_data_never_raises(monkeypatch):
+def test_embedded_data_never_raises(monkeypatch, caplog):
+    calls = []
+
     async def boom(ids, client=None):
+        calls.append(list(ids))
         msg = "network down"
         raise httpx.ConnectError(msg)
 
     monkeypatch.setattr(kick_chat, "fetch_emote_images", boom)
 
-    assert asyncio.run(embedded_data({"1": "AAA"})) is None
+    with caplog.at_level("ERROR", logger="stream_archive.kick_chat"):
+        assert asyncio.run(embedded_data({"1": "AAA"})) is None
+
+    assert calls == [["1"]]  # the stub ran, so the guard path is the one under test
+    assert any("emote embedding failed" in r.getMessage() for r in caplog.records)

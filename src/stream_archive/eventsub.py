@@ -6,7 +6,8 @@ import time
 from typing import Any
 
 import httpx
-import websockets
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from stream_archive.config import AppConfig, bare_name, is_kick_channel
 
@@ -21,9 +22,11 @@ _MAX_SEEN_IDS = 50_000
 # Cap on concurrent notification dispatches. Slow handlers wait on this
 # instead of growing tasks without bound.
 _MAX_CONCURRENT_DISPATCH = 16
-# A slow dispatch drops only its own event. The socket stays up: Twitch
-# redelivers, and polling covers the gap.
+# A slow dispatch drops only its own event, and the poll path reconciles the
+# gap. The socket stays up.
 _DISPATCH_TIMEOUT_S = 15
+# The two event types this client subscribes to for each channel.
+_EVENT_KINDS = ("online", "offline")
 
 
 class EventSubClient:
@@ -106,6 +109,16 @@ class EventSubClient:
             return "EventSub: connecting\u2026"
         return f"EventSub: connected via conduit ({len(self._subs)} channels subscribed)"
 
+    def _subscribed_fully(self, channel: str) -> bool:
+        """True when the channel has an id for both event types.
+
+        A channel with one event type must be retried: key presence alone
+        would hide the missing kind, and the channel would lose its online
+        or offline detection for good.
+        """
+        kinds = self._subs.get(channel)
+        return kinds is not None and all(kind in kinds for kind in _EVENT_KINDS)
+
     async def add_channel(self, channel: str) -> None:
         async with self._subs_lock:
             await self._add_channel(channel)
@@ -114,7 +127,7 @@ class EventSubClient:
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not subscribing %s", channel)
             return
-        if channel in self._subs:
+        if self._subscribed_fully(channel):
             return
         try:
             uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
@@ -126,7 +139,9 @@ class EventSubClient:
             return
         self._user_ids[channel] = uid
         self._id_to_channel[uid] = channel
-        await self._create_channel_subs(channel, uid)
+        created = await self._create_channel_subs(channel, uid)
+        if created:
+            self._subs.setdefault(channel, {}).update(created)
 
     async def remove_channel(self, channel: str) -> None:
         async with self._subs_lock:
@@ -152,7 +167,7 @@ class EventSubClient:
                 if ch not in channels:
                     await self._remove_channel(ch)
             for ch in channels:
-                if ch not in self._subs:
+                if not self._subscribed_fully(ch):
                     await self._add_channel(ch)
 
     async def _run(self) -> None:
@@ -177,7 +192,7 @@ class EventSubClient:
                 return
             url = self._reconnect_url or BASE_WS_URL
             self._reconnect_url = None
-            self._ws = await websockets.connect(url)
+            self._ws = await connect(url)
             try:
                 welcome = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=WELCOME_TIMEOUT))
             except TimeoutError:
@@ -202,6 +217,11 @@ class EventSubClient:
                     len(self._subs),
                     twitch_count,
                 )
+            else:
+                # A kind that failed in an earlier session is retried here.
+                # Twitch redelivers nothing for a subscription that never
+                # existed, so this pass is the only second chance.
+                await self._retry_partial_subs()
             while not self._stop.is_set():
                 msg = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=keepalive + 30))
                 if await self._handle_message(msg):
@@ -209,7 +229,7 @@ class EventSubClient:
         except TimeoutError:
             logger.error("[eventsub] keepalive timeout, reconnecting")
             return
-        except websockets.ConnectionClosed as e:
+        except ConnectionClosed as e:
             if e.code == 4007:
                 # Code 4007 is Twitch's normal server-initiated reconnect.
                 # Twitch sends the session_reconnect message before it.
@@ -262,20 +282,48 @@ class EventSubClient:
             resolved = {}
         identity_by_bare = {bare_name(c): c for c in channels}
         user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
+        # Every network call stays outside _subs_lock. The lock covers the
+        # three maps only, so add_channel, remove_channel, and sync_channels
+        # never wait for the subscription round trips of every channel.
+        created: dict[str, dict[str, str]] = {}
+        for channel in channels:
+            uid = user_ids.get(channel)
+            if uid is None:
+                logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
+                continue
+            created[channel] = await self._create_channel_subs(channel, uid)
         async with self._subs_lock:
-            self._user_ids = user_ids
-            self._id_to_channel = {uid: ch for ch, uid in user_ids.items()}
-            for channel in channels:
-                uid = user_ids.get(channel)
-                if uid is None:
-                    logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
-                    continue
-                await self._create_channel_subs(channel, uid)
-        if len(self._subs) < len(channels):
-            poll_only = [ch for ch in channels if ch not in self._subs]
+            # Update, do not replace: a channel that add_channel subscribed
+            # while this pass ran keeps its mapping.
+            self._user_ids.update(user_ids)
+            self._id_to_channel.update({uid: ch for ch, uid in user_ids.items()})
+            for channel, kinds in created.items():
+                self._subs.setdefault(channel, {}).update(kinds)
+        poll_only = [ch for ch in channels if not self._subscribed_fully(ch)]
+        if poll_only:
             logger.info("[eventsub] polling only for: %s", ", ".join(poll_only))
 
-    async def _create_channel_subs(self, channel: str, uid: str) -> None:
+    async def _retry_partial_subs(self) -> None:
+        """Create the event types that a channel is still missing."""
+        async with self._subs_lock:
+            partial = [(ch, self._user_ids.get(ch)) for ch in self._subs if not self._subscribed_fully(ch)]
+        for channel, uid in partial:
+            if uid is None:
+                logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
+                continue
+            created = await self._create_channel_subs(channel, uid)
+            if created:
+                async with self._subs_lock:
+                    self._subs.setdefault(channel, {}).update(created)
+
+    async def _create_channel_subs(self, channel: str, uid: str) -> dict[str, str]:
+        """Create both subscriptions of one channel. Return the ids that landed.
+
+        The method keeps no bookkeeping: the caller merges the result under
+        ``_subs_lock``. It never raises for one failed call, so a failure
+        cannot hide the result of the other call.
+        """
+
         def payload(sub_type: str) -> dict[str, Any]:
             return {
                 "type": sub_type,
@@ -287,31 +335,53 @@ class EventSubClient:
         results = await asyncio.gather(
             self._api.create_eventsub_subscription(payload("stream.online")),
             self._api.create_eventsub_subscription(payload("stream.offline")),
+            return_exceptions=True,
         )
-        for kind, (status, body) in zip(("online", "offline"), results, strict=True):
-            await self._handle_subscribe_response(channel, kind, status, body)
+        created: dict[str, str] = {}
+        for kind, result in zip(_EVENT_KINDS, results, strict=True):
+            if isinstance(result, BaseException):
+                # A status other than 202/400/403/409 raises. The sibling
+                # call can still have created its subscription, so its id
+                # must land in _subs.
+                logger.error("[eventsub] creating stream.%s for %s failed: %s", kind, channel, result)
+                continue
+            status, body = result
+            sub_id = await self._handle_subscribe_response(channel, kind, status, body, uid)
+            if sub_id is not None:
+                created[kind] = sub_id
+        return created
 
-    async def _handle_subscribe_response(self, channel: str, kind: str, status: int, body: dict[str, Any]) -> None:
+    async def _handle_subscribe_response(
+        self, channel: str, kind: str, status: int, body: dict[str, Any], uid: str
+    ) -> str | None:
+        """Return the subscription id for one response, or None.
+
+        The method does no bookkeeping and never raises, so one bad
+        response cannot discard the result of the other one.
+        """
         sub_type = f"stream.{kind}"
         if status == 202:
-            self._subs.setdefault(channel, {})[kind] = body["data"][0]["id"]
-        elif status == 409:
+            try:
+                return str(body["data"][0]["id"])
+            except KeyError, IndexError, TypeError:
+                logger.error("[eventsub] malformed 202 body creating %s for %s", sub_type, channel)
+                return None
+        if status == 409:
             logger.warning("[eventsub] subscription %s already exists for %s, resolving id", sub_type, channel)
             try:
                 subs = await self._api.list_eventsub_subscriptions()
                 existing = next(
-                    s
-                    for s in subs
-                    if s["type"] == sub_type
-                    and s["condition"].get("broadcaster_user_id") == self._user_ids.get(channel)
+                    s for s in subs if s["type"] == sub_type and s["condition"].get("broadcaster_user_id") == uid
                 )
-                self._subs.setdefault(channel, {})[kind] = existing["id"]
-            except StopIteration, KeyError:
-                logger.error("[eventsub] could not resolve existing subscription id for %s", channel)
-        elif status in (400, 403):
+                return str(existing["id"])
+            except (StopIteration, KeyError, httpx.HTTPError) as e:
+                logger.error("[eventsub] could not resolve existing subscription id for %s: %s", channel, e)
+                return None
+        if status in (400, 403):
             logger.error("[eventsub] subscription rejected for %s (%s); channel relies on polling", channel, status)
         else:
             logger.error("[eventsub] unexpected status %s creating %s for %s", status, sub_type, channel)
+        return None
 
     async def _handle_message(self, msg: dict[str, Any]) -> bool:
         """Dispatch one WebSocket message. Returns True when the socket must reconnect."""
@@ -372,11 +442,16 @@ class EventSubClient:
         A slow handler drops only its own event. The socket stays up.
         """
         try:
+            # Wait for a free slot outside the timeout, so the wait does not
+            # consume the budget of the handler itself.
             async with self._dispatch_sem:
                 await asyncio.wait_for(self._dispatch(msg), timeout=_DISPATCH_TIMEOUT_S)
         except TimeoutError:
+            # The timeout cancels the handler at an arbitrary await point, so
+            # it can have applied part of its effect. Keep the dedup marker:
+            # a redelivery would re-enter that handler while the abandoned
+            # work is still registered. The poll path reconciles the event.
             logger.warning("[eventsub] dispatch timed out, keeping connection")
-            self._forget_id(msg)
         except Exception:
             logger.error("[eventsub] bounded dispatch failed", exc_info=True)
             self._forget_id(msg)
@@ -385,28 +460,39 @@ class EventSubClient:
         sub = msg.get("payload", {}).get("subscription", {})
         sub_id = sub.get("id")
         logger.warning("[eventsub] subscription revoked: %s (%s)", sub.get("type"), sub_id)
+        target: tuple[str, str | None] | None = None
         async with self._subs_lock:
             for channel, kinds in list(self._subs.items()):
                 for kind, sid in list(kinds.items()):
                     if sid == sub_id:
                         del self._subs[channel][kind]
                         if not self._subs[channel]:
-                            # add_channel and sync_channels read key presence
-                            # as the subscribed test. An empty entry that stays
-                            # here would never be retried.
+                            # An empty entry means not subscribed, so the
+                            # channel is retried on the next sync. It also
+                            # hides no subscription id from the delete path.
                             del self._subs[channel]
-                        # Recreate at once through the normal subscribe path.
-                        # The surviving kind answers 409 and re-resolves its id.
-                        # A 400/403 keeps the existing polling fallback log.
-                        uid = self._user_ids.get(channel)
-                        if uid is None:
-                            logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
-                            return
-                        try:
-                            await self._create_channel_subs(channel, uid)
-                        except Exception as e:
-                            logger.error("[eventsub] resubscribe failed for %s: %s", channel, e, exc_info=True)
-                        return
+                        target = (channel, self._user_ids.get(channel))
+                        break
+                if target is not None:
+                    break
+        if target is None:
+            return
+        channel, uid = target
+        if uid is None:
+            logger.warning("[eventsub] no user id for %s, channel relies on polling", channel)
+            return
+        # Recreate at once through the normal subscribe path. The surviving
+        # kind answers 409 and re-resolves its id. A 400/403 keeps the
+        # existing polling fallback log. This call runs outside _subs_lock,
+        # so the read loop keeps processing keepalives meanwhile.
+        try:
+            created = await self._create_channel_subs(channel, uid)
+        except Exception as e:
+            logger.error("[eventsub] resubscribe failed for %s: %s", channel, e, exc_info=True)
+            return
+        if created:
+            async with self._subs_lock:
+                self._subs.setdefault(channel, {}).update(created)
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         try:

@@ -14,7 +14,7 @@ from stream_archive.config import (
     is_kick_channel,
     kick_bare_name,
 )
-from stream_archive.recorder.common import _redact_credentials
+from stream_archive.recorder.common import _close_late_stream, _redact_credentials
 from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,16 @@ class DiskOutputMixin:
         fd: Any = None
         f: Any = None
         try:
-            fd = await loop.run_in_executor(None, stream.open)
+            # Shield the open. On cancellation the worker thread keeps
+            # running, so the callback closes the handle it returns. Without
+            # the shield, that handle is dropped and only the garbage
+            # collector closes it.
+            open_future = asyncio.ensure_future(loop.run_in_executor(None, stream.open))
+            try:
+                fd = await asyncio.shield(open_future)
+            except asyncio.CancelledError:
+                open_future.add_done_callback(_close_late_stream)
+                raise
             # Open on the loop thread. A cancellation between an executor
             # call and its return drops the file object, and the garbage
             # collector then reports an open handle. One open() call costs
@@ -95,27 +104,36 @@ class DiskOutputMixin:
                 logger.info("[recorder] [ffmpeg:%s] %s", channel, _redact_credentials(text))
 
     async def _watch_growth(self, channel: str) -> None:
-        try:
-            cfg = self._config.disk
-            interval = cfg.check_interval_s
-            while True:
-                await asyncio.sleep(interval)
+        while True:
+            try:
+                # Read the config each tick: a config reload replaces
+                # self._config.disk with a fresh deep copy, and the live
+                # values must win.
+                cfg = self._config.disk
+                await asyncio.sleep(cfg.check_interval_s)
                 entry = self._recordings.get(channel)
                 if entry is None:
                     return
-                snap = await disk.disk_snapshot(self._config)
                 cap = cfg.max_total_gb
-                if cap > 0 and snap["archive_gb"] >= cap:
+                if cap <= 0:
+                    continue  # cap disabled: no snapshot, no archive walk
+                snap = await disk.disk_snapshot(self._config)
+                if snap["archive_gb"] >= cap:
                     if cfg.delete_oldest:
                         await self.delete_oldest_to_cap()
-                        snap = await disk.disk_snapshot(self._config)
+                    # The abort decision needs a live total, never the cached
+                    # one: a stale value must not stop a healthy recording.
+                    disk.invalidate_snapshot()
+                    snap = await disk.disk_snapshot(self._config)
                     if snap["archive_gb"] >= cap:
                         await self._abort(channel, f"recording archive at {cap:g} GB cap")
                         return
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error("[recorder] [%s] watchdog error: %s", channel, e)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # One transient fault must not disable the cap for the rest of
+                # the recording, so log it and check again next tick.
+                logger.error("[recorder] [%s] watchdog error: %s", channel, e)
 
     def _active_paths(self) -> set[str]:
         """Real paths that live captures hold open.
@@ -188,6 +206,9 @@ class DiskOutputMixin:
             removed += 1
             freed += size
             logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, path)
+        # The pass measured the archive and can have changed it, so drop any
+        # cached snapshot. The caller may re-check the cap straight after.
+        disk.invalidate_snapshot()
         return (removed, freed)
 
     async def cleanup_old_recordings(self, retention_days: float) -> int:
@@ -237,6 +258,9 @@ class DiskOutputMixin:
                 logger.info("[recorder] Removed expired recording: %s", path)
         except OSError as e:
             logger.error("[recorder] Cleanup failed: %s", e)
+        # The pass measured the archive and can have changed it, so drop any
+        # cached snapshot.
+        disk.invalidate_snapshot()
         return removed
 
     async def disk_snapshot(self) -> dict[str, Any]:

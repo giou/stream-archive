@@ -238,7 +238,9 @@ def test_apply_state_keeps_the_listener_for_the_api_alone():
         await wh.apply_state()
         assert wh._runner is not None
         assert wh._sync_task is None  # no webhook: no reconcile that deletes subs
-        await asyncio.sleep(0.03)
+        # A few loop turns give a stray sync task the chance to run.
+        for _ in range(3):
+            await asyncio.sleep(0)
         await wh.apply_state()  # a keep-listener reconcile changes nothing
         assert wh._runner is not None
         assert wh._sync_task is None
@@ -276,29 +278,6 @@ def test_apply_state_serves_webhook_and_api_together():
         await wh.close()
 
     asyncio.run(scenario())
-
-
-def test_sync_loop_runs_on_interval_cadence():
-    config = enabled_config(monitoring_interval=0.01)
-    calls = {"n": 0}
-
-    class CountingAPI:
-        async def get_channel_statuses(self, slugs):
-            calls["n"] += 1
-            return {}
-
-        async def list_event_subscriptions(self):
-            return []
-
-    wh = make_webhook(config=config, api=CountingAPI())
-
-    async def scenario():
-        await wh.apply_state()
-        await asyncio.sleep(0.06)
-        await wh.close()
-
-    asyncio.run(scenario())
-    assert calls["n"] >= 2
 
 
 def _signed_headers(private_key, message_id, timestamp, body, event_type):
@@ -494,12 +473,13 @@ def test_live_event_unmonitored_channel_ignored(keypair):
 
 
 def make_mock_api(handler):
+    # Pass the mock client through the constructor, so KickAPI does not build
+    # and leak an httpx client of its own. The caller closes this one.
     config = base_config()
     # The config model needs a real port, although KickAPI itself never binds.
     config["endpoint"]["listen_port"] = 8787
-    api = KickAPI(AppConfig.model_validate(config))
-    api.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return api
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return KickAPI(AppConfig.model_validate(config), http=client)
 
 
 def token_response(request):
@@ -507,40 +487,22 @@ def token_response(request):
     return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
 
 
-def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
-    private_key, public_pem = keypair
-    config = {
-        # save_config validates the whole config, so provide a valid one.
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["kick:xqc"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 0.01,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-        "endpoint": {
-            "enabled": True,
-            "listen_host": "127.0.0.1",
-            "listen_port": 8799,  # != 8787 (occupied by the docker-published port)
-            "public_url": "https://x.example.com",
-        },
-        "kick": {
-            "client_id": "cid",
-            "client_secret": "csec",
-            "record_chat": True,
-            "webhook": {"enabled": True},
-        },
-    }
-    config["_workdir"] = tmp_path
+def writable_config(tmp_path):
+    """enabled_config bound to a real file, so a flow that persists a flag can save it."""
+    raw = enabled_config()
+    raw["endpoint"]["listen_port"] = 8799  # a real port, which the model requires
+    raw["_workdir"] = tmp_path
     cfg_file = tmp_path / "config.json"
-    cfg_file.write_text(json.dumps({k: v for k, v in config.items() if not k.startswith("_")}, indent=4))
-    config = AppConfig.model_validate(config)
+    cfg_file.write_text(json.dumps({k: v for k, v in raw.items() if not k.startswith("_")}, indent=4))
+    config = AppConfig.model_validate(raw)
     config._workdir = tmp_path
     config._config_path = cfg_file
+    return config, cfg_file
 
+
+def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
+    private_key, public_pem = keypair
+    config, cfg_file = writable_config(tmp_path)
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=notifier)
 
@@ -568,12 +530,54 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
     assert json.loads(cfg_file.read_text())["kick"]["webhook"]["setup_notified"] is True
 
 
+def test_two_first_events_confirm_the_delivery_once(tmp_path, keypair):
+    """The flag is set before the send, so a second event cannot confirm too."""
+    private_key, public_pem = keypair
+    config, _ = writable_config(tmp_path)
+    messages = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingNotifier:
+        """Holds the send open until the test releases it."""
+
+        async def notify(self, message):
+            messages.append(message)
+            started.set()
+            await release.wait()
+
+    wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=BlockingNotifier())
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            body = live_event()
+            first = asyncio.create_task(
+                client.post(
+                    "/kick/webhook",
+                    data=body,
+                    headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
+                )
+            )
+            await asyncio.wait_for(started.wait(), 5)
+            # The first send is still in flight, and the flag is already set.
+            assert wh._config.kick.webhook.setup_notified is True
+            second = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m2", _fresh_ts(), body, wh.EVENT_LIVE),
+            )
+            assert second.status == 200
+            release.set()
+            assert (await first).status == 200
+
+    asyncio.run(scenario())
+    assert len(messages) == 1
+
+
 def test_unverified_event_does_not_confirm(tmp_path, keypair):
     private_key, public_pem = keypair
     config = base_config()
-    config.setdefault("kick", {}).setdefault("webhook", {}).update(
-        {"enabled": True, "public_url": "https://x.example.com/kick/webhook"}
-    )
+    config["kick"]["webhook"]["enabled"] = True
     notifier = FakeNotifier()
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=notifier)
 
@@ -606,12 +610,15 @@ def test_reconcile_creates_missing_subscriptions():
                 return httpx.Response(200, json={"data": []})
             if request.method == "POST":
                 seen["posts"].append(json.loads(request.content))
+                # The documented create response is endpoints.PostEventSubscription:
+                # name, version, subscription_id, error. The list endpoint below
+                # answers with the id of endpoints.GetEventSubscription instead.
                 return httpx.Response(
                     200,
                     json={
                         "data": [
-                            {"subscription_id": "sub-1"},
-                            {"subscription_id": "sub-2"},
+                            {"name": "livestream.status.updated", "version": 1, "subscription_id": "sub-1"},
+                            {"name": "chat.message.sent", "version": 1, "subscription_id": "sub-2"},
                         ]
                     },
                 )
@@ -621,7 +628,10 @@ def test_reconcile_creates_missing_subscriptions():
     wh = make_webhook(api=api)
 
     async def scenario():
-        await wh._sync_subscriptions(["kick:xqc"])
+        try:
+            await wh._sync_subscriptions(["kick:xqc"])
+        finally:
+            await api.client.aclose()
 
     asyncio.run(scenario())
 
@@ -701,7 +711,10 @@ def test_reconcile_deletes_stale_subscriptions():
     wh._subs = {"oldch": {"stale-1", "stale-2"}}
 
     async def scenario():
-        await wh._sync_subscriptions(["kick:xqc"])
+        try:
+            await wh._sync_subscriptions(["kick:xqc"])
+        finally:
+            await api.client.aclose()
 
     asyncio.run(scenario())
 
@@ -752,21 +765,22 @@ def test_apply_state_stops_the_sync_and_drops_subscriptions_when_the_webhook_goe
         pytest.fail(f"unexpected request: {request.method} {request.url}")
 
     config = enabled_config()
-    wh = make_webhook(config=config, api=make_mock_api(handler))
+    api = make_mock_api(handler)
+    wh = make_webhook(config=config, api=api)
     wh._subs = {"xqc": {"sub-1", "sub-2"}}
 
     async def scenario():
-        await wh.apply_state()
-        assert wh._sync_task is not None
-        wh._config.kick.webhook.enabled = False
-        await wh.apply_state()
-        assert wh._sync_task is None
-        # The probe order is a race, so wait for the delete calls.
-        for _ in range(100):
-            if deletes:
-                break
-            await asyncio.sleep(0.01)
-        await wh.close()
+        try:
+            await wh.apply_state()
+            assert wh._sync_task is not None
+            wh._config.kick.webhook.enabled = False
+            await wh.apply_state()
+            assert wh._sync_task is None
+            # apply_state awaits the deletes, so they are done when it returns.
+            assert deletes
+        finally:
+            await wh.close()
+            await api.client.aclose()
 
     asyncio.run(scenario())
     assert [sorted(ids) for ids in deletes] == [["sub-1", "sub-2"]]  # a set, so order varies
@@ -774,32 +788,66 @@ def test_apply_state_stops_the_sync_and_drops_subscriptions_when_the_webhook_goe
     assert wh.listening_needed()  # the endpoint stays on for the control API
 
 
-def test_reconcile_failure_notifies_once_and_clears_on_success():
-    config = enabled_config(monitoring_interval=0.01)
-    notifier = FakeNotifier()
-    calls = {"n": 0}
+class CountingAPI:
+    """Counts the sync runs, and signals the test at the requested run count."""
 
-    class FlakyAPI:
-        async def get_channel_statuses(self, slugs):
-            calls["n"] += 1
-            if calls["n"] < 3:
-                msg = "boom"
-                raise httpx.ConnectError(msg)
-            return {}
+    def __init__(self, until=2):
+        self.n = 0
+        self.until = until
+        self.ran = asyncio.Event()
 
-        async def list_event_subscriptions(self):
-            return []
+    async def get_channel_statuses(self, slugs):
+        self.n += 1
+        if self.n >= self.until:
+            self.ran.set()
+        return {}
 
-    wh = make_webhook(config=config, api=FlakyAPI(), notifier=notifier)
+    async def list_event_subscriptions(self):
+        return []
+
+
+def _drive_sync_loop(wh, api):
+    """Run the sync loop until the API served ``api.until`` runs, then close."""
 
     async def scenario():
         await wh.apply_state()
-        await asyncio.sleep(0.09)
+        await asyncio.wait_for(api.ran.wait(), timeout=5)
         await wh.close()
 
     asyncio.run(scenario())
 
-    assert calls["n"] >= 4
+
+def test_sync_loop_runs_on_interval_cadence():
+    config = enabled_config(monitoring_interval=0.01)
+    api = CountingAPI(until=3)
+    wh = make_webhook(config=config, api=api)
+
+    _drive_sync_loop(wh, api)
+
+    assert api.n >= 3
+
+
+def test_reconcile_failure_notifies_once_and_clears_on_success():
+    config = enabled_config(monitoring_interval=0.01)
+    notifier = FakeNotifier()
+    api = CountingAPI(until=5)
+
+    async def failing_statuses(slugs):
+        api.n += 1
+        if api.n >= api.until:
+            api.ran.set()
+        if api.n < 3:
+            msg = "boom"
+            raise httpx.ConnectError(msg)
+        return {}
+
+    api.get_channel_statuses = failing_statuses
+    wh = make_webhook(config=config, api=api, notifier=notifier)
+
+    _drive_sync_loop(wh, api)
+
+    # The fourth run succeeded, and run five proves the flag was cleared.
+    assert api.n >= 5
     assert len(notifier.messages) == 1  # sync failure notified once, no setup confirm
     assert "Kick webhook subscriptions out of sync" in notifier.messages[0]
     assert wh._sync_failed_notified is False  # flag cleared after the last success
@@ -808,24 +856,20 @@ def test_reconcile_failure_notifies_once_and_clears_on_success():
 def test_sync_failure_logged_once_per_episode(caplog):
     config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
+    api = CountingAPI(until=4)
 
-    class AlwaysFails:
-        async def get_channel_statuses(self, slugs):
-            msg = "boom"
-            raise httpx.ConnectError(msg)
+    async def always_fails(slugs):
+        api.n += 1
+        if api.n >= api.until:
+            api.ran.set()
+        msg = "boom"
+        raise httpx.ConnectError(msg)
 
-        async def list_event_subscriptions(self):
-            return []
-
-    wh = make_webhook(config=config, api=AlwaysFails(), notifier=notifier)
-
-    async def scenario():
-        await wh.apply_state()
-        await asyncio.sleep(0.05)
-        await wh.close()
+    api.get_channel_statuses = always_fails
+    wh = make_webhook(config=config, api=api, notifier=notifier)
 
     with caplog.at_level("DEBUG", logger="stream_archive.kick_webhook"):
-        asyncio.run(scenario())
+        _drive_sync_loop(wh, api)
 
     errors = [r for r in caplog.records if "subscription sync failed" in r.getMessage()]
     debugs = [r for r in caplog.records if "subscription sync still failing" in r.getMessage()]
@@ -839,15 +883,46 @@ def _server_error_500():
     return httpx.HTTPStatusError("Server error '500 Internal Server Error'", request=request, response=response)
 
 
-class ScriptedAPI:
-    """Fails with a 500 for the first ``failures`` entries, then succeeds."""
+class FakeClock:
+    """A monotonic clock that only the test moves.
 
-    def __init__(self, failures):
+    The sync-failure delay is measured in seconds. A stepped clock keeps the
+    delay tests independent of the speed of the machine that runs them.
+    """
+
+    def __init__(self, start=1000.0):
+        self.value = start
+
+    def time(self):
+        return self.value
+
+    def monotonic(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class ScriptedAPI:
+    """Fails with a 500 for the scripted entries, then succeeds.
+
+    Each call steps the test clock, so a scripted number of runs means a
+    known number of elapsed seconds.
+    """
+
+    def __init__(self, failures, clock, step, until):
         self.failures = failures
+        self.clock = clock
+        self.step = step
+        self.until = until
         self.n = 0
+        self.ran = asyncio.Event()
 
     async def get_channel_statuses(self, slugs):
         self.n += 1
+        self.clock.advance(self.step)
+        if self.n >= self.until:
+            self.ran.set()
         if self.n <= len(self.failures) and self.failures[self.n - 1]:
             raise _server_error_500()
         return {}
@@ -861,14 +936,16 @@ def test_sync_failure_5xx_stays_silent_until_delay_elapses(monkeypatch):
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 3600)
     config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
-    wh = make_webhook(config=config, api=ScriptedAPI([True] * 100), notifier=notifier)
+    clock = FakeClock()
+    monkeypatch.setattr("stream_archive.kick_webhook.time", clock)
+    # Each run moves the clock by a tenth of a second: 20 failing runs stay far
+    # below the delay.
+    api = ScriptedAPI([True] * 100, clock=clock, step=0.1, until=20)
+    wh = make_webhook(config=config, api=api, notifier=notifier)
 
-    async def scenario():
-        await wh.apply_state()
-        await asyncio.sleep(0.08)
-        await wh.close()
+    _drive_sync_loop(wh, api)
 
-    asyncio.run(scenario())
+    assert api.n >= 20
     assert notifier.messages == []
     assert wh._sync_failed_notified is False
     assert wh._sync_failing_since is not None  # episode timer armed
@@ -878,16 +955,16 @@ def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch)
     monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.02)
     config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
-    # Two 500-error episodes, separated by one recovery, each exceed the
-    # delay and notify once.
-    wh = make_webhook(config=config, api=ScriptedAPI([True] * 6 + [False] + [True] * 6), notifier=notifier)
+    clock = FakeClock()
+    monkeypatch.setattr("stream_archive.kick_webhook.time", clock)
+    # Each run moves the clock by 0.05s, so the second failing run of an
+    # episode outlives the 0.02s delay and notifies once. The successful run
+    # in the middle resets the timer, so the second episode notifies again.
+    api = ScriptedAPI([True] * 3 + [False] + [True] * 3, clock=clock, step=0.05, until=8)
+    wh = make_webhook(config=config, api=api, notifier=notifier)
 
-    async def scenario():
-        await wh.apply_state()
-        await asyncio.sleep(0.22)
-        await wh.close()
+    _drive_sync_loop(wh, api)
 
-    asyncio.run(scenario())
     assert len(notifier.messages) == 2
     assert "Kick webhook subscriptions out of sync" in notifier.messages[0]
     assert "500 Internal Server Error" in notifier.messages[0]
@@ -896,17 +973,17 @@ def test_sync_failure_5xx_notifies_after_delay_and_once_per_episode(monkeypatch)
 def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
     # Recovery resets the episode timer. Brief blips stay silent when each
     # failing run is shorter than the delay, even across several episodes.
-    monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.05)
+    monkeypatch.setattr("stream_archive.kick_webhook._SYNC_SERVER_ERROR_DELAY_S", 0.5)
     config = enabled_config(monitoring_interval=0.01)
     notifier = FakeNotifier()
-    wh = make_webhook(config=config, api=ScriptedAPI([True] * 3 + [False] + [True] * 3), notifier=notifier)
+    clock = FakeClock()
+    monkeypatch.setattr("stream_archive.kick_webhook.time", clock)
+    # Three failing runs move the clock by 0.15s, below the 0.5s delay.
+    api = ScriptedAPI([True] * 3 + [False] + [True] * 3, clock=clock, step=0.05, until=8)
+    wh = make_webhook(config=config, api=api, notifier=notifier)
 
-    async def scenario():
-        await wh.apply_state()
-        await asyncio.sleep(0.15)
-        await wh.close()
+    _drive_sync_loop(wh, api)
 
-    asyncio.run(scenario())
     assert notifier.messages == []
     assert wh._sync_failed_notified is False
 
@@ -1083,10 +1160,36 @@ def test_rate_limit_returns_429(keypair):
             for _ in range(4):
                 resp = await client.post("/kick/webhook", data=b"{}")
                 statuses.append(resp.status)
-            # The first request for an unseen key opens the bucket without
-            # charging a token (see _RateLimiter.allow), so the capacity-2
-            # bucket admits that request plus the next two, and the 4th is
-            # over budget.
-            assert statuses == [401, 401, 401, 429]
+            # The limiter charges the first request of an unseen key, so a
+            # capacity-2 bucket admits two requests and rejects the rest.
+            assert statuses == [401, 401, 429, 429]
 
     asyncio.run(scenario())
+
+
+def test_rate_limiter_caps_unseen_keys_per_window(monkeypatch):
+    """A flood of distinct addresses must not enter the bucket table for ever."""
+    clock = FakeClock()
+    monkeypatch.setattr("stream_archive.kick_webhook.time", clock)
+    limiter = _RateLimiter(max_requests=2, window_s=60, max_new_keys=2)
+
+    assert limiter.allow("a") is True
+    assert limiter.allow("b") is True
+    assert limiter.allow("c") is False  # over the cap for this window
+    # The next window admits new keys again.
+    clock.advance(60)
+    assert limiter.allow("c") is True
+
+
+def test_rate_limiter_evicts_the_least_recently_used_key(monkeypatch):
+    """A full table drops the key that was idle the longest, not the newest."""
+    clock = FakeClock()
+    monkeypatch.setattr("stream_archive.kick_webhook.time", clock)
+    limiter = _RateLimiter(max_requests=3, window_s=60, max_keys=2, max_new_keys=10)
+
+    assert limiter.allow("a") is True
+    assert limiter.allow("b") is True
+    assert limiter.allow("a") is True  # touching "a" makes "b" the oldest
+    assert limiter.allow("c") is True  # the full table drops "b"
+
+    assert list(limiter._buckets) == ["a", "c"]
