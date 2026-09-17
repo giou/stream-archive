@@ -1,0 +1,26 @@
+# Dev-only overlay for a checkout of this repository. It is not part of a
+# release, and the user guide never mentions it.
+#
+# The image installs the app in editable mode from /app/src, so the mount
+# below runs the working tree without a new build:
+#
+#   cd ~/stream-archive-data
+#   docker compose -f docker-compose.yml \
+#     -f ~/stream-archive/docker-compose.dev.yml up -d
+#
+# STREAM_ARCHIVE_SRC is the path of src/stream_archive in the checkout. The
+# default fits a checkout next to the data directory. Compose resolves a
+# relative path against the project directory, that is the directory of the
+# first -f file.
+#
+# A change to the Dockerfile, entrypoint.sh, the dependencies, or the plugin
+# needs a build. Build stream-archive:dev, then uncomment the image line.
+#
+# Return to the published image with `docker compose up -d` and no -f flags.
+services:
+  stream-archive:
+    # image: stream-archive:dev
+    # A broken import must stop the container, not loop on the restart policy.
+    restart: "no"
+    volumes:
+      - ${STREAM_ARCHIVE_SRC:-../stream-archive/src/stream_archive}:/app/src/stream_archive:ro

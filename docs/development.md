@@ -76,6 +76,33 @@ docker build --build-arg TTVLOL_PLUGIN_VERSION=8.3.0-20260701 .
 Users of the image pull a new release and change no file. The bot reports app
 releases only in `/update`.
 
+## Development container
+
+The image installs the app in editable mode from `/app/src`. Thus a bind
+mount runs the working tree, and a code change needs no new build.
+
+```sh
+cd ~/stream-archive-data
+docker compose -f docker-compose.yml -f ~/stream-archive/docker-compose.dev.yml up -d
+```
+
+`docker-compose.dev.yml` mounts `src/stream_archive` read-only over the copy
+in the image. It also sets `restart: "no"`, so a broken import stops the
+container instead of a restart loop. Set `STREAM_ARCHIVE_SRC` when the
+checkout is not next to the data directory. Compose resolves a relative path
+against the project directory, that is the directory of the first `-f` file.
+
+A change to the Dockerfile, `entrypoint.sh`, the dependencies, or the plugin
+needs a build. Build the image, then uncomment the `image:` line in the
+overlay:
+
+```sh
+docker build -t stream-archive:dev .
+```
+
+To return to the published image, run `docker compose up -d`. The plain
+command without `-f` always uses the released image.
+
 ## Plugin override
 
 To test a plugin release without a new image, mount a directory over
