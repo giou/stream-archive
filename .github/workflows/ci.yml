@@ -18,7 +18,7 @@ jobs:
       # Every action is pinned to a commit SHA. Dependabot (github-actions
       # ecosystem) keeps the pins current.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           # Same uv version as the image build (Dockerfile uv stage).
           version: "0.12.15"
