@@ -10,11 +10,11 @@ limits), and **Remote access** (the public URL tunnels, the Kick webhook
 toggle, and the HTTP control API). A submenu holds four buttons at most, plus
 **Back**. A toggle button names the action that applies now, for example
 **Disable Kick webhook**. The current value of a preset list carries a check
-mark, for example **✓ 1080p**. The channel list keeps **Back** in the first
-row, because the list can grow long. Destructive actions (remove a channel,
-enable delete-oldest) use inline confirmation buttons. The bot re-sends the
-settings menu after every restart, so the reply keyboard survives updates and
-reboots.
+mark, for example **✓ 1080p**. A value outside the presets marks **Custom**.
+The channel list keeps **Back** in the first row, because the list can grow
+long. Destructive actions (remove a channel, enable delete-oldest) use inline
+confirmation buttons. The bot re-sends the settings menu after every restart,
+so the reply keyboard survives updates and reboots.
 
 The app validates each change and writes it atomically to `config.json`. The
 change applies on the next poll cycle. A failed command leaves memory and disk
@@ -58,6 +58,10 @@ untouched.
   changes. The recorder also forces `disk` for audio-only channels as a safety
   net. Audio-only recordings are saved as `.m4a`: ffmpeg remuxes the AAC track
   into a fragmented MP4 without re-encoding.
+- The per-channel output mode override lives under
+  `/settings → Channels → <channel> → Mode`. `Global` clears the override back
+  to the global `output_mode`. The change applies to the next recording of that
+  channel.
 - The per-channel YouTube hold delay lives under
   `/settings → Channels → <channel> → Hold delay` (presets, `0` = off, or a
   custom value in seconds). `Global` clears the override back to the global

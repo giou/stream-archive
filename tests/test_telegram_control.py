@@ -1122,16 +1122,20 @@ def test_reply_keyboard_channels_layout(tmp_path):
 def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"] == [
-        [{"text": "Mode: Disk"}, {"text": "Mode: YouTube"}],
-        [{"text": "Mode: Both"}, {"text": "\u2713 Mode: Global"}],
-        [{"text": "Quality"}, {"text": "Hold delay"}],
-        [{"text": "Remove channel"}],
+        [{"text": "Mode"}, {"text": "Quality"}],
+        [{"text": "Hold delay"}, {"text": "Remove channel"}],
+        [{"text": "Back"}],
+    ]
+    assert ctrl.reply_keyboard("channel_mode", "twitch:channel1").to_dict()["keyboard"] == [
+        [{"text": "Disk"}, {"text": "YouTube"}, {"text": "Both"}],
+        [{"text": "\u2713 Global"}],
         [{"text": "Back"}],
     ]
     config.channel_output_modes["twitch:channel1"] = "youtube"
-    assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"][0] == [
-        {"text": "Mode: Disk"},
-        {"text": "\u2713 Mode: YouTube"},
+    assert ctrl.reply_keyboard("channel_mode", "twitch:channel1").to_dict()["keyboard"][0] == [
+        {"text": "Disk"},
+        {"text": "\u2713 YouTube"},
+        {"text": "Both"},
     ]
 
 
@@ -1181,10 +1185,34 @@ def test_reply_text_channel_submenu_mode(tmp_path):
     text, markup = asyncio.run(ctrl.handle_reply_text("\u2022 twitch:channel1"))
     assert "Channel: twitch:channel1" in text
     assert "global (disk)" in text
-    text, markup = asyncio.run(ctrl.handle_reply_text("Mode: YouTube"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Mode"))
+    assert "Output mode for twitch:channel1: global (disk)" in text
+    assert kb_labels(markup) == ["Disk", "YouTube", "Both", "\u2713 Global", "Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("YouTube"))
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
     assert config.channel_output_modes == {"twitch:channel1": "youtube"}
+    assert ctrl._menu == "channel"
     assert ctrl._menu_channel == "twitch:channel1"
+
+
+def test_channel_mode_submenu_global_resets(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.channel_output_modes = {"twitch:channel1": "youtube"}
+    ctrl._menu, ctrl._menu_channel = "channel_mode", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Global"))
+    assert "reset to global" in text
+    assert read_file(tmp_path)["channel_output_modes"] == {}
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+
+
+def test_back_from_channel_mode_to_channel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    ctrl._menu, ctrl._menu_channel = "channel_mode", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert ctrl._menu == "channel"
+    assert ctrl._menu_channel == "twitch:channel1"
+    assert "Output mode" in text
 
 
 def test_reply_text_channel_delete_asks_confirm(tmp_path):
@@ -3114,6 +3142,64 @@ def test_reply_text_channel_hold_menu(tmp_path):
     assert "Global: 0s" in text
     assert kb_labels(markup) == ["Off", "30s", "60s", "120s", "300s", "600s", "\u2713 Global", "Custom", "Back"]
     assert ctrl._menu == "channel_hold"
+
+
+def test_channel_hold_keyboard_marks_channel_override(tmp_path):
+    """The keyboard uses the chat's channel.
+
+    A bug built it from an empty channel, so it always marked Global even
+    when the channel had an override.
+    """
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.channel_youtube_hold_seconds = {"twitch:channel1": 600}
+    ctrl._menu, ctrl._menu_channel = "channel", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Hold delay"))
+    assert "YouTube hold delay for twitch:channel1: 600s" in text
+    labels = kb_labels(markup)
+    assert "\u2713 600s" in labels
+    assert "\u2713 Global" not in labels
+
+
+def test_keyboard_state_is_per_chat(tmp_path):
+    """Each chat's keyboard renders from that chat's own state.
+
+    A second chat must not see the admin chat's selected channel.
+    """
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=["twitch:channel1", "twitch:ch"])
+    config.channel_youtube_hold_seconds = {"twitch:ch": 600}
+    other = ADMIN_ID + 1
+    asyncio.run(ctrl.handle_reply_text("Channels", chat_id=other))
+    asyncio.run(ctrl.handle_reply_text("\u2022 twitch:ch", chat_id=other))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Hold delay", chat_id=other))
+    assert "YouTube hold delay for twitch:ch: 600s" in text
+    assert "\u2713 600s" in kb_labels(markup)
+
+    # The admin chat keeps its own menu: no channel selected yet.
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    asyncio.run(ctrl.handle_reply_text("\u2022 twitch:channel1"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Hold delay"))
+    assert "YouTube hold delay for twitch:channel1: 0s" in text
+    assert "\u2713 Global" in kb_labels(markup)
+
+
+def test_off_preset_values_mark_custom(tmp_path):
+    """A value outside the presets marks Custom alone.
+
+    The presets and the global value stay unmarked.
+    """
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    config.channel_youtube_hold_seconds = {"twitch:channel1": 90}
+    config.retention_days = 45
+    config.max_concurrent_recordings = 4
+    config.disk.max_total_gb = 60
+    for menu, channel_name in (
+        ("channel_hold", "twitch:channel1"),
+        ("retention", None),
+        ("maxrec", None),
+        ("disk_maxsize", None),
+    ):
+        labels = kb_labels(ctrl.reply_keyboard(menu, channel_name))
+        assert [label for label in labels if label.startswith("\u2713")] == ["\u2713 Custom"], menu
 
 
 def test_reply_text_channel_hold_set_preset(tmp_path):

@@ -271,13 +271,15 @@ class WebhookCommands:
         state.cloudflare_hostname = None
         if not host:
             return "\u274c No hostname \u2014 start the Named tunnel flow again.", self.reply_keyboard(
-                "kick_cloudflare"
+                "kick_cloudflare", chat_id=chat
             )
         token = self._config.endpoint.cloudflare_token
         cfg = await self._write_cloudflared_config(host)
         ok, hint = await self._cloudflared_named_start(token, config_path=cfg)
         if not ok:
-            return f"\u274c cloudflared failed to start:\n{hint}", self.reply_keyboard("kick_cloudflare_dns")
+            return f"\u274c cloudflared failed to start:\n{hint}", self.reply_keyboard(
+                "kick_cloudflare_dns", chat_id=chat
+            )
         url = normalize_endpoint_url(f"https://{host}")
         result = await self._apply_endpoint_state(
             True, url, "cloudflare", cloudflare_token=token, cloudflare_managed=True, chat_id=chat
@@ -286,7 +288,7 @@ class WebhookCommands:
             # The apply failed, so the endpoint stays off. Stop the
             # cloudflared process that nothing points at.
             self._cloudflared_stop()
-            return result, self.reply_keyboard("kick_cloudflare")
+            return result, self.reply_keyboard("kick_cloudflare", chat_id=chat)
         if dns_note is None:
             data = decode_token(token)
             tunnel_id = (data or {}).get("t") or "your-tunnel"
@@ -300,7 +302,7 @@ class WebhookCommands:
         state.menu = "kick_cloudflare"
         return (
             f"{result}\n\n{public_url_note(self._config)}\n" + dns_note + note,
-            self.reply_keyboard("kick_cloudflare"),
+            self.reply_keyboard("kick_cloudflare", chat_id=chat),
         )
 
     async def _apply_cloudflare_url(self, text: str, chat_id: int | None = None) -> tuple[str, Any]:
@@ -317,12 +319,12 @@ class WebhookCommands:
             True, url, "cloudflare", cloudflare_token=self._config.endpoint.cloudflare_token, chat_id=chat
         )
         if result.startswith("\u274c"):
-            return result, self.reply_keyboard(state.menu)
+            return result, self.reply_keyboard(state.menu, chat_id=chat)
         note = await self._reachability_note(url, "cloudflare")
         state.menu = "kick_cloudflare"
         return (
             f"{result}\n\n{public_url_note(self._config)}{note}",
-            self.reply_keyboard("kick_cloudflare"),
+            self.reply_keyboard("kick_cloudflare", chat_id=chat),
         )
 
     async def _probe_webhook_url(self, url: str) -> bool:

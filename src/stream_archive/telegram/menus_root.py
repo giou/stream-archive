@@ -27,7 +27,7 @@ async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
     if new_menu is None:
         return None
     state.menu = new_menu
-    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu)
+    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu, chat_id=chat_id)
 
 
 async def menu_channels(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -35,10 +35,13 @@ async def menu_channels(ctrl: TelegramController, chat_id: ChatId, text: str) ->
     state = ctrl._state_for(chat_id)
     if text == "Add channel":
         state.menu = "add_channel"
-        return await ctrl.menu_text("add_channel", chat_id=chat_id), ctrl.reply_keyboard("add_channel")
+        return await ctrl.menu_text("add_channel", chat_id=chat_id), ctrl.reply_keyboard("add_channel", chat_id=chat_id)
     if text.startswith("\u2022 ") and text[2:] in ctrl._config.channels:
         state.menu, state.channel = "channel", text[2:]
-        return (await ctrl.menu_text("channel", text[2:], chat_id=chat_id), ctrl.reply_keyboard("channel"))
+        return (
+            await ctrl.menu_text("channel", text[2:], chat_id=chat_id),
+            ctrl.reply_keyboard("channel", chat_id=chat_id),
+        )
     return None
 
 
@@ -47,9 +50,9 @@ async def menu_add_channel(ctrl: TelegramController, chat_id: ChatId, text: str)
     state = ctrl._state_for(chat_id)
     result = await ctrl.handle_add([text], chat_id=chat_id)
     if result.startswith("\u274c") or result.startswith("Usage"):
-        return result, ctrl.reply_keyboard("add_channel")
+        return result, ctrl.reply_keyboard("add_channel", chat_id=chat_id)
     state.menu = "channels"
-    return result, ctrl.reply_keyboard("channels")
+    return result, ctrl.reply_keyboard("channels", chat_id=chat_id)
 
 
 async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -63,20 +66,38 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
             f"Remove {ch} from monitoring? This stops any active recording and removes its output-mode override.",
             ctrl._confirm_keyboard("confirm_remove", ch),
         )
+    if text == "Mode":
+        state.menu = "channel_mode"
+        return await ctrl.menu_text("channel_mode", ch, chat_id=chat_id), ctrl.reply_keyboard(
+            "channel_mode", chat_id=chat_id
+        )
     if text == "Hold delay":
         state.menu = "channel_hold"
-        return await ctrl.menu_text("channel_hold", ch, chat_id=chat_id), ctrl.reply_keyboard("channel_hold")
+        return await ctrl.menu_text("channel_hold", ch, chat_id=chat_id), ctrl.reply_keyboard(
+            "channel_hold", chat_id=chat_id
+        )
     if text == "Quality":
         state.menu = "channel_quality"
-        return await ctrl.menu_text("channel_quality", ch, chat_id=chat_id), ctrl.reply_keyboard("channel_quality")
-    mode = text.removeprefix("Mode: ")
-    if mode in MODE_CHOICES:
-        result = ctrl.handle_mode([ch, MODE_CHOICES[mode]], chat_id=chat_id)
-        return result, ctrl.reply_keyboard("channel")
-    if text == "Mode: Global":
-        result = ctrl.handle_mode([ch, "default"], chat_id=chat_id)
-        return result, ctrl.reply_keyboard("channel")
+        return await ctrl.menu_text("channel_quality", ch, chat_id=chat_id), ctrl.reply_keyboard(
+            "channel_quality", chat_id=chat_id
+        )
     return None
+
+
+async def menu_channel_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route an output-mode preset or the global value for one channel."""
+    state = ctrl._state_for(chat_id)
+    ch = state.channel
+    if ch is None:
+        return None
+    if text == "Global":
+        result = ctrl.handle_mode([ch, "default"], chat_id=chat_id)
+    elif text in MODE_CHOICES:
+        result = ctrl.handle_mode([ch, MODE_CHOICES[text]], chat_id=chat_id)
+    else:
+        return None
+    state.menu = "channel"
+    return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
 
 
 async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -88,14 +109,14 @@ async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str
     if text in HOLD_CHOICES:
         result = ctrl.handle_channel_hold([ch, HOLD_CHOICES[text]], chat_id=chat_id)
         state.menu = "channel"
-        return result, ctrl.reply_keyboard("channel")
+        return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
     if text == "Global":
         result = ctrl.handle_channel_hold([ch, "default"], chat_id=chat_id)
         state.menu = "channel"
-        return result, ctrl.reply_keyboard("channel")
+        return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
     if text == "Custom":
         state.custom, state.menu = "channel_hold", "custom"
-        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
+        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
     return None
 
 
@@ -112,4 +133,4 @@ async def menu_channel_quality(ctrl: TelegramController, chat_id: ChatId, text: 
     else:
         return None
     state.menu = "channel"
-    return result, ctrl.reply_keyboard("channel")
+    return result, ctrl.reply_keyboard("channel", chat_id=chat_id)

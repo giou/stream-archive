@@ -58,21 +58,28 @@ class CommandsMixin:
 
     async def _cmd_help(self, update: Any, context: Any) -> None:
         self._show_root(self._chat_of(update))
-        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.reply_keyboard("root"))
+        await update.effective_message.reply_text(
+            self.handle_help(), reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update))
+        )
 
     async def _cmd_status(self, update: Any, context: Any) -> None:
         self._show_root(self._chat_of(update))
-        await update.effective_message.reply_text(await self.handle_status(), reply_markup=self.reply_keyboard("root"))
+        await update.effective_message.reply_text(
+            await self.handle_status(), reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update))
+        )
 
     async def _cmd_settings(self, update: Any, context: Any) -> None:
         self._show_root(self._chat_of(update))
         await update.effective_message.reply_text(
-            await self.menu_text("root"), reply_markup=self.reply_keyboard("root")
+            await self.menu_text("root", chat_id=self._chat_of(update)),
+            reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update)),
         )
 
     async def _cmd_start(self, update: Any, context: Any) -> None:
         self._show_root(self._chat_of(update))
-        await update.effective_message.reply_text(self.handle_help(), reply_markup=self.reply_keyboard("root"))
+        await update.effective_message.reply_text(
+            self.handle_help(), reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update))
+        )
 
     async def _cmd_channels(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(self.handle_channels())

@@ -77,6 +77,11 @@ def _marked_rows(layout: list[list[str]], choices: dict[str, str], current: str 
     return [[_mark(label, choices.get(label) == current) for label in row] for row in layout]
 
 
+def _custom_mark(choices: dict[str, str], current: str | None) -> str:
+    """Custom button label, marked when the current value is not a preset."""
+    return _mark("Custom", current is not None and current not in choices.values())
+
+
 # Keyboards that do not read config state.
 _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
     "root": [["Channels", "Output mode"], ["Quality", "Chat recording"], ["Storage & limits", "Remote access"]],
@@ -95,18 +100,20 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         # Back stays in the first row: a long channel list would push it out of view.
         return _frame([["Back"], ["Add channel"], *([f"\u2022 {ch}"] for ch in c.channels)])
     if menu == "channel":
+        return _frame([["Mode", "Quality"], ["Hold delay", "Remove channel"], ["Back"]])
+    if menu == "channel_mode":
         ch = state.channel or ""
         mode_override = c.channel_output_modes.get(ch)
-        buttons = [_mark(f"Mode: {label}", value == mode_override) for label, value in MODE_CHOICES.items()]
-        buttons.append(_mark("Mode: Global", mode_override is None))
-        return _frame([buttons[:2], buttons[2:], ["Quality", "Hold delay"], ["Remove channel"], ["Back"]])
+        rows = _marked_rows(_rows(MODE_CHOICES, 3), MODE_CHOICES, mode_override)
+        rows.append([_mark("Global", mode_override is None)])
+        rows.append(["Back"])
+        return _frame(rows)
     if menu == "channel_hold":
         ch = state.channel or ""
         hold_override = c.channel_youtube_hold_seconds.get(ch)
-        rows = _marked_rows(
-            _rows(HOLD_CHOICES, 3), HOLD_CHOICES, f"{hold_override:g}" if hold_override is not None else None
-        )
-        rows.append([_mark("Global", hold_override is None), "Custom"])
+        current = f"{hold_override:g}" if hold_override is not None else None
+        rows = _marked_rows(_rows(HOLD_CHOICES, 3), HOLD_CHOICES, current)
+        rows.append([_mark("Global", hold_override is None), _custom_mark(HOLD_CHOICES, current)])
         rows.append(["Back"])
         return _frame(rows)
     if menu == "channel_quality":
@@ -131,19 +138,22 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
     if menu == "quality":
         return _frame([*_marked_rows(_rows(QUALITY_CHOICES, 3), QUALITY_CHOICES, c.preferred_quality), ["Back"]])
     if menu == "retention":
-        rows = _marked_rows(_rows(RETENTION_CHOICES, 3), RETENTION_CHOICES, f"{c.retention_days:g}")
-        return _frame([*rows, ["Custom"], ["Back"]])
+        current = f"{c.retention_days:g}"
+        rows = _marked_rows(_rows(RETENTION_CHOICES, 3), RETENTION_CHOICES, current)
+        return _frame([*rows, [_custom_mark(RETENTION_CHOICES, current)], ["Back"]])
     if menu in ("maxrec", "maxyt"):
         count = c.max_concurrent_recordings if menu == "maxrec" else c.max_concurrent_youtube_streams
-        rows = _marked_rows(_rows(COUNT_CHOICES, 3), COUNT_CHOICES, f"{count:g}")
-        return _frame([*rows, ["Custom"], ["Back"]])
+        current = f"{count:g}"
+        rows = _marked_rows(_rows(COUNT_CHOICES, 3), COUNT_CHOICES, current)
+        return _frame([*rows, [_custom_mark(COUNT_CHOICES, current)], ["Back"]])
     if menu == "storage":
         return _frame([["Retention", "Disk limits"], ["Max recordings", "Max restreams"], ["Back"]])
     if menu == "disk":
         return _frame([["Max total size"], [f"{_toggle_action(c.disk.delete_oldest)} delete oldest"], ["Back"]])
     if menu == "disk_maxsize":
-        rows = _marked_rows(_rows(DISK_SIZE_CHOICES, 3), DISK_SIZE_CHOICES, f"{c.disk.max_total_gb:g}")
-        return _frame([*rows, ["Custom"], ["Back"]])
+        current = f"{c.disk.max_total_gb:g}"
+        rows = _marked_rows(_rows(DISK_SIZE_CHOICES, 3), DISK_SIZE_CHOICES, current)
+        return _frame([*rows, [_custom_mark(DISK_SIZE_CHOICES, current)], ["Back"]])
     if menu == "remote_access":
         return _frame(
             [
@@ -289,6 +299,17 @@ async def _text_channel(ctrl: TelegramController, state: MenuState) -> str:
     return f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}"
 
 
+async def _text_channel_mode(ctrl: TelegramController, state: MenuState) -> str:
+    c = ctrl._config
+    ch = state.channel or ""
+    override = c.channel_output_modes.get(ch)
+    return (
+        f"Output mode for {ch}: {override or f'global ({c.output_mode})'}\n\n"
+        "Disk records to this server, YouTube re-streams, Both does both. "
+        "The value applies to the next recording of this channel."
+    )
+
+
 async def _text_channel_hold(ctrl: TelegramController, state: MenuState) -> str:
     c = ctrl._config
     ch = state.channel or ""
@@ -420,6 +441,7 @@ MENU: dict[str, MenuDef] = {
     "channels": _pair("channels", _text_channels),
     "add_channel": _pair("add_channel", _text_add_channel),
     "channel": _pair("channel", _text_channel),
+    "channel_mode": _pair("channel_mode", _text_channel_mode),
     "channel_hold": _pair("channel_hold", _text_channel_hold),
     "channel_quality": _pair("channel_quality", _text_channel_quality),
     "chat": _pair("chat", _text_chat),
@@ -447,6 +469,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "channels": root_menus.menu_channels,
     "add_channel": root_menus.menu_add_channel,
     "channel": root_menus.menu_channel,
+    "channel_mode": root_menus.menu_channel_mode,
     "channel_hold": root_menus.menu_channel_hold,
     "channel_quality": root_menus.menu_channel_quality,
     "chat": settings_menus.menu_chat,
@@ -474,6 +497,7 @@ PARENT: dict[str, str] = {
     "channels": "root",
     "add_channel": "channels",
     "channel": "channels",
+    "channel_mode": "channel",
     "channel_hold": "channel",
     "channel_quality": "channel",
     "chat": "root",
@@ -515,15 +539,17 @@ async def menu_back(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
     if parent is None:
         if state.menu != "root":  # unknown menu: fall back to root, like dispatch_text
             state.menu, state.channel = "root", None
-            return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root")
+            return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
         return None  # no Back button on root
     if state.menu in ("kick_cloudflare_hostname", "kick_cloudflare_dns"):
         state.cloudflare_hostname = None
     if parent == "channel":
         state.menu = "channel"
-        return await ctrl.menu_text("channel", state.channel, chat_id=chat_id), ctrl.reply_keyboard("channel")
+        return await ctrl.menu_text("channel", state.channel, chat_id=chat_id), ctrl.reply_keyboard(
+            "channel", chat_id=chat_id
+        )
     state.menu, state.channel = parent, None
-    return await ctrl.menu_text(parent, chat_id=chat_id), ctrl.reply_keyboard(parent)
+    return await ctrl.menu_text(parent, chat_id=chat_id), ctrl.reply_keyboard(parent, chat_id=chat_id)
 
 
 async def dispatch_text(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -539,7 +565,7 @@ async def dispatch_text(ctrl: TelegramController, chat_id: ChatId, text: str) ->
     handler = HANDLERS.get(state.menu)
     if handler is None:  # unknown menu: reset to root instead of going silent
         state.menu, state.channel = "root", None
-        return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root")
+        return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
     return await handler(ctrl, chat_id, text)
 
 

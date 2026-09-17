@@ -31,7 +31,7 @@ async def menu_chat(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
     if args is None:
         return None
     result = await ctrl.handle_chat(args, chat_id=chat_id)
-    return result, ctrl.reply_keyboard("chat")
+    return result, ctrl.reply_keyboard("chat", chat_id=chat_id)
 
 
 async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -40,7 +40,7 @@ async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
     if text in MODE_CHOICES:
         result = ctrl.handle_mode([MODE_CHOICES[text]], chat_id=chat_id)
         state.menu = "root"
-        return result, ctrl.reply_keyboard("root")
+        return result, ctrl.reply_keyboard("root", chat_id=chat_id)
     return None
 
 
@@ -50,7 +50,7 @@ async def menu_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
     if text in QUALITY_CHOICES:
         result = ctrl.handle_quality([QUALITY_CHOICES[text]], chat_id=chat_id)
         state.menu = "root"
-        return result, ctrl.reply_keyboard("root")
+        return result, ctrl.reply_keyboard("root", chat_id=chat_id)
     return None
 
 
@@ -60,10 +60,10 @@ async def menu_retention(ctrl: TelegramController, chat_id: ChatId, text: str) -
     if text in RETENTION_CHOICES:
         result = ctrl.handle_retention([RETENTION_CHOICES[text]], chat_id=chat_id)
         state.menu = "storage"
-        return result, ctrl.reply_keyboard("storage")
+        return result, ctrl.reply_keyboard("storage", chat_id=chat_id)
     if text == "Custom":
         state.custom, state.menu = "retention", "custom"
-        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
+        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
     return None
 
 
@@ -78,10 +78,10 @@ async def menu_limits(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
             return None
         result = handler([COUNT_CHOICES[text]], chat_id=chat_id)
         state.menu = "storage"
-        return result, ctrl.reply_keyboard("storage")
+        return result, ctrl.reply_keyboard("storage", chat_id=chat_id)
     if text == "Custom":
         state.custom, state.menu = menu, "custom"
-        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
+        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
     return None
 
 
@@ -97,7 +97,7 @@ async def menu_storage(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
     if new_menu is None:
         return None
     state.menu = new_menu
-    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu)
+    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu, chat_id=chat_id)
 
 
 async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -105,7 +105,9 @@ async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
     state = ctrl._state_for(chat_id)
     if text == "Max total size":
         state.menu = "disk_maxsize"
-        return await ctrl.menu_text("disk_maxsize", chat_id=chat_id), ctrl.reply_keyboard("disk_maxsize")
+        return await ctrl.menu_text("disk_maxsize", chat_id=chat_id), ctrl.reply_keyboard(
+            "disk_maxsize", chat_id=chat_id
+        )
     if text == "Enable delete oldest":
         return (
             "Enable 'delete oldest'? When the disk is over the max total size, the oldest recordings will be deleted.",
@@ -113,7 +115,7 @@ async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
         )
     if text == "Disable delete oldest":
         result = ctrl.handle_disk(["delete_oldest", "off"], chat_id=chat_id)
-        return result, ctrl.reply_keyboard("disk")
+        return result, ctrl.reply_keyboard("disk", chat_id=chat_id)
     return None
 
 
@@ -123,10 +125,10 @@ async def menu_disk_maxsize(ctrl: TelegramController, chat_id: ChatId, text: str
     if text in DISK_SIZE_CHOICES:
         result = ctrl.handle_disk(["maxsize", DISK_SIZE_CHOICES[text]], chat_id=chat_id)
         state.menu = "disk"
-        return result, ctrl.reply_keyboard("disk")
+        return result, ctrl.reply_keyboard("disk", chat_id=chat_id)
     if text == "Custom":
         state.custom, state.menu = state.menu, "custom"
-        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom")
+        return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
     return None
 
 
@@ -147,13 +149,11 @@ async def menu_custom(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
     else:  # unknown custom setting: never write it into another setting
         return None
     if result.startswith("\u274c") or result.startswith("Usage"):
-        return result, ctrl.reply_keyboard("custom")
+        return result, ctrl.reply_keyboard("custom", chat_id=chat_id)
     parent = (
         "channel"
         if setting == "channel_hold"
         else ("storage" if setting in ("retention", "maxrec", "maxyt") else "disk")
     )
     state.menu = parent
-    # The channel menu marks the overrides of the selected channel, so it
-    # needs the channel. Other parent menus are global.
-    return result, ctrl.reply_keyboard(parent, state.channel if parent == "channel" else None)
+    return result, ctrl.reply_keyboard(parent, chat_id=chat_id)

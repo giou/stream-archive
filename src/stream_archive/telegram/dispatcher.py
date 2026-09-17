@@ -155,8 +155,8 @@ class TelegramController(
         try:
             await self._app.bot.send_message(
                 chat_id=self._admin_id,
-                text=await self.menu_text("root"),
-                reply_markup=self.reply_keyboard("root"),
+                text=await self.menu_text("root", chat_id=self._admin_id),
+                reply_markup=self.reply_keyboard("root", chat_id=self._admin_id),
             )
         except Exception:
             logger.warning("[telegram] Failed to re-send settings menu after restart", exc_info=True)
@@ -239,7 +239,7 @@ class TelegramController(
         await context.bot.send_message(
             chat_id=chat_id,
             text=await self.menu_text(state.menu, state.channel, chat_id=chat_id),
-            reply_markup=self.reply_keyboard(state.menu, state.channel),
+            reply_markup=self.reply_keyboard(state.menu, state.channel, chat_id=chat_id),
         )
 
     async def _on_text(self, update: Any, context: Any) -> None:
@@ -267,9 +267,18 @@ class TelegramController(
         except Exception:
             logger.warning("[telegram] Failed to notify admin", exc_info=True)
 
-    def reply_keyboard(self, menu: str = "root", channel: str | None = None) -> ReplyKeyboardMarkup:
-        """Reply-keyboard rows for ``menu``. Button labels are the routing literals."""
-        return menus.render_keyboard(self, menu, channel)
+    def reply_keyboard(
+        self, menu: str = "root", channel: str | None = None, chat_id: ChatId | None = None
+    ) -> ReplyKeyboardMarkup:
+        """Reply-keyboard rows for ``menu``. Button labels are the routing literals.
+
+        The handlers pass the chat they serve, so the marks come from that
+        chat's state. Without a chat id the admin chat supplies it, as in
+        ``menu_text``. The state channel fills ``channel`` when the caller
+        passes none.
+        """
+        state = self._state_for(chat_id if chat_id is not None else self._admin_id)
+        return menus.render_keyboard(self, menu, channel if channel is not None else state.channel)
 
     async def menu_text(self, menu: str = "root", channel: str | None = None, chat_id: ChatId | None = None) -> str:
         """Return the status or instruction body shown above the reply keyboard for ``menu``."""
