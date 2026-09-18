@@ -68,11 +68,15 @@ jobs:
       - name: Resolve the newest streamlink-ttvlol release and its digest
         id: ttvlol
         run: |
-          # The plugin repository is public, so the unauthenticated endpoint
-          # answers. GITHUB_TOKEN is scoped to this repository and cannot read
-          # another one, so `gh` would always fail here.
-          TAG=$(curl -fsSL https://api.github.com/repos/2bc4/streamlink-ttvlol/releases/latest \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          # Resolve the tag through the release asset redirect. This needs no
+          # API call: the unauthenticated GitHub API is rate limited per
+          # address and answered 403 on a shared runner, and GITHUB_TOKEN
+          # cannot read another repository. The Dockerfile resolves the release
+          # the same way, so both name the same tag.
+          RELEASE_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+            https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py)"
+          TAG="${RELEASE_URL%/*}"
+          TAG="${TAG##*/}"
           if [ -z "$TAG" ]; then
             echo "cannot resolve the streamlink-ttvlol tag" >&2; exit 1
           fi
