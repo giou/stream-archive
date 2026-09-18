@@ -2,16 +2,18 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -24,6 +26,29 @@ from pydantic import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _finite(value: float) -> float:
+    """Reject a value that JSON cannot carry.
+
+    ``float('inf')`` and ``float('nan')`` pass a ``ge`` bound (``nan`` fails
+    every comparison, and ``inf`` satisfies a non-negative one), and
+    ``json.dump`` then writes the non-standard ``Infinity``/``NaN`` token
+    that strict JSON clients reject. A NaN range check is also blind:
+    ``nan < 0`` is false, so a hand-written bound lets it through.
+    """
+    if not math.isfinite(value):
+        msg = "must be a finite number"
+        raise ValueError(msg)
+    return value
+
+
+#: A number that survives a JSON round trip and a range comparison.
+FiniteNonNegative = Annotated[float, Field(ge=0), AfterValidator(_finite)]
+#: The same for a value that must be strictly positive. json.load accepts the
+#: non-standard Infinity literal, and inf satisfies gt=0, so the bound alone
+#: does not reject it.
+FinitePositive = Annotated[float, Field(gt=0), AfterValidator(_finite)]
 
 _CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_]{0,24}$")
 _KICK_CHANNEL_RE = re.compile(
@@ -150,14 +175,14 @@ class YouTubeConfig(BaseModel):
 
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
-    hold_seconds: float = Field(0, ge=0)
+    hold_seconds: FiniteNonNegative = 0
 
 
 class UpdateCheckConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
     enabled: bool = True
-    interval_hours: float = Field(24, gt=0)
+    interval_hours: FinitePositive = 24
 
     @field_validator("enabled", mode="before")
     @classmethod
@@ -168,8 +193,8 @@ class UpdateCheckConfig(BaseModel):
 class DiskConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
-    max_total_gb: float = Field(0, ge=0)
-    check_interval_s: float = Field(60, gt=0)
+    max_total_gb: FiniteNonNegative = 0
+    check_interval_s: FinitePositive = 60
     delete_oldest: bool = True
 
     @field_validator("delete_oldest", mode="before")
@@ -289,13 +314,13 @@ class AppConfig(BaseModel):
     twitch_client_secret: str = Field(min_length=1)
     channels: list[str] = Field(min_length=1)
     proxy_list: list[str] = Field(min_length=1)
-    monitoring_interval: float = Field(gt=0)
+    monitoring_interval: FinitePositive
     timezone: str = Field(min_length=1)
     plugin_dir: str = Field(min_length=1)
     recording_dir: str = Field(min_length=1)
 
     # optional with defaults
-    retention_days: float = Field(0, ge=0)
+    retention_days: FiniteNonNegative = 0
     output_mode: OutputMode = "disk"
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, float] = {}
@@ -303,8 +328,8 @@ class AppConfig(BaseModel):
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
-    max_concurrent_recordings: float = Field(0, ge=0)
-    max_concurrent_youtube_streams: float = Field(0, ge=0)
+    max_concurrent_recordings: FiniteNonNegative = 0
+    max_concurrent_youtube_streams: FiniteNonNegative = 0
     record_chat: bool = True
     chat_dir: str = Field("chat", min_length=1)
     disk: DiskConfig = DiskConfig()
@@ -378,8 +403,10 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_hold_keys(cls, v: dict[str, float]) -> dict[str, float]:
         for ch, seconds in v.items():
-            if seconds < 0:
-                msg = f"channel_youtube_hold_seconds.{ch} must be >= 0"
+            # A NaN value fails every comparison, so the bound alone would
+            # accept it; _finite rejects it explicitly.
+            if not math.isfinite(seconds) or seconds < 0:
+                msg = f"channel_youtube_hold_seconds.{ch} must be a finite number >= 0"
                 raise ValueError(msg)
         return _normalize_channel_map(v, "channel_youtube_hold_seconds")
 
@@ -414,23 +441,11 @@ class AppConfig(BaseModel):
     def _migrate_legacy_webhook_settings(cls, data: Any) -> Any:
         """Move listener and tunnel settings of older configs to ``endpoint``.
 
-        Before the endpoint split, ``kick.webhook`` held the listener, the
-        public URL, and the tunnel. The old files used one flag for the
-        listener and the webhook, so the migration keeps both features on.
-        A file that already has an ``endpoint`` section is left alone.
+        See :func:`_apply_legacy_layout`, which ``get_config`` also calls
+        before the environment interpolation. Both callers must agree, so
+        the layout is applied by one function.
         """
-        if not isinstance(data, dict) or "endpoint" in data:
-            return data
-        kick = data.get("kick")
-        if not isinstance(kick, dict) or not isinstance(kick.get("webhook"), dict):
-            return data
-        webhook: dict[str, Any] = kick["webhook"]
-        moved = {key: webhook[key] for key in _LEGACY_ENDPOINT_KEYS if key in webhook}
-        if not moved:
-            return data
-        if "enabled" in moved:
-            webhook = {**webhook, "enabled": moved["enabled"]}
-        return {**data, "endpoint": moved, "kick": {**kick, "webhook": webhook}}
+        return _apply_legacy_layout(data)
 
     @model_validator(mode="after")
     def _require_kick_creds(self) -> AppConfig:
@@ -505,6 +520,34 @@ def _load_json_file(config_path: Path) -> Any:
 
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _apply_legacy_layout(data: Any) -> Any:
+    """Move the pre-split listener and tunnel keys of older files to ``endpoint``.
+
+    Before the endpoint split, ``kick.webhook`` held the listener, the public
+    URL, and the tunnel. The old files used one flag for the listener and the
+    webhook, so the migration keeps both features on. A file that already has
+    an ``endpoint`` section is left alone.
+
+    Call this before the environment interpolation. ``_interpolate_env``
+    records each masked value by its path in the file it was given, and
+    ``save_config`` looks the value up again at that recorded path. A key
+    that moves afterwards has no value at its recorded path, so the mask is
+    dropped and the resolved secret is written to disk as a literal.
+    """
+    if not isinstance(data, dict) or "endpoint" in data:
+        return data
+    kick = data.get("kick")
+    if not isinstance(kick, dict) or not isinstance(kick.get("webhook"), dict):
+        return data
+    webhook: dict[str, Any] = kick["webhook"]
+    moved = {key: webhook[key] for key in _LEGACY_ENDPOINT_KEYS if key in webhook}
+    if not moved:
+        return data
+    if "enabled" in moved:
+        webhook = {**webhook, "enabled": moved["enabled"]}
+    return {**data, "endpoint": moved, "kick": {**kick, "webhook": webhook}}
 
 
 def _interpolate_env(data: Any, path: tuple[Any, ...] = ()) -> tuple[Any, dict[tuple[Any, ...], tuple[str, str]]]:
@@ -590,7 +633,10 @@ def _locate_value(data: Any, path: tuple[Any, ...], loaded: Any) -> tuple[Any, .
 def get_config(path: Path | None = None) -> AppConfig:
     config_path = path or _find_config()
     raw = _load_json_file(config_path)
-    data, placeholders = _interpolate_env(raw)
+    # Apply the legacy layout first, so every `${ENV_VAR}` mask is recorded
+    # under a path that the validated model still has (see
+    # _apply_legacy_layout).
+    data, placeholders = _interpolate_env(_apply_legacy_layout(raw))
     cfg = AppConfig.model_validate(data)
     # Absolutize so relative settings (recordings/, chat/, tokens, state)
     # resolve against the config directory regardless of the process cwd.
@@ -667,11 +713,18 @@ def save_config(config: AppConfig) -> None:
         try:
             # Create the temporary file with its final mode. The file holds the
             # same secrets as config.json, so no other user may read it, not
-            # even during the write.
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            # even during the write. O_EXCL and O_NOFOLLOW keep a pre-existing
+            # entry at that path (a symlink or a hard link planted by another
+            # writer) from redirecting this write or its secret plaintext.
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            except FileExistsError:
+                # A file left by a crashed run. Remove the entry itself (never
+                # a symlink target) and create it exclusively.
+                tmp.unlink()
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
             # os.open applies its mode only when it creates the file, and the
-            # umask clears bits of that mode. A temporary file left by a
-            # crashed run keeps its old permissions without this call.
+            # umask clears bits of that mode.
             os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)

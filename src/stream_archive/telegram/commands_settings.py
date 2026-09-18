@@ -38,6 +38,29 @@ DISK_SIZE_CHOICES: dict[str, str] = {"Unlimited": "0", "25": "25", "50": "50", "
 HOLD_CHOICES: dict[str, str] = {"Off": "0", "30s": "30", "60s": "60", "120s": "120", "300s": "300", "600s": "600"}
 
 
+#: Config keys an object built at process start owns, so a reload cannot
+#: rebind them. The bot application polls with the token it was built with,
+#: and the Twitch and Kick clients hold their credentials and cached tokens.
+_RESTART_REQUIRED: tuple[str, ...] = (
+    "bot_telegram_api",
+    "twitch_client_id",
+    "twitch_client_secret",
+    "kick.client_id",
+    "kick.client_secret",
+    "youtube.privacy_status",
+)
+
+
+def _dotted(data: dict[str, Any], key: str) -> Any:
+    """Value of a dotted config key, or None when any part is missing."""
+    node: Any = data
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
 def _not_monitored(channel: str) -> str:
     """Reply for a per-channel setting of a channel that is not monitored.
 
@@ -53,6 +76,9 @@ class SettingsCommands:
     _eventsub: Any
     _kick_webhook: Any
     _admin_id: int
+    #: Provided by the other mixins of the controller that composes this one.
+    rebind_admin: Any
+    reconcile_removed_channels: Any
     # Maps a (chat id, nonce) pair to its quality mutation and the affected channels.
     # The admin must confirm before the change applies.
     _pending_audio_switch: dict[PendingKey, AudioSwitch]
@@ -369,11 +395,21 @@ class SettingsCommands:
         return "Usage: /chat <on|off> [twitch|kick]"
 
     async def handle_reload(self) -> str:
+        before_channels = list(self._config.channels)
+        before = self._config.model_dump()
         try:
             reload_config(self._config)
         except ValueError as e:
             return f"\u274c Reload failed: {e}"
+        # The admin gate, the callback gate and the alert target were built
+        # from the startup config, so a changed telegram_user_id must reach
+        # them here; otherwise the previous identity keeps every operation.
+        self.rebind_admin()
+        notes: list[str] = []
         try:
+            notes = await self.reconcile_removed_channels(
+                [ch for ch in before_channels if ch not in self._config.channels]
+            )
             await self._eventsub.sync_channels(self._config.channels)
             if self._kick_webhook:
                 # The listener serves the endpoint and the control API. This call
@@ -383,6 +419,24 @@ class SettingsCommands:
                 await self._kick_webhook.sync_channels(self._config.channels)
         except Exception as e:
             # The file is reloaded already, so report the failure instead of
-            # leaving the admin without a reply and the state out of sync.
-            return f"\u26a0\ufe0f Config reloaded, but applying it failed: {e}"
+            # leaving the admin without a reply and the state out of sync. A
+            # channel that was already released is still reported: it is gone
+            # from the file, so a retry cannot report it again.
+            detail = f"\u26a0\ufe0f Config reloaded, but applying it failed: {e}"
+            if notes:
+                detail += "\n" + "\n".join(notes)
+            return detail
+        # Some values are held by an object the process built at startup and
+        # cannot be swapped in place: the bot application polls with its own
+        # token, and the API clients hold their credentials and cached tokens.
+        # Say so, instead of reporting a revocation or a rotation as applied.
+        stale = [key for key in _RESTART_REQUIRED if _dotted(before, key) != _dotted(self._config.model_dump(), key)]
+        if stale:
+            return (
+                "\u26a0\ufe0f Config reloaded, but these keys need a restart: "
+                + ", ".join(stale)
+                + ("\n" + "\n".join(notes) if notes else "")
+            )
+        if notes:
+            return "\u2705 Config reloaded from config.json\n" + "\n".join(notes)
         return "\u2705 Config reloaded from config.json"

@@ -82,3 +82,53 @@ def test_health_bind_failure_returns_none(caplog):
 
     warnings = [r for r in caplog.records if r.name == "stream_archive.scheduler" and r.levelno == logging.WARNING]
     assert any("health endpoint unavailable" in r.getMessage() for r in warnings)
+
+
+class _HangingRecorder:
+    """A recorder whose close() never returns, like one stuck in an emote fetch."""
+
+    def __init__(self):
+        self.closed = False
+        self.cancelled = False
+
+    async def close(self):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        finally:
+            self.closed = True
+
+
+def test_shutdown_bounds_the_recorder_close(monkeypatch):
+    """The teardown must not outlast the container's stop grace period.
+
+    The chat finalizer writes its trailer after awaiting the emote fetch, and
+    that fetch is bounded per request rather than in total. An unbounded close
+    let a slow emote CDN hold shutdown past the grace period, and the process
+    was then killed with the chat file still an unterminated .tmp.
+    """
+    monkeypatch.setattr(scheduler_module, "_SHUTDOWN_DEADLINE_S", 0.05)
+    recorder = _HangingRecorder()
+
+    async def scenario():
+        await scheduler_module._shutdown(
+            health_runner=None,
+            kick_webhook=None,
+            eventsub=None,
+            twitch_api=None,
+            kick_api=None,
+            recorder=recorder,
+            notifier=None,
+            updater=None,
+            updater_task=None,
+            telegram=None,
+            youtube_streamer=None,
+            shared_http=None,
+        )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert recorder.cancelled is True
+    # The cancellation still ran the close path's cleanup, not just the wait.
+    assert recorder.closed is True

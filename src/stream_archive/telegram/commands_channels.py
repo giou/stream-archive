@@ -68,21 +68,53 @@ class ChannelsCommands:
         )
         if is_error(result):
             return result
+        note = await self._release_channel(ch)
+        return f"{result}\n{note}" if note else result
+
+    async def reconcile_removed_channels(self, removed: list[str]) -> list[str]:
+        """Release every channel that left ``config.channels`` without /remove.
+
+        An operator can delete a channel from config.json and apply the file
+        with /reload, which replaces the config but runs no command. Without
+        this step the capture, the chat writer, the YouTube re-stream, the
+        monitor's live state and the platform subscriptions all keep running
+        for a channel the config no longer monitors, and no later command can
+        stop them: /remove refuses a channel that is not in the list, and the
+        platform events for it are dropped as unmonitored.
+        """
+        notes: list[str] = []
+        for ch in removed:
+            note = await self._release_channel(ch)
+            if note:
+                notes.append(f"{ch}: {note}")
+        return notes
+
+    async def _release_channel(self, ch: str) -> str | None:
+        """Stop the capture, the live state and the subscriptions of one channel.
+
+        Returns a note for the admin when a capture was stopped or a stop
+        failed, or None when there was nothing to stop.
+        """
+        note: str | None = None
         if self._recorder.is_recording(ch):
             try:
                 await self._recorder.stop(ch)
-                result += "\nRecording stopped."
+                note = "Recording stopped."
             except Exception:
-                # The config no longer holds the channel, so the monitor and
-                # the subscriptions must still learn about the removal.
                 logger.exception("[telegram] Failed to stop the recording of %s", ch)
-                result += "\n\u26a0\ufe0f Recording stop failed \u2014 see logs."
-        # The monitor keeps live state and a per-channel lock when
-        # the stop fails, so tell it about the removal either way.
+                note = "\u26a0\ufe0f Recording stop failed \u2014 see logs."
+        # The monitor keeps live state and a per-channel lock when the stop
+        # fails, so tell it about the removal either way.
         self._monitor.remove_channel(ch)
-        if is_kick_channel(ch):
-            if self._kick_webhook:
-                await self._kick_webhook.remove_channel(ch)
-        else:
-            await self._eventsub.remove_channel(ch)
-        return result
+        try:
+            if is_kick_channel(ch):
+                if self._kick_webhook:
+                    await self._kick_webhook.remove_channel(ch)
+            else:
+                await self._eventsub.remove_channel(ch)
+        except Exception:
+            # The local state is released already; a subscription that stays
+            # behind only costs a few ignored deliveries, and the sync loop
+            # reconciles it on the next pass.
+            logger.exception("[telegram] Failed to remove the subscriptions of %s", ch)
+        return note

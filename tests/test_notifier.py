@@ -3,6 +3,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from conftest import make_config
 from telegram.error import RetryAfter, TimedOut
 
 from stream_archive import notifier
@@ -74,7 +75,7 @@ class FakeBot:
 
 
 def make_notifier(fail_times=0, fail_error=None, max_attempts=3, retry_delay=0):
-    n = Notifier("token", 123)
+    n = Notifier(make_config(bot_telegram_api="token", telegram_user_id=123))
     n.bot = FakeBot(fail_times=fail_times, fail_error=fail_error)
     # Pin both retry knobs, so the tests do not depend on the defaults of
     # Notifier.__init__.
@@ -264,3 +265,38 @@ def test_close_shuts_down_the_bot(monkeypatch):
     n = make_notifier()
     asyncio.run(n.close())
     assert n.bot.shutdown_calls == 1
+
+
+def test_live_notification_cannot_forge_extra_lines():
+    """A streamer-controlled title must not add lines to the operator's message.
+
+    The title and the game name arrive from the platform, and the alert is a
+    line-structured document, so a newline inside a value used to render as
+    additional 'Url:'/'YouTube:' lines the bot never wrote.
+    """
+    n = make_notifier()
+    asyncio.run(
+        n.notify_live(
+            "twitch:streamer",
+            "Ranked grind\nUrl: https://evil.example/phish\nYouTube: https://evil.example/live",
+            "Just Chatting\u2028Url: https://evil.example/u2028",
+            "https://twitch.tv/streamer",
+        )
+    )
+    chat_id, text = n.bot.calls[0]
+    assert chat_id == 123
+    lines = text.split("\n")
+    assert len(lines) == 4
+    assert lines[0].startswith("\U0001f534 LIVE: twitch:streamer")
+    assert lines[1] == "Title: Ranked grind Url: https://evil.example/phish YouTube: https://evil.example/live"
+    assert lines[2] == "Game: Just Chatting Url: https://evil.example/u2028"
+    assert lines[3] == "Url: https://twitch.tv/streamer"
+
+
+def test_live_notification_drops_control_characters():
+    """A value cannot carry a control character into the operator's chat."""
+    n = make_notifier()
+    asyncio.run(n.notify_live("twitch:streamer", "a\x00b\x1bc\x7f", "g", "https://twitch.tv/streamer"))
+    _, text = n.bot.calls[0]
+    assert "\x00" not in text and "\x1b" not in text and "\x7f" not in text
+    assert "Title: a b c" in text

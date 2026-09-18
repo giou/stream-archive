@@ -58,6 +58,41 @@ def sanitize_filename(name: str) -> str:
     return safe
 
 
+#: Characters that break the line structure of a message, reorder displayed
+#: text, or carry no glyph: C0/C1 controls, the line and paragraph
+#: separators, and the bidirectional overrides.
+_METADATA_BREAKS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+#: Longest text kept from platform metadata in a message body.
+MAX_METADATA_CHARS = 200
+
+
+def strip_line_breaks(value: str) -> str:
+    """Replace the characters that break a line structure, and nothing else.
+
+    Use this for a value that is already bounded and must stay exact, such as
+    a file name shown to the operator: collapsing or trimming it would name a
+    file that does not exist on disk.
+    """
+    return _METADATA_BREAKS_RE.sub(" ", value) if value else ""
+
+
+def sanitize_metadata_text(value: str, limit: int = MAX_METADATA_CHARS) -> str:
+    """Make one line of platform metadata safe in a message or a title.
+
+    A streamer controls the stream title and the game name. The Telegram
+    notification and the YouTube description are line-structured documents
+    the operator reads, so a line break inside a value forges extra lines,
+    and a separator such as U+2028 breaks a message exactly like a newline.
+    Replace those with a space, drop the control characters, and cap the
+    length. This is the same reasoning as ``sanitize_filename``, for text
+    that is displayed rather than written to a file.
+    """
+    if not value:
+        return ""
+    return " ".join(strip_line_breaks(value).split())[:limit]
+
+
 def _redact_credentials(text: str) -> str:
     """Replace the credentials of every URL in ``text`` with ``***``.
 

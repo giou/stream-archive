@@ -31,7 +31,7 @@ from stream_archive.recorder.chat_output import ChatOutputMixin
 from stream_archive.recorder.common import _close_late_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
-from stream_archive.recorder.types import HoldState, Recording
+from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YouTubeLimits, YoutubeOutputMixin
 
 if TYPE_CHECKING:
@@ -111,6 +111,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # event loop cannot garbage-collect a task in flight, and close()
         # can drain the tasks.
         self._bg_tasks = set()
+        # Open chat writers, keyed by channel, and their real paths. See
+        # ChatOutputMixin for why the recording entry is not enough.
+        self._open_chat = {}
+        self._chat_paths = set()
 
     async def start(
         self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
@@ -219,6 +223,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 on_error=self._chat_error_handler(channel, chat_path),
             )
             entry["chat_recorder"] = chat_recorder
+            self._register_chat_paths(chat_path)
             entry["chat_task"] = chat_recorder.start()
 
         if is_kick_channel(channel) and self._config.kick.record_chat:
@@ -227,7 +232,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             chat_path = os.path.join(chat_dir, "kick", slug, f"{safe_title}-{now}.chat.json")
             started_wall = datetime.now(ZoneInfo(self._config.timezone)).isoformat()
             start = parse_time(started_wall)
-            entry["kick_chat"] = {
+            kick_state: KickChatState = {
                 "path": chat_path,
                 "writer": ChatJsonWriter(chat_path, on_error=self._chat_error_handler(channel, chat_path)),
                 "title": stream_title,
@@ -241,6 +246,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 "emote_names": {},
                 "emote_skipped": 0,
             }
+            entry["kick_chat"] = kick_state
+            self._register_kick_chat(channel, kick_state, chat_path)
 
     async def _start_unlocked(
         self,
@@ -369,9 +376,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
             entry["tasks"] = tasks
 
-            disk_cfg = self._config.disk
-            if disk_cfg.max_total_gb > 0:
-                entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
+            # Arm the watchdog for every capture. It re-reads the live cap
+            # each tick and does nothing while the cap is disabled, so a cap
+            # that is enabled after the capture started still applies to it.
+            # Arming it only when the cap was already set left a running
+            # capture unmeasured for the rest of its life.
+            entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
             self._ended_clean.pop(channel, None)
             logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
@@ -404,6 +414,15 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 # file goes too.
                 state["writer"].discard()
                 entry.pop("kick_chat", None)
+                self._release_kick_chat(channel, state, state["writer"].path)
+            recorder = entry.get("chat_recorder")
+            if recorder is not None:
+                # Cancelling the chat task does not close its writer, and a
+                # failed start keeps no chat, so remove the partial file first.
+                # Closing is synchronous, so the release cannot happen while
+                # the writer is still open.
+                recorder.discard()
+                self._release_chat_paths(recorder.chat_path)
             self._recordings.pop(channel, None)
             if not isinstance(e, Exception):
                 # CancelledError and the like: the caller does not want a
@@ -434,10 +453,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         chat_recorder = entry.pop("chat_recorder", None)
         if chat_recorder:
-            try:
-                await chat_recorder.stop()
-            except Exception as e:
-                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+            # _finalize_chat releases the writer's paths. Stopping the capture
+            # directly would leave its chat file protected from the archive
+            # passes for the rest of the process.
+            await self._finalize_chat(channel, chat_recorder)
         await self._finalize_kick_chat(entry)
 
         youtube_info = entry.get("youtube_info")
@@ -480,16 +499,32 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             )
 
     async def stop_all(self) -> None:
+        cancelled: asyncio.CancelledError | None = None
         for channel in list(self._recordings):
             # One failing channel must not keep the others running: their
-            # streamlink and ffmpeg children would survive shutdown.
+            # streamlink and ffmpeg children would survive shutdown. A
+            # cancellation is deferred the same way, because the shutdown
+            # deadline cancels whatever it interrupts and the remaining
+            # channels still need their children and chat writers closed.
             try:
                 await self.stop(channel)
+            except asyncio.CancelledError as e:
+                cancelled = e
+                logger.warning("[recorder] stop of %s was interrupted; stopping the rest first", channel)
             except Exception:
                 logger.error("[recorder] stop failed for %s", channel, exc_info=True)
+        if cancelled is not None:
+            raise cancelled
 
     async def close(self) -> None:
-        await self.stop_all()
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            await self.stop_all()
+        except asyncio.CancelledError as e:
+            # The shutdown deadline fired. Finish the teardown anyway: the
+            # held broadcasts and the background finalizers must not be left
+            # behind, and the caller still sees the cancellation.
+            cancelled = e
         for ch, held in list(self._held.items()):
             # One bad entry must not skip the rest: every remaining
             # keep-alive process and broadcast needs its own teardown.
@@ -508,6 +543,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._reserved_channels.clear()
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        if cancelled is not None:
+            raise cancelled
 
     def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> None:
         """Run a finalize coroutine in the background, with a held reference.
@@ -612,10 +649,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         chat_recorder = entry.pop("chat_recorder", None)
         if chat_recorder:
-            try:
-                await chat_recorder.stop()
-            except Exception as e:
-                logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+            # _finalize_chat releases the writer's paths. Stopping the capture
+            # directly would leave its chat file protected from the archive
+            # passes for the rest of the process.
+            await self._finalize_chat(channel, chat_recorder)
         await self._finalize_kick_chat(entry)
 
         if entry.get("youtube_info"):

@@ -10,6 +10,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -186,21 +187,28 @@ class CloudflaredTunnel:
         return url, None
 
     async def start_named(self, token: str, config_path: Path | None = None) -> tuple[bool, str | None]:
-        """Start a named tunnel with ``cloudflared tunnel run --token``.
+        """Start a named tunnel with the install token in its environment.
 
         Return (True, None) or (False, hint). With ``config_path``, use the
         local ingress file so no dashboard configuration is needed. Flag
         order matters: ``--no-autoupdate`` and ``--config`` are
         ``tunnel``-command options and must precede ``run``.
+
+        The token goes in ``TUNNEL_TOKEN`` rather than ``--token``. A command
+        line is world-readable through ``/proc/<pid>/cmdline``, while the
+        environment is not, and every other path treats this value as a
+        credential (config.json is 0600, the token is never logged or echoed).
         """
         self.stop()
         cmd = ["cloudflared", "tunnel", "--no-autoupdate"]
         if config_path is not None:
             cmd += ["--config", str(config_path)]
-        cmd += ["run", "--token", token]
+        cmd += ["run"]
+        env = {**os.environ, "TUNNEL_TOKEN": token}
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

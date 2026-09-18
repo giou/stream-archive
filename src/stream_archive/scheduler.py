@@ -33,6 +33,14 @@ _CLEANUP_INTERVAL_SECONDS = 86400.0
 #: Retry delay after a failed retention sweep.
 _CLEANUP_RETRY_SECONDS = 3600.0
 
+#: Deadline for stopping every capture during shutdown, in seconds. The chat
+#: finalizer renames its file after awaiting the emote fetch, and that fetch
+#: is bounded per request rather than in total, so a slow emote CDN can hold
+#: the teardown past the container's stop grace period and be killed with the
+#: chat file still an unterminated .tmp. Smaller than the shipped
+#: stop_grace_period (90 s), so the tree gets to finish its own cleanup.
+_SHUTDOWN_DEADLINE_S = 60.0
+
 _READY = False  # flips True once recorder and API clients exist; reset at the start of each run
 
 
@@ -121,7 +129,7 @@ async def run_scheduler() -> None:
     # YouTube broadcast behind.
     try:
         twitch_api = TwitchAPI(config, http=shared_http)
-        notifier = Notifier(config.bot_telegram_api, config.telegram_user_id)
+        notifier = Notifier(config)
         health_runner = await _start_health_server()
 
         # Constructed unconditionally so a live /mode youtube|both always has a
@@ -313,7 +321,19 @@ async def _shutdown(
             logger.error("[scheduler] kick api close failed", exc_info=True)
     if recorder is not None:
         try:
-            await recorder.close()
+            # Bound the capture teardown. The chat finalizer writes its trailer
+            # after awaiting the emote fetch, which is bounded per request and
+            # not in total, so an unbounded close() can outlast the container's
+            # stop grace period and be killed with the file still a .tmp. A
+            # timeout cancels the finalizer, whose CancelledError path writes
+            # the trailer without the emote images and renames the file.
+            await asyncio.wait_for(recorder.close(), timeout=_SHUTDOWN_DEADLINE_S)
+        except TimeoutError:
+            logger.error(
+                "[scheduler] recorder close exceeded the %.0fs shutdown deadline; "
+                "open chat captures were finalized without their emote images",
+                _SHUTDOWN_DEADLINE_S,
+            )
         except Exception:
             logger.error("[scheduler] recorder close failed", exc_info=True)
     if youtube_streamer is not None:

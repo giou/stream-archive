@@ -766,3 +766,91 @@ def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
     assert "bogus" not in rewritten
     save_config(cfg)  # later saves keep working
     assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == data["bot_telegram_api"]
+
+
+def legacy_config():
+    """A file in the pre-endpoint-split layout: listener keys under kick.webhook."""
+    data = valid_config()
+    data["kick"] = {
+        "client_id": "cid",
+        "client_secret": "csec",
+        "webhook": {
+            "enabled": True,
+            "listen_host": "0.0.0.0",
+            "listen_port": 8787,
+            "public_url": "https://x.example.com",
+            "cloudflare_token": "",
+        },
+    }
+    return data
+
+
+def test_legacy_migration_keeps_the_env_mask_on_a_moved_key(monkeypatch, tmp_path):
+    """A moved key must not unmask its environment placeholder.
+
+    The placeholder tracker keys each masked value by its path in the file.
+    When the layout moves afterwards, the recorded path is gone, and the
+    resolved secret used to be written out as a literal.
+    """
+    monkeypatch.setenv("CF_TOKEN", "cf-secret-123")
+    data = legacy_config()
+    data["kick"]["webhook"]["cloudflare_token"] = "${CF_TOKEN}"
+    (tmp_path / "config.json").write_text(json.dumps(data))
+
+    cfg = get_config(tmp_path / "config.json")
+    assert cfg.endpoint.cloudflare_token == "cf-secret-123"
+    save_config(cfg)
+
+    raw = (tmp_path / "config.json").read_text()
+    assert json.loads(raw)["endpoint"]["cloudflare_token"] == "${CF_TOKEN}"
+    assert "cf-secret-123" not in raw
+
+
+def test_legacy_migration_still_moves_the_listener_keys(tmp_path):
+    """The migration itself is unchanged by the masking fix."""
+    (tmp_path / "config.json").write_text(json.dumps(legacy_config()))
+
+    cfg = get_config(tmp_path / "config.json")
+
+    assert cfg.endpoint.enabled is True
+    assert cfg.endpoint.listen_port == 8787
+    assert cfg.kick.webhook.enabled is True
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_disk_cap_is_rejected(value):
+    """No non-finite cap may reach the file.
+
+    ``ge=0`` already rejects NaN and -inf (both fail the comparison), but
+    +inf satisfies it, so only the finite check catches that one: it would
+    be stored as the non-standard Infinity token and the cap would never
+    apply.
+    """
+    with pytest.raises(ValueError):
+        build(disk={"max_total_gb": value})
+    with pytest.raises(ValueError, match="finite"):
+        build(disk={"max_total_gb": float("inf")})
+
+
+def test_non_finite_hold_seconds_are_rejected():
+    """The per-channel bound is hand-written, so NaN slipped past it."""
+    with pytest.raises(ValueError, match="finite"):
+        build(channel_youtube_hold_seconds={"twitch:channel1": float("nan")})
+    with pytest.raises(ValueError, match="finite"):
+        build(channel_youtube_hold_seconds={"twitch:channel1": float("inf")})
+
+
+def test_save_does_not_follow_a_symlink_at_the_temp_path(tmp_path):
+    """A planted entry at config.json.tmp must not receive the secret copy."""
+    target = tmp_path / "victim.txt"
+    target.write_text("original")
+    data = valid_config()
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    (tmp_path / "config.json.tmp").symlink_to(target)
+
+    cfg = get_config(tmp_path / "config.json")
+    save_config(cfg)
+
+    assert target.read_text() == "original"
+    assert not (tmp_path / "config.json.tmp").exists()
+    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == "bot_token"

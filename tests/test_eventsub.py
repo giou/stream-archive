@@ -486,3 +486,92 @@ def test_close_cancels_an_in_flight_dispatch():
 
     asyncio.run(scenario())
     assert mon.online_calls == []
+
+
+def test_frame_without_object_metadata_is_dropped_not_fatal():
+    """A malformed frame must cost one frame, not a reconnect.
+
+    Reading metadata with .get() on a non-object raised AttributeError out of
+    the read loop, which closed the socket and lost every event until the
+    backoff expired.
+    """
+    client = make_client()
+
+    async def scenario():
+        for frame in (
+            # json.loads can return any JSON type, and the read loop passes its
+            # result straight in.
+            [],
+            None,
+            "text",
+            7,
+            {"metadata": "not-an-object"},
+            {"metadata": None},
+            {},
+            {"metadata": {"message_type": "session_reconnect"}, "payload": "nope"},
+        ):
+            assert await client._handle_message(frame) is False
+
+    asyncio.run(scenario())
+
+
+def test_reconnect_url_must_be_a_secure_websocket_url():
+    """The server-supplied reconnect URL is dialed verbatim, so pin the scheme."""
+    client = make_client()
+
+    async def scenario():
+        assert (
+            await client._handle_message(
+                {
+                    "metadata": {"message_type": "session_reconnect"},
+                    "payload": {"session": {"reconnect_url": "ws://eventsub.example/ws"}},
+                }
+            )
+            is False
+        )
+        assert client._reconnect_url is None
+        assert (
+            await client._handle_message(
+                {
+                    "metadata": {"message_type": "session_reconnect"},
+                    "payload": {"session": {"reconnect_url": "wss://eventsub.example/ws"}},
+                }
+            )
+            is True
+        )
+        assert client._reconnect_url == "wss://eventsub.example/ws"
+
+    asyncio.run(scenario())
+
+
+def test_notification_with_a_non_string_id_is_dropped():
+    """The dedup store is a dict keyed by the id, so the id must be a string.
+
+    A JSON list or object as message_id made `seen.get(...)` raise TypeError,
+    which escaped the read loop and cost a reconnect.
+    """
+    client = make_client()
+
+    async def scenario():
+        for bad in (["a"], {"a": 1}, 7, []):
+            assert (
+                await client._handle_message(
+                    {"metadata": {"message_type": "notification", "message_id": bad}, "payload": {}}
+                )
+                is False
+            )
+
+    asyncio.run(scenario())
+
+
+def test_revocation_with_a_non_object_payload_is_ignored():
+    """A malformed revocation must not raise out of the read loop."""
+    client = make_client()
+
+    async def scenario():
+        for payload in ("x", [], 7, None):
+            assert (
+                await client._handle_message({"metadata": {"message_type": "revocation"}, "payload": payload}) is False
+            )
+
+    asyncio.run(scenario())

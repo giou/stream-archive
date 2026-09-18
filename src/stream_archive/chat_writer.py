@@ -31,6 +31,35 @@ def file_info() -> dict[str, Any]:
     }
 
 
+class _IndentingWriter:
+    """Write JSON text, indenting every new line by the parent's prefix.
+
+    ``json.dumps(value, indent=2).replace("\\n", "\\n  ")`` builds a second
+    complete copy of the serialized value. For the embedded emote data that
+    copy is megabytes, and it is alive while the first copy still is.
+    ``json.dump`` writes its output in small chunks instead, so this wrapper
+    adds the prefix chunk by chunk and keeps the bytes identical to the
+    replace() form. A JSON encoder escapes a newline inside a string, so a
+    real newline in a chunk is always structural and never inside a value.
+    """
+
+    def __init__(self, fh: TextIO, prefix: str) -> None:
+        self._fh = fh
+        self._prefix = prefix
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        # Report what the handle received, not the input length: the indent
+        # adds characters, and a caller may check the count.
+        return self._fh.write(text.replace("\n", "\n" + self._prefix) if "\n" in text else text)
+
+
+def _dump_indented(fh: TextIO, value: Any, prefix: str = "  ") -> None:
+    """Serialize ``value`` into ``fh`` with the parent's indentation."""
+    json.dump(value, _IndentingWriter(fh, prefix), ensure_ascii=False, indent=2)
+
+
 class ChatJsonWriter:
     """Write one TwitchDownloader ChatRoot file comment by comment.
 
@@ -51,7 +80,17 @@ class ChatJsonWriter:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             # The handle stays open until close(): comments land in the file
             # while the recording runs, not inside one with-block.
-            self._fh = open(self.tmp_path, "w", encoding="utf-8")  # noqa: SIM115
+            # The file holds chat text, which can carry user data, so create
+            # it private rather than with the process umask.
+            fd = os.open(self.tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                self._fh = os.fdopen(fd, "w", encoding="utf-8")
+            except OSError:
+                # _fail() only closes self._fh, which is still None here. A
+                # failed fdopen also leaves the descriptor unowned.
+                os.close(fd)
+                raise
             self._fh.write('{"comments": [')
             self._good_offset = self._fh.tell()
         except OSError as e:
@@ -63,8 +102,8 @@ class ChatJsonWriter:
         if fh is None:
             return False
         try:
-            text = json.dumps(comment, ensure_ascii=False, indent=2).replace("\n", "\n  ")
-            fh.write((",\n  " if self.comments else "\n  ") + text)
+            fh.write(",\n  " if self.comments else "\n  ")
+            _dump_indented(fh, comment)
             fh.flush()
             # tell() can raise too, and the rollback below needs the offset
             # of the last complete comment.
@@ -100,8 +139,8 @@ class ChatJsonWriter:
                 if key == "comments":
                     logger.error("[chat_writer] trailer key 'comments' collides with the comment array; skipped")
                     continue
-                text = json.dumps(value, ensure_ascii=False, indent=2).replace("\n", "\n  ")
-                fh.write(",\n  " + json.dumps(key) + ": " + text)
+                fh.write(",\n  " + json.dumps(key) + ": ")
+                _dump_indented(fh, value)
             fh.write("\n}\n")
             fh.flush()
             os.fsync(fh.fileno())

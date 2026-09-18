@@ -133,8 +133,18 @@ def main() -> None:
             print(f"   {exc}")
             continue
         # A pasted URL carries the state of its own authorization request.
-        # Reject a URL from an older attempt before the exchange.
-        if pasted_state is not None and pasted_state != server.auth_state:  # type: ignore[attr-defined]
+        # Require it: the state is the only thing binding the code to the
+        # authorization request this run printed, and a paste without one
+        # could be text the operator did not generate. An empty line is not a
+        # paste: it means "the browser finished", and the code then comes from
+        # the callback, which checked the state itself.
+        if pasted and pasted_state is None:
+            print(
+                "   That text carries no state, so it cannot be matched to this authorization.\n"
+                "   Paste the FULL redirect URL from the browser's address bar."
+            )
+            continue
+        if pasted and pasted_state != server.auth_state:  # type: ignore[attr-defined]
             print("   That redirect URL belongs to an earlier attempt. Paste the URL of the page you just opened.")
             continue
         if not candidate:

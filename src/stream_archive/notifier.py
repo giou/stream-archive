@@ -7,13 +7,16 @@ from typing import Any
 from telegram import Bot
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
+from stream_archive.config import AppConfig
+from stream_archive.recorder.common import sanitize_metadata_text, strip_line_breaks
+
 logger = logging.getLogger(__name__)
 
 
 class Notifier:
-    def __init__(self, bot_token: str, chat_id: int):
-        self.bot = Bot(token=bot_token)
-        self.chat_id = chat_id
+    def __init__(self, config: AppConfig):
+        self._config = config
+        self.bot = Bot(token=config.bot_telegram_api)
         #: Total send attempts, the first one included.
         self._max_attempts = 3
         self._retry_delay = 2
@@ -22,6 +25,11 @@ class Notifier:
         #: and the budget stops a hostile or broken RetryAfter value.
         self._max_flood_waits = 3
         self._max_flood_wait_seconds = 300.0
+
+    @property
+    def chat_id(self) -> int:
+        """The alert target. It follows the live config, so a reload moves it."""
+        return self._config.telegram_user_id
 
     async def notify(self, message: str) -> None:
         attempt = 0
@@ -74,6 +82,10 @@ class Notifier:
                 return
 
     async def notify_live(self, channel: str, title: str, game: str, url: str, youtube_url: str | None = None) -> None:
+        # The title and the game name come from the streamer, and this message
+        # is line-structured, so both are canonicalized to one line each.
+        title = sanitize_metadata_text(title)
+        game = sanitize_metadata_text(game)
         text = f"🔴 LIVE: {channel}\nTitle: {title}\nGame: {game}\nUrl: {url}"
         if youtube_url:
             text += f"\nYouTube: {youtube_url}"
@@ -88,7 +100,10 @@ class Notifier:
             size_mb = file_info.get("size_mb")
             date = file_info.get("date")
             if name is not None:
-                parts.append(f"File: {name}")
+                # The name points at a file on disk, so only the line-breaking
+                # characters are replaced: collapsing or capping it would name
+                # a file that does not exist.
+                parts.append(f"File: {strip_line_breaks(name)}")
             if size_mb is not None:
                 parts.append(f"Size: {size_mb} MB")
             if date is not None:

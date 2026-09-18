@@ -2,6 +2,8 @@ import asyncio
 import json
 import threading
 
+import pytest
+
 from stream_archive.config import AppConfig
 from stream_archive.youtube_streamer import SCOPES, YouTubeStreamer, build_video_description
 
@@ -40,6 +42,7 @@ class FakeCreds:
     def __init__(self, gate=None, fail_times=0):
         self.valid = False
         self.expired = True
+        self.token = "access-token"
         self.refresh_token = "rt"
         self.refresh_calls = 0
         self.refresh_thread = None
@@ -148,3 +151,135 @@ def test_refresh_failure_reaches_every_caller_and_frees_the_lock(tmp_path, monke
             await streamer.close()
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+
+def test_broadcast_title_and_description_are_one_line_each():
+    """The published title and description carry platform text, so canonicalize it."""
+    description = build_video_description("author\nUrl: https://evil.example", "twitch:ch", "game\u2028x")
+    assert description.split("\n") == [
+        "Twitch stream by author Url: https://evil.example",
+        "Game: game x",
+        "Originally streamed at: https://twitch.tv/ch",
+        "Recorded by StreamArchive",
+    ]
+
+
+class _RecordingClient:
+    """HTTP client double that records method/path and can cancel one call."""
+
+    def __init__(self, cancel_path: str | None = None, block_path: str | None = None, delete_delay: float = 0):
+        self.calls: list[tuple[str, str]] = []
+        self.cancel_path = cancel_path
+        self.block_path = block_path
+        self.delete_delay = delete_delay
+        self.streamer = None
+        self.tracking_seen: list[int] = []
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request(self, method, url, **_kwargs):
+        path = url.rsplit("/v3/", 1)[-1]
+        self.calls.append((method, path))
+        if self.block_path is not None and path == self.block_path:
+            self.reached.set()
+            await self.release.wait()
+        if method == "DELETE":
+            # Observe the streamer's reference to this task from inside it:
+            # that is exactly what keeps the rollback alive after the await
+            # that started it was cancelled.
+            if self.streamer is not None:
+                self.tracking_seen.append(len(self.streamer._rollback_tasks))
+            if self.delete_delay:
+                await asyncio.sleep(self.delete_delay)
+        if self.cancel_path is not None and path == self.cancel_path:
+            raise asyncio.CancelledError
+        if method == "POST" and path == "liveBroadcasts":
+            return _Response({"id": "bcast-1"})
+        if method == "POST" and path == "liveStreams":
+            return _Response(
+                {
+                    "id": "stream-1",
+                    "cdn": {"ingestionInfo": {"ingestionAddress": "rtmp://a/live2", "streamName": "key"}},
+                }
+            )
+        return _Response({})
+
+
+class _Response:
+    def __init__(self, payload):
+        self.status_code = 200
+        self.content = b"{}"
+        self.text = ""
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+def test_cancelled_create_rolls_back_the_broadcast_and_stream(tmp_path, monkeypatch):
+    """A cancellation must not leave YouTube resources behind.
+
+    The termination path cancels the recording task, and CancelledError is a
+    BaseException, so the rollback that handles every other failure never ran:
+    the account kept a broadcast and a live stream, bound, with neither ended
+    nor deleted, because the caller never received their ids.
+    """
+    creds = FakeCreds()
+    creds.valid = True
+    creds.expired = False
+    (tmp_path / "youtube_token.json").write_text(json.dumps(TOKEN_DATA))
+    streamer, stub = make_streamer(tmp_path, creds)
+    # The credentials double keeps the exchange offline.
+    monkeypatch.setattr("stream_archive.youtube_streamer.Credentials", stub)
+    client = _RecordingClient(cancel_path="liveBroadcasts/bind")
+    streamer._client = client
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await streamer.create_stream("author", "title", "twitch:ch", "game")
+
+    asyncio.run(scenario())
+
+    assert ("POST", "liveBroadcasts/bind") in client.calls
+    assert ("DELETE", "liveStreams") in client.calls
+    assert ("DELETE", "liveBroadcasts") in client.calls
+
+
+def test_rollback_survives_the_cancellation_that_started_it(tmp_path, monkeypatch):
+    """The rollback must keep a strong reference to survive its own trigger.
+
+    The cancellation path starts the rollback task and awaits it through
+    shield, which drops its callback on the inner task once the outer await is
+    cancelled. Without a reference held by the streamer, the loop can collect
+    that task and the broadcast and bound live stream stay on the account.
+    """
+    creds = FakeCreds()
+    creds.valid = True
+    creds.expired = False
+    (tmp_path / "youtube_token.json").write_text(json.dumps(TOKEN_DATA))
+    streamer, stub = make_streamer(tmp_path, creds)
+    monkeypatch.setattr("stream_archive.youtube_streamer.Credentials", stub)
+    client = _RecordingClient(block_path="liveBroadcasts/bind")
+    client.streamer = streamer
+    streamer._client = client
+
+    async def scenario():
+        task = asyncio.ensure_future(streamer.create_stream("author", "title", "twitch:ch", "game"))
+        await client.reached.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        if streamer._rollback_tasks:
+            await asyncio.gather(*streamer._rollback_tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert client.tracking_seen and set(client.tracking_seen) == {1}, (
+        f"the streamer must hold the rollback task while it runs: observed {client.tracking_seen}"
+    )
+    assert ("DELETE", "liveStreams") in client.calls
+    assert ("DELETE", "liveBroadcasts") in client.calls
+    assert streamer._rollback_tasks == set()

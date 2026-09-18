@@ -90,6 +90,9 @@ class FakeKickAPI:
         self.fetch_count += 1
         return self.public_key_pem
 
+    def has_public_key(self):
+        return self.public_key_pem is not None
+
     def clear_public_key_cache(self):
         pass
 
@@ -1134,13 +1137,21 @@ def test_bad_signature_key_refetch_rate_limited(keypair):
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             headers = _signed_headers(private_key, "m1", _fresh_ts(), b"tampered", wh.EVENT_LIVE)
-            for _ in range(5):
+            # The first request fetches the key, refetches, verifies against the
+            # fresh key and rejects the signature: a fetched key that does not
+            # verify means the delivery is not authentic.
+            resp = await client.post("/kick/webhook", data=body, headers=headers)
+            assert resp.status == 401
+            for _ in range(4):
+                # The refetch window is closed, so the receiver cannot tell a
+                # forged signature from a rotated key and must stay retryable.
                 resp = await client.post("/kick/webhook", data=body, headers=headers)
-                assert resp.status == 401
+                assert resp.status == 503
             # The first request fetches the key once and refetches once.
             # The 60s negative cache keeps the other 4 requests purely local.
             assert api.fetch_count == 2
-            # After the refetch window elapses, one more refetch is allowed.
+            # After the refetch window elapses, one more refetch is allowed and
+            # the answer is a verdict again.
             wh._next_key_refetch = 0.0
             resp = await client.post("/kick/webhook", data=body, headers=headers)
             assert resp.status == 401
@@ -1193,3 +1204,337 @@ def test_rate_limiter_evicts_the_least_recently_used_key(monkeypatch):
     assert limiter.allow("c") is True  # the full table drops "b"
 
     assert list(limiter._buckets) == ["a", "c"]
+
+
+class _StalledRequest:
+    """A request whose body never arrives: the slow-body flood shape.
+
+    Nothing but the attributes ``_handle`` reads is defined, so the request
+    can be driven directly without a socket. Both the streaming read and the
+    whole-body read are provided, so the same stub stalls either shape.
+    """
+
+    def __init__(self, remote="10.0.0.1"):
+        self.headers = {}
+        self.content_length = 4096
+        self.remote = remote
+        self.released = asyncio.Event()
+        self.content = SimpleNamespace(read=self._read)
+
+    async def _read(self, _size):
+        await self.released.wait()
+        return b""
+
+    async def read(self):
+        await self.released.wait()
+        return b""
+
+
+class FailingKeyAPI(FakeKickAPI):
+    """A Kick API whose public-key fetch always fails."""
+
+    def __init__(self):
+        super().__init__(public_key_pem=None)
+        self.failures = 0
+
+    async def get_public_key(self, force=False):
+        self.failures += 1
+        msg = "kick public key unavailable"
+        raise RuntimeError(msg)
+
+
+def test_relabelled_chat_event_does_not_change_recording_state(keypair):
+    """The unsigned type header must not turn a chat body into a stop.
+
+    The signature covers message-id, timestamp and body only, so a body must
+    confirm the action its header claims. A chat body has no is_live field.
+    """
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = chat_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
+            )
+            assert resp.status == 200
+
+    asyncio.run(scenario())
+    assert monitor.offline == []
+    assert monitor.online == []
+    assert recorder.chat == []
+
+
+def test_relabelled_live_event_is_not_written_to_chat(keypair):
+    """The reverse direction: a livestream body must not become a chat entry."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = live_event(is_live=False)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
+            )
+            assert resp.status == 200
+
+    asyncio.run(scenario())
+    assert recorder.chat == []
+    assert monitor.offline == []
+
+
+def test_livestream_event_without_a_boolean_state_is_ignored(keypair):
+    """A livestream body with no is_live field must not read as 'stream ended'."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    wh = make_webhook(config=base_config(), monitor=monitor, api=FakeKickAPI(public_pem))
+    body = json.dumps({"broadcaster": {"channel_slug": "xqc"}}).encode()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
+            )
+            assert resp.status == 200
+
+    asyncio.run(scenario())
+    assert monitor.offline == []
+    assert monitor.online == []
+
+
+def test_non_finite_timestamp_is_rejected(keypair):
+    """'nan' parses as a float, and every comparison against it is false."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = chat_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", "nan", body, wh.EVENT_CHAT),
+            )
+            assert resp.status == 401
+
+    asyncio.run(scenario())
+    assert recorder.chat == []
+
+
+def test_failed_key_fetch_is_not_repeated_for_every_request(keypair):
+    """A cold key cache plus a failing Kick API must not cost one call per request.
+
+    The answer must stay retryable: the request was not judged either way, so
+    a permanent 401 would make the sender drop a delivery it should repeat.
+    """
+    private_key, _ = keypair
+    api = FailingKeyAPI()
+    wh = make_webhook(config=base_config(), monitor=FakeMonitor(), api=api)
+    body = chat_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            for index in range(5):
+                resp = await client.post(
+                    "/kick/webhook",
+                    data=body,
+                    headers=_signed_headers(private_key, f"m{index}", _fresh_ts(), body, wh.EVENT_CHAT),
+                )
+                assert resp.status == 503
+                assert resp.headers["Retry-After"]
+
+    asyncio.run(scenario())
+    assert api.failures == 1
+
+
+def test_unverified_requests_do_not_consume_the_dispatch_budget(keypair):
+    """Slow unauthenticated bodies must not refuse a genuine signed delivery."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = chat_event()
+
+    async def scenario():
+        stalls = [asyncio.create_task(wh._handle(_StalledRequest())) for _ in range(16)]
+        await asyncio.sleep(0.05)  # let every stall reach the body read
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
+            )
+            assert resp.status == 200
+        for stall in stalls:
+            stall.cancel()
+        await asyncio.gather(*stalls, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert len(recorder.chat) == 1
+
+
+class _SegmentedRequest:
+    """A request whose body arrives in several pieces, like a real delivery.
+
+    ``request.content.read(n)`` returns as soon as any data is buffered, so a
+    receiver that reads once and verifies sees a truncated body.
+    """
+
+    def __init__(self, pieces, headers, remote="10.0.0.2"):
+        self._pieces = list(pieces)
+        self.headers = headers
+        self.content_length = sum(len(p) for p in pieces)
+        self.remote = remote
+        self.content = SimpleNamespace(read=self._read)
+
+    async def _read(self, size):
+        if not self._pieces:
+            return b""
+        return self._pieces.pop(0)[:size]
+
+
+def test_body_split_across_segments_is_verified_whole(keypair):
+    """A delivery that arrives in several pieces must not be read truncated.
+
+    Reading once returned only the first buffered chunk, so the signature was
+    checked against a partial body and a genuine event was answered 401.
+    """
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = chat_event()
+    mid = len(body) // 2
+    pieces = [body[:mid], body[mid:]]
+    headers = _signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT)
+
+    async def scenario():
+        response = await wh._handle(_SegmentedRequest(pieces, headers))
+        assert response.status == 200
+
+    asyncio.run(scenario())
+    assert len(recorder.chat) == 1
+
+
+def test_missing_public_key_asks_for_a_redelivery(keypair):
+    """A 200 without a key is not a verdict on the signature.
+
+    The cache stays cold, so every genuine delivery would otherwise be
+    answered 401, which a sender treats as permanent.
+    """
+    private_key, _ = keypair
+    api = FakeKickAPI(public_key_pem=None)  # a fetch that returns no key
+    wh = make_webhook(config=base_config(), monitor=FakeMonitor(), api=api)
+    body = chat_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
+            )
+            assert resp.status == 503
+            assert resp.headers["Retry-After"]
+
+    asyncio.run(scenario())
+
+
+def test_key_rotation_refetch_failure_stays_retryable(keypair):
+    """The forced rotation refetch is a fetch too: its failure is not a verdict."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
+    body = chat_event()
+
+    async def failing_force(force=False):
+        if force:
+            msg = "kick api unreachable"
+            raise RuntimeError(msg)
+        return "not-the-signing-key"  # the cached key cannot verify this delivery
+
+    wh._api.get_public_key = failing_force
+    wh._api.has_public_key = lambda: True
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post(
+                "/kick/webhook",
+                data=body,
+                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
+            )
+            assert resp.status == 503
+
+    asyncio.run(scenario())
+    assert recorder.chat == []
+
+
+def test_a_concurrent_cold_cache_burst_makes_one_key_fetch(keypair):
+    """The cold-cache window is claimed before the await, not after it.
+
+    Verification now runs before the dispatch permit, so nothing else bounds
+    concurrent fetches: a check-then-act window would let a burst each issue
+    its own outbound Kick API call.
+    """
+    private_key, _ = keypair
+    calls = []
+
+    class CountingAPI(FakeKickAPI):
+        async def get_public_key(self, force=False):
+            calls.append(force)
+            await asyncio.sleep(0.05)  # a real fetch takes time
+            return None  # no key: the cache stays cold
+
+    api = CountingAPI(public_key_pem=None)
+    wh = make_webhook(config=base_config(), monitor=FakeMonitor(), api=api)
+    body = chat_event()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            responses = await asyncio.gather(
+                *[
+                    client.post(
+                        "/kick/webhook",
+                        data=body,
+                        headers=_signed_headers(private_key, f"m{i}", _fresh_ts(), body, wh.EVENT_CHAT),
+                    )
+                    for i in range(5)
+                ]
+            )
+            assert {r.status for r in responses} == {503}
+
+    asyncio.run(scenario())
+    assert len(calls) == 1, f"the burst must share one fetch, got {len(calls)}"
+
+
+def test_empty_key_body_is_rejected_as_too_large(keypair):
+    """The drain still enforces the size cap on a body that never ends."""
+    private_key, public_pem = keypair
+    wh = make_webhook(config=base_config(), monitor=FakeMonitor(), api=FakeKickAPI(public_pem))
+    headers = {
+        "Kick-Event-Type": wh.EVENT_CHAT,
+        "Kick-Event-Message-Id": "m1",
+        "Kick-Event-Message-Timestamp": _fresh_ts(),
+        "Kick-Event-Signature": "AAAA",
+    }
+    big = _SegmentedRequest([b"x" * 4096] * 40, headers)  # 160 KiB, over the 64 KiB cap
+
+    async def scenario():
+        response = await wh._handle(big)
+        assert response.status == 413
+
+    asyncio.run(scenario())

@@ -65,7 +65,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve the newest streamlink-ttvlol release
+      - name: Resolve the newest streamlink-ttvlol release and its digest
         id: ttvlol
         run: |
           # The plugin repository is public, so the unauthenticated endpoint
@@ -79,7 +79,22 @@ jobs:
           if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9A-Za-z._-]+$'; then
             echo "unexpected streamlink-ttvlol tag: $TAG" >&2; exit 1
           fi
+          # Hash the asset here and pass the digest to the build, which then
+          # refuses to install any other bytes. This keeps the digest in the
+          # release log equal to the digest inside the published image, and it
+          # fails the build if the asset changes between the two downloads.
+          # The build would compute and record the digest on its own when the
+          # argument is empty; passing it is what makes the published artifact
+          # verifiable against this log line.
+          curl -fsSL -o /tmp/twitch.py \
+            "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py"
+          SHA=$(sha256sum /tmp/twitch.py | cut -d' ' -f1)
+          if [ -z "$SHA" ]; then
+            echo "cannot hash the streamlink-ttvlol asset" >&2; exit 1
+          fi
+          echo "streamlink-ttvlol ${TAG} sha256 ${SHA}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
       - name: Resolve the image tags
         id: image
         run: |
@@ -104,6 +119,7 @@ jobs:
           push: true
           build-args: |
             TTVLOL_PLUGIN_VERSION=${{ steps.ttvlol.outputs.tag }}
+            TTVLOL_PLUGIN_SHA256=${{ steps.ttvlol.outputs.sha256 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ steps.image.outputs.tags }}

@@ -14,9 +14,9 @@ bytes keyed by emote id) before it falls back to Twitch's CDN. This module:
 
 The recorder writes the comments while the recording runs. The limits in this
 module bound the emote work for one recording: 1024 distinct emote ids, 512
-KiB for one image, and 16 MiB for all images. An over-limit emote keeps its
-text token, so TwitchDownloader renders plain text there, never a broken
-image.
+KiB for one image, 16 MiB for all images, and 16 MiB for the base64 text the
+chat file embeds. An over-limit emote keeps its text token, so
+TwitchDownloader renders plain text there, never a broken image.
 """
 
 import asyncio
@@ -40,7 +40,9 @@ _EMOTE_FETCH_CONCURRENCY = 8
 MAX_EMOTES_PER_RECORDING = 1024
 #: Largest image accepted for one emote.
 MAX_EMOTE_BYTES = 512 * 1024
-#: Largest total download for one recording.
+#: Largest total download for one recording. The same value bounds the
+#: base64 text that the chat file embeds, because that text is held in
+#: memory while the trailer is written.
 MAX_EMOTE_TOTAL_BYTES = 16 * 1024 * 1024
 
 
@@ -299,15 +301,36 @@ async def embedded_data(emote_names: dict[str, str], client: httpx.AsyncClient |
         return None
     if not images:
         return None
-    first_party = [
-        {
-            "id": eid,
-            "imageScale": 2,
-            "data": base64.b64encode(images[eid]).decode("ascii"),
-            "name": emote_names.get(eid, eid),
-        }
-        for eid in emote_names
-        if eid in images
-    ]
-    logger.info("[kick_chat] embedded %d emote image(s)", len(first_party))
+    # The embedded block is held as text while the trailer is written, so it
+    # is bounded separately from the download cap: base64 grows the data by a
+    # third, and the whole block is serialized into the file.
+    first_party: list[dict[str, Any]] = []
+    encoded_total = 0
+    skipped = 0
+    for eid in emote_names:
+        image = images.get(eid)
+        if image is None:
+            continue
+        encoded = base64.b64encode(image)
+        if encoded_total + len(encoded) > MAX_EMOTE_TOTAL_BYTES:
+            skipped += 1
+            continue
+        encoded_total += len(encoded)
+        first_party.append(
+            {
+                "id": eid,
+                "imageScale": 2,
+                "data": encoded.decode("ascii"),
+                "name": emote_names.get(eid, eid),
+            }
+        )
+    if skipped:
+        logger.warning(
+            "[kick_chat] embeddedData limit reached (%d bytes); %d emote image(s) stay as text",
+            MAX_EMOTE_TOTAL_BYTES,
+            skipped,
+        )
+    if not first_party:
+        return None
+    logger.info("[kick_chat] embedded %d emote image(s), %d bytes of encoded data", len(first_party), encoded_total)
     return {"firstParty": first_party}

@@ -35,18 +35,27 @@ COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
 WORKDIR /app
 
-# twitch.py plugin (2bc4/streamlink-ttvlol). The build fetches the release in
-# TTVLOL_PLUGIN_VERSION. The default "latest" points at the newest release, but
-# it does not change the RUN command text, so a rebuilt image keeps the cached
-# layer and the old plugin copy in it. The publish workflow passes the resolved
-# tag, which changes the command text and with it the layer cache key. Use
-# --no-cache, or --build-arg TTVLOL_PLUGIN_VERSION=<tag>, to fetch the current
-# release by hand.
-# The file is fetched without a checksum on purpose (the release asset is
-# mutable). The syntax check rejects a truncated file or an HTML error page.
-# The build resolves "latest" through the GitHub redirect and prints the
-# release tag, so the log names the plugin an image contains.
+# twitch.py plugin (2bc4/streamlink-ttvlol). The recorder imports this file
+# into its own process, so it runs with the app's authority: the bot token,
+# the Twitch and Kick client secrets, the YouTube token, and the data
+# directory. The build downloads the release, checks that GitHub served it
+# from the expected project, and records its sha256 both in the log and in
+# /app/plugins/twitch.py.sha256, so a running image can be identified.
+#
+# TTVLOL_PLUGIN_VERSION selects the release. The default "latest" points at
+# the newest release, but it does not change the RUN command text, so a
+# rebuilt image keeps the cached layer and the old plugin copy in it. The
+# publish workflow passes the resolved tag, which changes the command text
+# and with it the layer cache key.
+#
+# TTVLOL_PLUGIN_SHA256 is optional. Set it to the digest of a release you
+# reviewed and the build refuses to install any other bytes; it is part of
+# this RUN, so changing it also invalidates the cached layer. Leave it empty
+# to accept whatever the release currently serves, which the build hashes and
+# records. A tag without a digest pins the release, not the bytes: GitHub
+# release assets are mutable.
 ARG TTVLOL_PLUGIN_VERSION=latest
+ARG TTVLOL_PLUGIN_SHA256=
 RUN mkdir -p /app/plugins \
  && if [ "${TTVLOL_PLUGIN_VERSION}" = "latest" ]; then \
       RELEASE_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
@@ -59,9 +68,19 @@ RUN mkdir -p /app/plugins \
  && if [ -z "${TAG}" ]; then \
       echo "cannot resolve the streamlink-ttvlol release" >&2; exit 1; \
     fi \
- && echo "TTVLOL plugin release: ${TAG}" \
- && curl -fsSL -o /app/plugins/twitch.py \
-      "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py" \
+ && URL="https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py" \
+ && FINAL="$(curl -fsSL -o /app/plugins/twitch.py -w '%{url_effective}' "${URL}")" \
+ && case "${FINAL}" in \
+      https://github.com/2bc4/streamlink-ttvlol/releases/*|https://*.githubusercontent.com/*) ;; \
+      *) echo "unexpected download URL for the plugin: ${FINAL}" >&2; exit 1 ;; \
+    esac \
+ && ACTUAL="$(sha256sum /app/plugins/twitch.py | cut -d' ' -f1)" \
+ && if [ -n "${TTVLOL_PLUGIN_SHA256}" ] && [ "${ACTUAL}" != "${TTVLOL_PLUGIN_SHA256}" ]; then \
+      echo "TTVLOL plugin checksum mismatch for ${TAG}: pinned ${TTVLOL_PLUGIN_SHA256}, downloaded ${ACTUAL}" >&2; \
+      exit 1; \
+    fi \
+ && echo "TTVLOL plugin: ${TAG} sha256 ${ACTUAL}${TTVLOL_PLUGIN_SHA256:+ (pinned)}" \
+ && printf '%s  twitch.py\n' "${ACTUAL}" > /app/plugins/twitch.py.sha256 \
  && python -c "import ast; ast.parse(open('/app/plugins/twitch.py').read())"
 
 # Two-stage dependency install so source edits do not invalidate the dep layer.

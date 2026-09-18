@@ -135,5 +135,7 @@ Then configure the optional features:
 ## License
 
 [MIT](LICENSE). The image contains the third-party `twitch.py` plugin
-(streamlink-ttvlol). The build fetches the plugin from upstream releases. The
-plugin keeps its upstream license.
+(streamlink-ttvlol). The recorder imports that file into its own process, so
+the build downloads it from the upstream release, records its sha256 in
+`/app/plugins/twitch.py.sha256`, and can be pinned to reviewed bytes with the
+`TTVLOL_PLUGIN_SHA256` build argument. The plugin keeps its upstream license.

@@ -320,3 +320,29 @@ def test_embedded_data_never_raises(monkeypatch, caplog):
 
     assert calls == [["1"]]  # the stub ran, so the guard path is the one under test
     assert any("emote embedding failed" in r.getMessage() for r in caplog.records)
+
+
+def test_embedded_data_bounds_the_encoded_payload(monkeypatch, caplog):
+    """The embedded block is held as text, so its own size is bounded.
+
+    Base64 grows the images by a third, and the whole block is serialized into
+    the file. Without a bound, one recording's finalize held several copies of
+    a 16 MiB emote set in memory.
+    """
+    monkeypatch.setattr("stream_archive.kick_chat.MAX_EMOTE_TOTAL_BYTES", 8)
+
+    def handler(request):
+        return httpx.Response(200, content=b"1234")  # 4 bytes -> 8 base64 chars
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with caplog.at_level("WARNING"):
+                embedded = await embedded_data({"1": "A", "2": "B", "3": "C"}, client)
+        return embedded
+
+    embedded = asyncio.run(scenario())
+
+    assert embedded is not None
+    assert [item["id"] for item in embedded["firstParty"]] == ["1"]
+    assert "embeddedData limit reached" in caplog.text
+    json.dumps(embedded)  # the truncated block is still valid JSON

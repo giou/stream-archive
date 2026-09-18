@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -11,13 +12,49 @@ from stream_archive.kick_chat import (
     embedded_data,
     streamer_identity,
 )
-from stream_archive.recorder.types import Recording
+from stream_archive.recorder.types import KickChatState, Recording
 
 logger = logging.getLogger(__name__)
 
 
 class ChatOutputMixin:
     _recordings: dict[str, Recording]
+    #: Chat captures whose writer is still open, keyed by channel.
+    #: A capture keeps its entry only until its end path detaches it, and
+    #: the finalizer then runs on the detached entry; this registry is what
+    #: the ingest gate and the deletion passes consult for that window.
+    _open_chat: dict[str, KickChatState]
+    #: Real paths of every open chat writer, so a deletion pass can never
+    #: unlink a file a capture still holds (entry or not).
+    _chat_paths: set[str]
+
+    def _chat_writer_paths(self, chat_path: str) -> set[str]:
+        """Real paths of one chat capture: the final file and its tmp copy."""
+        return {os.path.realpath(chat_path), os.path.realpath(chat_path + ".tmp")}
+
+    def _register_chat_paths(self, chat_path: str) -> None:
+        """Track an open chat writer, of either platform."""
+        self._chat_paths |= self._chat_writer_paths(chat_path)
+
+    def _release_chat_paths(self, chat_path: str) -> None:
+        """Forget a writer that is closed, renamed or discarded."""
+        self._chat_paths -= self._chat_writer_paths(chat_path)
+
+    def _register_kick_chat(self, channel: str, state: KickChatState, chat_path: str) -> None:
+        """Track one Kick capture, for the ingest gate and the deletion passes."""
+        self._open_chat[channel] = state
+        self._register_chat_paths(chat_path)
+
+    def _release_kick_chat(self, channel: str, state: KickChatState, chat_path: str) -> None:
+        """Forget a Kick capture whose writer is closed, renamed or discarded.
+
+        The channel can already hold a newer capture when a finalizer that was
+        still running when the next recording started gets here, so only the
+        registration this call owns is dropped.
+        """
+        if self._open_chat.get(channel) is state:
+            self._open_chat.pop(channel, None)
+        self._release_chat_paths(chat_path)
 
     async def _finalize_chat(self, channel: str, chat_recorder: Any) -> None:
         """Finalize chat after a failure. The method logs errors and never raises."""
@@ -25,6 +62,10 @@ class ChatOutputMixin:
             await chat_recorder.stop()
         except Exception as e:
             logger.error("[recorder] [%s] chat finalize error: %s", channel, e)
+        finally:
+            # The writer is closed or renamed now, so its paths are archive
+            # files again and the deletion passes may consider them.
+            self._release_chat_paths(chat_recorder.chat_path)
 
     async def stop_chat(self, channel: str, platform: str | None = None) -> None:
         """Stop and finalize chat capture for an active recording.
@@ -50,6 +91,14 @@ class ChatOutputMixin:
         """
         entry = self._recordings.get(channel)
         state = entry.get("kick_chat") if entry is not None else None
+        if state is None:
+            # Every end path but /chat off detaches the entry before the
+            # finalizer finishes, and the finalizer keeps the file open until
+            # it renames it. A delivery inside that window belongs in the file
+            # being written, not in the bin: the contract is stated at
+            # _finalize_kick_chat, and the /chat off path already behaves this
+            # way because it keeps the entry.
+            state = self._open_chat.get(channel)
         if state is None:
             return
         if state.get("streamer_id") is None:
@@ -130,3 +179,4 @@ class ChatOutputMixin:
             # keep the collected comments on disk.
         finally:
             entry.pop("kick_chat", None)
+            self._release_kick_chat(state["channel"], state, state["writer"].path)

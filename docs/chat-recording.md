@@ -33,7 +33,8 @@ leaves a partial `.tmp` file, and the `retention_days` cleanup removes stale
 `.tmp` files together with the recordings.
 
 The Kick emote step is bounded per recording: 1024 distinct emote ids, 512 KiB
-for one image, and 16 MiB in total. An over-limit emote keeps its text token,
+for one image, 16 MiB of downloaded images, and 16 MiB of base64 text embedded
+in the file. An over-limit emote keeps its text token,
 so TwitchDownloader renders plain text there.
 
 Chat files count toward `disk.max_total_gb` together with the recordings. The

@@ -2178,3 +2178,244 @@ def test_redact_credentials_covers_proxy_and_ingest_urls():
     ingest = _redact_credentials("rtmp://a.rtmp.youtube.com/live2/abcd-efgh-1234?backup=1 failed")
     assert "abcd-efgh-1234" not in ingest
     assert "rtmp://a.rtmp.youtube.com/live2/***?backup=1" in ingest
+
+
+def test_start_arms_the_watchdog_even_when_the_cap_is_off(tmp_path, monkeypatch):
+    """A cap enabled after a capture started must still apply to that capture.
+
+    The watchdog re-reads the live cap each tick, but it only exists if the
+    capture created it. Arming it only when the cap was already set left a
+    running capture unmeasured for the rest of its life, and no later start
+    decision revisits a channel that is already recording.
+    """
+    config = make_config(tmp_path)
+    config.disk = {"max_total_gb": 0}  # shipped default: cap disabled
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda channel, title, game: (SustainedStream(), "a", "t", "g"))
+
+    async def scenario():
+        assert await rec.start("twitch:ch")
+        entry = rec._recordings["twitch:ch"]
+        assert entry.get("watchdog") is not None
+        await rec.close()
+
+    asyncio.run(scenario())
+
+
+def _kick_capture(rec, channel="kick:ch", title="stream", now="01_01_2026-000000"):
+    """Start a real Kick chat capture and detach its entry, as the end paths do.
+
+    ``_start_chat_capture`` is the code that creates the writer and registers
+    it; the detach mirrors ``_stop_unlocked`` and ``_on_task_finished``, which
+    remove the recording entry before the finalizer renames the file.
+    """
+    entry: dict = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
+    entry["started_at"] = time.monotonic()
+    rec._recordings[channel] = entry
+    rec._start_chat_capture(entry, channel, title, "game", "author", None, title, now)
+    rec._recordings.pop(channel)
+    return entry
+
+
+def test_chat_capture_is_protected_between_stop_and_rename(tmp_path):
+    """The deletion passes must not unlink a chat file the finalizer still holds.
+
+    Every end path but /chat off removes the recording entry before the
+    finalizer writes the trailer, and while the rename is pending the tmp
+    file has no other copy anywhere.
+    """
+    config = make_config(tmp_path)
+    config.kick.record_chat = True
+    config.disk.max_total_gb = 5e-7  # ~524 B cap, under the idle chat file
+    rec = Recorder(config)
+    entry = _kick_capture(rec)
+    live_tmp = Path(entry["kick_chat"]["writer"].tmp_path)
+    idle = live_tmp.parent / "idle.chat.json"
+    idle.write_bytes(b"x" * 1024)
+    t0 = time.time() - 100
+    os.utime(live_tmp, (t0, t0))
+    os.utime(idle, (t0 + 10, t0 + 10))
+
+    removed, _ = asyncio.run(rec.delete_oldest_to_cap())
+
+    assert live_tmp.exists(), "the finalizer still holds this file open"
+    assert not idle.exists()
+    assert removed == 1
+    entry["kick_chat"]["writer"].discard()
+
+
+def test_kick_chat_reaches_a_capture_that_is_finalizing(tmp_path):
+    """A signed delivery inside the finalize window belongs in the file.
+
+    add_kick_chat used to resolve the capture through the recording map,
+    which every end path empties before the finalizer runs, so a delivery
+    answered 200 was dropped with no log line. The finalizer documents the
+    opposite contract, and the /chat off path already keeps its entry.
+    """
+    config = make_config(tmp_path)
+    config.kick.record_chat = True
+    rec = Recorder(config)
+    entry = _kick_capture(rec)
+    writer = entry["kick_chat"]["writer"]
+    payload = {"message_id": "m1", "content": "hello", "sender": {}, "broadcaster": {}}
+
+    async def scenario():
+        await rec.add_kick_chat("kick:ch", payload)
+        writer.close({"FileInfo": {}, "streamer": {}, "video": {}})
+
+    asyncio.run(scenario())
+
+    document = json.loads(Path(writer.path).read_text())
+    assert len(document["comments"]) == 1
+
+
+class _StoppedChatRecorder:
+    """A Twitch chat capture whose writer is already closed."""
+
+    def __init__(self, chat_path):
+        self.chat_path = str(chat_path)
+
+    async def stop(self):
+        return None
+
+
+def test_stop_releases_the_chat_path_for_the_archive_passes(tmp_path):
+    """A finished chat file must become deletable again.
+
+    The deletion passes seed their protected set from the open-writer registry.
+    Releasing a writer only in the background finalizer left every capture
+    stopped through stop()/abort() protected for the rest of the process, so
+    the cap and the retention sweep could never reclaim those files.
+    """
+    config = make_config(tmp_path)
+    config.record_chat = True
+    config.disk.max_total_gb = 5e-7  # ~524 B cap, under the two files below
+    rec = Recorder(config)
+    chat = tmp_path / "chat" / "twitch" / "ch"
+    chat.mkdir(parents=True, exist_ok=True)
+    path = chat / "live.chat.json"
+    idle = chat / "idle.chat.json"
+    t0 = time.time() - 100
+    path.write_bytes(b"x" * 1024)
+    idle.write_bytes(b"x" * 1024)
+    os.utime(path, (t0, t0))
+    os.utime(idle, (t0 + 10, t0 + 10))
+    rec._register_chat_paths(str(path))
+    rec._recordings["twitch:ch"] = {
+        "tasks": [],
+        "filepath": None,
+        "chat_recorder": _StoppedChatRecorder(path),
+    }
+
+    asyncio.run(rec.stop("twitch:ch"))
+    removed, _ = asyncio.run(rec.delete_oldest_to_cap())
+
+    assert not path.exists(), "the release must let the cap reclaim the file"
+    assert removed == 2
+
+
+def test_close_keeps_tearing_down_after_a_cancellation(tmp_path):
+    """The shutdown deadline must not skip the rest of the recorder teardown.
+
+    close() is cancelled mid-teardown when the deadline fires. CancelledError
+    is a BaseException, so the per-channel 'except Exception' guards let it
+    escape: the remaining channels keep their ffmpeg/streamlink children and
+    open chat writers, and the held broadcasts are never ended.
+    """
+    config = make_config(tmp_path)
+    rec = Recorder(config)
+    stopped: list[str] = []
+    ended: list[tuple[str, str]] = []
+
+    async def fake_stop(channel):
+        if channel == "twitch:a":
+            raise asyncio.CancelledError
+        stopped.append(channel)
+
+    async def fake_end(channel, broadcast_id):
+        ended.append((channel, broadcast_id))
+
+    rec.stop = fake_stop  # type: ignore[method-assign]
+    rec._end_broadcast = fake_end  # type: ignore[method-assign]
+    rec._recordings.update({"twitch:a": {}, "twitch:b": {}, "twitch:c": {}})
+    rec._held["twitch:held"] = {"youtube_info": {"broadcast_id": "bcast-1"}, "end_task": None, "keepalive": None}
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await rec.close()
+
+    asyncio.run(scenario())
+
+    assert stopped == ["twitch:b", "twitch:c"]
+    assert ended == [("twitch:held", "bcast-1")]
+    assert rec._held == {}
+
+
+def test_cancelled_chat_stop_still_closes_the_writer(tmp_path):
+    """A cancelled stop() must still close the chat file.
+
+    stop() waits for the reader before it renames the file, so a cancellation
+    delivered there skipped the rename and left the writer holding the only
+    copy, while the recorder released the path and let a deletion pass unlink
+    it.
+    """
+    from stream_archive.chat_recorder import ChatRecorder
+
+    chat_path = tmp_path / "chat" / "twitch" / "ch" / "one.chat.json"
+    chat_path.parent.mkdir(parents=True, exist_ok=True)
+    rec = ChatRecorder("ch", str(chat_path), "title", "game")
+    rec._writer.add_comment({"body": "hello"})
+    reader: list[asyncio.Task[None]] = []
+
+    async def scenario():
+        async def blocked_reader():
+            await asyncio.sleep(3600)
+
+        rec._task = asyncio.ensure_future(blocked_reader())
+        reader.append(rec._task)
+        await asyncio.sleep(0)
+        stop_task = asyncio.ensure_future(rec.stop())
+        await asyncio.sleep(0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+    asyncio.run(scenario())
+    with contextlib.suppress(asyncio.CancelledError):
+        asyncio.run(asyncio.gather(*reader, return_exceptions=True))
+
+    assert chat_path.exists(), "the cancelled stop must still rename the file"
+    assert json.loads(chat_path.read_text())["comments"][0]["body"] == "hello"
+
+
+def test_failed_start_discards_the_partial_chat_and_releases_its_path(tmp_path, monkeypatch):
+    """A start that fails after the chat capture opened must clean it up.
+
+    Two things must hold: the partial file goes (the capture kept no chat),
+    and its path stops being protected only once the writer is closed, so a
+    concurrent deletion pass never sees an open file as an archive file.
+    """
+    config = make_config(tmp_path)
+    config.record_chat = True
+    config.output_mode = "disk"
+
+    from stream_archive.chat_recorder import ChatRecorder
+
+    def failing_start(self):
+        msg = "chat capture could not start"
+        raise RuntimeError(msg)
+
+    # The chat writer exists by then, so the failure handler must remove it and
+    # release its path.
+    monkeypatch.setattr(ChatRecorder, "start", failing_start)
+    rec = Recorder(config)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda channel, title, game: (SustainedStream(), "a", "t", "g"))
+
+    async def scenario():
+        assert await rec.start("twitch:ch") is False
+        assert rec._chat_paths == set()
+
+    asyncio.run(scenario())
+
+    leftovers = list((tmp_path / "chat").rglob("*.tmp")) if (tmp_path / "chat").exists() else []
+    assert leftovers == [], f"a failed start must remove its partial chat file: {leftovers}"

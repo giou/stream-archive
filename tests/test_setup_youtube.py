@@ -2,6 +2,7 @@ import threading
 
 import httpx
 import pytest
+from conftest import make_config
 
 from stream_archive.setup_youtube import _CallbackHandler, extract_code, extract_code_and_state
 
@@ -122,3 +123,113 @@ def test_callback_rejects_request_without_code():
         assert not server.auth_event.is_set()
     finally:
         _stop_server(server)
+
+
+class _FakeFlow:
+    """InstalledAppFlow double: no browser, no network, one recorded exchange."""
+
+    class _Credentials:
+        @staticmethod
+        def to_json() -> str:
+            return '{"token": "stub"}'
+
+    def __init__(self, state="expected-state"):
+        self.state = state
+        self.redirect_uri = ""
+        self.exchanged: list[str] = []
+        self.credentials = self._Credentials()
+
+    def authorization_url(self, **_kwargs):
+        return f"https://accounts.google.com/o/oauth2/auth?state={self.state}", self.state
+
+    def fetch_token(self, code=None, **_kwargs):
+        self.exchanged.append(code)
+
+
+def _run_main(monkeypatch, tmp_path, pastes, expect_exit=True, callback_code=None):
+    """Drive main() with a stubbed flow and a scripted paste sequence.
+
+    With ``callback_code``, the loopback callback is treated as having stored
+    that code before the operator answered, which is the documented flow.
+    """
+    import stream_archive.setup_youtube as module
+
+    config = make_config(youtube={"client_secrets_file": str(tmp_path / "client_secret.json")})
+    config._workdir = tmp_path
+    config._config_path = tmp_path / "config.json"
+    (tmp_path / "client_secret.json").write_text("{}")
+    monkeypatch.setattr(module, "get_config", lambda: config)
+    flow = _FakeFlow()
+    monkeypatch.setattr(module.InstalledAppFlow, "from_client_secrets_file", lambda *a, **k: flow)
+    monkeypatch.setattr(module.webbrowser, "open", lambda *a, **k: None)
+    answers = iter(pastes)
+    created: dict = {}
+    real_server = module.HTTPServer
+
+    class Recording(real_server):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created["server"] = self
+
+    monkeypatch.setattr(module, "HTTPServer", Recording)
+
+    def answer(*_a, **_k):
+        if callback_code is not None:
+            created["server"].auth_code = callback_code
+            created["server"].auth_event.set()
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", answer)
+    try:
+        if expect_exit:
+            with pytest.raises(SystemExit):
+                module.main()
+        else:
+            module.main()  # a success path: the tool returns normally
+    finally:
+        # main() only closes the callback server on its success path, and the
+        # harness reuses the real HTTPServer, so release it here on every path.
+        server = created.get("server")
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+    return flow
+
+
+def test_main_refuses_a_state_less_paste(monkeypatch, tmp_path):
+    """A pasted code with no state cannot be bound to this authorization.
+
+    The state is the only thing tying a code to the request the tool printed,
+    and the pasted path used to exchange a state-less paste, outranking the
+    code that had passed the callback's own state check.
+    """
+    flow = _run_main(
+        monkeypatch,
+        tmp_path,
+        ["https://attacker.example/oauth2?code=4%2F0ATTACKER", "not a url", "still not a url"],
+    )
+    assert flow.exchanged == []
+
+
+def test_main_exchanges_a_paste_with_the_matching_state(monkeypatch, tmp_path):
+    """The documented paste path still works when the state matches."""
+    flow = _run_main(
+        monkeypatch,
+        tmp_path,
+        ["https://127.0.0.1/?code=4%2F0GOOD&state=expected-state"],
+        expect_exit=False,
+    )
+    assert flow.exchanged == ["4/0GOOD"]
+    assert (tmp_path / "youtube_token.json").exists()
+
+
+def test_main_accepts_the_browser_callback_after_an_empty_enter(monkeypatch, tmp_path):
+    """The documented automatic flow must survive the state guard.
+
+    The prompt says to press Enter once the browser shows the success page.
+    An empty line is not a paste: the code comes from the callback, which
+    checked the state itself. Requiring a state for it broke the main path.
+    """
+    flow = _run_main(monkeypatch, tmp_path, [""], expect_exit=False, callback_code="4/0FROMCALLBACK")
+    assert flow.exchanged == ["4/0FROMCALLBACK"]
+    assert (tmp_path / "youtube_token.json").exists()

@@ -385,10 +385,25 @@ class EventSubClient:
 
     async def _handle_message(self, msg: dict[str, Any]) -> bool:
         """Dispatch one WebSocket message. Returns True when the socket must reconnect."""
-        mtype = msg.get("metadata", {}).get("message_type")
+        if not isinstance(msg, dict):
+            # json.loads can return any JSON type, and the single caller
+            # passes its result straight in. Reading .get() on a list, a
+            # string or None would raise out of the read loop.
+            logger.warning("[eventsub] message is not a JSON object, ignoring")
+            return False
+        metadata = msg.get("metadata")
+        if not isinstance(metadata, dict):
+            # A frame without an object metadata is not one this client can
+            # act on. Raising here would escape the read loop and cost a
+            # reconnect, so drop the frame instead.
+            logger.warning("[eventsub] message without an object metadata, ignoring")
+            return False
+        mtype = metadata.get("message_type")
         if mtype == "notification":
-            msg_id = msg.get("metadata", {}).get("message_id")
-            if msg_id is not None and not self._remember_id(msg_id):
+            msg_id = metadata.get("message_id")
+            # The dedup store is a dict keyed by the id, so a non-string JSON
+            # value would raise TypeError out of the read loop.
+            if isinstance(msg_id, str) and not self._remember_id(msg_id):
                 logger.debug("[eventsub] duplicate event, ignoring")
                 return False
             t = asyncio.create_task(self._bounded_dispatch(msg))
@@ -397,11 +412,30 @@ class EventSubClient:
         elif mtype == "session_keepalive":
             pass
         elif mtype == "session_reconnect":
-            self._reconnect_url = msg["payload"]["session"]["reconnect_url"]
+            url = self._reconnect_url_of(msg)
+            if url is None:
+                logger.warning("[eventsub] session_reconnect without a usable websocket URL, ignoring")
+                return False
+            self._reconnect_url = url
             return True
         elif mtype == "revocation":
             await self._handle_revocation(msg)
         return False
+
+    @staticmethod
+    def _reconnect_url_of(msg: dict[str, Any]) -> str | None:
+        """Reconnect URL of a session_reconnect frame, or None.
+
+        The URL is dialed verbatim, so it must be a websocket URL. A frame
+        that asked for a plaintext ``ws://`` endpoint would downgrade a
+        transport this client can otherwise keep encrypted.
+        """
+        payload = msg.get("payload")
+        session = payload.get("session") if isinstance(payload, dict) else None
+        url = session.get("reconnect_url") if isinstance(session, dict) else None
+        if not isinstance(url, str) or not url.startswith("wss://"):
+            return None
+        return url
 
     def _remember_id(self, message_id: str | None) -> bool:
         """True when the message id is new within the dedup window.
@@ -457,7 +491,9 @@ class EventSubClient:
             self._forget_id(msg)
 
     async def _handle_revocation(self, msg: dict[str, Any]) -> None:
-        sub = msg.get("payload", {}).get("subscription", {})
+        payload = msg.get("payload")
+        subscription = payload.get("subscription") if isinstance(payload, dict) else None
+        sub = subscription if isinstance(subscription, dict) else {}
         sub_id = sub.get("id")
         logger.warning("[eventsub] subscription revoked: %s (%s)", sub.get("type"), sub_id)
         target: tuple[str, str | None] | None = None

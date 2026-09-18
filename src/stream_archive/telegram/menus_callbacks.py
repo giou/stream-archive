@@ -38,6 +38,10 @@ class AdminCallbackQueryHandler(CallbackQueryHandler[Any, Any]):
             return None
         return super().check_update(update)
 
+    def rebind(self, admin_id: int) -> None:
+        """Follow a changed ``telegram_user_id`` after a config reload."""
+        self._admin_id = admin_id
+
 
 def confirm_keyboard(action: str, value: str) -> InlineKeyboardMarkup:
     """Build a confirm/cancel keyboard with a unique nonce per message."""

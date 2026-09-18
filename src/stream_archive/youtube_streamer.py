@@ -10,6 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 from stream_archive.config import AppConfig, channel_url, is_kick_channel
+from stream_archive.recorder.common import sanitize_metadata_text
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,8 @@ _API_BASE = "https://www.googleapis.com/youtube/v3"
 def build_video_description(author: str, channel: str, game: str) -> str:
     """Build the description text for a re-streamed Twitch or Kick broadcast."""
     platform = "Kick" if is_kick_channel(channel) else "Twitch"
+    author = sanitize_metadata_text(author)
+    game = sanitize_metadata_text(game)
     return (
         f"{platform} stream by {author}\n"
         f"Game: {game}\n"
@@ -36,6 +39,8 @@ class YouTubeStreamer:
         self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
         self._refresh_lock = asyncio.Lock()
+        #: Rollback tasks that outlived the await that started them.
+        self._rollback_tasks: set[asyncio.Task[None]] = set()
 
     async def _get_credentials(self, refresh: bool = False) -> Credentials:
         """Return usable credentials, or raise.
@@ -83,6 +88,24 @@ class YouTubeStreamer:
         with os.fdopen(os.open(self._token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             json.dump(data, f)
 
+    async def _rollback_create(self, stream_id: str | None, broadcast_id: str | None) -> None:
+        """Remove the live stream and broadcast a failed create left behind.
+
+        Both requests must run: an unused live stream keeps counting against
+        the concurrent-stream quota, and a broadcast that never went live can
+        only be deleted, not completed.
+        """
+        if stream_id is not None:
+            try:
+                await self._request("DELETE", "liveStreams", params={"id": stream_id})
+            except Exception as cleanup_err:
+                logger.error("[youtube] Failed to clean up stream %s: %s", stream_id, cleanup_err)
+        if broadcast_id is not None:
+            try:
+                await self._request("DELETE", "liveBroadcasts", params={"id": broadcast_id})
+            except Exception as cleanup_err:
+                logger.error("[youtube] Failed to clean up broadcast %s: %s", broadcast_id, cleanup_err)
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         creds = await self._get_credentials()
         headers = kwargs.pop("headers", {})
@@ -104,7 +127,10 @@ class YouTubeStreamer:
         return resp.json()
 
     async def create_stream(self, author: str, title: str, channel: str, game: str) -> dict[str, Any]:
-        raw_title = f"{author} - {title}"
+        # The author and the title come from the platform, and this title is
+        # published on the operator's public channel: canonicalize it to one
+        # line before the API's own limits apply.
+        raw_title = sanitize_metadata_text(f"{author} - {title}", limit=200)
         raw_title = raw_title.replace("<", "").replace(">", "")
         broadcast_title = raw_title[:100]
         if raw_title != broadcast_title:
@@ -163,21 +189,31 @@ class YouTubeStreamer:
             params = {"id": broadcast_id, "streamId": stream_id, "part": "id,snippet,status"}
             logger.info("[youtube] Binding broadcast %s to stream %s", broadcast_id, stream_id)
             await self._request("POST", "liveBroadcasts/bind", params=params)
-        except Exception:
-            if stream_id is not None:
-                try:
-                    # An unused live stream keeps counting against the
-                    # concurrent-stream quota, so remove it.
-                    await self._request("DELETE", "liveStreams", params={"id": stream_id})
-                except Exception as cleanup_err:
-                    logger.error("[youtube] Failed to clean up stream %s: %s", stream_id, cleanup_err)
-            if broadcast_id is not None:
-                try:
-                    # The broadcast never went live, so complete is not a
-                    # valid transition. Delete it instead.
-                    await self._request("DELETE", "liveBroadcasts", params={"id": broadcast_id})
-                except Exception as cleanup_err:
-                    logger.error("[youtube] Failed to clean up broadcast %s: %s", broadcast_id, cleanup_err)
+        except BaseException:
+            # BaseException, not Exception: the termination path cancels the
+            # recording task, and CancelledError is not an Exception. With
+            # ``except Exception`` a shutdown during the create left the
+            # broadcast and the live stream on the account, bound and neither
+            # ended nor deleted, because the caller never received their ids.
+            # The cleanup itself must survive the pending cancellation, so it
+            # runs shielded.
+            # The task is held in a set: the loop keeps only a weak reference,
+            # and shield drops its callback on the inner task once this await is
+            # cancelled, so without the reference a second cancellation or loop
+            # teardown could collect the rollback mid-flight and leave the
+            # broadcast and its bound live stream behind.
+            rollback = asyncio.ensure_future(self._rollback_create(stream_id, broadcast_id))
+            self._rollback_tasks.add(rollback)
+            rollback.add_done_callback(self._rollback_tasks.discard)
+            try:
+                await asyncio.shield(rollback)
+            except BaseException:  # a second cancellation: the task still runs
+                logger.error(
+                    "[youtube] Rollback of stream %s / broadcast %s was interrupted; "
+                    "it continues in the background, remove them manually if it also fails",
+                    stream_id,
+                    broadcast_id,
+                )
             raise
 
         return {
@@ -199,4 +235,8 @@ class YouTubeStreamer:
         await self._request("POST", "liveBroadcasts/transition", params=params)
 
     async def close(self) -> None:
+        # Let an in-flight rollback finish first: it is removing resources that
+        # would otherwise stay on the account with nothing tracking them.
+        if self._rollback_tasks:
+            await asyncio.gather(*self._rollback_tasks, return_exceptions=True)
         await self._client.aclose()

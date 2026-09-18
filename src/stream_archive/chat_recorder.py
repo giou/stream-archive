@@ -140,12 +140,33 @@ class ChatRecorder:
         return self._task
 
     async def stop(self) -> int:
-        """Cancel the run task, then finalize."""
+        """Cancel the run task, then finalize.
+
+        A cancellation must still close the writer: the caller releases the
+        file's protected paths once this method returns, and that file is the
+        only copy, so a writer left open here would let a deletion pass unlink
+        a file a live writer still holds.
+        """
         if self._task is not None:
             self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-        await self._finalize()
+            try:
+                await asyncio.gather(self._task, return_exceptions=True)
+            except asyncio.CancelledError:
+                # _finalize_now() writes synchronously, so a second
+                # cancellation cannot interrupt it.
+                self._finalize_now()
+                raise
+        self._finalize_now()
         return self._writer.comments
+
+    def discard(self) -> None:
+        """Close and remove the partial chat file, without a trailer.
+
+        For a start that failed: that capture kept no chat, so no final file is
+        written. Synchronous, so a failure handler cannot be interrupted
+        between closing the writer and releasing its paths.
+        """
+        self._writer.discard()
 
     async def _run(self) -> None:
         attempts = 0
@@ -295,8 +316,13 @@ class ChatRecorder:
             "message": message,
         }
 
-    async def _finalize(self) -> None:
-        """Write the trailer keys, then rename the file into place, exactly once."""
+    def _finalize_now(self) -> None:
+        """Write the trailer keys, then rename the file into place, exactly once.
+
+        Synchronous on purpose: it holds no await, so a caller that is already
+        being cancelled cannot be interrupted between the trailer write and the
+        rename.
+        """
         if self._finalized:
             return
         self._finalized = True

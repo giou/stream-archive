@@ -173,6 +173,10 @@ class KickAPI:
             self._public_key = data
         return self._public_key
 
+    def has_public_key(self) -> bool:
+        """True when a key is cached, so verification needs no outbound call."""
+        return bool(self._public_key)
+
     def clear_public_key_cache(self) -> None:
         self._public_key = None
 

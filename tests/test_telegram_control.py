@@ -6,10 +6,16 @@ import re
 import threading
 import types
 import unittest.mock
+from datetime import UTC, datetime
+
+from telegram import Chat, Message, Update
+from telegram import User as TelegramUser
+from telegram.ext import MessageHandler
 
 from stream_archive.config import get_config
 from stream_archive.telegram import TelegramController
 from stream_archive.telegram.dispatcher import _deferred_affected_channels
+from stream_archive.telegram.menus_callbacks import AdminCallbackQueryHandler
 from stream_archive.tunnels import tailscale_funnel_off
 
 
@@ -1970,7 +1976,10 @@ def test_cloudflared_quick_start_missing_binary(tmp_path, monkeypatch):
 def test_cloudflared_named_start_registered(tmp_path, monkeypatch):
     def fake_exec(*args, **kwargs):
         assert args[:4] == ("cloudflared", "tunnel", "--no-autoupdate", "run")
-        assert "--token" in args
+        # The install token is a credential: it goes in the child's
+        # environment, never on the world-readable command line.
+        assert "--token" not in args
+        assert kwargs["env"]["TUNNEL_TOKEN"] == "tok"
         return _CloudflaredFakeProc(
             lines=[
                 b"INF Registered tunnel connection connIndex=0\n",
@@ -3450,3 +3459,112 @@ def test_parse_public_hostname_rejects_malformed_input():
     assert parse_public_hostname("not a hostname") is None
     assert parse_public_hostname("https://kick.example.com/path") == "kick.example.com"
     assert parse_public_hostname("kick.example.com.") == "kick.example.com"
+
+
+def _admin_update(user_id, text="hi"):
+    """A real PTB update from one user, for the admin gate behaviour check."""
+    user = TelegramUser(id=user_id, first_name="admin", is_bot=False)
+    chat = Chat(id=user_id, type=Chat.PRIVATE)
+    message = Message(message_id=1, date=datetime.now(UTC), chat=chat, from_user=user, text=text)
+    return Update(update_id=1, message=message)
+
+
+def _registered_callback_handler(handlers):
+    """The callback handler the handler table actually returns."""
+    return next(h for h in handlers if isinstance(h, AdminCallbackQueryHandler))
+
+
+def test_reload_moves_the_admin_gate_to_the_new_identity(tmp_path):
+    """A reloaded telegram_user_id must replace the previous admin everywhere.
+
+    The handler filters, the callback gate and the controller's own admin id
+    are built once, so a removal or a handover used to leave the previous
+    identity authorized and the new one authorized nowhere.
+    """
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    handlers = ctrl.command_handlers()
+    old_admin, new_admin = 12345, 22222
+    assert ctrl._admin_filter.check_update(_admin_update(old_admin))
+    registered = _registered_callback_handler(handlers)
+    assert registered is ctrl._callback_handler, "the table must carry the handler the rebind reaches"
+    assert registered._admin_id == old_admin
+    text_handler = next(h for h in handlers if isinstance(h, MessageHandler))
+    assert text_handler.filters.check_update(_admin_update(old_admin, "menu"))
+
+    file_config = read_file(tmp_path)
+    file_config["telegram_user_id"] = new_admin
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+    asyncio.run(ctrl.handle_reload())
+
+    assert config.telegram_user_id == new_admin
+    assert ctrl._admin_id == new_admin
+    # The one filter object every handler shares now admits only the new id.
+    assert ctrl._admin_filter.check_update(_admin_update(new_admin))
+    assert not ctrl._admin_filter.check_update(_admin_update(old_admin))
+    # The gate the dispatcher runs is the one the reload re-pointed.
+    assert _registered_callback_handler(ctrl.command_handlers())._admin_id == new_admin
+    assert not text_handler.filters.check_update(_admin_update(old_admin, "menu"))
+    assert text_handler.filters.check_update(_admin_update(new_admin, "menu"))
+
+
+def test_reload_reports_the_keys_that_need_a_restart(tmp_path):
+    """A rotated bot token or client secret must not read as applied."""
+    _, ctrl, _, _, _ = make_controller(tmp_path)
+    file_config = read_file(tmp_path)
+    file_config["twitch_client_secret"] = "rotated"
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+
+    text = asyncio.run(ctrl.handle_reload())
+
+    assert text.startswith("\u26a0\ufe0f")
+    assert "twitch_client_secret" in text
+
+
+def test_reload_stops_a_channel_that_left_the_file(tmp_path):
+    """A hand edit plus /reload must release the channel it removed.
+
+    /remove stops the capture, drops the monitor's live state and deletes the
+    subscriptions. A reload bypassed all of it, and no later command could
+    stop the capture, because /remove refuses a channel that is not listed.
+    """
+    config, ctrl, recorder, monitor, eventsub = make_controller(
+        tmp_path, channels=["twitch:channel1", "twitch:channel2"], recording=["twitch:channel2"]
+    )
+    file_config = read_file(tmp_path)
+    file_config["channels"] = ["twitch:channel1"]
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+
+    text = asyncio.run(ctrl.handle_reload())
+
+    assert recorder.stop_calls == ["twitch:channel2"]
+    assert not recorder.is_recording("twitch:channel2")
+    assert "twitch:channel2" in monitor.remove_calls
+    assert "twitch:channel2" in eventsub.removed
+    assert "Recording stopped." in text
+
+
+def test_reload_reports_a_released_channel_even_when_applying_fails(tmp_path):
+    """A release that already happened must be reported, not swallowed.
+
+    The channel is gone from the file, so a retry cannot report it again: the
+    reply that carries the apply failure must still name it.
+    """
+    config, ctrl, recorder, monitor, eventsub = make_controller(
+        tmp_path, channels=["twitch:channel1", "twitch:channel2"], recording=["twitch:channel2"]
+    )
+    file_config = read_file(tmp_path)
+    file_config["channels"] = ["twitch:channel1"]
+    (tmp_path / "config.json").write_text(json.dumps(file_config, indent=4))
+
+    async def failing_apply_state():
+        msg = "listener rebind failed"
+        raise RuntimeError(msg)
+
+    ctrl._kick_webhook.apply_state = failing_apply_state
+
+    text = asyncio.run(ctrl.handle_reload())
+
+    assert text.startswith("\u26a0\ufe0f")
+    assert "listener rebind failed" in text
+    assert "twitch:channel2" in text
+    assert recorder.stop_calls == ["twitch:channel2"]

@@ -141,8 +141,13 @@ class DiskOutputMixin:
         A deletion pass must never unlink a file that a recording writes
         through an open handle. That covers the recording file, the chat
         file, and the in-progress chat `.tmp` file.
+
+        The chat paths come from the open-writer registry, not from the
+        recording entries: a capture detaches its entry before its finalizer
+        renames the file, and that window is exactly when the file has no
+        other copy.
         """
-        active: set[str] = set()
+        active: set[str] = set(getattr(self, "_chat_paths", ()))
         for e in self._recordings.values():
             filepath = e.get("filepath")
             if filepath:

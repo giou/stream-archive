@@ -110,10 +110,31 @@ class TelegramController(
             self._http = build_shared_client()
             self._owns_http = True
         self._admin_id = config.telegram_user_id
+        # One filter object gates every command handler, so a reload can
+        # re-point the whole gate at a changed telegram_user_id in place.
+        self._admin_filter = filters.User(user_id=self._admin_id)
         self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
         self._cloudflared = CloudflaredTunnel()
         self._restore_task = None
+        self._callback_handler: Any = None
+
+    def rebind_admin(self) -> None:
+        """Point every admin gate at the current config.
+
+        The handler filters and the callback gate are built once, from the
+        admin id the process started with. A config reload that changes
+        ``telegram_user_id`` must reach them here, or the previous identity
+        keeps every operation and the new one is authorized nowhere.
+        """
+        new_id = self._config.telegram_user_id
+        if new_id == self._admin_id:
+            return
+        logger.info("[telegram] Admin identity changed to %s", new_id)
+        self._admin_id = new_id
+        self._admin_filter.user_ids = frozenset({new_id})
+        if self._callback_handler is not None:
+            self._callback_handler.rebind(new_id)
 
     def command_handlers(self) -> list[Any]:
         """Handlers of the admin commands, the reply text, and the buttons.
@@ -122,7 +143,8 @@ class TelegramController(
         has a handler. Keep the order: a command handler comes before the
         text handler, and the text handler before the buttons.
         """
-        admin = filters.User(user_id=self._admin_id)
+        admin = self._admin_filter
+        self._callback_handler = callbacks.AdminCallbackQueryHandler(self._on_callback, admin_id=self._admin_id)
         return [
             CommandHandler("help", self._cmd_help, filters=admin),
             CommandHandler("status", self._cmd_status, filters=admin),
@@ -141,8 +163,8 @@ class TelegramController(
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
             CommandHandler("start", self._cmd_start, filters=admin),
-            MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(user_id=self._admin_id), self._on_text),
-            callbacks.AdminCallbackQueryHandler(self._on_callback, admin_id=self._admin_id),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & admin, self._on_text),
+            self._callback_handler,
         ]
 
     async def start(self) -> None:

@@ -1,6 +1,8 @@
 import json
 import os
+import stat
 
+from stream_archive import chat_writer as cw
 from stream_archive.chat_writer import ChatJsonWriter, file_info
 
 
@@ -172,3 +174,30 @@ def test_close_failure_keeps_tmp_and_no_target(tmp_path, monkeypatch):
     assert "rename failed" in str(errors[0])
     assert (tmp_path / "chat.json.tmp").exists()
     assert not (tmp_path / "chat.json").exists()
+
+
+def test_chat_file_is_created_private(tmp_path):
+    """Chat text can carry user data, so the file is not world readable.
+
+    The writer used open(), which applies the process umask (0644 in the
+    image), unlike config.json which is written 0600.
+    """
+    path = tmp_path / "chat" / "one.chat.json"
+    writer = ChatJsonWriter(str(path))
+    assert writer.add_comment({"body": "hello"}) is True
+    assert writer.close({"FileInfo": {}}) is True
+
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_write_reports_the_characters_it_wrote(tmp_path):
+    """The wrapper is file-like, so its count must match the handle's.
+
+    Returning the input length under-reported every line the indent prefixed.
+    """
+    path = tmp_path / "wrapped.json"
+    with open(path, "w", encoding="utf-8") as fh:
+        writer = cw._IndentingWriter(fh, "  ")
+        assert writer.write("a\nb") == 5  # "a" + newline + the 2-space indent + "b"
+        assert writer.write("") == 0
+    assert path.read_text(encoding="utf-8") == "a\n  b"

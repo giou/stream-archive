@@ -3,11 +3,12 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 from aiohttp import web
@@ -49,8 +50,25 @@ _MAX_RATE_LIMIT_IPS = 10_000
 # so normal traffic needs one key. The cap limits a flood that uses many
 # distinct addresses, which the table size alone does not.
 _MAX_NEW_RATE_LIMIT_IPS = 100
-# Cap on concurrent in-flight webhook requests. This blunts request floods.
+#: Result of one signature check. "unavailable" is not a verdict: the public
+#: key could not be fetched, so the sender must be asked to redeliver rather
+#: than told that its signature is bad.
+VerifyResult = Literal["ok", "bad", "unavailable"]
+
+# Cap on concurrent in-flight webhook dispatches. The permit is taken only
+# after the signature check, so an unauthenticated caller cannot occupy a
+# slot that a genuine delivery needs.
 _MAX_CONCURRENT = 16
+# Largest accepted event body. Kick events are small, and the cap is applied
+# before the signature check so an unauthenticated caller cannot make the
+# receiver buffer an arbitrary payload.
+_MAX_BODY_BYTES = 64 * 1024
+# Deadline for reading the body of one event. It bounds the work an
+# unverified request can hold open without occupying a dispatch permit.
+_BODY_READ_TIMEOUT_S = 5.0
+# Wait for a free dispatch permit before answering "busy". Short, because
+# Kick retries a refused delivery.
+_DISPATCH_WAIT_S = 0.1
 # Kick-side sync failures (5xx) alert only after they persist this long, so
 # a transient API outage does not page the admin. Other failures notify at
 # once.
@@ -119,16 +137,24 @@ class _RateLimiter:
 
 
 def _parse_timestamp(value: str) -> float | None:
-    """Kick sends ISO-8601. Epoch seconds are accepted too. None when unparseable."""
+    """Kick sends ISO-8601. Epoch seconds are accepted too. None when unparseable.
+
+    A non-finite value is rejected: ``float('nan')`` parses, and every
+    comparison against it is false, which would make the freshness check
+    pass instead of fail.
+    """
     value = value.strip()
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         pass
+    else:
+        return parsed if math.isfinite(parsed) else None
     try:
-        return float(value)
+        seconds = float(value)
     except ValueError:
         return None
+    return seconds if math.isfinite(seconds) else None
 
 
 class MonitorProtocol(Protocol):
@@ -150,6 +176,7 @@ class KickAPIProtocol(Protocol):
     """The Kick API calls that the receiver needs."""
 
     async def get_public_key(self, force: bool = False) -> str | None: ...
+    def has_public_key(self) -> bool: ...
     async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]: ...
     async def list_event_subscriptions(self) -> list[dict[str, Any]]: ...
     async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]: ...
@@ -191,6 +218,7 @@ class KickWebhook:
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
         self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
         self._next_key_refetch = 0.0  # monotonic time. Gates the rotation refetch.
+        self._next_key_fetch = 0.0  # monotonic time. Gates a repeat of a failed key fetch.
         self._app = web.Application()
         self._app.router.add_post("/kick/webhook", self._handle)
 
@@ -347,26 +375,55 @@ class KickWebhook:
         client = request.remote or "unknown"
         if not self._rate_limiter.allow(client):
             return web.Response(status=429, text="too many requests")
+        # Read the body and verify the signature before taking a dispatch
+        # permit. An unauthenticated caller must not be able to hold the
+        # shared budget that a genuine delivery needs: the read is bounded
+        # by size and by time here, and the per-address bucket above bounds
+        # the request rate.
+        if request.content_length is not None and request.content_length > _MAX_BODY_BYTES:
+            return web.Response(status=413, text="body too large")
+        chunks: list[bytes] = []
+        total = 0
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=0.1)
+            # ``content.read(n)`` returns as soon as any data is buffered, so
+            # drain the body to EOF: a delivery split across TCP segments is
+            # otherwise verified truncated, fails the signature check, and is
+            # answered 401, which a webhook sender treats as permanent. One
+            # deadline covers the whole read.
+            async with asyncio.timeout(_BODY_READ_TIMEOUT_S):
+                while total <= _MAX_BODY_BYTES:
+                    chunk = await request.content.read(_MAX_BODY_BYTES + 1 - total)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+        except TimeoutError:
+            return web.Response(status=413, text="body too slow")
+        if total > _MAX_BODY_BYTES:
+            return web.Response(status=413, text="body too large")
+        body = b"".join(chunks)
+        event_type = request.headers.get("Kick-Event-Type", "")
+        try:
+            verified = await self._verify(request, body)
+        except UnicodeDecodeError:
+            logger.warning("[kick_webhook] event body is not valid UTF-8")
+            return web.Response(status=400, text="bad encoding")
+        if verified == "unavailable":
+            # The public key could not be fetched, so this request cannot be
+            # judged either way. A retryable status makes Kick redeliver,
+            # instead of the permanent 401 that a signature failure earns.
+            logger.warning("[kick_webhook] public key unavailable, asking for a redelivery")
+            return web.Response(status=503, text="key unavailable", headers={"Retry-After": "5"})
+        if verified != "ok":
+            # Attackers control event_type, so log only known values.
+            known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
+            logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
+            return web.Response(status=401, text="unauthorized")
+        try:
+            await asyncio.wait_for(self._sem.acquire(), timeout=_DISPATCH_WAIT_S)
         except TimeoutError:
             return web.Response(status=503, text="busy", headers={"Retry-After": "1"})
         try:
-            try:
-                body = await asyncio.wait_for(request.read(), timeout=5)
-            except TimeoutError:
-                return web.Response(status=413, text="body too slow")
-            event_type = request.headers.get("Kick-Event-Type", "")
-            try:
-                verified = await self._verify(request, body)
-            except UnicodeDecodeError:
-                logger.warning("[kick_webhook] event body is not valid UTF-8")
-                return web.Response(status=400, text="bad encoding")
-            if not verified:
-                # Attackers control event_type, so log only known values.
-                known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
-                logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
-                return web.Response(status=401, text="unauthorized")
             msg_id = request.headers.get("Kick-Event-Message-Id")
             if not self._remember_id(msg_id):
                 logger.debug("[kick_webhook] duplicate event, ignoring")
@@ -420,31 +477,52 @@ class KickWebhook:
         seen[message_id] = now + _VERIFY_WINDOW_S
         return True
 
-    async def _verify(self, request: Any, body: bytes) -> bool:
+    async def _verify(self, request: Any, body: bytes) -> VerifyResult:
         message_id = request.headers.get("Kick-Event-Message-Id")
         timestamp = request.headers.get("Kick-Event-Message-Timestamp")
         signature_b64 = request.headers.get("Kick-Event-Signature")
         if not message_id or not timestamp or not signature_b64:
-            return False
+            return "bad"
         try:
             signature = base64.b64decode(signature_b64)
         except Exception:
-            return False
+            return "bad"
         event_time = _parse_timestamp(timestamp)
         if event_time is None or abs(time.time() - event_time) > _VERIFY_WINDOW_S:
             logger.warning("[kick_webhook] event timestamp outside freshness window")
-            return False
+            return "bad"
         # Strict decode: a non-UTF-8 body is corrupt, not a rotation. It
         # raises UnicodeDecodeError, and the caller answers 400.
         body_text = body.decode("utf-8", errors="strict")
+        message = f"{message_id}.{timestamp}.{body_text}".encode()
+        # A warm cache verifies without any outbound call. A cold cache needs
+        # one, and the window for it is claimed before the await: otherwise a
+        # concurrent burst would all pass the check and each issue a call,
+        # spending the Kick rate limit one request at a time.
+        if not self._api.has_public_key():
+            now = time.monotonic()
+            if now < self._next_key_fetch:
+                return "unavailable"
+            self._next_key_fetch = now + _KEY_REFETCH_INTERVAL_S
         try:
-            message = f"{message_id}.{timestamp}.{body_text}".encode()
             public_key = await self._api.get_public_key()
+        except Exception:
+            # The window stays claimed, so the failure is not repeated for
+            # every request for the rest of the interval.
+            return "unavailable"
+        if not public_key:
+            # A 200 without a key leaves the cache cold, so this delivery
+            # cannot be judged either: ask for a redelivery instead of
+            # telling the sender that its signature is bad.
+            return "unavailable"
+        # A key is cached now, so the cold-start window is no longer needed.
+        self._next_key_fetch = 0.0
+        try:
             self._verify_signature(public_key, message, signature)
         except Exception:
             pass
         else:
-            return True
+            return "ok"
         # The failure can mean that Kick rotated the key. Refetch
         # (rate-limited) and retry once. The refetch bypasses the cache
         # (force), so the code detects rotation reliably. Meanwhile, a flood
@@ -452,15 +530,26 @@ class KickWebhook:
         # outbound calls. The code attempts only one refetch per interval.
         now = time.monotonic()
         if now < self._next_key_refetch:
-            return False
+            # The refetch is already rate-limited; this delivery still cannot
+            # be judged, so it stays retryable rather than permanent.
+            return "unavailable"
         self._next_key_refetch = now + _KEY_REFETCH_INTERVAL_S
         try:
             public_key = await self._api.get_public_key(force=True)
+        except Exception:
+            # The refetch is a fetch: its failure is not a verdict on the
+            # signature, so the sender must redeliver rather than treat a
+            # genuine event as forged.
+            return "unavailable"
+        if not public_key:
+            return "unavailable"
+        try:
             self._verify_signature(public_key, message, signature)
         except Exception:
-            return False
-        else:
-            return True
+            # The key was fetched and the signature still does not match, so
+            # this delivery is not authentic.
+            return "bad"
+        return "ok"
 
     def _verify_signature(self, public_key_pem: Any, message: bytes, signature: bytes) -> None:
         key = serialization.load_pem_public_key(
@@ -486,7 +575,16 @@ class KickWebhook:
         if channel not in self._config.channels:
             logger.debug("[kick_webhook] livestream event for unmonitored channel %s, ignoring", channel)
             return
-        if event.get("is_live"):
+        # The operation is chosen from the Kick-Event-Type header, which the
+        # signature does not cover (it signs message-id, timestamp and body).
+        # So the signed body has to confirm the action instead of merely
+        # failing to contradict it: a body without a boolean state field is
+        # not a livestream event and must never read as "stream ended".
+        is_live = event.get("is_live")
+        if not isinstance(is_live, bool):
+            logger.warning("[kick_webhook] livestream event without a boolean is_live, ignoring")
+            return
+        if is_live:
             # title/game are None on purpose: the recorder fills them from the
             # streamlink kick plugin's metadata (no extra API call on the hot path).
             await self._monitor.handle_online(channel, None, None, None, self._config)
@@ -506,6 +604,12 @@ class KickWebhook:
         channel = f"{KICK_PREFIX}{slug}"
         if channel not in self._config.channels:
             logger.debug("[kick_webhook] chat event for unmonitored channel %s, ignoring", channel)
+            return
+        # Same binding as above, in the other direction: a chat event must
+        # carry the chat fields, so a message-shaped body cannot be written
+        # into the archive under a different event type.
+        if not isinstance(event.get("message_id"), str) or not isinstance(event.get("content"), str):
+            logger.warning("[kick_webhook] chat event without a message_id and content, ignoring")
             return
         sender = event.get("sender") or {}
         identity = sender.get("identity") or {}

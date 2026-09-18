@@ -33,7 +33,7 @@ untouched.
 | `/remove <channel>` | Stop monitoring a channel. A live recording stops (the offline notification goes out) and the app deletes the webhook and EventSub subscriptions of the channel |
 | `/retention <days>` | Set `retention_days`. `0` disables cleanup |
 | `/mode [channel] <disk\|youtube\|both\|default>` | Set `output_mode`, or a per-channel override. `default` clears the override. Applies to new recordings |
-| `/reload` | Re-read `config.json` from disk, then re-apply the endpoint and API state and re-sync the webhook and EventSub subscriptions |
+| `/reload` | Re-read `config.json` from disk, then re-apply the endpoint and API state, release the channels the file no longer monitors, and re-sync the webhook and EventSub subscriptions. A changed `telegram_user_id` takes effect at once. Keys an object built at start owns (`bot_telegram_api`, the Twitch and Kick client credentials, `youtube.privacy_status`) need a restart, and the reply names them |
 | `/restart` | Gracefully restart the app |
 | `/update` | Check for a new app release now. Check-only: the app downloads and applies nothing. Apply an update with `docker compose pull && docker compose up -d` |
 | `/quality [channel] <value\|default>` | Show the preferred quality, or set it globally or for one channel (`best`, `1080p`, `720p`, …, `audio_only`). `default` clears the per-channel override |
@@ -72,7 +72,11 @@ untouched.
   affects new recordings only. A platform toggle (`/chat off twitch`) affects
   only that platform, and the other platform keeps running.
 - `/retention` and `/reload` apply immediately. The cleanup loop and the
-  monitor read the live settings every cycle.
+  monitor read the live settings every cycle. A `/reload` also stops the
+  recording, the chat capture and the re-stream of a channel that leaves
+  `channels` in the file, and moves the admin gate to a changed
+  `telegram_user_id`. It reports any key that only takes effect after a
+  restart.
 - `/restart` replies first, then triggers the scheduler shutdown. The compose
   policy `restart: unless-stopped` relaunches the container.
 - Secrets (bot token, Twitch credentials, proxy credentials, Kick credentials,
