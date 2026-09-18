@@ -8,7 +8,6 @@ from stream_archive.config import (
     OutputMode,
     effective_quality,
     is_kick_channel,
-    normalize_channel_name,
     reload_config,
 )
 from stream_archive.telegram.menu_state import AudioSwitch, PendingKey, is_error
@@ -61,14 +60,6 @@ def _dotted(data: dict[str, Any], key: str) -> Any:
     return node
 
 
-def _not_monitored(channel: str) -> str:
-    """Reply for a per-channel setting of a channel that is not monitored.
-
-    A typo would otherwise store an override that can never take effect.
-    """
-    return f"\u274c {channel} is not in the monitored list (add it with /add first)"
-
-
 class SettingsCommands:
     _config: AppConfig
     _apply: Any
@@ -79,6 +70,7 @@ class SettingsCommands:
     #: Provided by the other mixins of the controller that composes this one.
     rebind_admin: Any
     reconcile_removed_channels: Any
+    _resolve_channel_arg: Callable[..., tuple[str, str] | tuple[None, str]]
     # Maps a (chat id, nonce) pair to its quality mutation and the affected channels.
     # The admin must confirm before the change applies.
     _pending_audio_switch: dict[PendingKey, AudioSwitch]
@@ -108,13 +100,10 @@ class SettingsCommands:
             return cast(str, self._apply(mutate, lambda c: f"Output mode set to {m}", chat_id))
 
         if len(args) == 2:
-            ch, m = args[0], args[1].lower()
-            normalized = normalize_channel_name(ch)
-            if normalized is None:
-                return f"\u274c Invalid channel name: {ch!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
-            ch = normalized
-            if ch not in self._config.channels:
-                return _not_monitored(ch)
+            ch, err = self._resolve_channel_arg(args[0])
+            if ch is None:
+                return err
+            m = args[1].lower()
             if m == "default":
 
                 def mutate(candidate: AppConfig) -> None:
@@ -135,11 +124,9 @@ class SettingsCommands:
     def handle_channel_hold(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 2:
             return "Usage: /channelhold <channel> <seconds|default>"
-        ch = normalize_channel_name(args[0])
+        ch, err = self._resolve_channel_arg(args[0])
         if ch is None:
-            return f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
-        if ch not in self._config.channels:
-            return _not_monitored(ch)
+            return err
         if args[1] == "default":
 
             def mutate(candidate: AppConfig) -> None:
@@ -200,6 +187,20 @@ class SettingsCommands:
         self._prune_pending(self._pending_audio_switch, chat)
         return f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(conflicts)}"
 
+    def _apply_quality(self, mutate: Callable[[AppConfig], Any], ok_text: str, chat_id: int | None) -> str:
+        """Save one quality change, or hold it for a confirm when it conflicts.
+
+        A change to audio_only can force a recording onto disk, and that
+        switch needs the confirm of the admin.
+        """
+        conflicts, err = self._probe_quality_change(mutate)
+        if err is not None:
+            return f"\u274c {err}"
+        gated = self._gate_quality(mutate, conflicts, chat_id)
+        if gated is not None:
+            return gated
+        return cast(str, self._apply(mutate, lambda _candidate: ok_text, chat_id))
+
     def handle_quality(self, args: list[str], chat_id: int | None = None) -> str:
         c = self._config
         if not args:
@@ -215,22 +216,12 @@ class SettingsCommands:
             def mutate(candidate: AppConfig) -> None:
                 candidate.preferred_quality = q
 
-            conflicts, err = self._probe_quality_change(mutate)
-            if err is not None:
-                return f"\u274c {err}"
-            gated = self._gate_quality(mutate, conflicts, chat_id)
-            if gated is not None:
-                return gated
-            return cast(str, self._apply(mutate, lambda candidate: f"Quality set to {q}", chat_id))
+            return self._apply_quality(mutate, f"Quality set to {q}", chat_id)
         if len(args) == 2:
-            normalized = normalize_channel_name(args[0])
-            if normalized is None:
-                return (
-                    f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
-                )
-            ch, q = normalized, args[1].lower()
-            if ch not in self._config.channels:
-                return _not_monitored(ch)
+            ch, err = self._resolve_channel_arg(args[0])
+            if ch is None:
+                return err
+            q = args[1].lower()
             if q == "default":
 
                 def mutate(candidate: AppConfig) -> None:
@@ -238,68 +229,49 @@ class SettingsCommands:
 
                 # Resetting to global can create a conflict when the global
                 # quality is audio_only, so this path runs through the same gate.
-                conflicts, err = self._probe_quality_change(mutate)
-                if err is not None:
-                    return f"\u274c {err}"
-                gated = self._gate_quality(mutate, conflicts, chat_id)
-                if gated is not None:
-                    return gated
-                return cast(
-                    str,
-                    self._apply(
-                        mutate,
-                        lambda candidate: f"Quality for {ch} reset to global ({candidate.preferred_quality})",
-                        chat_id,
-                    ),
-                )
+                return self._apply_quality(mutate, f"Quality for {ch} reset to global ({c.preferred_quality})", chat_id)
 
             def mutate(candidate: AppConfig) -> None:
                 candidate.channel_preferred_qualities[ch] = q
 
-            conflicts, err = self._probe_quality_change(mutate)
-            if err is not None:
-                return f"\u274c {err}"
-            gated = self._gate_quality(mutate, conflicts, chat_id)
-            if gated is not None:
-                return gated
-            return cast(str, self._apply(mutate, lambda candidate: f"Quality for {ch} set to {q}", chat_id))
+            return self._apply_quality(mutate, f"Quality for {ch} set to {q}", chat_id)
         return "Usage: /quality <best|1080p|720p|...> or /quality <channel> <quality|default>"
 
-    def handle_maxrecordings(self, args: list[str], chat_id: int | None = None) -> str:
+    def _set_count(self, field: str, label: str, usage: str, args: list[str], chat_id: int | None) -> str:
+        """Show or set one concurrency count of the config.
+
+        The error reply uses ``label`` with a lower-case first letter.
+        """
         if not args:
-            return f"Max recordings: {self._config.max_concurrent_recordings} (0 = unlimited)"
-        if len(args) == 1:
-            try:
-                n = int(args[0])
-            except ValueError:
-                return "\u274c max recordings must be an integer"
-            return cast(
-                str,
-                self._apply(
-                    lambda candidate: setattr(candidate, "max_concurrent_recordings", n),
-                    lambda candidate: f"Max recordings set to {n}",
-                    chat_id,
-                ),
-            )
-        return "Usage: /maxrecordings <n> (0 = unlimited)"
+            return f"{label}: {getattr(self._config, field)} (0 = unlimited)"
+        if len(args) != 1:
+            return usage
+        try:
+            n = int(args[0])
+        except ValueError:
+            return f"\u274c {label[:1].lower()}{label[1:]} must be an integer"
+        return cast(
+            str,
+            self._apply(
+                lambda candidate: setattr(candidate, field, n),
+                lambda candidate: f"{label} set to {n}",
+                chat_id,
+            ),
+        )
+
+    def handle_maxrecordings(self, args: list[str], chat_id: int | None = None) -> str:
+        return self._set_count(
+            "max_concurrent_recordings", "Max recordings", "Usage: /maxrecordings <n> (0 = unlimited)", args, chat_id
+        )
 
     def handle_maxyoutube(self, args: list[str], chat_id: int | None = None) -> str:
-        if not args:
-            return f"Max YouTube re-streams: {self._config.max_concurrent_youtube_streams} (0 = unlimited)"
-        if len(args) == 1:
-            try:
-                n = int(args[0])
-            except ValueError:
-                return "\u274c max YouTube re-streams must be an integer"
-            return cast(
-                str,
-                self._apply(
-                    lambda candidate: setattr(candidate, "max_concurrent_youtube_streams", n),
-                    lambda candidate: f"Max YouTube re-streams set to {n}",
-                    chat_id,
-                ),
-            )
-        return "Usage: /maxyoutube <n> (0 = unlimited)"
+        return self._set_count(
+            "max_concurrent_youtube_streams",
+            "Max YouTube re-streams",
+            "Usage: /maxyoutube <n> (0 = unlimited)",
+            args,
+            chat_id,
+        )
 
     def handle_disk(self, args: list[str], chat_id: int | None = None) -> str:
         c = self._config

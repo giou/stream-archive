@@ -7,7 +7,15 @@ reads and writes go through that chat's ``MenuState`` only.
 from typing import TYPE_CHECKING
 
 from stream_archive.telegram.commands_settings import HOLD_CHOICES, MODE_CHOICES, QUALITY_CHOICES
-from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult, MenuState, is_error
+from stream_archive.telegram.menu_state import (
+    CHANNEL_BUTTON_PREFIX,
+    ChatId,
+    MenuResult,
+    MenuState,
+    is_error,
+    open_menu,
+    pick_preset,
+)
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -28,6 +36,7 @@ def _channel_gone(ctrl: TelegramController, state: MenuState) -> str | None:
 
 async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route a press on the root menu."""
+
     state = ctrl._state_for(chat_id)
     new_menu = {
         "Channels": "channels",
@@ -39,8 +48,7 @@ async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
     }.get(text)
     if new_menu is None:
         return None
-    state.menu = new_menu
-    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu, chat_id=chat_id)
+    return await open_menu(ctrl, new_menu, chat_id, state=state)
 
 
 async def menu_channels(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -76,6 +84,7 @@ async def menu_add_channel(ctrl: TelegramController, chat_id: ChatId, text: str)
 
 async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route a press on one channel's menu."""
+
     state = ctrl._state_for(chat_id)
     ch = state.channel or ""
     gone = _channel_gone(ctrl, state)
@@ -88,39 +97,33 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
             ctrl._confirm_keyboard("confirm_remove", ch),
         )
     if text == "Mode":
-        state.menu = "channel_mode"
-        return await ctrl.menu_text("channel_mode", ch, chat_id=chat_id), ctrl.reply_keyboard(
-            "channel_mode", chat_id=chat_id
-        )
+        return await open_menu(ctrl, "channel_mode", chat_id, channel=ch, state=state)
     if text == "Hold delay":
-        state.menu = "channel_hold"
-        return await ctrl.menu_text("channel_hold", ch, chat_id=chat_id), ctrl.reply_keyboard(
-            "channel_hold", chat_id=chat_id
-        )
+        return await open_menu(ctrl, "channel_hold", chat_id, channel=ch, state=state)
     if text == "Quality":
-        state.menu = "channel_quality"
-        return await ctrl.menu_text("channel_quality", ch, chat_id=chat_id), ctrl.reply_keyboard(
-            "channel_quality", chat_id=chat_id
-        )
+        return await open_menu(ctrl, "channel_quality", chat_id, channel=ch, state=state)
     return None
 
 
 async def menu_channel_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route an output-mode preset or the global value for one channel."""
+
     state = ctrl._state_for(chat_id)
     ch = state.channel or ""
     gone = _channel_gone(ctrl, state)
     if gone is not None:
         state.menu, state.channel = "channels", None
         return gone, ctrl.reply_keyboard("channels", chat_id=chat_id)
-    if text == "Global":
-        result = ctrl.handle_mode([ch, "default"], chat_id=chat_id)
-    elif text in MODE_CHOICES:
-        result = ctrl.handle_mode([ch, MODE_CHOICES[text]], chat_id=chat_id)
-    else:
-        return None
-    state.menu = "channel"
-    return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
+    return await pick_preset(
+        ctrl,
+        state,
+        text,
+        MODE_CHOICES,
+        lambda value: ctrl.handle_mode([ch, value], chat_id=chat_id),
+        "channel",
+        chat_id,
+        global_value="default",
+    )
 
 
 async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -147,17 +150,20 @@ async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str
 
 async def menu_channel_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route a quality preset or the global value for one channel."""
+
     state = ctrl._state_for(chat_id)
     ch = state.channel or ""
     gone = _channel_gone(ctrl, state)
     if gone is not None:
         state.menu, state.channel = "channels", None
         return gone, ctrl.reply_keyboard("channels", chat_id=chat_id)
-    if text == "Global":
-        result = ctrl.handle_quality([ch, "default"], chat_id=chat_id)
-    elif text in QUALITY_CHOICES:
-        result = ctrl.handle_quality([ch, QUALITY_CHOICES[text]], chat_id=chat_id)
-    else:
-        return None
-    state.menu = "channel"
-    return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
+    return await pick_preset(
+        ctrl,
+        state,
+        text,
+        QUALITY_CHOICES,
+        lambda value: ctrl.handle_quality([ch, value], chat_id=chat_id),
+        "channel",
+        chat_id,
+        global_value="default",
+    )

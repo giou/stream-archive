@@ -3,28 +3,16 @@ import json
 import logging
 
 import httpx
+from conftest import make_config as _make_config
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
 
-from stream_archive.config import AppConfig
 from stream_archive.eventsub import EventSubClient
 
 
 def make_config(**overrides):
-    data = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["ch"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-    }
-    data.update(overrides)
-    return AppConfig.model_validate(data)
+    """A valid config with empty Kick credentials: EventSub is Twitch-only."""
+    return _make_config(kick={"client_id": "", "client_secret": ""}, **overrides)
 
 
 class FakeTwitchAPI:

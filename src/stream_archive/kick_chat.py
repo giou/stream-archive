@@ -51,8 +51,8 @@ def parse_time(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError, AttributeError:
+        return datetime.fromisoformat(value)
+    except TypeError, ValueError:
         return None
 
 

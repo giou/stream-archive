@@ -1,9 +1,9 @@
 """Reply-keyboard tables and routing for the Telegram bot.
 
-``MENU`` maps each menu name to its render pair ``(text_fn, keyboard_fn)``.
-``HANDLERS`` maps each menu name to the function that routes one press.
-``dispatch_text`` is the only entry: Back handling plus a table lookup.
-The dispatcher keeps no menu branches of its own.
+``TEXT`` maps each menu name to its body-text function. ``HANDLERS`` maps
+each menu name to the function that routes one press. ``dispatch_text`` is
+the only entry: Back handling plus a table lookup. The dispatcher keeps no
+menu branches of its own.
 """
 
 from __future__ import annotations
@@ -30,12 +30,6 @@ from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, Me
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
-
-#: Render pair for one menu: body text plus keyboard.
-MenuDef = tuple[
-    "Callable[[TelegramController, MenuState], Awaitable[str]]",
-    "Callable[[TelegramController, MenuState], ReplyKeyboardMarkup]",
-]
 
 
 def _frame(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -85,10 +79,6 @@ def _custom_mark(choices: dict[str, str], current: str | None) -> str:
 # Keyboards that do not read config state.
 _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
     "root": [["Channels", "Output mode"], ["Quality", "Chat recording"], ["Storage & limits", "Remote access"]],
-    "add_channel": [["Back"]],
-    "custom": [["Back"]],
-    "kick_cloudflare_token": [["Back"]],
-    "kick_cloudflare_hostname": [["Back"]],
     "kick_cloudflare_dns": [["Skip DNS"], ["Back"]],
 }
 
@@ -422,46 +412,33 @@ async def _text_custom(ctrl: TelegramController, state: MenuState) -> str:
     return f"{label}. Send the new value{units}:"
 
 
-def _keys_for(menu: str) -> Callable[[TelegramController, MenuState], ReplyKeyboardMarkup]:
-    """Build the keyboard function for ``menu``."""
-
-    def build(ctrl: TelegramController, state: MenuState) -> ReplyKeyboardMarkup:
-        return _keyboard(ctrl, state, menu)
-
-    build.__name__ = f"keys_{menu}"
-    return build
-
-
-def _pair(menu: str, text_fn: Callable[[TelegramController, MenuState], Awaitable[str]]) -> MenuDef:
-    return (text_fn, _keys_for(menu))
-
-
-MENU: dict[str, MenuDef] = {
-    "root": _pair("root", _text_root),
-    "channels": _pair("channels", _text_channels),
-    "add_channel": _pair("add_channel", _text_add_channel),
-    "channel": _pair("channel", _text_channel),
-    "channel_mode": _pair("channel_mode", _text_channel_mode),
-    "channel_hold": _pair("channel_hold", _text_channel_hold),
-    "channel_quality": _pair("channel_quality", _text_channel_quality),
-    "chat": _pair("chat", _text_chat),
-    "mode": _pair("mode", _text_mode),
-    "quality": _pair("quality", _text_quality),
-    "retention": _pair("retention", _text_retention),
-    "maxrec": _pair("maxrec", _text_maxrec),
-    "maxyt": _pair("maxyt", _text_maxyt),
-    "disk": _pair("disk", _text_disk),
-    "disk_maxsize": _pair("disk_maxsize", _text_disk_maxsize),
-    "custom": _pair("custom", _text_custom),
-    "storage": _pair("storage", _text_storage),
-    "remote_access": _pair("remote_access", _text_remote_access),
-    "api": _pair("api", _text_api),
-    "kick_webhook": _pair("kick_webhook", _text_kick_webhook),
-    "kick_cloudflare": _pair("kick_cloudflare", _text_kick_cloudflare),
-    "kick_tailscale": _pair("kick_tailscale", _text_kick_tailscale),
-    "kick_cloudflare_token": _pair("kick_cloudflare_token", _text_kick_cloudflare_token),
-    "kick_cloudflare_hostname": _pair("kick_cloudflare_hostname", _text_kick_cloudflare_hostname),
-    "kick_cloudflare_dns": _pair("kick_cloudflare_dns", _text_kick_cloudflare_dns),
+#: Body text of each menu.
+TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
+    "root": _text_root,
+    "channels": _text_channels,
+    "add_channel": _text_add_channel,
+    "channel": _text_channel,
+    "channel_mode": _text_channel_mode,
+    "channel_hold": _text_channel_hold,
+    "channel_quality": _text_channel_quality,
+    "chat": _text_chat,
+    "mode": _text_mode,
+    "quality": _text_quality,
+    "retention": _text_retention,
+    "maxrec": _text_maxrec,
+    "maxyt": _text_maxyt,
+    "disk": _text_disk,
+    "disk_maxsize": _text_disk_maxsize,
+    "custom": _text_custom,
+    "storage": _text_storage,
+    "remote_access": _text_remote_access,
+    "api": _text_api,
+    "kick_webhook": _text_kick_webhook,
+    "kick_cloudflare": _text_kick_cloudflare,
+    "kick_tailscale": _text_kick_tailscale,
+    "kick_cloudflare_token": _text_kick_cloudflare_token,
+    "kick_cloudflare_hostname": _text_kick_cloudflare_hostname,
+    "kick_cloudflare_dns": _text_kick_cloudflare_dns,
 }
 
 HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuResult]]] = {
@@ -572,21 +549,17 @@ async def dispatch_text(ctrl: TelegramController, chat_id: ChatId, text: str) ->
 async def render_text(
     ctrl: TelegramController, menu: str, channel: str | None = None, custom: str | None = None
 ) -> str:
-    """Render the body text for ``menu`` through the MENU table."""
-    entry = MENU.get(menu)
-    if entry is None:
+    """Render the body text for ``menu`` through the TEXT table."""
+    text_fn = TEXT.get(menu)
+    if text_fn is None:
         text: str = await ctrl.handle_status()
         return text
-    text_fn, _ = entry
     state = MenuState(menu=menu, channel=channel, custom=custom)
     return await text_fn(ctrl, state)
 
 
 def render_keyboard(ctrl: TelegramController, menu: str, channel: str | None = None) -> ReplyKeyboardMarkup:
-    """Build the keyboard for ``menu`` through the MENU table."""
-    entry = MENU.get(menu)
-    if entry is None:
+    """Build the keyboard for ``menu``. An unknown menu gets the Back button."""
+    if menu not in TEXT:
         return _frame([["Back"]])
-    _, keyboard_fn = entry
-    state = MenuState(menu=menu, channel=channel)
-    return keyboard_fn(ctrl, state)
+    return _keyboard(ctrl, MenuState(menu=menu, channel=channel), menu)

@@ -38,17 +38,15 @@ def channel_recording_dir(config: AppConfig, channel_dir: str) -> Path:
     return resolve_recording_dir(config) / channel_dir
 
 
-_RECORDING_PATTERNS = ("*.mp4", "*.mkv", "*.ts", "*.m4a")
+#: File suffixes of the recording artifacts: video captures, then audio-only.
+_RECORDING_SUFFIXES = (".mp4", ".mkv", ".ts", ".m4a")
 
 #: Chat files, plus the in-progress `.tmp` files of the streaming writer.
-_CHAT_PATTERNS = ("*.chat.json", "*.chat.json.tmp")
-
-#: File suffixes of the pattern tuples above, for the single-pass scans.
-_RECORDING_SUFFIXES = tuple(pattern[1:] for pattern in _RECORDING_PATTERNS)
-_CHAT_SUFFIXES = tuple(pattern[1:] for pattern in _CHAT_PATTERNS)
+_CHAT_SUFFIXES = (".chat.json", ".chat.json.tmp")
 
 #: Bounds for the snapshot cache lifetime. The lifetime follows the cap-check
-#: interval, so the cache never ages past the refresh of its callers.
+#: interval, so the cache never ages past the refresh of its callers, and a
+#: sub-second interval still coalesces the starts of one sweep.
 _SNAPSHOT_MIN_TTL_S = 1.0
 _SNAPSHOT_MAX_TTL_S = 60.0
 

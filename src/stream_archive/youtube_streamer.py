@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from datetime import UTC
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -15,7 +16,16 @@ from stream_archive.recorder.common import sanitize_metadata_text
 logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
+#: Name of the OAuth token file inside the working directory.
+TOKEN_NAME = "youtube_token.json"
 _API_BASE = "https://www.googleapis.com/youtube/v3"
+
+
+def save_token(credentials: Credentials, path: Path) -> None:
+    """Write credentials as a JSON token file with mode 0600."""
+    data = json.loads(credentials.to_json())  # type: ignore[no-untyped-call]
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(data, f)
 
 
 def build_video_description(author: str, channel: str, game: str) -> str:
@@ -35,7 +45,7 @@ class YouTubeStreamer:
     def __init__(self, config: AppConfig):
         yt = config.youtube
         self._privacy_status = yt.privacy_status
-        self._token_path = config.workdir / "youtube_token.json"
+        self._token_path = config.workdir / TOKEN_NAME
         self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
         self._refresh_lock = asyncio.Lock()
@@ -74,19 +84,15 @@ class YouTubeStreamer:
                 if (refresh or creds.expired) and creds.refresh_token:
                     await asyncio.to_thread(creds.refresh, Request())
                     self._save_token()
-                elif not refresh or not creds.refresh_token:
+                else:
                     msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
                     raise RuntimeError(msg)
 
             return self._credentials
 
     def _save_token(self) -> None:
-        credentials = self._credentials
-        if credentials is None:
-            return
-        data = json.loads(credentials.to_json())  # type: ignore[no-untyped-call]
-        with os.fdopen(os.open(self._token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-            json.dump(data, f)
+        if self._credentials is not None:
+            save_token(self._credentials, self._token_path)
 
     async def _rollback_create(self, stream_id: str | None, broadcast_id: str | None) -> None:
         """Remove the live stream and broadcast a failed create left behind.

@@ -1,18 +1,21 @@
 """Per-chat Telegram menu state shared by the dispatcher and menu modules.
 
-The bot used to keep one global menu (``_menu``/``_menu_channel``/``_custom_setting``),
-so two chats could never hold different menus. State now lives in small
-``MenuState`` records keyed by chat id. Confirm guards use ``(chat_id, nonce)``
-keys, so one chat can never confirm another chat's prompt.
+The bot used to keep one global menu, so two chats could never hold
+different menus. State now lives in small ``MenuState`` records keyed by
+chat id. Confirm guards use ``(chat_id, nonce)`` keys, so one chat can
+never confirm another chat's prompt.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from telegram import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
 from stream_archive.config import AppConfig
+
+if TYPE_CHECKING:
+    from stream_archive.telegram.dispatcher import TelegramController
 
 #: Chat id of the Telegram conversation a menu belongs to.
 ChatId = int
@@ -62,12 +65,59 @@ class MenuState:
     cloudflare_hostname: str | None = None
 
 
+async def open_menu(
+    ctrl: TelegramController,
+    menu: str,
+    chat_id: ChatId,
+    *,
+    channel: str | None = None,
+    state: MenuState | None = None,
+) -> MenuResult:
+    """Open ``menu`` for one chat and answer with its text and keyboard.
+
+    Pass ``state`` to move that chat into the menu. Without ``channel``
+    the keyboard and the text fall back to the channel of the chat state.
+    """
+    if state is not None:
+        state.menu = menu
+    return await ctrl.menu_text(menu, channel, chat_id=chat_id), ctrl.reply_keyboard(menu, chat_id=chat_id)
+
+
+async def pick_preset(
+    ctrl: TelegramController,
+    state: MenuState,
+    text: str,
+    choices: dict[str, str],
+    apply: Callable[[str], str],
+    back: str,
+    chat_id: ChatId,
+    *,
+    global_value: str | None = None,
+) -> MenuResult:
+    """Apply the preset that one pressed label names, then open ``back``.
+
+    ``global_value`` is the config value of the "Global" button. A menu
+    without that button passes none, so a "Global" press is not handled.
+    """
+    if text == "Global":
+        if global_value is None:
+            return None
+        value = global_value
+    elif text in choices:
+        value = choices[text]
+    else:
+        return None
+    result = apply(value)
+    state.menu = back
+    return result, ctrl.reply_keyboard(back, chat_id=chat_id)
+
+
 class ChatStateMixin:
     """Per-chat menu storage for the controller.
 
     Owns the ``_states`` map, the confirm guards, and chat resolution.
-    The ``_menu``-family properties are single-chat views of the admin
-    menu for old callers; new code uses ``_state_for(chat_id)``.
+    Every caller reads and writes the menu of a chat through
+    ``_state_for(chat_id)``.
     """
 
     _admin_id: int
@@ -145,35 +195,3 @@ class ChatStateMixin:
         state.custom = None
         state.cloudflare_hostname = None
         return state
-
-    @property
-    def _menu(self) -> str:
-        return self._state_for(self._admin_id).menu
-
-    @_menu.setter
-    def _menu(self, value: str) -> None:
-        self._state_for(self._admin_id).menu = value
-
-    @property
-    def _menu_channel(self) -> str | None:
-        return self._state_for(self._admin_id).channel
-
-    @_menu_channel.setter
-    def _menu_channel(self, value: str | None) -> None:
-        self._state_for(self._admin_id).channel = value
-
-    @property
-    def _custom_setting(self) -> str | None:
-        return self._state_for(self._admin_id).custom
-
-    @_custom_setting.setter
-    def _custom_setting(self, value: str | None) -> None:
-        self._state_for(self._admin_id).custom = value
-
-    @property
-    def _cloudflare_hostname(self) -> str | None:
-        return self._state_for(self._admin_id).cloudflare_hostname
-
-    @_cloudflare_hostname.setter
-    def _cloudflare_hostname(self, value: str | None) -> None:
-        self._state_for(self._admin_id).cloudflare_hostname = value

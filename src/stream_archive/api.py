@@ -21,7 +21,7 @@ import logging
 import math
 import secrets
 from collections.abc import Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aiohttp import web
 
@@ -29,6 +29,7 @@ from stream_archive.config import AppConfig, api_base_url, effective_quality, en
 from stream_archive.updater import installed_app_version
 
 if TYPE_CHECKING:
+    from stream_archive.recorder import Recorder
     from stream_archive.telegram import TelegramController
 
 logger = logging.getLogger(__name__)
@@ -71,13 +72,6 @@ class _ApiError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
-
-
-class RecorderProtocol(Protocol):
-    """The recorder calls that the API needs."""
-
-    def active_channels(self) -> list[str]: ...
-    def is_recording(self, channel: str) -> bool: ...
 
 
 def _plain(text: str) -> str:
@@ -231,7 +225,7 @@ def _hold_seconds(value: Any) -> str:
 class ControlAPI:
     """Serve /api/v1 on the shared listener and apply changes like the bot."""
 
-    def __init__(self, config: AppConfig, controller: TelegramController, recorder: RecorderProtocol) -> None:
+    def __init__(self, config: AppConfig, controller: TelegramController, recorder: Recorder) -> None:
         self._config = config
         self._ctrl = controller
         self._recorder = recorder

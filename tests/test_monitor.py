@@ -2,29 +2,11 @@ import asyncio
 import time
 
 import httpx
+from conftest import make_config
 
 from stream_archive import monitor as monitor_module
-from stream_archive.config import AppConfig
 from stream_archive.monitor import Monitor
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
-
-
-def make_config(**overrides):
-    data = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["ch"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-        "kick": {"client_id": "cid", "client_secret": "cs"},
-    }
-    data.update(overrides)
-    return AppConfig.model_validate(data)
 
 
 class FakeTwitchAPI:

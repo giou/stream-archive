@@ -10,7 +10,7 @@ import re
 from typing import TYPE_CHECKING
 
 from stream_archive.telegram.commands_webhook import public_url_note
-from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error
+from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error, open_menu
 from stream_archive.tunnels import parse_public_hostname
 
 if TYPE_CHECKING:
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 async def menu_remote_access(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the Remote access menu: the endpoint toggle, a tunnel, or a feature."""
+
     state = ctrl._state_for(chat_id)
     if text == "Enable endpoint":
         return await ctrl._enable_endpoint(chat_id=chat_id), ctrl.reply_keyboard("remote_access", chat_id=chat_id)
@@ -35,8 +36,7 @@ async def menu_remote_access(ctrl: TelegramController, chat_id: ChatId, text: st
     }.get(text)
     if new_menu is None:
         return None
-    state.menu = new_menu
-    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu, chat_id=chat_id)
+    return await open_menu(ctrl, new_menu, chat_id, state=state)
 
 
 async def menu_kick_webhook(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -84,10 +84,7 @@ async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: 
             ctrl.reply_keyboard("kick_cloudflare", chat_id=chat_id),
         )
     if text == "Named tunnel":
-        state.menu = "kick_cloudflare_token"
-        return await ctrl.menu_text("kick_cloudflare_token", chat_id=chat_id), ctrl.reply_keyboard(
-            "kick_cloudflare_token", chat_id=chat_id
-        )
+        return await open_menu(ctrl, "kick_cloudflare_token", chat_id, state=state)
     return None
 
 

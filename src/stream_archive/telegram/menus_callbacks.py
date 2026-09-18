@@ -12,12 +12,33 @@ from typing import TYPE_CHECKING, Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
 
-from stream_archive.telegram.menu_state import ChatId
+from stream_archive.telegram.menu_state import ChatId, PendingKey
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
 
 logger = logging.getLogger(__name__)
+
+
+async def _send_prompt(
+    ctrl: TelegramController,
+    key: PendingKey,
+    chat_id: ChatId,
+    text: str,
+    markup: InlineKeyboardMarkup,
+    label: str,
+) -> None:
+    """Send one deferred prompt and remember that the chat saw it.
+
+    A failed send leaves the key unmarked, so a later trigger retries it.
+    ``label`` names the prompt kind in the log: the two pending stores can
+    hold the same nonce, so the chat id and nonce alone do not identify it.
+    """
+    try:
+        await ctrl._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        ctrl._apply_warnings_sent.add(key)
+    except Exception:
+        logger.warning("[telegram] Failed to send %s to chat %s (nonce %s)", label, chat_id, key[1], exc_info=True)
 
 
 class AdminCallbackQueryHandler(CallbackQueryHandler[Any, Any]):
@@ -201,15 +222,7 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
                 ],
             ]
         )
-        try:
-            await ctrl._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-            ctrl._apply_warnings_sent.add(key)
-        except Exception:
-            # The entry stays pending, so every later trigger retries this
-            # send. Log the chat and the nonce to keep the repeat diagnosable.
-            logger.warning(
-                "[telegram] Failed to send apply-now warning to chat %s (nonce %s)", chat_id, nonce, exc_info=True
-            )
+        await _send_prompt(ctrl, key, chat_id, text, markup, "apply-now warning")
     for key in list(ctrl._pending_audio_switch):
         if key in ctrl._apply_warnings_sent:
             continue
@@ -232,10 +245,4 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
                 ],
             ]
         )
-        try:
-            await ctrl._app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
-            ctrl._apply_warnings_sent.add(key)
-        except Exception:
-            logger.warning(
-                "[telegram] Failed to send audio-only warning to chat %s (nonce %s)", chat_id, nonce, exc_info=True
-            )
+        await _send_prompt(ctrl, key, chat_id, text, markup, "audio-only warning")

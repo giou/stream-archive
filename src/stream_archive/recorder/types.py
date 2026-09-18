@@ -59,7 +59,6 @@ class Recording(TypedDict, total=False):
     tasks: list[asyncio.Task[Any]]
     # streamlink ships no type stubs, so the stream objects that feed these
     # handles stay Any. The handles themselves have known types.
-    process: asyncio.subprocess.Process | None  # ffmpeg child fed from a streamlink stream
     chat_recorder: ChatRecorder | None  # Twitch IRC recorder tied to the same capture
     chat_task: asyncio.Task[Any] | None
     kick_chat: KickChatState | None

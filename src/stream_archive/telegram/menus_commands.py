@@ -75,12 +75,6 @@ class CommandsMixin:
             reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update)),
         )
 
-    async def _cmd_start(self, update: Any, context: Any) -> None:
-        self._show_root(self._chat_of(update))
-        await update.effective_message.reply_text(
-            self.handle_help(), reply_markup=self.reply_keyboard("root", chat_id=self._chat_of(update))
-        )
-
     async def _cmd_channels(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(self.handle_channels())
 

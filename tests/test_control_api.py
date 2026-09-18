@@ -10,6 +10,7 @@ import asyncio
 import json
 
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import make_config as valid_config
 
 from stream_archive.api import ControlAPI
 from stream_archive.config import get_config
@@ -89,21 +90,17 @@ def read_file(tmp_path):
 
 
 def make_api(tmp_path, *, enabled=True, recording=(), channels=("twitch:channel1",)):
-    """Build controller + API on a real KickWebhook app, as the scheduler does."""
-    data = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": list(channels),
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-        "api": {"enabled": enabled, "key": KEY},
-        "kick": {"client_id": "client_id", "client_secret": "client_secret"},
-    }
+    """Build controller + API on a real KickWebhook app, as the scheduler does.
+
+    The shared defaults differ here: the API key and the kick credentials are
+    the local placeholders. Only the keys the helper sets go in the file: a
+    key left out keeps its model default.
+    """
+    data = valid_config(
+        channels=list(channels),
+        api={"enabled": enabled, "key": KEY},
+        kick={"client_id": "client_id", "client_secret": "client_secret"},
+    ).model_dump(mode="json", exclude_unset=True)
     (tmp_path / "config.json").write_text(json.dumps(data))
     config = get_config(tmp_path / "config.json")
     recorder = FakeRecorder(recording=recording)

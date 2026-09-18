@@ -3,40 +3,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from stream_archive.config import AppConfig, bare_name, is_kick_channel, kick_bare_name
+from stream_archive.config import AppConfig, bare_name, is_kick_channel
 
 if TYPE_CHECKING:
+    from stream_archive.kick_api import KickAPI
     from stream_archive.notifier import Notifier
     from stream_archive.recorder import Recorder
+    from stream_archive.twitch_api import TwitchAPI
 
 logger = logging.getLogger(__name__)
 
 FAILURE_NOTIFY_INTERVAL = 1800
 DISK_NOTIFY_INTERVAL = 1800
-
-
-class TwitchAPIProtocol(Protocol):
-    """Calls the monitor needs from the Twitch API client."""
-
-    async def resolve_user_ids(self, usernames: list[str]) -> dict[str, str]: ...
-    async def get_live_streams(self, user_ids: dict[str, str]) -> dict[str, Any]: ...
-
-
-class KickAPIProtocol(Protocol):
-    """Calls the monitor needs from the Kick API client."""
-
-    async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]: ...
-
-
-# Shape returned by Recorder.disk_snapshot(). Keys include dir_gb, chat_gb,
-# archive_gb (recordings + chat, the value the cap measures), free_gb,
-# total_fs_gb, used_fs_gb, chat_count, file_count, dir, and usage_ok. The last
-# key is False when the free-space probe failed.
-DiskSnapshot = dict[str, Any]
 
 
 class Monitor:
@@ -51,11 +33,9 @@ class Monitor:
         self._kick_api_error_logged = False
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
-        if channel not in self._locks:
-            self._locks[channel] = asyncio.Lock()
-        return self._locks[channel]
+        return self._locks.setdefault(channel, asyncio.Lock())
 
-    async def check_channels(self, twitch_api: TwitchAPIProtocol, kick_api: KickAPIProtocol, config: AppConfig) -> None:
+    async def check_channels(self, twitch_api: TwitchAPI, kick_api: KickAPI, config: AppConfig) -> None:
         # Policy asymmetry. Unknown Twitch users are skipped with a
         # warning (fail-open). Unknown Kick slugs count as offline
         # (fail-closed). Keep the difference.
@@ -108,7 +88,7 @@ class Monitor:
         kick_channels = [c for c in config.channels if is_kick_channel(c)]
         if kick_channels:
             try:
-                statuses = await kick_api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
+                statuses = await kick_api.get_channel_statuses([bare_name(c) for c in kick_channels])
             except Exception as e:
                 # Log one error per failure episode. The loop retries every
                 # interval, so an error per cycle is only noise.
@@ -120,7 +100,7 @@ class Monitor:
             else:
                 self._kick_api_error_logged = False
                 for ch in kick_channels:
-                    bare = kick_bare_name(ch)
+                    bare = bare_name(ch)
                     status = statuses.get(bare)
                     if status is None:
                         # Fail-closed. An unknown slug counts as offline.
@@ -149,11 +129,6 @@ class Monitor:
         if channel not in config.channels:
             return
         await self._ensure_stopped(channel, config)
-
-    async def _snapshot_if_needed(self, config: AppConfig) -> DiskSnapshot | None:
-        disk_cfg = config.disk
-        need_snap = disk_cfg.max_total_gb > 0
-        return await self.recorder.disk_snapshot() if need_snap else None
 
     async def _ensure_recording(
         self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
@@ -264,10 +239,10 @@ class Monitor:
         """
         self._last_failure_notify.pop(channel, None)
         self._last_disk_notify.pop(channel, None)
-        # kick_bare_name strips the twitch: prefix too, so a Twitch channel
+        # bare_name strips the twitch: prefix too, so a Twitch channel
         # must not evict the entry that belongs to kick:<name>.
         if is_kick_channel(channel):
-            self._warned_unknown_kick.discard(kick_bare_name(channel))
+            self._warned_unknown_kick.discard(bare_name(channel))
 
     def is_live(self, channel: str) -> bool:
         """True when the monitor holds live state for the channel."""
@@ -293,8 +268,8 @@ class Monitor:
                 return None
             # Refresh per start. A tick-level snapshot goes stale when
             # several channels start in one sweep.
-            snapshot = await self._snapshot_if_needed(config)
-            if snapshot is not None and snapshot["archive_gb"] >= cap:
+            snapshot = await self.recorder.disk_snapshot()
+            if snapshot["archive_gb"] >= cap:
                 if disk_cfg.delete_oldest:
                     await self.recorder.delete_oldest_to_cap()
                     snapshot = await self.recorder.disk_snapshot()

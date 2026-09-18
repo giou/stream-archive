@@ -38,6 +38,23 @@ def _close_late_stream(future: asyncio.Future[Any]) -> None:
         stream.close()
 
 
+async def _open_stream(stream: Any) -> Any:
+    """Open a streamlink stream on the executor, shielded from cancellation.
+
+    A worker thread cannot be stopped, so on cancellation the callback
+    closes the handle it returns. Without the shield the caller drops that
+    handle and only the garbage collector closes it. Use for both the disk
+    and the ffmpeg pipe paths.
+    """
+    loop = asyncio.get_running_loop()
+    open_future = asyncio.ensure_future(loop.run_in_executor(None, stream.open))
+    try:
+        return await asyncio.shield(open_future)
+    except asyncio.CancelledError:
+        open_future.add_done_callback(_close_late_stream)
+        raise
+
+
 def sanitize_filename(name: str) -> str:
     """Replace the characters that a file system rejects, and cap the length.
 

@@ -3,8 +3,8 @@ import json
 import threading
 
 import pytest
+from conftest import make_config as valid_config
 
-from stream_archive.config import AppConfig
 from stream_archive.youtube_streamer import SCOPES, YouTubeStreamer, build_video_description
 
 TOKEN_DATA = {"refresh_token": "rt", "client_id": "cid", "client_secret": "csec"}
@@ -80,19 +80,12 @@ class CredentialsStub:
 
 
 def make_streamer(tmp_path, creds):
-    data = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["twitch:ch"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": str(tmp_path),
-    }
-    cfg = AppConfig.model_validate(data)
+    """Build a streamer on a valid config, bound to tmp_path as the workdir.
+
+    The shared defaults differ here: the channel is twitch:ch and the
+    recordings live in tmp_path, where the token file also lives.
+    """
+    cfg = valid_config(channels=["twitch:ch"], recording_dir=str(tmp_path))
     cfg._workdir = tmp_path
     stub = CredentialsStub(creds)
     return YouTubeStreamer(cfg), stub

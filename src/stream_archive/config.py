@@ -2,25 +2,25 @@ import contextlib
 import copy
 import json
 import logging
-import math
 import os
 import re
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 from urllib.parse import urlparse, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeFloat,
+    PositiveFloat,
     PrivateAttr,
+    StrictBool,
     StrictInt,
     StrictStr,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -28,27 +28,10 @@ from pydantic import (
 logger = logging.getLogger(__name__)
 
 
-def _finite(value: float) -> float:
-    """Reject a value that JSON cannot carry.
-
-    ``float('inf')`` and ``float('nan')`` pass a ``ge`` bound (``nan`` fails
-    every comparison, and ``inf`` satisfies a non-negative one), and
-    ``json.dump`` then writes the non-standard ``Infinity``/``NaN`` token
-    that strict JSON clients reject. A NaN range check is also blind:
-    ``nan < 0`` is false, so a hand-written bound lets it through.
-    """
-    if not math.isfinite(value):
-        msg = "must be a finite number"
-        raise ValueError(msg)
-    return value
-
-
-#: A number that survives a JSON round trip and a range comparison.
-FiniteNonNegative = Annotated[float, Field(ge=0), AfterValidator(_finite)]
-#: The same for a value that must be strictly positive. json.load accepts the
-#: non-standard Infinity literal, and inf satisfies gt=0, so the bound alone
-#: does not reject it.
-FinitePositive = Annotated[float, Field(gt=0), AfterValidator(_finite)]
+# Every model that holds a float sets ``allow_inf_nan=False``. Without it, inf
+# and nan pass a plain bound (``nan`` fails every comparison, and ``inf``
+# satisfies a non-negative one), and json.dump then writes the non-standard
+# Infinity or NaN token that strict JSON clients reject.
 
 _CHANNEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_]{0,24}$")
 _KICK_CHANNEL_RE = re.compile(
@@ -97,10 +80,6 @@ def bare_name(channel: str) -> str:
     return channel
 
 
-def kick_bare_name(channel: str) -> str:
-    return bare_name(channel)
-
-
 def channel_url(channel: str) -> str:
     """Return the public profile URL for notifications."""
     return (
@@ -147,14 +126,6 @@ def normalize_channel_name(name: str) -> str | None:
     return f"twitch:{name.lower()}" if _CHANNEL_RE.match(name) else None
 
 
-def _require_bool(v: object, label: str) -> bool:
-    """Reject non-boolean values with an error that names the setting."""
-    if not isinstance(v, bool):
-        msg = f"{label} must be a boolean"
-        raise ValueError(msg)
-    return v
-
-
 def _normalize_channel_map[V](raw: dict[str, V], setting: str) -> dict[str, V]:
     """Map each key through normalize_channel_name. Reject bad names."""
     normalized: dict[str, V] = {}
@@ -171,47 +142,32 @@ def _normalize_channel_map[V](raw: dict[str, V], setting: str) -> dict[str, V]:
 
 
 class YouTubeConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
-    hold_seconds: FiniteNonNegative = 0
+    hold_seconds: NonNegativeFloat = 0
 
 
 class UpdateCheckConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
-    enabled: bool = True
-    interval_hours: FinitePositive = 24
-
-    @field_validator("enabled", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
-        return _require_bool(v, f"update_check.{info.field_name}")
+    enabled: StrictBool = True
+    interval_hours: PositiveFloat = 24
 
 
 class DiskConfig(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
-    max_total_gb: FiniteNonNegative = 0
-    check_interval_s: FinitePositive = 60
-    delete_oldest: bool = True
-
-    @field_validator("delete_oldest", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any) -> bool:
-        return _require_bool(v, "disk.delete_oldest")
+    max_total_gb: NonNegativeFloat = 0
+    check_interval_s: PositiveFloat = 60
+    delete_oldest: StrictBool = True
 
 
 class EventSubConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
-    enabled: bool = True
-
-    @field_validator("enabled", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any) -> bool:
-        return _require_bool(v, "eventsub.enabled")
+    enabled: StrictBool = True
 
 
 class EndpointConfig(BaseModel):
@@ -223,27 +179,13 @@ class EndpointConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    enabled: bool = False
+    enabled: StrictBool = False
     listen_host: str = Field("127.0.0.1", min_length=1)
     listen_port: StrictInt = Field(8787, ge=1, le=65535)
     public_url: StrictStr = ""
     tunnel: Literal["", "cloudflare", "tailscale"] = ""
     cloudflare_token: StrictStr = ""
-    cloudflare_managed: bool = False
-
-    @field_validator("enabled", "cloudflare_managed", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
-        return _require_bool(v, f"endpoint.{info.field_name}")
-
-    @field_validator("tunnel")
-    @classmethod
-    def _tunnel_only(cls, v: Any) -> str:
-        if v not in ("", "cloudflare", "tailscale"):
-            msg = "endpoint.tunnel must be one of '', 'cloudflare', 'tailscale'"
-            raise ValueError(msg)
-        out: str = v
-        return out
+    cloudflare_managed: StrictBool = False
 
     @model_validator(mode="after")
     def _require_public_url_when_enabled(self) -> EndpointConfig:
@@ -260,13 +202,8 @@ class KickWebhookConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    enabled: bool = False
-    setup_notified: bool = False
-
-    @field_validator("enabled", "setup_notified", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
-        return _require_bool(v, f"kick.webhook.{info.field_name}")
+    enabled: StrictBool = False
+    setup_notified: StrictBool = False
 
 
 class KickConfig(BaseModel):
@@ -274,13 +211,8 @@ class KickConfig(BaseModel):
 
     client_id: str = ""
     client_secret: str = ""
-    record_chat: bool = True
+    record_chat: StrictBool = True
     webhook: KickWebhookConfig = KickWebhookConfig()
-
-    @field_validator("record_chat", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any) -> bool:
-        return _require_bool(v, "kick.record_chat")
 
 
 class ApiConfig(BaseModel):
@@ -288,13 +220,8 @@ class ApiConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    enabled: bool = False
+    enabled: StrictBool = False
     key: str = ""
-
-    @field_validator("enabled", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any, info: ValidationInfo) -> bool:
-        return _require_bool(v, f"api.{info.field_name}")
 
 
 class AppConfig(BaseModel):
@@ -305,7 +232,7 @@ class AppConfig(BaseModel):
     pydantic.ValidationError (a ValueError subclass).
     """
 
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
     # required
     telegram_user_id: StrictInt
@@ -314,23 +241,23 @@ class AppConfig(BaseModel):
     twitch_client_secret: str = Field(min_length=1)
     channels: list[str] = Field(min_length=1)
     proxy_list: list[str] = Field(min_length=1)
-    monitoring_interval: FinitePositive
+    monitoring_interval: PositiveFloat
     timezone: str = Field(min_length=1)
     plugin_dir: str = Field(min_length=1)
     recording_dir: str = Field(min_length=1)
 
     # optional with defaults
-    retention_days: FiniteNonNegative = 0
+    retention_days: NonNegativeFloat = 0
     output_mode: OutputMode = "disk"
     channel_output_modes: dict[str, OutputMode] = {}
-    channel_youtube_hold_seconds: dict[str, float] = {}
+    channel_youtube_hold_seconds: dict[str, NonNegativeFloat] = {}
     channel_preferred_qualities: dict[str, str] = {}
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
-    max_concurrent_recordings: FiniteNonNegative = 0
-    max_concurrent_youtube_streams: FiniteNonNegative = 0
-    record_chat: bool = True
+    max_concurrent_recordings: NonNegativeFloat = 0
+    max_concurrent_youtube_streams: NonNegativeFloat = 0
+    record_chat: StrictBool = True
     chat_dir: str = Field("chat", min_length=1)
     disk: DiskConfig = DiskConfig()
     eventsub: EventSubConfig = EventSubConfig()
@@ -347,13 +274,13 @@ class AppConfig(BaseModel):
     def workdir(self) -> Path:
         """Bound working directory. Raise when the config is unbound."""
         with _CONFIG_LOCK:
-            return _bound_workdir(self)
+            return _bound(self, "_workdir", "a working directory")
 
     @property
     def config_path(self) -> Path:
         """Bound source path. Raise when the config is unbound."""
         with _CONFIG_LOCK:
-            return _bound_config_path(self)
+            return _bound(self, "_config_path", "a config path")
 
     @field_validator("channels")
     @classmethod
@@ -401,13 +328,7 @@ class AppConfig(BaseModel):
 
     @field_validator("channel_youtube_hold_seconds")
     @classmethod
-    def _normalize_hold_keys(cls, v: dict[str, float]) -> dict[str, float]:
-        for ch, seconds in v.items():
-            # A NaN value fails every comparison, so the bound alone would
-            # accept it; _finite rejects it explicitly.
-            if not math.isfinite(seconds) or seconds < 0:
-                msg = f"channel_youtube_hold_seconds.{ch} must be a finite number >= 0"
-                raise ValueError(msg)
+    def _normalize_hold_keys(cls, v: dict[str, NonNegativeFloat]) -> dict[str, NonNegativeFloat]:
         return _normalize_channel_map(v, "channel_youtube_hold_seconds")
 
     @field_validator("timezone")
@@ -419,11 +340,6 @@ class AppConfig(BaseModel):
             msg = f"Invalid timezone: {v!r}"
             raise ValueError(msg) from None
         return v
-
-    @field_validator("record_chat", mode="before")
-    @classmethod
-    def _bool_only(cls, v: Any) -> bool:
-        return _require_bool(v, "record_chat")
 
     @field_validator("preferred_quality")
     @classmethod
@@ -459,26 +375,11 @@ class AppConfig(BaseModel):
         return self
 
 
-def _bound_workdir(config: AppConfig) -> Path:
-    """Return the bound working directory. Callers hold _CONFIG_LOCK."""
-    try:
-        workdir: Path | None = config._workdir
-    except AttributeError:
-        workdir = None
-    if workdir is None:
-        msg = "AppConfig is not bound to a config path"
-        raise RuntimeError(msg)
-    return workdir
-
-
-def _bound_config_path(config: AppConfig) -> Path:
-    """Return the bound source path. Callers hold _CONFIG_LOCK."""
-    try:
-        path: Path | None = config._config_path
-    except AttributeError:
-        path = None
+def _bound(config: AppConfig, attr: str, what: str) -> Path:
+    """Return a bound path attribute. Callers hold _CONFIG_LOCK."""
+    path: Path | None = getattr(config, attr, None)
     if path is None:
-        msg = "AppConfig is not bound to a config path"
+        msg = f"AppConfig is not bound to {what}"
         raise RuntimeError(msg)
     return path
 
@@ -679,7 +580,7 @@ def save_config(config: AppConfig) -> None:
     so a list that changed before the save keeps its mask.
     """
     with _CONFIG_LOCK:
-        config_path = _bound_config_path(config)
+        config_path = _bound(config, "_config_path", "a config path")
         validated = AppConfig.model_validate(config.model_dump())  # catches invalid in-place mutations
         data = validated.model_dump()
         # Tracker entries to remove. The write below can fail, and the file
@@ -788,7 +689,8 @@ def apply_config_change(config: AppConfig, mutate: Callable[[AppConfig], None]) 
         candidate = config.model_copy(deep=True)
         mutate(candidate)
         save_config(candidate)
-        _replace_in_place(config, candidate)
+        # Keep the live instance: every module holds this object.
+        _copy_state(config, candidate)
         return candidate
 
 
@@ -798,19 +700,9 @@ def reload_config(config: AppConfig) -> None:
     Raises ValueError on any failure.
     """
     with _CONFIG_LOCK:
-        fresh = get_config(_bound_config_path(config))
+        fresh = get_config(_bound(config, "_config_path", "a config path"))
         _copy_state(config, fresh)
         _bind(config, fresh._workdir, fresh._config_path, dict(fresh._env_placeholders))
-
-
-def _replace_in_place(target: AppConfig, source: AppConfig) -> None:
-    """Copy source's state onto target without changing target's identity.
-
-    Every module holds the same config instance. A reload must replace
-    the state while keeping that object identity.
-    """
-    with _CONFIG_LOCK:
-        _copy_state(target, source)
 
 
 def _copy_state(target: AppConfig, source: AppConfig) -> None:

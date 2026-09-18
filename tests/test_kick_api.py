@@ -3,42 +3,49 @@ import json
 
 import httpx
 import pytest
+from conftest import make_config as _make_config
 
 from stream_archive.config import AppConfig
 from stream_archive.kick_api import _USER_AGENT, KickAPI
 
 
 def base_config():
-    return {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["ch"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-        "kick": {
-            "client_id": "cid",
-            "client_secret": "csec",
-            "record_chat": True,
-            "webhook": {"enabled": False},
-        },
-    }
+    """A valid config dict with the Kick app credentials and chat on."""
+    return _make_config(kick={"client_secret": "csec"}).model_dump()
 
 
 _apis: list[KickAPI] = []
 
 
-def make_api(handler, config=None):
+def token_handler(request):
+    assert request.url.path == "/oauth/token"
+    assert request.method == "POST"
+    form = request.content.decode()
+    assert "grant_type=client_credentials" in form
+    assert "client_id=cid" in form
+    assert "client_secret=csec" in form
+    return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+
+
+def no_other_request(request):
+    pytest.fail(f"unexpected request: {request.method} {request.url}")
+
+
+def make_api(handler=no_other_request, config=None, token=token_handler):
     """Build a KickAPI on an injected mock-transport client.
 
-    The constructor path also sets ``_owns_client`` False, so the fixture
-    closes the injected client itself.
+    Every authenticated call needs a token first, so that POST is served
+    here and ``handler`` describes only the endpoint under test. The
+    constructor path also sets ``_owns_client`` False, so the fixture closes
+    the injected client itself.
     """
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"User-Agent": _USER_AGENT})
+
+    def route(request):
+        if request.url.path == "/oauth/token":
+            return token(request)
+        return handler(request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(route), headers={"User-Agent": _USER_AGENT})
     api = KickAPI(AppConfig.model_validate(config or base_config()), http=client)
     _apis.append(api)
     return api
@@ -55,26 +62,14 @@ def _close_api_clients():
         _apis.clear()
 
 
-def token_handler(request):
-    assert request.url.path == "/oauth/token"
-    assert request.method == "POST"
-    form = request.content.decode()
-    assert "grant_type=client_credentials" in form
-    assert "client_id=cid" in form
-    assert "client_secret=csec" in form
-    return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
-
-
 def test_token_fetched_and_cached():
     calls = {"tokens": 0}
 
-    def handler(request):
-        if request.url.path == "/oauth/token":
-            calls["tokens"] += 1
-            return token_handler(request)
-        return httpx.Response(200, json={"data": []})
+    def token(request):
+        calls["tokens"] += 1
+        return token_handler(request)
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         assert await api._get_token() == "tok-1"
@@ -89,14 +84,12 @@ def test_token_refetched_when_inside_the_expiry_skew():
     """A token that expires inside the 60 s skew is stale at once."""
     calls = {"tokens": 0}
 
-    def handler(request):
-        if request.url.path == "/oauth/token":
-            calls["tokens"] += 1
-            expires_in = 30 if calls["tokens"] == 1 else 3600
-            return httpx.Response(200, json={"access_token": f"tok-{calls['tokens']}", "expires_in": expires_in})
-        return httpx.Response(200, json={"data": []})
+    def token(request):
+        calls["tokens"] += 1
+        expires_in = 30 if calls["tokens"] == 1 else 3600
+        return httpx.Response(200, json={"access_token": f"tok-{calls['tokens']}", "expires_in": expires_in})
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         assert await api._get_token() == "tok-1"
@@ -126,8 +119,6 @@ def test_get_channel_statuses_maps_live_offline_unknown():
     }
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.url.path == "/public/v1/channels"
         assert request.headers["Authorization"] == "Bearer tok-1"
         slugs = [v for k, v in request.url.params.multi_items() if k == "slug"]
@@ -145,7 +136,7 @@ def test_get_channel_statuses_maps_live_offline_unknown():
 
 
 def test_get_channel_statuses_empty_list_returns_empty():
-    api = make_api(lambda request: pytest.fail("no request expected"))
+    api = make_api()
     assert asyncio.run(api.get_channel_statuses([])) == {}
 
 
@@ -153,8 +144,6 @@ def test_get_channel_statuses_chunks_over_50_slugs():
     requests = []
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         slugs = [v for k, v in request.url.params.multi_items() if k == "slug"]
         requests.append(slugs)
         return httpx.Response(
@@ -191,8 +180,6 @@ def test_get_public_key_cached():
     pem = "-----BEGIN PUBLIC KEY-----\nAAA\n-----END PUBLIC KEY-----\n"
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.url.path == "/public/v1/public-key"
         calls["n"] += 1
         # live API nests the PEM under data.public_key
@@ -221,8 +208,6 @@ def test_list_event_subscriptions_filters_foreign_app():
     ]
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.method == "GET"
         return httpx.Response(200, json={"data": subs})
 
@@ -239,8 +224,6 @@ def test_list_event_subscriptions_without_client_id_returns_empty():
     subs = [{"id": "ours-1", "app_id": "cid", "broadcaster_user_id": 1}]
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
         return httpx.Response(200, json={"data": subs})
 
     config = base_config()
@@ -254,8 +237,6 @@ def test_create_event_subscriptions_posts_documented_body():
     seen = {}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.method == "POST"
         seen["body"] = json.loads(request.content)
         return httpx.Response(
@@ -286,8 +267,6 @@ def test_delete_event_subscriptions_sends_ids():
     seen = {}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.method == "DELETE"
         seen["params"] = list(request.url.params.multi_items())
         return httpx.Response(200, json={"data": []})
@@ -299,7 +278,7 @@ def test_delete_event_subscriptions_sends_ids():
 
 
 def test_delete_event_subscriptions_empty_is_noop():
-    api = make_api(lambda request: pytest.fail("no request expected"))
+    api = make_api()
     asyncio.run(api.delete_event_subscriptions([]))
 
 
@@ -307,8 +286,6 @@ def test_http_errors_propagate(monkeypatch):
     monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         return httpx.Response(500, json={"message": "boom"})
 
     api = make_api(handler)
@@ -320,8 +297,6 @@ def test_channels_request_sends_user_agent():
     seen = {}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         seen["ua"] = request.headers.get("User-Agent")
         return httpx.Response(200, json={"data": []})
 
@@ -336,8 +311,6 @@ def test_transient_status_retried_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         calls["n"] += 1
         if calls["n"] == 1:
             return httpx.Response(503, request=request)
@@ -353,8 +326,6 @@ def test_transport_error_retried_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         calls["n"] += 1
         if calls["n"] == 1:
             msg = "boom"
@@ -371,8 +342,6 @@ def test_retries_exhausted_raises(monkeypatch):
     calls = {"n": 0}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         calls["n"] += 1
         return httpx.Response(503, request=request)
 
@@ -386,8 +355,6 @@ def test_client_error_not_retried():
     calls = {"n": 0}
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         calls["n"] += 1
         return httpx.Response(400, request=request)
 
@@ -398,10 +365,10 @@ def test_client_error_not_retried():
 
 
 def test_token_error_propagates():
-    def handler(request):
+    def token(request):
         return httpx.Response(401, json={"message": "bad creds"})
 
-    api = make_api(handler)
+    api = make_api(token=token)
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(api.get_channel_statuses(["xqc"]))
 
@@ -411,11 +378,11 @@ def test_concurrent_token_refresh_is_single_flight():
     exactly one client_credentials POST."""
     calls = {"tokens": 0}
 
-    def handler(request):
+    def token(request):
         calls["tokens"] += 1
         return token_handler(request)
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         return await asyncio.gather(*[api._get_token() for _ in range(5)])
@@ -429,8 +396,6 @@ def test_get_public_key_keeps_cache_on_malformed_response():
     pem = "-----BEGIN PUBLIC KEY-----\nAAA\n-----END PUBLIC KEY-----\n"
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_handler(request)
         assert request.url.path == "/public/v1/public-key"
         calls["n"] += 1
         if calls["n"] == 1:

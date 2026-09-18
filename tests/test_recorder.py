@@ -13,10 +13,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_config as valid_config
 from streamlink.exceptions import NoStreamsError, PluginError
 
 from stream_archive import disk
-from stream_archive.config import AppConfig
 from stream_archive.recorder import Recorder, sanitize_filename
 from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 
@@ -48,25 +48,53 @@ async def wait_until(condition, timeout=5.0):
     await asyncio.wait_for(_poll(), timeout)
 
 
-def make_config(tmp_path):
-    d = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["ch"],
-        "proxy_list": ["httpproxy://u:p@h:1"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": str(tmp_path / "recordings"),
-        "output_mode": "disk",
-        "record_chat": False,
-    }
-    cfg = AppConfig.model_validate(d)
+def make_config(tmp_path, **overrides):
+    """Build a valid config bound to tmp_path.
+
+    The shared defaults differ here: chat recording is off, the recordings
+    live under tmp_path, and the config carries a working directory and a
+    config path. ``overrides`` win over these defaults.
+    """
+    cfg = valid_config(
+        **{
+            "proxy_list": ["httpproxy://u:p@h:1"],
+            "recording_dir": str(tmp_path / "recordings"),
+            "record_chat": False,
+            **overrides,
+        }
+    )
     cfg._workdir = tmp_path
     cfg._config_path = tmp_path / "config.json"
     return cfg
+
+
+def make_recorder(tmp_path, monkeypatch, stream=None, **config_overrides):
+    """Build a Recorder with the plugin load and the stream resolve stubbed.
+
+    ``stream`` is the factory that builds the fake feed. Tests that need
+    another feed pass their own class. The resolve stub reports the plugin
+    metadata as (stream, author, title, game).
+    """
+    rec = Recorder(make_config(tmp_path, **config_overrides))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    factory = FakeStream if stream is None else stream
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (factory(), "author", "Title", "Game"))
+    return rec
+
+
+def seed_finished_entry(rec, channel="ch", *, stream=None, **fields):
+    """Seed an entry whose recording task ends at once, then return that task.
+
+    ``stream`` builds the coroutine the task runs. The default task ends with
+    no data. ``fields`` set the entry keys the test needs.
+    """
+    entry = {"tasks": [], "youtube_info": None, "kick_chat": None}
+    entry.update(fields)
+    task = asyncio.create_task(asyncio.sleep(0) if stream is None else stream())
+    entry["tasks"] = [task]
+    rec._recordings[channel] = entry
+    task.add_done_callback(lambda t: rec._on_task_finished(channel, t))
+    return task
 
 
 class FakeChatRecorder:
@@ -212,9 +240,7 @@ def test_proxy_failure_log_hides_credentials(tmp_path, monkeypatch, caplog):
 
 
 def test_start_success(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch)
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -365,11 +391,7 @@ def test_start_duplicate_resolves_once(tmp_path, monkeypatch):
 
 
 def test_start_youtube_without_streamer_returns_false(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.output_mode = "youtube"
-    rec = Recorder(config)  # youtube_streamer defaults to None
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, output_mode="youtube")  # youtube_streamer defaults to None
 
     assert asyncio.run(rec.start("ch")) is False
     assert "ch" not in rec._recordings
@@ -416,9 +438,7 @@ def test_pipe_stream_read_error_returns_false(tmp_path, monkeypatch):
 
 
 def test_recording_task_failure_removes_entry(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=FakeFailingStream)
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -458,14 +478,7 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
     async def scenario():
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1"},
-            "kick_chat": None,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, youtube_info={"broadcast_id": "b1"})
         await task
         await wait_until(lambda: "ch" not in rec._recordings and bool(yt.ended))
         assert "ch" not in rec._recordings
@@ -488,14 +501,7 @@ def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
             msg = "stream interrupted"
             raise RuntimeError(msg)
 
-        task = asyncio.create_task(boom())
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": None,
-            "kick_chat": None,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, stream=boom)
         await asyncio.gather(task, return_exceptions=True)
         await wait_until(lambda: "ch" not in rec._recordings)
         assert "ch" not in rec._recordings
@@ -505,11 +511,7 @@ def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
 
 
 def test_clean_end_flag_cleared_on_restart(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.output_mode = "disk"
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=SustainedStream, output_mode="disk")
 
     async def scenario():
         rec._ended_clean["ch"] = time.monotonic()
@@ -587,16 +589,12 @@ def test_quick_youtube_end_sets_restart_backoff(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
     async def finish_with(lifetime_s):
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1"},
-            "kick_chat": None,
-            "mode": "youtube",
-            "started_at": time.monotonic() - lifetime_s,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(
+            rec,
+            youtube_info={"broadcast_id": "b1"},
+            mode="youtube",
+            started_at=time.monotonic() - lifetime_s,
+        )
         await task
 
     asyncio.run(finish_with(10))
@@ -616,16 +614,7 @@ def test_disk_end_no_backoff(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_load_plugin", lambda: None)
 
     async def scenario():
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": None,
-            "kick_chat": None,
-            "mode": "disk",
-            "started_at": time.monotonic() - 10,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, mode="disk", started_at=time.monotonic() - 10)
         await task
 
     asyncio.run(scenario())
@@ -668,11 +657,7 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
 
 
 def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -697,9 +682,7 @@ def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
 
 
 def test_start_chat_disabled(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))  # record_chat defaults to False in make_config
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch)  # record_chat defaults to False in make_config
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -712,11 +695,7 @@ def test_start_chat_disabled(tmp_path, monkeypatch):
 
 
 def test_recording_failure_stops_chat(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeFailingStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=FakeFailingStream, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -730,11 +709,7 @@ def test_recording_failure_stops_chat(tmp_path, monkeypatch):
 
 
 def test_stop_chat_stops_only_chat(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -763,11 +738,7 @@ def test_stop_chat_unknown_channel_is_noop(tmp_path, monkeypatch):
 
 
 def test_stop_chat_platform_kick_keeps_twitch_irc(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -846,11 +817,7 @@ def test_cancelled_recording_closes_the_late_stream(tmp_path, monkeypatch):
 
 
 def test_stop_all_finalizes_chat_for_every_channel(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -870,7 +837,6 @@ def test_stop_returns_file_info(tmp_path):
         f.write(b"\0" * 1048577)  # exactly 1 MiB + 1 byte
     rec._recordings["ch"] = {
         "tasks": [],
-        "process": None,
         "youtube_info": None,
         "filepath": filepath,
     }
@@ -1086,9 +1052,7 @@ def test_start_audio_only_forces_disk_mode(tmp_path, monkeypatch):
 
 
 def test_start_records_mode_and_started_at(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch)
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -1174,11 +1138,7 @@ def test_restart_disk_suppresses_live_notification(tmp_path, monkeypatch):
 
 
 def test_recording_settings_chat_state_twitch(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=SustainedStream, record_chat=True)
 
     async def scenario():
         assert await rec.start("ch") is True
@@ -1191,9 +1151,7 @@ def test_recording_settings_chat_state_twitch(tmp_path, monkeypatch):
 
 
 def test_restart_not_recording_returns_false(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=SustainedStream)
     assert asyncio.run(rec.restart("ch")) is False
 
 
@@ -1204,7 +1162,6 @@ def test_recording_info_reports_duration_and_size(tmp_path):
     filepath.write_bytes(b"\0" * (3 * 1024 * 1024))
     rec._recordings["ch"] = {
         "tasks": [],
-        "process": None,
         "youtube_info": None,
         "filepath": str(filepath),
         "started_at": time.monotonic() - 125,
@@ -1254,7 +1211,7 @@ def test_abort_serializes_with_stop(tmp_path):
             await released.wait()  # recording task runs until torn down
 
         task = asyncio.create_task(feed())
-        rec._recordings["ch"] = {"tasks": [task], "process": None, "youtube_info": None, "kick_chat": None}
+        rec._recordings["ch"] = {"tasks": [task], "youtube_info": None, "kick_chat": None}
 
         results = await asyncio.gather(rec._abort("ch", "cap"), rec.stop("ch"))
         released.set()
@@ -1385,11 +1342,8 @@ def test_disk_snapshot_counts_chat_files(tmp_path):
 
 
 def make_kick_config(tmp_path, record_chat=True):
-    config = make_config(tmp_path)
-    config.kick = {"client_id": "cid", "client_secret": "cs", "record_chat": record_chat}
-    config.channels = ["kick:xqc"]
-    config.record_chat = True
-    return config
+    """Build a config that records the kick channel, with the chat switch set."""
+    return make_config(tmp_path, kick={"record_chat": record_chat}, channels=["kick:xqc"], record_chat=True)
 
 
 class CapturingFakePlugin(FakePlugin):
@@ -1429,12 +1383,7 @@ def test_resolve_stream_kick_uses_plugin_directly(tmp_path, monkeypatch):
 
 
 def test_start_twitch_prefixed_uses_twitch_dir(tmp_path, monkeypatch):
-    config = make_config(tmp_path)
-    config.channels = ["twitch:streamer1"]
-    config.record_chat = True
-    rec = Recorder(config)
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, channels=["twitch:streamer1"], record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
 
     async def scenario():
@@ -1754,14 +1703,7 @@ def test_hold_expiry_ends_broadcast(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_start_keepalive", no_keepalive)
 
     async def scenario():
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
-            "kick_chat": None,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, youtube_info={"broadcast_id": "b1", "rtmp_url": "rtmp://x"})
         await task
         await asyncio.sleep(0.15)  # beyond the 0.05s hold
         assert yt.ended == ["b1"]
@@ -1816,17 +1758,14 @@ def test_failed_reused_task_ends_immediately(tmp_path, monkeypatch):
             msg = "stream interrupted"
             raise RuntimeError(msg)
 
-        task = asyncio.create_task(boom())
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1"},
-            "kick_chat": None,
-            "mode": "youtube",
-            "started_at": time.monotonic() - 300,  # avoid quick-end backoff noise
-            "reused": True,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(
+            rec,
+            stream=boom,
+            youtube_info={"broadcast_id": "b1"},
+            mode="youtube",
+            started_at=time.monotonic() - 300,  # avoid quick-end backoff noise
+            reused=True,
+        )
         await asyncio.gather(task, return_exceptions=True)
         await asyncio.sleep(0.05)
         assert yt.ended == ["b1"]
@@ -1928,14 +1867,7 @@ def test_hold_spawns_keepalive_and_stops_on_expiry(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_start_keepalive", fake_start)
 
     async def scenario():
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
-            "kick_chat": None,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, youtube_info={"broadcast_id": "b1", "rtmp_url": "rtmp://x"})
         await task
         await asyncio.sleep(0.15)
         assert yt.ended == ["b1"]
@@ -1990,14 +1922,7 @@ def test_keepalive_early_death_ends_broadcast(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_start_keepalive", dying_keepalive)
 
     async def scenario():
-        task = asyncio.create_task(asyncio.sleep(0))
-        rec._recordings["ch"] = {
-            "tasks": [task],
-            "process": None,
-            "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
-            "kick_chat": None,
-        }
-        task.add_done_callback(lambda t: rec._on_task_finished("ch", t))
+        task = seed_finished_entry(rec, youtube_info={"broadcast_id": "b1", "rtmp_url": "rtmp://x"})
         await task
         await asyncio.sleep(0.1)
         assert yt.ended == ["b1"]
@@ -2012,9 +1937,7 @@ def test_start_setup_failure_cleans_registered_entry(tmp_path, monkeypatch):
     If the OS denies makedirs after registration, start returns False and
     nothing stays registered. A retry succeeds once the cause is gone.
     """
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch)
     real_makedirs = os.makedirs
     denied = {"on": True}
 
@@ -2050,7 +1973,7 @@ def test_cleanup_spares_active_recording(tmp_path):
     t = time.time() - 30 * 86400
     seed_recording(old_active, t)
     seed_recording(old_idle, t)
-    rec._recordings["ch"] = {"tasks": [], "process": None, "youtube_info": None, "filepath": str(old_active)}
+    rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": str(old_active)}
 
     removed = asyncio.run(rec.cleanup_old_recordings(7))
 
@@ -2104,9 +2027,7 @@ def test_cancelled_start_leaves_no_stale_entry(tmp_path, monkeypatch):
     entry then stayed behind without tasks, so every later start
     short-circuited on it and the channel was never recorded again.
     """
-    rec = Recorder(make_config(tmp_path))
-    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    rec = make_recorder(tmp_path, monkeypatch, stream=SustainedStream)
 
     class BlockingNotifier(FakeNotifier):
         def __init__(self):
@@ -2209,7 +2130,7 @@ def _kick_capture(rec, channel="kick:ch", title="stream", now="01_01_2026-000000
     it; the detach mirrors ``_stop_unlocked`` and ``_on_task_finished``, which
     remove the recording entry before the finalizer renames the file.
     """
-    entry: dict = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
+    entry: dict = {"tasks": [], "youtube_info": None, "filepath": None}
     entry["started_at"] = time.monotonic()
     rec._recordings[channel] = entry
     rec._start_chat_capture(entry, channel, title, "game", "author", None, title, now)

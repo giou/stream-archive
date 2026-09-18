@@ -22,12 +22,29 @@ class ChannelsCommands:
     def handle_channels(self) -> str:
         return "\n".join(f"{i}. {ch}" for i, ch in enumerate(self._config.channels, 1))
 
+    def _resolve_channel_arg(self, value: str, *, monitored: bool = True) -> tuple[str, str] | tuple[None, str]:
+        """Normalize one channel argument, or report why it is unusable.
+
+        Returns the normalized channel with an empty error, or none and the
+        failure reply. With ``monitored`` the channel must be in the
+        monitored list: a typo would otherwise store an override that can
+        never take effect. /add and /remove check membership against the
+        config they change, so they pass ``monitored=False``.
+        """
+        ch = normalize_channel_name(value)
+        if ch is None:
+            reply = f"\u274c Invalid channel name: {value!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+            return None, reply
+        if monitored and ch not in self._config.channels:
+            return None, f"\u274c {ch} is not in the monitored list (add it with /add first)"
+        return ch, ""
+
     async def handle_add(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
             return "Usage: /add <channel>"
-        ch = normalize_channel_name(args[0])
+        ch, err = self._resolve_channel_arg(args[0], monitored=False)
         if ch is None:
-            return f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+            return err
 
         def mutate(candidate: AppConfig) -> None:
             if ch in candidate.channels:
@@ -50,9 +67,9 @@ class ChannelsCommands:
     async def handle_remove(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
             return "Usage: /remove <channel>"
-        ch = normalize_channel_name(args[0])
+        ch, err = self._resolve_channel_arg(args[0], monitored=False)
         if ch is None:
-            return f"\u274c Invalid channel name: {args[0]!r} (use twitch:<name> for Twitch or kick:<name> for Kick)"
+            return err
 
         def mutate(candidate: AppConfig) -> None:
             if ch not in candidate.channels:

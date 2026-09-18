@@ -162,7 +162,7 @@ class TelegramController(
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
-            CommandHandler("start", self._cmd_start, filters=admin),
+            CommandHandler("start", self._cmd_help, filters=admin),
             MessageHandler(filters.TEXT & ~filters.COMMAND & admin, self._on_text),
             self._callback_handler,
         ]

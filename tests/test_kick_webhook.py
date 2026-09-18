@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import make_config as _make_config
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -22,33 +23,20 @@ def _fresh_ts():
 
 
 def base_config():
-    return {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["kick:xqc"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-        "endpoint": {
-            "enabled": False,
-            "listen_host": "127.0.0.1",
-            "listen_port": 0,  # ephemeral for tests
-            "public_url": "",
-        },
-        "kick": {
-            "client_id": "cid",
-            "client_secret": "csec",
-            "record_chat": True,
-            # The receiver accepts deliveries only while the feature is on, so
-            # the normal test config has it on. Tests of the off state set it
-            # to false themselves.
-            "webhook": {"enabled": True},
-        },
-    }
+    """A valid config dict with the Kick webhook on and an ephemeral port.
+
+    The receiver accepts deliveries only while the feature is on, so the
+    normal test config has it on. Tests of the off state set it to false.
+    The endpoint section keeps the legacy webhook migration away from
+    ``kick.webhook``, which these tests set.
+    """
+    data = _make_config(
+        channels=["kick:xqc"],
+        endpoint={"enabled": False},
+        kick={"client_secret": "csec", "webhook": {"enabled": True}},
+    ).model_dump()
+    data["endpoint"]["listen_port"] = 0  # ephemeral for tests
+    return data
 
 
 class FakeMonitor:
@@ -292,21 +280,27 @@ def _signed_headers(private_key, message_id, timestamp, body, event_type):
     }
 
 
+def post_event(wh, private_key, body, event_type, msg_id="m1", ts=None):
+    """Post one signed delivery to the live receiver and return its status."""
+    timestamp = _fresh_ts() if ts is None else ts
+    headers = _signed_headers(private_key, msg_id, timestamp, body, event_type)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.post("/kick/webhook", data=body, headers=headers)
+            return resp.status
+
+    return asyncio.run(scenario())
+
+
 def test_live_event_dispatches_online(keypair):
     private_key, public_pem = keypair
     monitor = FakeMonitor()
     config = base_config()
     wh = make_webhook(config=config, monitor=monitor, api=FakeKickAPI(public_pem))
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            await client.post(
-                "/kick/webhook",
-                data=live_event(is_live=True),
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), live_event(is_live=True), wh.EVENT_LIVE),
-            )
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
 
-    asyncio.run(scenario())
     assert len(monitor.online) == 1
     channel, title, game, user_id, cfg = monitor.online[0]
     assert channel == "kick:xqc"
@@ -320,16 +314,8 @@ def test_live_event_dispatches_offline(keypair):
     config = base_config()
     wh = make_webhook(config=config, monitor=monitor, api=FakeKickAPI(public_pem))
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            body = live_event(is_live=False)
-            await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
-            )
+    assert post_event(wh, private_key, live_event(is_live=False), wh.EVENT_LIVE) == 200
 
-    asyncio.run(scenario())
     assert monitor.online == []
     assert len(monitor.offline) == 1
     assert monitor.offline[0][0] == "kick:xqc"
@@ -373,16 +359,8 @@ def test_chat_event_dispatches_normalized_payload(keypair):
     recorder = FakeRecorder()
     wh = make_webhook(recorder=recorder, api=FakeKickAPI(public_pem))
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            body = chat_event()
-            await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
-            )
+    assert post_event(wh, private_key, chat_event(), wh.EVENT_CHAT) == 200
 
-    asyncio.run(scenario())
     assert len(recorder.chat) == 1
     channel, payload = recorder.chat[0]
     assert channel == "kick:xqc"
@@ -441,18 +419,8 @@ def test_missing_signature_headers_401(keypair):
 def test_unknown_event_type_returns_204(keypair):
     private_key, public_pem = keypair
     wh = make_webhook(api=FakeKickAPI(public_pem))
-    body = b"{}"
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, "some.future.event"),
-            )
-            assert resp.status == 204
-
-    asyncio.run(scenario())
+    assert post_event(wh, private_key, b"{}", "some.future.event") == 204
 
 
 def test_live_event_unmonitored_channel_ignored(keypair):
@@ -462,26 +430,25 @@ def test_live_event_unmonitored_channel_ignored(keypair):
     config["channels"] = ["kick:other"]
     wh = make_webhook(config=config, monitor=monitor, api=FakeKickAPI(public_pem))
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            body = live_event(is_live=True)
-            await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
-            )
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
 
-    asyncio.run(scenario())
     assert monitor.online == []
 
 
 def make_mock_api(handler):
+    """Build a KickAPI on a mock transport that answers the token POST itself."""
+
+    def route(request):
+        if request.url.path == "/oauth/token":
+            return token_response(request)
+        return handler(request)
+
     # Pass the mock client through the constructor, so KickAPI does not build
     # and leak an httpx client of its own. The caller closes this one.
     config = base_config()
     # The config model needs a real port, although KickAPI itself never binds.
     config["endpoint"]["listen_port"] = 8787
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(route))
     return KickAPI(AppConfig.model_validate(config), http=client)
 
 
@@ -604,8 +571,6 @@ def test_reconcile_creates_missing_subscriptions():
     }
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_response(request)
         if request.url.path == "/public/v1/channels":
             return httpx.Response(200, json={"data": [channel_data]})
         if request.url.path == "/public/v1/events/subscriptions":
@@ -662,8 +627,6 @@ def test_reconcile_deletes_stale_subscriptions():
     }
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_response(request)
         if request.url.path == "/public/v1/channels":
             # The monitored channel must resolve. An unresolved slug makes the
             # reconcile skip the cleanup pass (fail safe).
@@ -760,8 +723,6 @@ def test_apply_state_stops_the_sync_and_drops_subscriptions_when_the_webhook_goe
     deletes = []
 
     def handler(request):
-        if request.url.path == "/oauth/token":
-            return token_response(request)
         if request.url.path == "/public/v1/events/subscriptions" and request.method == "DELETE":
             deletes.append([v for k, v in request.url.params.multi_items() if k == "id"])
             return httpx.Response(200, json={"data": []})
@@ -994,46 +955,6 @@ def test_sync_failure_5xx_short_episodes_never_notify(monkeypatch):
 # ---- replay protection & flood hardening -----------------------------------
 
 
-def test_stale_timestamp_rejected_401(keypair):
-    private_key, public_pem = keypair
-    monitor = FakeMonitor()
-    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
-    body = live_event(is_live=True)
-    stale = str(int(time.time()) - 600)  # outside the 5-minute window
-
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", stale, body, wh.EVENT_LIVE),
-            )
-            assert resp.status == 401
-
-    asyncio.run(scenario())
-    assert monitor.online == []
-
-
-def test_future_timestamp_rejected_401(keypair):
-    private_key, public_pem = keypair
-    monitor = FakeMonitor()
-    wh = make_webhook(monitor=monitor, api=FakeKickAPI(public_pem))
-    body = live_event(is_live=True)
-    future = str(int(time.time()) + 600)
-
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", future, body, wh.EVENT_LIVE),
-            )
-            assert resp.status == 401
-
-    asyncio.run(scenario())
-    assert monitor.online == []
-
-
 @pytest.mark.parametrize(
     "offset",
     [
@@ -1063,34 +984,15 @@ def test_timestamp_freshness_boundary(keypair, monkeypatch, offset):
     timestamp = str(int(fixed_now) + offset)
     expected = 200 if abs(offset) <= _VERIFY_WINDOW_S else 401
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", timestamp, body, wh.EVENT_LIVE),
-            )
-            assert resp.status == expected
-
-    asyncio.run(scenario())
+    assert post_event(wh, private_key, body, wh.EVENT_LIVE, ts=timestamp) == expected
     assert len(monitor.online) == (1 if expected == 200 else 0)
 
 
 def test_unparseable_timestamp_rejected_401(keypair):
     private_key, public_pem = keypair
     wh = make_webhook(api=FakeKickAPI(public_pem))
-    body = live_event()
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", "not-a-date", body, wh.EVENT_LIVE),
-            )
-            assert resp.status == 401
-
-    asyncio.run(scenario())
+    assert post_event(wh, private_key, live_event(), wh.EVENT_LIVE, ts="not-a-date") == 401
 
 
 def test_duplicate_message_id_dropped(keypair):
@@ -1253,18 +1155,10 @@ def test_relabelled_chat_event_does_not_change_recording_state(keypair):
     monitor = FakeMonitor()
     recorder = FakeRecorder()
     wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
-    body = chat_event()
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
-            )
-            assert resp.status == 200
+    # The header claims a livestream event, and the body is chat.
+    assert post_event(wh, private_key, chat_event(), wh.EVENT_LIVE) == 200
 
-    asyncio.run(scenario())
     assert monitor.offline == []
     assert monitor.online == []
     assert recorder.chat == []
@@ -1278,16 +1172,8 @@ def test_relabelled_live_event_is_not_written_to_chat(keypair):
     wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
     body = live_event(is_live=False)
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
-            )
-            assert resp.status == 200
+    assert post_event(wh, private_key, body, wh.EVENT_CHAT) == 200
 
-    asyncio.run(scenario())
     assert recorder.chat == []
     assert monitor.offline == []
 
@@ -1299,16 +1185,8 @@ def test_livestream_event_without_a_boolean_state_is_ignored(keypair):
     wh = make_webhook(config=base_config(), monitor=monitor, api=FakeKickAPI(public_pem))
     body = json.dumps({"broadcaster": {"channel_slug": "xqc"}}).encode()
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE),
-            )
-            assert resp.status == 200
+    assert post_event(wh, private_key, body, wh.EVENT_LIVE) == 200
 
-    asyncio.run(scenario())
     assert monitor.offline == []
     assert monitor.online == []
 
@@ -1319,18 +1197,8 @@ def test_non_finite_timestamp_is_rejected(keypair):
     monitor = FakeMonitor()
     recorder = FakeRecorder()
     wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
-    body = chat_event()
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", "nan", body, wh.EVENT_CHAT),
-            )
-            assert resp.status == 401
-
-    asyncio.run(scenario())
+    assert post_event(wh, private_key, chat_event(), wh.EVENT_CHAT, ts="nan") == 401
     assert recorder.chat == []
 
 
@@ -1459,7 +1327,6 @@ def test_key_rotation_refetch_failure_stays_retryable(keypair):
     monitor = FakeMonitor()
     recorder = FakeRecorder()
     wh = make_webhook(config=base_config(), monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
-    body = chat_event()
 
     async def failing_force(force=False):
         if force:
@@ -1470,16 +1337,7 @@ def test_key_rotation_refetch_failure_stays_retryable(keypair):
     wh._api.get_public_key = failing_force
     wh._api.has_public_key = lambda: True
 
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post(
-                "/kick/webhook",
-                data=body,
-                headers=_signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_CHAT),
-            )
-            assert resp.status == 503
-
-    asyncio.run(scenario())
+    assert post_event(wh, private_key, chat_event(), wh.EVENT_CHAT) == 503
     assert recorder.chat == []
 
 

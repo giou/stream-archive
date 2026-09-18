@@ -4,8 +4,8 @@ import json
 
 import httpx
 import pytest
+from conftest import make_config as valid_config
 
-from stream_archive.config import AppConfig
 from stream_archive.updater import (
     _APP_RELEASES_URL,
     UpdateChecker,
@@ -65,19 +65,12 @@ class FakeHttp:
 
 
 def make_config(tmp_path):
-    config = {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["channel1"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-    }
-    cfg = AppConfig.model_validate(config)
+    """Build a valid config bound to tmp_path.
+
+    The shared defaults differ here: channel1 is the only channel, and the
+    config carries a working directory and a config path.
+    """
+    cfg = valid_config(channels=["channel1"])
     cfg._workdir = tmp_path
     cfg._config_path = tmp_path / "config.json"
     return cfg

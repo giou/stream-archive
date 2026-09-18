@@ -58,11 +58,7 @@ class TwitchAPI:
             return {}
         resolved: dict[str, str] = {}
         try:
-            token = await self._get_token()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Client-Id": self._client_id,
-            }
+            headers = await self._headers()
             # Twitch rejects more than 100 logins in one request.
             for start in range(0, len(usernames), _MAX_QUERY_ITEMS):
                 chunk = usernames[start : start + _MAX_QUERY_ITEMS]
@@ -85,11 +81,7 @@ class TwitchAPI:
             return {}
         streams: dict[str, Any] = {}
         try:
-            token = await self._get_token()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Client-Id": self._client_id,
-            }
+            headers = await self._headers()
             ids = list(user_ids.values())
             # Twitch rejects more than 100 user_ids in one request.
             for start in range(0, len(ids), _MAX_QUERY_ITEMS):
@@ -105,7 +97,8 @@ class TwitchAPI:
             raise
         return streams
 
-    async def _eventsub_headers(self) -> dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
+        """Auth headers for every Helix request."""
         token = await self._get_token()
         return {
             "Authorization": f"Bearer {token}",
@@ -114,14 +107,14 @@ class TwitchAPI:
 
     async def list_conduits(self) -> list[Any]:
         """Return existing EventSub conduits. Each dict has id and shard_count."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.get("https://api.twitch.tv/helix/eventsub/conduits", headers=headers)
         resp.raise_for_status()
         data: list[Any] = resp.json()["data"]
         return data
 
     async def create_conduit(self, shard_count: int = 1) -> dict[str, Any]:
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.post(
             "https://api.twitch.tv/helix/eventsub/conduits",
             headers=headers,
@@ -133,7 +126,7 @@ class TwitchAPI:
 
     async def delete_conduit(self, conduit_id: str) -> None:
         """Delete a conduit. Deletion cascades to its subscriptions. Treats 404 as success."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.delete(
             "https://api.twitch.tv/helix/eventsub/conduits", headers=headers, params={"id": conduit_id}
         )
@@ -143,7 +136,7 @@ class TwitchAPI:
 
     async def update_conduit_shards(self, conduit_id: str, session_id: str) -> dict[str, Any]:
         """Associate the single WebSocket shard ('0') with an EventSub session."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.patch(
             "https://api.twitch.tv/helix/eventsub/conduits/shards",
             headers=headers,
@@ -164,7 +157,7 @@ class TwitchAPI:
         429, or a 5xx, raises ``httpx.HTTPStatusError``, and the caller
         must handle it.
         """
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.post(
             "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, json=payload
         )
@@ -182,7 +175,7 @@ class TwitchAPI:
 
     async def delete_eventsub_subscription(self, sub_id: str) -> None:
         """Delete a subscription. 404 is success."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.delete(
             "https://api.twitch.tv/helix/eventsub/subscriptions", headers=headers, params={"id": sub_id}
         )
@@ -192,7 +185,7 @@ class TwitchAPI:
 
     async def list_eventsub_subscriptions(self) -> list[Any]:
         """List all subscriptions with cursor pagination (max 10 pages of 100)."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         data = []
         cursor = None
         for _ in range(10):
@@ -218,7 +211,7 @@ class TwitchAPI:
 
     async def get_stream(self, user_id: str) -> Any:
         """Return a single stream snapshot (title/game_name), or None when offline."""
-        headers = await self._eventsub_headers()
+        headers = await self._headers()
         resp = await self.client.get(
             "https://api.twitch.tv/helix/streams", headers=headers, params={"user_id": user_id}
         )

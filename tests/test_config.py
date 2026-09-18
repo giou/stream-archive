@@ -4,6 +4,7 @@ import stat
 from pathlib import Path
 
 import pytest
+from conftest import make_config as _make_config
 
 from stream_archive.config import (
     AppConfig,
@@ -19,18 +20,13 @@ from stream_archive.config import (
 
 
 def valid_config():
-    return {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["twitch:channel1"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-    }
+    """A minimal config file: no kick, endpoint, or api section.
+
+    The tests mutate this plain dict, so it stays a dict instead of a model.
+    """
+    data = _make_config(channels=["twitch:channel1"]).model_dump()
+    del data["kick"], data["endpoint"], data["api"]
+    return data
 
 
 def build(**overrides):
@@ -110,6 +106,37 @@ def test_obsolete_disk_keys_are_dropped():
             lambda c: c.__setitem__("channel_preferred_qualities", {"kick:x": ""}),
             r"channel_preferred_qualities\.kick:x must be a non-empty quality string",
         ),
+        (lambda c: c.__setitem__("channels", ["bad name!"]), r"Invalid channel name: 'bad name!'"),
+        # Names are lowercased first, so both spellings are one channel.
+        (lambda c: c.__setitem__("channels", ["twitch:Foo", "FOO"]), "Duplicate channel: 'twitch:foo'"),
+        (lambda c: c.__setitem__("timezone", "Mars/Olympus"), r"Invalid timezone: 'Mars/Olympus'"),
+        (lambda c: c.__setitem__("output_mode", "cloud"), "output_mode"),
+        (lambda c: c.__setitem__("monitoring_interval", 0), "monitoring_interval"),
+        (lambda c: c.__setitem__("monitoring_interval", -5), "monitoring_interval"),
+        (lambda c: c.__setitem__("retention_days", -1), "retention_days"),
+        (lambda c: c.__setitem__("retention_days", "x"), "retention_days"),
+        (
+            lambda c: c.__setitem__("channel_output_modes", {"channel1": "cloud"}),
+            r"channel_output_modes\.channel1",
+        ),
+        (
+            lambda c: c.__setitem__("channel_output_modes", {"bad name!": "disk"}),
+            "Invalid channel name in channel_output_modes",
+        ),
+        (lambda c: c.__setitem__("channel_output_modes", []), "channel_output_modes"),
+        (
+            lambda c: c.__setitem__("channel_youtube_hold_seconds", {"bad name!": 60}),
+            "Invalid channel name in channel_youtube_hold_seconds",
+        ),
+        (
+            lambda c: c.__setitem__("channel_youtube_hold_seconds", {"channel1": -1}),
+            r"channel_youtube_hold_seconds\.channel1",
+        ),
+        (lambda c: c.__setitem__("youtube", {"hold_seconds": -1}), r"youtube\.hold_seconds"),
+        (lambda c: c.__setitem__("update_check", {"enabled": "yes"}), r"update_check\.enabled"),
+        (lambda c: c.__setitem__("update_check", {"interval_hours": 0}), r"update_check\.interval_hours"),
+        (lambda c: c.__setitem__("update_check", {"interval_hours": -1}), r"update_check\.interval_hours"),
+        (lambda c: c.__setitem__("update_check", []), "update_check"),
     ],
 )
 def test_invalid_new_settings_raise(mutate, match):
@@ -142,43 +169,6 @@ def test_missing_required_key_raises(key):
         AppConfig.model_validate(config)
 
 
-def test_invalid_channel_name_raises():
-    config = valid_config()
-    config["channels"] = ["bad name!"]
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_invalid_timezone_raises():
-    config = valid_config()
-    config["timezone"] = "Mars/Olympus"
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_invalid_output_mode_raises():
-    config = valid_config()
-    config["output_mode"] = "cloud"
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-@pytest.mark.parametrize("interval", [0, -5])
-def test_non_positive_monitoring_interval_raises(interval):
-    config = valid_config()
-    config["monitoring_interval"] = interval
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-@pytest.mark.parametrize("retention_days", [-1, "x"])
-def test_invalid_retention_days_raises(retention_days):
-    config = valid_config()
-    config["retention_days"] = retention_days
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
 def test_positive_retention_days_passes():
     config = build(retention_days=7)
     assert config.retention_days == 7
@@ -197,43 +187,6 @@ def test_channel_quality_keys_normalized_and_effective_quality():
 def test_valid_channel_output_modes_passes():
     config = build(channel_output_modes={"channel1": "youtube", "other": "both"})
     assert config.channel_output_modes == {"twitch:channel1": "youtube", "twitch:other": "both"}
-
-
-def test_invalid_channel_output_mode_value_raises():
-    config = valid_config()
-    config["channel_output_modes"] = {"channel1": "cloud"}
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_invalid_channel_output_mode_name_raises():
-    config = valid_config()
-    config["channel_output_modes"] = {"bad name!": "disk"}
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_channel_output_modes_non_dict_raises():
-    config = valid_config()
-    config["channel_output_modes"] = []
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda c: c.__setitem__("update_check", {"enabled": "yes"}),
-        lambda c: c.__setitem__("update_check", {"interval_hours": 0}),
-        lambda c: c.__setitem__("update_check", {"interval_hours": -1}),
-        lambda c: c.__setitem__("update_check", []),
-    ],
-)
-def test_invalid_update_check_raises(mutate):
-    config = valid_config()
-    mutate(config)
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
 
 
 def test_valid_update_check_values_pass():
@@ -318,14 +271,6 @@ def test_twitch_prefix_is_preserved():
     assert config.channels == ["twitch:foo"]
 
 
-def test_two_spellings_of_one_twitch_channel_raise():
-    """Names are lowercased first, so both spellings are the same channel."""
-    config = valid_config()
-    config["channels"] = ["twitch:Foo", "FOO"]
-    with pytest.raises(ValueError, match="Duplicate channel: 'twitch:foo'"):
-        AppConfig.model_validate(config)
-
-
 def test_kick_channel_output_modes_key_passes():
     config = kick_config()
     config["channel_output_modes"] = {"kick:xqc": "youtube"}
@@ -354,7 +299,7 @@ def test_endpoint_enabled_requires_public_url():
 def test_kick_record_chat_non_bool_raises():
     config = kick_config()
     config["kick"]["record_chat"] = "yes"
-    with pytest.raises(ValueError, match="kick.record_chat must be a boolean"):
+    with pytest.raises(ValueError, match=r"kick\.record_chat"):
         AppConfig.model_validate(config)
 
 
@@ -603,27 +548,6 @@ def test_channel_hold_override_normalized():
     assert config.channel_youtube_hold_seconds == {"twitch:channel1": 60}
 
 
-def test_invalid_channel_hold_key_raises():
-    config = valid_config()
-    config["channel_youtube_hold_seconds"] = {"bad name!": 60}
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_negative_channel_hold_raises():
-    config = valid_config()
-    config["channel_youtube_hold_seconds"] = {"channel1": -1}
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
-def test_negative_global_hold_raises():
-    config = valid_config()
-    config["youtube"] = {"hold_seconds": -1}
-    with pytest.raises(ValueError):
-        AppConfig.model_validate(config)
-
-
 def test_config_example_is_valid_json_and_appconfig():
     data = json.loads((Path(__file__).resolve().parent.parent / "config.json.example").read_text())
     data["telegram_user_id"] = 12345  # placeholder string fails StrictInt by design
@@ -636,7 +560,7 @@ def test_api_defaults_and_validation():
     config = build()
     assert config.api.enabled is False
     assert config.api.key == ""
-    with pytest.raises(ValueError, match="api.enabled must be a boolean"):
+    with pytest.raises(ValueError, match=r"api\.enabled"):
         build(api={"enabled": "yes"})
 
 

@@ -2,24 +2,9 @@ import asyncio
 
 import httpx
 import pytest
+from conftest import make_config as _make_config
 
-from stream_archive.config import AppConfig
 from stream_archive.twitch_api import _MAX_QUERY_ITEMS, TwitchAPI
-
-
-def base_config():
-    return {
-        "telegram_user_id": 12345,
-        "bot_telegram_api": "bot_token",
-        "twitch_client_id": "client_id",
-        "twitch_client_secret": "client_secret",
-        "channels": ["ch"],
-        "proxy_list": ["httpproxy://user:pass@host:port"],
-        "monitoring_interval": 60,
-        "timezone": "UTC",
-        "plugin_dir": "plugins",
-        "recording_dir": "recordings",
-    }
 
 
 class YieldingTransport(httpx.AsyncBaseTransport):
@@ -41,14 +26,6 @@ class YieldingTransport(httpx.AsyncBaseTransport):
         return self._handler(request)
 
 
-def make_api(handler, transport=None):
-    # Inject the mock client through the constructor: TwitchAPI owns the
-    # client only when it creates it, so the tests close this one themselves.
-    transport = httpx.MockTransport(handler) if transport is None else transport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    return TwitchAPI(AppConfig.model_validate(base_config()), http=client)
-
-
 def token_handler(request):
     assert request.url.path == "/oauth2/token"
     assert request.method == "POST"
@@ -57,6 +34,30 @@ def token_handler(request):
     assert "client_id=client_id" in form
     assert "client_secret=client_secret" in form
     return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+
+
+def no_other_request(request):
+    pytest.fail(f"unexpected request: {request.method} {request.url}")
+
+
+def make_api(handler=no_other_request, transport=None, token=token_handler):
+    """Build a TwitchAPI on an injected mock-transport client.
+
+    Every Twitch call needs a token first, so that POST is served here and
+    ``handler`` describes only the endpoint under test. Injecting the client
+    through the constructor leaves TwitchAPI without ownership of it, so the
+    tests close this one themselves.
+    """
+
+    def route(request):
+        if request.url.path == "/oauth2/token":
+            return token(request)
+        return handler(request)
+
+    transport = httpx.MockTransport(route) if transport is None else transport(route)
+    client = httpx.AsyncClient(transport=transport)
+    # Twitch calls need no Kick credentials, so the Kick section stays empty.
+    return TwitchAPI(_make_config(kick={"client_id": "", "client_secret": ""}), http=client)
 
 
 def assert_auth_headers(request):
@@ -68,12 +69,11 @@ def assert_auth_headers(request):
 def test_token_fetched_and_cached():
     calls = {"tokens": 0}
 
-    def handler(request):
-        # token_handler asserts the path, so any other request fails clearly.
+    def token(request):
         calls["tokens"] += 1
         return token_handler(request)
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         try:
@@ -90,11 +90,11 @@ def test_concurrent_token_refresh_is_single_flight():
     """A burst of callers must produce exactly one client_credentials POST."""
     calls = {"tokens": 0}
 
-    def handler(request):
+    def token(request):
         calls["tokens"] += 1
         return token_handler(request)
 
-    api = make_api(handler, transport=YieldingTransport)
+    api = make_api(transport=YieldingTransport, token=token)
 
     async def scenario():
         try:
@@ -110,11 +110,11 @@ def test_token_request_error_is_not_cached():
     """A failed token POST must raise and must not poison the cache."""
     calls = {"tokens": 0}
 
-    def handler(request):
+    def token(request):
         calls["tokens"] += 1
         return httpx.Response(400, json={"message": "invalid client"})
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         try:
@@ -135,11 +135,11 @@ def test_short_lived_token_is_refetched_after_expiry():
     """A token inside the 60s safety margin must trigger a second POST."""
     tokens = []
 
-    def handler(request):
+    def token(request):
         tokens.append("tok")
         return httpx.Response(200, json={"access_token": f"tok-{len(tokens)}", "expires_in": 30})
 
-    api = make_api(handler)
+    api = make_api(token=token)
 
     async def scenario():
         try:
@@ -158,8 +158,6 @@ def test_resolve_user_ids_keeps_max_items_in_one_request():
     chunks = []
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            return token_handler(request)
         assert request.url.path == "/helix/users"
         assert_auth_headers(request)
         chunk = request.url.params.get_list("login")
@@ -186,8 +184,6 @@ def test_resolve_user_ids_splits_over_max_items_into_chunks():
     chunks = []
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            return token_handler(request)
         assert request.url.path == "/helix/users"
         assert_auth_headers(request)
         chunk = request.url.params.get_list("login")
@@ -220,8 +216,6 @@ def test_get_live_streams_splits_over_max_items_into_chunks():
     chunks = []
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            return token_handler(request)
         assert request.url.path == "/helix/streams"
         assert_auth_headers(request)
         chunk = request.url.params.get_list("user_id")
@@ -269,8 +263,6 @@ def test_create_eventsub_subscription_answers_a_non_json_body_with_an_empty_dict
     """A handled status with a non-JSON body must not raise a parse error."""
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            return token_handler(request)
         assert request.url.path == "/helix/eventsub/subscriptions"
         assert_auth_headers(request)
         # A proxy or a WAF can answer a handled status with an HTML page.
@@ -292,8 +284,6 @@ def test_create_eventsub_subscription_raises_for_an_unhandled_status():
     """A status that the callers do not handle must raise."""
 
     def handler(request):
-        if request.url.path == "/oauth2/token":
-            return token_handler(request)
         assert request.url.path == "/helix/eventsub/subscriptions"
         return httpx.Response(401, json={"message": "invalid token"})
 

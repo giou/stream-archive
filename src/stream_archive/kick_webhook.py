@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from aiohttp import web
@@ -18,11 +18,17 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from stream_archive.config import (
     KICK_PREFIX,
     AppConfig,
+    bare_name,
     is_kick_channel,
-    kick_bare_name,
     save_config,
     webhook_public_url,
 )
+
+if TYPE_CHECKING:
+    from stream_archive.kick_api import KickAPI
+    from stream_archive.monitor import Monitor
+    from stream_archive.notifier import Notifier
+    from stream_archive.recorder import Recorder
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +151,7 @@ def _parse_timestamp(value: str) -> float | None:
     """
     value = value.strip()
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value).timestamp()
     except ValueError:
         pass
     else:
@@ -157,38 +163,6 @@ def _parse_timestamp(value: str) -> float | None:
     return seconds if math.isfinite(seconds) else None
 
 
-class MonitorProtocol(Protocol):
-    """The monitor calls that the receiver needs."""
-
-    async def handle_online(
-        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
-    ) -> None: ...
-    async def handle_offline(self, channel: str, config: AppConfig) -> None: ...
-
-
-class RecorderProtocol(Protocol):
-    """The recorder call that the receiver needs."""
-
-    async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None: ...
-
-
-class KickAPIProtocol(Protocol):
-    """The Kick API calls that the receiver needs."""
-
-    async def get_public_key(self, force: bool = False) -> str | None: ...
-    def has_public_key(self) -> bool: ...
-    async def get_channel_statuses(self, slugs: list[str]) -> dict[str, dict[str, Any]]: ...
-    async def list_event_subscriptions(self) -> list[dict[str, Any]]: ...
-    async def create_event_subscriptions(self, broadcaster_user_id: int, events: list[str]) -> list[dict[str, Any]]: ...
-    async def delete_event_subscriptions(self, ids: list[str]) -> None: ...
-
-
-class NotifierProtocol(Protocol):
-    """The notification call that the receiver needs."""
-
-    async def notify(self, message: str) -> None: ...
-
-
 class KickWebhook:
     EVENT_LIVE = "livestream.status.updated"  # v1
     EVENT_CHAT = "chat.message.sent"  # v1
@@ -196,10 +170,10 @@ class KickWebhook:
     def __init__(
         self,
         config: AppConfig,
-        monitor: MonitorProtocol,
-        recorder: RecorderProtocol,
-        kick_api: KickAPIProtocol,
-        notifier: NotifierProtocol | None,
+        monitor: Monitor,
+        recorder: Recorder,
+        kick_api: KickAPI,
+        notifier: Notifier | None,
     ):
         self._config = config
         self._monitor = monitor
@@ -650,9 +624,9 @@ class KickWebhook:
         desired = {}  # bare slug -> broadcaster_user_id
         kick_channels = [c for c in channels if is_kick_channel(c)]
         if kick_channels:
-            statuses = await self._api.get_channel_statuses([kick_bare_name(c) for c in kick_channels])
+            statuses = await self._api.get_channel_statuses([bare_name(c) for c in kick_channels])
             for c in kick_channels:
-                bare = kick_bare_name(c)
+                bare = bare_name(c)
                 status = statuses.get(bare)
                 if status is None:
                     logger.warning("[kick_webhook] channel not found for webhook subs: %s", c)
@@ -687,7 +661,7 @@ class KickWebhook:
         # that did not resolve above has no uid, so this pass cannot tell its
         # channel apart from an unmonitored one. Skip the whole pass then: a
         # missed deletion is harmless, a wrong deletion kills event delivery.
-        unresolved = {kick_bare_name(c) for c in kick_channels} - set(desired)
+        unresolved = {bare_name(c) for c in kick_channels} - set(desired)
         if unresolved:
             logger.warning(
                 "[kick_webhook] %d kick channel(s) unresolved, skipping subscription cleanup", len(unresolved)
@@ -738,7 +712,7 @@ class KickWebhook:
         """Subscribe a newly added kick channel to both events. This logs errors."""
         if not is_kick_channel(channel):
             return
-        bare = kick_bare_name(channel)
+        bare = bare_name(channel)
         try:
             statuses = await self._api.get_channel_statuses([bare])
             uid = (statuses.get(bare) or {}).get("broadcaster_user_id")
@@ -756,7 +730,7 @@ class KickWebhook:
         """Delete all recorded subscriptions for a removed kick channel."""
         if not is_kick_channel(channel):
             return
-        bare = kick_bare_name(channel)
+        bare = bare_name(channel)
         ids = self._subs.pop(bare, set())
         if not ids:
             return

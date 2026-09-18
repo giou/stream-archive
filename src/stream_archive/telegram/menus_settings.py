@@ -13,7 +13,7 @@ from stream_archive.telegram.commands_settings import (
     QUALITY_CHOICES,
     RETENTION_CHOICES,
 )
-from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error
+from stream_archive.telegram.menu_state import ChatId, MenuResult, is_error, open_menu, pick_preset
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -36,22 +36,26 @@ async def menu_chat(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
 
 async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the output-mode pick."""
+
     state = ctrl._state_for(chat_id)
-    if text in MODE_CHOICES:
-        result = ctrl.handle_mode([MODE_CHOICES[text]], chat_id=chat_id)
-        state.menu = "root"
-        return result, ctrl.reply_keyboard("root", chat_id=chat_id)
-    return None
+    return await pick_preset(
+        ctrl, state, text, MODE_CHOICES, lambda value: ctrl.handle_mode([value], chat_id=chat_id), "root", chat_id
+    )
 
 
 async def menu_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the global quality pick."""
+
     state = ctrl._state_for(chat_id)
-    if text in QUALITY_CHOICES:
-        result = ctrl.handle_quality([QUALITY_CHOICES[text]], chat_id=chat_id)
-        state.menu = "root"
-        return result, ctrl.reply_keyboard("root", chat_id=chat_id)
-    return None
+    return await pick_preset(
+        ctrl,
+        state,
+        text,
+        QUALITY_CHOICES,
+        lambda value: ctrl.handle_quality([value], chat_id=chat_id),
+        "root",
+        chat_id,
+    )
 
 
 async def menu_retention(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
@@ -87,6 +91,7 @@ async def menu_limits(ctrl: TelegramController, chat_id: ChatId, text: str) -> M
 
 async def menu_storage(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the Storage & limits menu."""
+
     state = ctrl._state_for(chat_id)
     new_menu = {
         "Retention": "retention",
@@ -96,8 +101,7 @@ async def menu_storage(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
     }.get(text)
     if new_menu is None:
         return None
-    state.menu = new_menu
-    return await ctrl.menu_text(new_menu, chat_id=chat_id), ctrl.reply_keyboard(new_menu, chat_id=chat_id)
+    return await open_menu(ctrl, new_menu, chat_id, state=state)
 
 
 async def menu_disk(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:

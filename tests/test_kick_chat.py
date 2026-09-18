@@ -211,18 +211,31 @@ def test_collect_emote_names_reports_limit_skips(monkeypatch):
     assert names == {"1": "AAA", "2": "BBB"}
 
 
+def run_with_client(handler, call):
+    """Run ``call`` with an httpx client on a mock transport.
+
+    ``handler`` answers each request. ``call`` takes the client and returns
+    the coroutine to await. The helper returns the result of that coroutine.
+    """
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await call(client)
+
+    return asyncio.run(scenario())
+
+
 def test_fetch_emote_images_with_mock_transport():
     def handler(request):
         if request.url.path.endswith("/37226/fullsize"):
             return httpx.Response(200, content=b"PNGDATA")
         return httpx.Response(404)
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            images = await fetch_emote_images(["37226", "missing"], client)
-        assert images == {"37226": b"PNGDATA"}  # 404 skipped silently
+    async def call(client):
+        return await fetch_emote_images(["37226", "missing"], client)
 
-    asyncio.run(scenario())
+    images = run_with_client(handler, call)
+    assert images == {"37226": b"PNGDATA"}  # 404 skipped silently
 
 
 def test_fetch_emote_images_count_limit():
@@ -232,38 +245,35 @@ def test_fetch_emote_images_count_limit():
         names.append(request.url.path)
         return httpx.Response(200, content=b"IMG")
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            images = await fetch_emote_images(["1", "2", "3", "4"], client, max_emotes=2)
-        assert len(images) == 2
-        assert len(names) == 2  # the limit stops the requests, not only the result
+    async def call(client):
+        return await fetch_emote_images(["1", "2", "3", "4"], client, max_emotes=2)
 
-    asyncio.run(scenario())
+    images = run_with_client(handler, call)
+    assert len(images) == 2
+    assert len(names) == 2  # the limit stops the requests, not only the result
 
 
 def test_fetch_emote_images_per_image_limit():
     def handler(request):
         return httpx.Response(200, content=b"x" * 64)
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            images = await fetch_emote_images(["1"], client, max_bytes_each=16)
-        assert images == {}  # an oversized image is skipped, the capture continues
+    async def call(client):
+        return await fetch_emote_images(["1"], client, max_bytes_each=16)
 
-    asyncio.run(scenario())
+    images = run_with_client(handler, call)
+    assert images == {}  # an oversized image is skipped, the capture continues
 
 
 def test_fetch_emote_images_total_limit():
     def handler(request):
         return httpx.Response(200, content=b"x" * 4)
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            images = await fetch_emote_images(["1", "2", "3", "4", "5"], client, max_total_bytes=8)
-        assert sum(len(v) for v in images.values()) == 8  # 4-byte images fill the cap exactly
-        assert images
+    async def call(client):
+        return await fetch_emote_images(["1", "2", "3", "4", "5"], client, max_total_bytes=8)
 
-    asyncio.run(scenario())
+    images = run_with_client(handler, call)
+    assert sum(len(v) for v in images.values()) == 8  # 4-byte images fill the cap exactly
+    assert images
 
 
 def test_embedded_data_base64_and_name():
@@ -272,24 +282,23 @@ def test_embedded_data_base64_and_name():
             return httpx.Response(200, content=b"\x89PNG-fake")
         return httpx.Response(404)
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            embedded = await embedded_data({"37226": "KEKW", "404": "MISSING"}, client)
-        assert embedded == {
-            "firstParty": [
-                {
-                    "id": "37226",
-                    "imageScale": 2,
-                    "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
-                    "name": "KEKW",  # parsed from the [emote:id:NAME] token
-                }
-            ]
-        }
-        # TwitchDownloader can deserialize the result. FileInfo versions above
-        # 1.2.2 gate this modern shape.
-        json.dumps(embedded)
+    async def call(client):
+        return await embedded_data({"37226": "KEKW", "404": "MISSING"}, client)
 
-    asyncio.run(scenario())
+    embedded = run_with_client(handler, call)
+    assert embedded == {
+        "firstParty": [
+            {
+                "id": "37226",
+                "imageScale": 2,
+                "data": base64.b64encode(b"\x89PNG-fake").decode("ascii"),
+                "name": "KEKW",  # parsed from the [emote:id:NAME] token
+            }
+        ]
+    }
+    # TwitchDownloader can deserialize the result. FileInfo versions above
+    # 1.2.2 gate this modern shape.
+    json.dumps(embedded)
 
 
 def test_embedded_data_without_images_or_names():
@@ -298,11 +307,10 @@ def test_embedded_data_without_images_or_names():
     def handler(request):
         return httpx.Response(404)
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            assert await embedded_data({"1": "AAA"}, client) is None
+    async def call(client):
+        return await embedded_data({"1": "AAA"}, client)
 
-    asyncio.run(scenario())
+    assert run_with_client(handler, call) is None
 
 
 def test_embedded_data_never_raises(monkeypatch, caplog):
@@ -334,13 +342,11 @@ def test_embedded_data_bounds_the_encoded_payload(monkeypatch, caplog):
     def handler(request):
         return httpx.Response(200, content=b"1234")  # 4 bytes -> 8 base64 chars
 
-    async def scenario():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            with caplog.at_level("WARNING"):
-                embedded = await embedded_data({"1": "A", "2": "B", "3": "C"}, client)
-        return embedded
+    async def call(client):
+        with caplog.at_level("WARNING"):
+            return await embedded_data({"1": "A", "2": "B", "3": "C"}, client)
 
-    embedded = asyncio.run(scenario())
+    embedded = run_with_client(handler, call)
 
     assert embedded is not None
     assert [item["id"] for item in embedded["firstParty"]] == ["1"]

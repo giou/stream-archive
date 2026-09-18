@@ -24,15 +24,14 @@ from stream_archive.config import (
     channel_url,
     effective_quality,
     is_kick_channel,
-    kick_bare_name,
 )
 from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
-from stream_archive.recorder.common import _close_late_stream, sanitize_filename
+from stream_archive.recorder.common import _open_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
-from stream_archive.recorder.youtube_output import YouTubeLimits, YoutubeOutputMixin
+from stream_archive.recorder.youtube_output import YoutubeOutputMixin
 
 if TYPE_CHECKING:
     from stream_archive.notifier import Notifier
@@ -68,7 +67,6 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _youtube_starts: list[float]
     _youtube_budget_lock: asyncio.Lock
     _held: dict[str, HoldState]
-    _limits: YouTubeLimits
     _reserve_lock: asyncio.Lock
     _reserved_channels: dict[str, str]
     _bg_tasks: set[asyncio.Task[Any]]
@@ -78,12 +76,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         config: AppConfig,
         youtube_streamer: YouTubeStreamer | None = None,
         notifier: Notifier | None = None,
-        limits: YouTubeLimits | None = None,
     ) -> None:
         self._config = config
         self._youtube = youtube_streamer
         self._notifier = notifier
-        self._limits = limits if limits is not None else YouTubeLimits()
         self._recordings = {}
         self._locks = {}
         self._session = Streamlink()
@@ -164,9 +160,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         return mode
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
-        if channel not in self._locks:
-            self._locks[channel] = asyncio.Lock()
-        return self._locks[channel]
+        return self._locks.setdefault(channel, asyncio.Lock())
 
     def _chat_error_handler(self, channel: str, chat_path: str) -> Callable[[Exception], None]:
         """Build the callback that a chat writer calls after a write failure.
@@ -228,7 +222,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         if is_kick_channel(channel) and self._config.kick.record_chat:
             chat_dir = disk.chat_dir_path(self._config)
-            slug = kick_bare_name(channel)
+            slug = bare_name(channel)
             chat_path = os.path.join(chat_dir, "kick", slug, f"{safe_title}-{now}.chat.json")
             started_wall = datetime.now(ZoneInfo(self._config.timezone)).isoformat()
             start = parse_time(started_wall)
@@ -308,7 +302,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # not turn into an UnboundLocalError that masks the real error.
         tasks: list[asyncio.Task[Any]] = []
         try:
-            entry: Recording = {"tasks": [], "process": None, "youtube_info": None, "filepath": None}
+            entry: Recording = {"tasks": [], "youtube_info": None, "filepath": None}
             entry["started_at"] = time.monotonic()
             entry["mode"] = mode
             self._recordings[channel] = entry
@@ -335,38 +329,21 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 # The live notification goes out at the end of this method.
                 # A task that ends during that wait then finds its task list
                 # here, and the entry cannot stay behind without a task.
-            elif mode == "youtube":
-                if self._youtube is not None:
-                    yt_task = self._track(
+            elif self._youtube is not None:  # mode youtube or both
+                yt_task = self._track(
+                    channel,
+                    self._stream_youtube(
                         channel,
-                        self._stream_youtube(
-                            channel,
-                            author,
-                            stream_title,
-                            stream_game,
-                            best,
-                            None,
-                            notify=notify,
-                            youtube_notify=youtube_notify,
-                        ),
-                    )
-                    tasks.append(yt_task)
-            elif mode == "both":
-                if self._youtube is not None:
-                    yt_task = self._track(
-                        channel,
-                        self._stream_youtube(
-                            channel,
-                            author,
-                            stream_title,
-                            stream_game,
-                            best,
-                            entry["filepath"],
-                            notify=notify,
-                            youtube_notify=youtube_notify,
-                        ),
-                    )
-                    tasks.append(yt_task)
+                        author,
+                        stream_title,
+                        stream_game,
+                        best,
+                        entry["filepath"] if mode == "both" else None,
+                        notify=notify,
+                        youtube_notify=youtube_notify,
+                    ),
+                )
+                tasks.append(yt_task)
 
             if not tasks:
                 del self._recordings[channel]
@@ -452,17 +429,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             await asyncio.gather(*(entry.get("tasks", []) + ([wd] if wd else [])), return_exceptions=True)
 
         chat_recorder = entry.pop("chat_recorder", None)
-        if chat_recorder:
-            # _finalize_chat releases the writer's paths. Stopping the capture
-            # directly would leave its chat file protected from the archive
-            # passes for the rest of the process.
-            await self._finalize_chat(channel, chat_recorder)
-        await self._finalize_kick_chat(entry)
-
         youtube_info = entry.get("youtube_info")
-
-        if youtube_info:
-            await self._release_broadcast(channel, youtube_info, entry)
+        await self._finalize_entry(channel, entry, chat_recorder)
 
         filepath = entry.get("filepath")
         file_info = None
@@ -648,15 +616,19 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             await asyncio.gather(*gathered, return_exceptions=True)
 
         chat_recorder = entry.pop("chat_recorder", None)
+        await self._finalize_entry(channel, entry, chat_recorder)
+
+    async def _finalize_entry(self, channel: str, entry: Recording, chat_recorder: ChatRecorder | None) -> None:
+        """Finalize the chat capture, the broadcast, and the held state."""
         if chat_recorder:
             # _finalize_chat releases the writer's paths. Stopping the capture
             # directly would leave its chat file protected from the archive
             # passes for the rest of the process.
             await self._finalize_chat(channel, chat_recorder)
         await self._finalize_kick_chat(entry)
-
-        if entry.get("youtube_info"):
-            await self._release_broadcast(channel, entry["youtube_info"], entry)
+        youtube_info = entry.get("youtube_info")
+        if youtube_info:
+            await self._release_broadcast(channel, youtube_info, entry)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings
@@ -708,14 +680,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         loop = asyncio.get_running_loop()
         clean = False
         try:
-            # Shield the open, like the disk path: the worker thread keeps
-            # running after a cancellation, and its handle needs a close.
-            open_future = asyncio.ensure_future(loop.run_in_executor(None, stream.open))
-            try:
-                fd = await asyncio.shield(open_future)
-            except asyncio.CancelledError:
-                open_future.add_done_callback(_close_late_stream)
-                raise
+            fd = await _open_stream(stream)
         except Exception as e:
             logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
             return False

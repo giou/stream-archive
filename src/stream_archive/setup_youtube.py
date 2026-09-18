@@ -1,6 +1,4 @@
 import contextlib
-import json
-import os
 import sys
 import threading
 import webbrowser
@@ -12,8 +10,7 @@ from urllib.parse import parse_qs, urlparse
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from stream_archive.config import get_config
-
-SCOPES = ["https://www.googleapis.com/auth/youtube"]
+from stream_archive.youtube_streamer import SCOPES, TOKEN_NAME, save_token
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -187,10 +184,8 @@ def main() -> None:
     server.shutdown()
     server.server_close()
 
-    token_path = config._workdir / "youtube_token.json"
-    data = json.loads(flow.credentials.to_json())
-    with os.fdopen(os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(data, f)
+    token_path = config._workdir / TOKEN_NAME
+    save_token(flow.credentials, token_path)
 
     print()
     print(f"Token saved to {token_path}")

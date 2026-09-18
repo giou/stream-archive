@@ -12,9 +12,8 @@ from stream_archive.config import (
     AppConfig,
     bare_name,
     is_kick_channel,
-    kick_bare_name,
 )
-from stream_archive.recorder.common import _close_late_stream, _redact_credentials
+from stream_archive.recorder.common import _open_stream, _redact_credentials
 from stream_archive.recorder.types import Recording
 
 logger = logging.getLogger(__name__)
@@ -31,6 +30,8 @@ def _archive_files(recording_base: Path, chat_base: Path) -> Iterator[Path]:
 class DiskOutputMixin:
     _config: AppConfig
     _recordings: dict[str, Recording]
+    #: Real paths of every open chat writer. See ChatOutputMixin.
+    _chat_paths: set[str]
     # Set by Recorder (core.py). Typed as the exact call shape so a
     # signature drift fails type checks instead of failing at runtime.
     _abort: Callable[[str, str], Coroutine[Any, Any, None]]
@@ -38,7 +39,7 @@ class DiskOutputMixin:
     def _channel_dir(self, channel: str) -> str:
         """Return the recording subdirectory (kick/<slug>, twitch/<name>, else bare)."""
         if is_kick_channel(channel):
-            return f"kick/{kick_bare_name(channel)}"
+            return f"kick/{bare_name(channel)}"
         if channel.startswith("twitch:"):
             return f"twitch/{bare_name(channel)}"
         return channel
@@ -49,16 +50,7 @@ class DiskOutputMixin:
         fd: Any = None
         f: Any = None
         try:
-            # Shield the open. On cancellation the worker thread keeps
-            # running, so the callback closes the handle it returns. Without
-            # the shield, that handle is dropped and only the garbage
-            # collector closes it.
-            open_future = asyncio.ensure_future(loop.run_in_executor(None, stream.open))
-            try:
-                fd = await asyncio.shield(open_future)
-            except asyncio.CancelledError:
-                open_future.add_done_callback(_close_late_stream)
-                raise
+            fd = await _open_stream(stream)
             # Open on the loop thread. A cancellation between an executor
             # call and its return drops the file object, and the garbage
             # collector then reports an open handle. One open() call costs
@@ -147,11 +139,14 @@ class DiskOutputMixin:
         renames the file, and that window is exactly when the file has no
         other copy.
         """
-        active: set[str] = set(getattr(self, "_chat_paths", ()))
+        active: set[str] = set(self._chat_paths)
         for e in self._recordings.values():
             filepath = e.get("filepath")
             if filepath:
                 active.add(os.path.realpath(filepath))
+            # The registry above is the contract for open writers. The walk
+            # below repeats it from the entry side on purpose: unlink of a
+            # live file loses data, so the two views must agree.
             chat_recorder = e.get("chat_recorder")
             if chat_recorder is not None:
                 active.add(os.path.realpath(chat_recorder.chat_path))
@@ -163,6 +158,22 @@ class DiskOutputMixin:
                 if writer is not None:
                     active.add(os.path.realpath(writer.tmp_path))
         return active
+
+    def _remove_if_inactive(self, path: Path, active: set[str]) -> int | None:
+        """Unlink one archive file that no live capture holds.
+
+        Return the size in bytes, or None when the file stayed: a live
+        capture holds it, or the removal failed.
+        """
+        if os.path.realpath(path) in active:
+            return None
+        try:
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("[recorder] Failed to delete %s: %s", path, e)
+            return None
+        return size
 
     async def delete_oldest_to_cap(self) -> tuple[int, int]:
         """Delete the oldest archive files until under disk.max_total_gb.
@@ -197,19 +208,15 @@ class DiskOutputMixin:
         total = sum(size for _, size, _ in stats)
         cap_bytes = int(cap * 1024**3)
         removed = freed = 0
-        for _, size, path in stats:
+        for _mtime, _size, path in stats:
             if total < cap_bytes:
                 break
-            if os.path.realpath(path) in active:
+            freed_here = self._remove_if_inactive(path, active)
+            if freed_here is None:
                 continue
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as e:
-                logger.warning("[recorder] Failed to delete %s: %s", path, e)
-                continue
-            total -= size
+            total -= freed_here
             removed += 1
-            freed += size
+            freed += freed_here
             logger.info("[recorder] Deleted oldest to stay under %s GB cap: %s", cap, path)
         # The pass measured the archive and can have changed it, so drop any
         # cached snapshot. The caller may re-check the cap straight after.
@@ -252,12 +259,7 @@ class DiskOutputMixin:
             # runs in the worker thread.
             active = self._active_paths()
             for path in expired:
-                if os.path.realpath(path) in active:
-                    continue
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as e:
-                    logger.warning("[recorder] Failed to delete %s: %s", path, e)
+                if self._remove_if_inactive(path, active) is None:
                     continue
                 removed += 1
                 logger.info("[recorder] Removed expired recording: %s", path)
