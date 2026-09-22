@@ -108,19 +108,35 @@ class YouTubeStreamer:
             try:
                 with open(self._token_path) as f:
                     data = json.load(f)
-                creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
             except (OSError, ValueError) as err:
-                # A corrupt or unreadable token file is an operator problem,
-                # not a code fault, so it must not surface as a bare
-                # JSONDecodeError traceback.
+                data = {}
+                # Rebind before the handler ends: the name dies with the
+                # except block, and the message below needs the cause.
+                load_err: BaseException | None = err
+            else:
+                load_err = None
+            token_err: str | None = None
+            if load_err is not None:
+                token_err = str(load_err)
+            elif not isinstance(data, dict):
+                # json.load succeeded on a list, string, or null. That shape
+                # never authenticates, so fail here with the operator message
+                # instead of a bare traceback from the credentials call below.
+                token_err = "is not a JSON object"
+            if token_err is not None:
                 msg = (
-                    f"YouTube token file {self._token_path} is unreadable or corrupt ({err}). "
+                    f"YouTube token file {self._token_path} {token_err}. "
+                    "Run 'python setup_youtube.py' again to authenticate."
+                )
+                raise RuntimeError(msg) from load_err
+            try:
+                creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
+            except (TypeError, KeyError, AttributeError, ValueError) as err:
+                msg = (
+                    f"YouTube token file {self._token_path} has an unexpected shape ({err}). "
                     "Run 'python setup_youtube.py' again to authenticate."
                 )
                 raise RuntimeError(msg) from err
-            if creds is None:
-                msg = "YouTube token could not be loaded."
-                raise RuntimeError(msg)
             self._credentials = creds
 
             if refresh or not creds.valid:

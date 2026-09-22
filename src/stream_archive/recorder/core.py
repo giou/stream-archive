@@ -538,9 +538,18 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 logger.error("[recorder] held broadcast cleanup failed for %s", ch, exc_info=True)
         self._reserved_channels.clear()
         # A finalizer can start another one, so drain until the set stays
-        # empty. A single snapshot would drop those tasks unawaited.
-        while self._bg_tasks:
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        # empty. A single snapshot would drop those tasks unawaited. A
+        # cancellation of this drain lands inside the await, so defer it like
+        # the loops above: the finalizers finish first and the caller still
+        # sees the cancellation.
+        try:
+            while self._bg_tasks:
+                await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        except asyncio.CancelledError as e:
+            cancelled = e
+            logger.warning("[recorder] background drain was interrupted; finishing the rest first")
+            while self._bg_tasks:
+                await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if cancelled is not None:
             raise cancelled
 

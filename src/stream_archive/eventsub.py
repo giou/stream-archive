@@ -160,13 +160,17 @@ class EventSubClient:
         """Delete the tracked subscriptions of the given channels.
 
         An id stays tracked until its delete succeeds, so a failed call is
-        retried by the next sync instead of leaking a live subscription.
+        retried by the next sync instead of leaking a live subscription. A
+        channel with no tracked ids still gets its empty entry and its user
+        id dropped: without that, a channel whose subscribe failed and that
+        is then removed from the config stays in _subs and syncs forever.
         """
         if self._conduit_id is None or self._session_id is None:
             logger.debug("[eventsub] no live session, not unsubscribing %s", ", ".join(channels))
             return
         async with self._subs_lock:
             work = [(ch, kind, sid) for ch in channels for kind, sid in self._subs.get(ch, {}).items()]
+            empty = [ch for ch in channels if ch in self._subs and not self._subs[ch]]
         for channel, kind, sub_id in work:
             try:
                 await self._api.delete_eventsub_subscription(sub_id)
@@ -175,6 +179,24 @@ class EventSubClient:
                 continue
             async with self._subs_lock:
                 self._forget_sub(channel, kind, sub_id)
+        for channel in empty:
+            async with self._subs_lock:
+                if channel in self._subs and not self._subs[channel]:
+                    self._forget_empty(channel)
+
+    def _forget_empty(self, channel: str) -> None:
+        """Drop an entry that holds no subscription ids. The caller holds the lock."""
+        kinds = self._subs.get(channel)
+        if kinds is None:
+            return
+        if kinds:
+            # A reconnect added a subscription while the delete ran: the
+            # normal delete path owns it now.
+            return
+        del self._subs[channel]
+        uid = self._user_ids.pop(channel, None)
+        if uid is not None:
+            self._id_to_channel.pop(uid, None)
 
     def _forget_sub(self, channel: str, kind: str, sub_id: str) -> None:
         """Drop one deleted subscription from the maps. The caller holds the lock."""

@@ -59,11 +59,11 @@ jobs:
           if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
             echo "cannot hash the streamlink-ttvlol asset" >&2; exit 1
           fi
-          # A plugin that does not parse must never reach a pull request.
-          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
-            "vendor/streamlink-ttvlol/${TAG}/twitch.py"
-          sed -i "s|^ARG TTVLOL_PLUGIN_VERSION=.*|ARG TTVLOL_PLUGIN_VERSION=${TAG}|" Dockerfile
-          sed -i "s|^ARG TTVLOL_PLUGIN_SHA256=.*|ARG TTVLOL_PLUGIN_SHA256=${SHA}|" Dockerfile
+          # A plugin that does not parse must never reach a pull request. The
+          # runner's python3 can be older than the 3.14 the image and CI pin,
+          # so the ast.parse gate would fail a plugin that uses 3.14-only
+          # syntax. Run it through the same interpreter that CI uses.
+          uvx --python 3.14 --with . python -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
           {
             echo "Upstream release \`${TAG}\`, replacing \`${PINNED}\`."
             echo
@@ -73,7 +73,11 @@ jobs:
             echo
             echo '```diff'
             diff -u "vendor/streamlink-ttvlol/${PINNED}/twitch.py" \
-              "vendor/streamlink-ttvlol/${TAG}/twitch.py" | head -c 60000 || true
+              "vendor/streamlink-ttvlol/${TAG}/twitch.py" | head -c 60000
+            DIFF_STATUS="${PIPESTATUS[0]}"
+            if [ "$DIFF_STATUS" -gt 1 ]; then
+              echo "cannot diff the plugin versions" >&2; exit 1
+            fi
             echo '```'
           } > /tmp/pr-body.md
       - name: Open the pull request
@@ -86,10 +90,17 @@ jobs:
           BRANCH="ttvlol/${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          if gh pr view "$BRANCH" --json number -q .number >/dev/null 2>&1; then
+            echo "a pull request for ${TAG} is already open, skipping" >&2
+            exit 0
+          fi
+          # A previous weekly run can leave the branch behind even without an
+          # open pull request, so reset it instead of failing on creation.
+          git checkout -B "$BRANCH"
+          git rm -r -q "vendor/streamlink-ttvlol/${PINNED}" 2>/dev/null || true
           git add Dockerfile "vendor/streamlink-ttvlol/${TAG}"
           git commit -m "chore(deps): bump the streamlink-ttvlol plugin to ${TAG}"
-          git push -u origin "$BRANCH"
+          git push --force-with-lease -u origin "$BRANCH"
           gh pr create \
             --title "Bump the streamlink-ttvlol plugin to ${TAG}" \
             --body-file /tmp/pr-body.md

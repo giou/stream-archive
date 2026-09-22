@@ -31,11 +31,11 @@ FROM python:3.14.7-slim
 #
 # curl exists for install.sh only, which needs it (or wget) to add the apt repo,
 # and the purge drops the CLI from the runtime image in the same layer.
-ARG TTLSCALE_INSTALL_SHA256=4207f322e10ad26b3054abe7c99dfb54da09843c8d0a50d0a82f8eff4972a0d1
+ARG TAILSCALE_INSTALL_SHA256=4207f322e10ad26b3054abe7c99dfb54da09843c8d0a50d0a82f8eff4972a0d1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg tzdata ca-certificates curl \
  && curl -fsSL -o /tmp/tailscale-install.sh https://tailscale.com/install.sh \
- && printf '%s  tailscale-install.sh\n' "${TTLSCALE_INSTALL_SHA256}" > /tmp/tailscale-install.sh.sha256 \
+ && printf '%s  tailscale-install.sh\n' "${TAILSCALE_INSTALL_SHA256}" > /tmp/tailscale-install.sh.sha256 \
  && (cd /tmp && sha256sum -c tailscale-install.sh.sha256) \
  && sh /tmp/tailscale-install.sh \
  && rm -f /tmp/tailscale-install.sh /tmp/tailscale-install.sh.sha256 \

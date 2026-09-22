@@ -87,13 +87,10 @@ jobs:
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull" | jq -r .token)
             PUBLISHED=$(curl -fsS --retry 3 --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
               "https://ghcr.io/v2/${REPOSITORY}/tags/list?n=1000" | jq -r '.tags[]?' \
-              | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
-            NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | sort -V | tail -1)
-            if [ "$NEWEST" = "${GITHUB_REF_NAME}" ]; then
-              TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
-            else
-              echo "::warning::${GITHUB_REF_NAME} is not newer than ${PUBLISHED}, so :latest stays there" >&2
-            fi
+              | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
+            # A first stable release has no published tags to compare with, so
+            # an empty PUBLISHED means this tag is the newest by definition.
+            NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | grep . | sort -V | tail -1)
           fi
           {
             echo "tags<<EOF"

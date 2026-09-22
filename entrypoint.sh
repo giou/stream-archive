@@ -85,16 +85,39 @@ fi
 # The home of the app must be writable by the app identity and private to it:
 # Streamlink's plugin cache defaults to $HOME/.cache, and a world-writable home
 # lets another uid pre-create that path and swap a symlink under the app. The
-# rootfs is read-only, so the home lives on the /tmp tmpfs. Keep the image
-# HOME=/tmp when the directory cannot be created.
+# rootfs is read-only, so the home lives on the /tmp tmpfs. This block runs as
+# root, so it validates the path before it touches anything: a custom home must
+# stay under /tmp and must not be /tmp itself, and an existing symlink is
+# refused instead of followed. The image HOME=/tmp is only a fallback: this
+# block runs before the identity drop, while the plain fallback below covers a
+# failure of this block and nothing else.
 app_home="${STREAM_ARCHIVE_HOME:-/tmp/stream-archive}"
+case "$app_home" in
+    /tmp/*) ;;
+    *) echo "entrypoint: STREAM_ARCHIVE_HOME must stay under /tmp, refusing '$app_home'" >&2; exit 1 ;;
+esac
+if [ "$app_home" = "/tmp" ]; then
+    echo "entrypoint: STREAM_ARCHIVE_HOME must not be /tmp itself" >&2; exit 1
+fi
+if [ -L "$app_home" ]; then
+    echo "entrypoint: '$app_home' is a symlink, refusing to adopt it as HOME" >&2; exit 1
+fi
 if mkdir -p "$app_home" 2>/dev/null; then
-    chmod 700 "$app_home" 2>/dev/null || true
+    [ -L "$app_home" ] && {
+        echo "entrypoint: '$app_home' became a symlink while creating it, refusing" >&2; exit 1
+    }
+    if ! chmod 700 "$app_home" 2>/dev/null; then
+        echo "entrypoint: cannot set mode 700 on '$app_home', it stays shared" >&2
+    fi
     if [ "$(id -u)" = "0" ] && [ -n "$uid" ] && [ "$uid" -ne 0 ]; then
-        chown "$uid:$gid" "$app_home" 2>/dev/null || true
+        if ! chown "$uid:$gid" "$app_home" 2>/dev/null; then
+            echo "entrypoint: cannot give '$app_home' to uid $uid, it stays shared" >&2
+        fi
     fi
     HOME="$app_home"
     export HOME
+else
+    echo "entrypoint: cannot create '$app_home', the app runs with HOME=/tmp" >&2
 fi
 
 if [ -n "$uid" ]; then
