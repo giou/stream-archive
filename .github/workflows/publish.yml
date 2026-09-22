@@ -88,23 +88,27 @@ jobs:
             # The grep can match nothing on a first or prerelease-only
             # registry, but curl and jq errors must stay fatal: a transient
             # outage that looks like "no published tags" would otherwise
-            # promote :latest on a stale assumption. Read the tag list, fail
-            # on an empty or null list, then filter to stable tags only.
+            # promote :latest on a stale assumption. Read the tag list and
+            # fail on an empty or null list; then filter to stable tags.
             REGISTRY_TAGS=$(curl -fsS --retry 3 --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
               "https://ghcr.io/v2/${REPOSITORY}/tags/list?n=1000" | jq -r '.tags // empty | .[]?')
             if [ -z "$REGISTRY_TAGS" ]; then
-              echo "the registry returned no tags at all, failing instead of guessing :latest" >&2; exit 1
-            fi
-            # An empty stable match is not an error: a first stable release
-            # has no earlier stable tag, so this tag is the newest by
-            # definition.
-            PUBLISHED=$(printf '%s\n' "$REGISTRY_TAGS" | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
-            NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | grep . | sort -V | tail -1)
-            if [ "$NEWEST" = "${GITHUB_REF_NAME}" ]; then
-              TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+              echo "the registry returned no tags at all, so this release ships without :latest" >&2
             else
-              echo "::warning::${GITHUB_REF_NAME} is not newer than ${PUBLISHED}, so :latest stays there" >&2
+              # An empty stable match is not an error: a first stable release
+              # has no earlier stable tag, so this tag is the newest by
+              # definition.
+              PUBLISHED=$(printf '%s\n' "$REGISTRY_TAGS" | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
+              NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | grep . | sort -V | tail -1)
+              if [ "$NEWEST" = "${GITHUB_REF_NAME}" ]; then
+                TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+              else
+                echo "::warning::${GITHUB_REF_NAME} is not newer than ${PUBLISHED}, so :latest stays there" >&2
+              fi
             fi
+          fi
+          {
+            echo "tags<<EOF"
             printf '%s\n' "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"

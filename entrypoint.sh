@@ -89,13 +89,20 @@ fi
 # root, so it rejects anything it cannot make private instead of continuing
 # with a shared home: a silently shared home would re-expose the cache path
 # the block exists to protect.
+#
+# spelled path fails closed. mkdir -p of a path whose existing final or
+# intermediate component is a symlink resolves through it, so the canonical
+# path after creation must equal the spelled path exactly. chmod and chown
+# then touch only that directory; a bare prefix check would allow a symlink
+# that stays under /tmp, so equality is required. A non-directory component
+# and any chmod/chown failure also fail closed below.
 app_home="${STREAM_ARCHIVE_HOME:-/tmp/stream-archive}"
-# Strip trailing slashes first: "/tmp/" must resolve to "/tmp", not pass the
-# prefix check. Reject dot segments after that: "/tmp/foo/../.." canonicalizes
-# to "/", and a plain pattern check cannot see through it.
 while [ "$app_home" != "${app_home%/}" ]; do
     app_home="${app_home%/}"
 done
+if [ -z "$app_home" ]; then
+    echo "entrypoint: STREAM_ARCHIVE_HOME names nothing, refusing" >&2; exit 1
+fi
 case "$app_home" in
     *"/../"*|*"/./"*|*/..|*/.) echo "entrypoint: STREAM_ARCHIVE_HOME has dot segments, refusing '$app_home'" >&2; exit 1 ;;
 esac
@@ -103,25 +110,19 @@ case "$app_home" in
     /tmp/*) ;;
     *) echo "entrypoint: STREAM_ARCHIVE_HOME must stay under /tmp, refusing '$app_home'" >&2; exit 1 ;;
 esac
-if [ -L "$app_home" ]; then
-    echo "entrypoint: '$app_home' is a symlink, refusing to adopt it as HOME" >&2; exit 1
+if [ -L "$app_home" ] || [ -e "$app_home" ] && [ ! -d "$app_home" ]; then
+    echo "entrypoint: '$app_home' exists and is not a directory, refusing" >&2; exit 1
 fi
-# A symlink planted between the two checks would redirect the chmod/chown
-# below, so verify the canonical path after creation. realpath resolves the
-# chain; readlink -f is the fallback where realpath is missing.
-canonical="$(realpath -m "$app_home" 2>/dev/null || readlink -f "$app_home" 2>/dev/null || printf '%s' "$app_home")"
-case "$canonical" in
-    /tmp/*) ;;
-    *) echo "entrypoint: '$app_home' resolves outside /tmp, refusing" >&2; exit 1 ;;
-esac
 if ! mkdir -p "$app_home" 2>/dev/null || [ ! -d "$app_home" ]; then
     echo "entrypoint: cannot create '$app_home', and the app must not run with a shared home" >&2; exit 1
 fi
-canonical="$(realpath -m "$app_home" 2>/dev/null || readlink -f "$app_home" 2>/dev/null || printf '%s' "$app_home")"
-case "$canonical" in
-    /tmp/*) ;;
-    *) echo "entrypoint: '$app_home' resolves outside /tmp after creation, refusing" >&2; exit 1 ;;
-esac
+canonical="$(realpath "$app_home" 2>/dev/null || readlink -f "$app_home" 2>/dev/null || true)"
+if [ -z "$canonical" ]; then
+    echo "entrypoint: cannot canonicalize '$app_home', refusing" >&2; exit 1
+fi
+if [ "$canonical" != "$app_home" ]; then
+    echo "entrypoint: '$app_home' resolves to '$canonical', refusing to adopt it as HOME" >&2; exit 1
+fi
 if ! chmod 700 "$app_home" 2>/dev/null; then
     echo "entrypoint: cannot set mode 700 on '$app_home', and the app must not run with a shared home" >&2; exit 1
 fi
