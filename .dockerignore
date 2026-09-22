@@ -5,20 +5,32 @@
 **/.venv
 **/__pycache__/
 **/*.pyc
+**/*.pyo
+**/*.pyd
 **/.pytest_cache/
 **/.mypy_cache/
 **/.ruff_cache/
+**/.github/
 **/tests/
+**/docs/
 **/recordings/
 **/chat/
-# Runtime secrets: config, tokens, cloud credentials. The trailing "*" also
-# covers the atomic-write temp files (config.json.tmp, update_state.json.tmp)
-# and config.json.example, which the image does not need.
+# Runtime secrets: config, tokens, cloud credentials, and the atomic-write temp
+# files around them (config.py writes "<name>.json.tmp", youtube_streamer.py
+# writes ".<name>.<random>.tmp"). The image holds none of these, because the
+# Dockerfile copies a fixed list of paths rather than the whole context; these
+# patterns are the second line of defence for a future `COPY . .`. The trailing
+# "*" on config also covers config.json.example, which the image does not need.
 **/config*.json*
 **/client_secret*.json
 **/credentials*.json
 **/youtube_token*.json
 **/update_state*.json*
+**/*.json.tmp
+**/.*.tmp
+**/*.chat.json
+**/*.chat.json.tmp
+**/*.bak
 # Key material: tunnel state, service-account keys, PEM files.
 **/*.pem
 **/*.key
@@ -26,7 +38,7 @@
 **/.env*
 # .tz: nothing in this repo reads these files. The filter covers host tooling
 # that writes them next to a checkout.
-.tz
+**/.tz
 **/cloudflared/
 # ":Zone.Identifier" is the Windows download marker.
 **/*:Zone.Identifier
@@ -34,4 +46,6 @@
 **/dist/
 **/*.egg-info/
 **/*.log
+**/.coverage
+**/htmlcov/
 **/.DS_Store

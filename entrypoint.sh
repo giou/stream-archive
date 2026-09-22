@@ -1,9 +1,16 @@
 #!/bin/sh
-# Runs the app as the data-dir owner so the host user can manage recorded
-# files regardless of their uid/gid (docker-compose mounts the data dir at
-# /data). USER_UID/USER_GID force a specific identity. Without a data dir
-# (plain `docker run`) the image user is kept.
+# Runs the app as the data-dir owner so the host user can manage recorded files
+# regardless of their uid/gid (docker-compose mounts the data dir at /data).
+# USER_UID/USER_GID force a specific identity. The app never runs as root: when
+# no other identity is available the entrypoint exits instead of keeping the
+# image identity. The container itself starts as root, because only root can
+# adopt another uid.
 set -eu
+
+if [ "$#" -eq 0 ]; then
+    echo "entrypoint: no command given. Use the image CMD or pass a command." >&2
+    exit 1
+fi
 
 DATA_DIR="${STREAM_ARCHIVE_DATA:-/data}"
 requested_uid="${USER_UID:-}"
@@ -35,68 +42,100 @@ normalize_id() {
     echo "$value"
 }
 
+# The exit above ends the subshell of the command substitution only, so the call
+# sites check the status too: an invalid id must not leave uid empty and fall
+# through to the image identity.
 uid=""
 gid=""
 if [ -n "$requested_uid" ]; then
-    uid="$(normalize_id USER_UID "$requested_uid")"
+    uid="$(normalize_id USER_UID "$requested_uid")" || exit 1
 fi
 if [ -n "$requested_gid" ]; then
-    gid="$(normalize_id USER_GID "$requested_gid")"
+    gid="$(normalize_id USER_GID "$requested_gid")" || exit 1
 fi
 
-if [ -z "$uid" ] && [ -d "$DATA_DIR" ]; then
-    uid="$(stat -c %u "$DATA_DIR" 2>/dev/null)" || {
+# One stat call returns both ids: two calls could read two different owners if
+# the data dir changes between them.
+owner_uid=""
+owner_gid=""
+if [ -d "$DATA_DIR" ]; then
+    owner="$(stat -c '%u %g' "$DATA_DIR" 2>/dev/null)" || {
         echo "entrypoint: cannot read the owner of data dir '$DATA_DIR'" >&2
         exit 1
     }
+    owner_uid="${owner%% *}"
+    owner_gid="${owner##* }"
+fi
+if [ -z "$uid" ]; then
+    uid="$owner_uid"
+fi
+if [ -n "$uid" ] && [ -z "$gid" ]; then
     # An explicit USER_GID wins over the data-dir group: docker-compose tells
-    # the user to grant access to the tailscale socket that way.
-    if [ -z "$gid" ]; then
-        gid="$(stat -c %g "$DATA_DIR" 2>/dev/null)" || gid="$uid"
+    # the user to grant access to the tailscale socket that way. Take the
+    # data-dir group only when the data dir belongs to that uid.
+    if [ "$owner_uid" = "$uid" ]; then
+        gid="$owner_gid"
+    else
+        gid="$uid"
+        echo "entrypoint: USER_GID is not set and '$DATA_DIR' does not belong to uid $uid," >&2
+        echo "entrypoint: so the app gets gid $uid. Set USER_GID to the group of '$DATA_DIR'." >&2
     fi
 fi
 
-if [ -n "$uid" ]; then
-    if [ -z "$gid" ]; then
-        # USER_UID without USER_GID. Take the data-dir group when the data dir
-        # belongs to that uid. Without that match the uid is all we know.
-        if [ -d "$DATA_DIR" ] && [ "$(stat -c %u "$DATA_DIR" 2>/dev/null)" = "$uid" ]; then
-            gid="$(stat -c %g "$DATA_DIR" 2>/dev/null)" || gid="$uid"
-        else
-            gid="$uid"
-            echo "entrypoint: USER_GID is not set and '$DATA_DIR' does not belong to uid $uid," >&2
-            echo "entrypoint: so the app gets gid $uid. Set USER_GID to the group of '$DATA_DIR'." >&2
-        fi
+# The home of the app must be writable by the app identity and private to it:
+# Streamlink's plugin cache defaults to $HOME/.cache, and a world-writable home
+# lets another uid pre-create that path and swap a symlink under the app. The
+# rootfs is read-only, so the home lives on the /tmp tmpfs. Keep the image
+# HOME=/tmp when the directory cannot be created.
+app_home="${STREAM_ARCHIVE_HOME:-/tmp/stream-archive}"
+if mkdir -p "$app_home" 2>/dev/null; then
+    chmod 700 "$app_home" 2>/dev/null || true
+    if [ "$(id -u)" = "0" ] && [ -n "$uid" ] && [ "$uid" -ne 0 ]; then
+        chown "$uid:$gid" "$app_home" 2>/dev/null || true
     fi
+    HOME="$app_home"
+    export HOME
+fi
 
-    # setpriv switches to arbitrary numeric ids without a passwd entry.
-    # --clear-groups drops any supplementary groups. --no-new-privs stops a
-    # setuid binary from regaining privileges. The -- separator keeps a
-    # command that starts with "-" out of the setpriv option list.
+if [ -n "$uid" ]; then
     if [ "$(id -u)" = "0" ]; then
-        # Warn on the identity that the app runs as, not on one that a container
-        # started as another user drops again.
+        # The app must not run as root: it holds the bot token and the client
+        # secrets, and files written by root are not manageable on the host.
+        # Refuse, so the misconfiguration shows up in the container log.
         if [ "$uid" -eq 0 ]; then
-            echo "entrypoint: resolved uid is 0, so the app runs as root." >&2
-            echo "entrypoint: set USER_UID and USER_GID, or chown '$DATA_DIR' to a non-root user." >&2
+            echo "entrypoint: the resolved identity is uid 0, so the app would run as root." >&2
+            echo "entrypoint: chown '$DATA_DIR' to a non-root user, or set USER_UID and USER_GID." >&2
+            exit 1
         fi
-        if [ "$gid" -eq 0 ] && [ "$uid" -ne 0 ]; then
+        if [ "$gid" -eq 0 ]; then
             echo "entrypoint: resolved gid is 0, so the app keeps the root group." >&2
             echo "entrypoint: set USER_GID to the group that owns '$DATA_DIR'." >&2
         fi
+
+        # setpriv switches to arbitrary numeric ids without a passwd entry.
+        # --clear-groups drops any supplementary groups. --no-new-privs stops a
+        # setuid binary from regaining privileges. The -- separator keeps a
+        # command that starts with "-" out of the setpriv option list.
         exec setpriv --no-new-privs --reuid="$uid" --regid="$gid" --clear-groups -- "$@"
     fi
 
     # A container that already runs as a non-root user cannot call setpriv, so
     # it keeps its identity.
-    if [ -n "$requested_uid" ] || [ -n "$requested_gid" ]; then
-        echo "entrypoint: the container already runs as uid $(id -u), so USER_UID/USER_GID are ignored." >&2
+    if [ "$uid" != "$(id -u)" ]; then
+        echo "entrypoint: the container runs as uid $(id -u), so it cannot adopt uid $uid." >&2
+        echo "entrypoint: '$DATA_DIR' must be writable by uid $(id -u)." >&2
     fi
 else
-    # No identity to adopt. The app then writes config.json and recordings/ as
-    # the image user, which is root in this image.
-    echo "entrypoint: '$DATA_DIR' is not a directory and USER_UID is not set, so the app keeps the" >&2
-    echo "entrypoint: image identity (uid $(id -u), gid $(id -g)). Create the directory or set USER_UID." >&2
+    # No identity to adopt.
+    if [ -n "$requested_gid" ]; then
+        echo "entrypoint: USER_GID is set but USER_UID is not, so the requested gid has no effect." >&2
+    fi
+    if [ "$(id -u)" = "0" ]; then
+        echo "entrypoint: '$DATA_DIR' is not a directory and USER_UID is not set, so there is no" >&2
+        echo "entrypoint: non-root identity for the app. Create '$DATA_DIR', or set USER_UID and" >&2
+        echo "entrypoint: USER_GID." >&2
+        exit 1
+    fi
 fi
 
 exec "$@"

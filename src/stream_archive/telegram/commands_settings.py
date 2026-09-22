@@ -1,3 +1,4 @@
+import math
 import secrets
 from collections.abc import Callable
 from typing import Any, cast
@@ -84,6 +85,8 @@ class SettingsCommands:
             n = int(args[0])
         except ValueError:
             return "\u274c retention must be an integer"
+        if n < 0:
+            return "\u274c retention must be a non-negative integer (0 = off)"
 
         def mutate(candidate: AppConfig) -> None:
             candidate.retention_days = n
@@ -250,6 +253,8 @@ class SettingsCommands:
             n = int(args[0])
         except ValueError:
             return f"\u274c {label[:1].lower()}{label[1:]} must be an integer"
+        if n < 0:
+            return f"\u274c {label[:1].lower()}{label[1:]} must be a non-negative integer"
         return cast(
             str,
             self._apply(
@@ -309,6 +314,10 @@ class SettingsCommands:
             v = float(val)
         except ValueError:
             return f"\u274c {cmd} must be a number"
+        if not math.isfinite(v) or v < 0:
+            # A NaN or an infinity would persist and then silently disable
+            # every later "used > limit" check of the disk limiter.
+            return f"\u274c {cmd} must be a non-negative number"
         if cmd == "maxsize":
             return cast(
                 str,
@@ -402,7 +411,8 @@ class SettingsCommands:
         # cannot be swapped in place: the bot application polls with its own
         # token, and the API clients hold their credentials and cached tokens.
         # Say so, instead of reporting a revocation or a rotation as applied.
-        stale = [key for key in _RESTART_REQUIRED if _dotted(before, key) != _dotted(self._config.model_dump(), key)]
+        after = self._config.model_dump()
+        stale = [key for key in _RESTART_REQUIRED if _dotted(before, key) != _dotted(after, key)]
         if stale:
             return (
                 "\u26a0\ufe0f Config reloaded, but these keys need a restart: "

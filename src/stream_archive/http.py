@@ -9,7 +9,7 @@ from stream_archive.updater import installed_app_version
 _USER_AGENT = f"stream-archive/{installed_app_version() or 'dev'}"
 
 
-def build_shared_client() -> httpx.AsyncClient:
+def build_http_client() -> httpx.AsyncClient:
     """Build an outbound HTTP client with the project defaults.
 
     The function returns a new client on every call. The caller owns that

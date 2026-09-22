@@ -65,27 +65,58 @@ class MenuState:
     cloudflare_hostname: str | None = None
 
 
+#: Fields of ``MenuState`` that one menu reads. Navigation clears every field
+#: that the target menu does not own, so no value of an earlier flow
+#: survives. This table is the only place that decides the ownership.
+_OWNED_FIELDS: dict[str, frozenset[str]] = {
+    "channel": frozenset({"channel"}),
+    "channel_mode": frozenset({"channel"}),
+    "channel_hold": frozenset({"channel"}),
+    "channel_quality": frozenset({"channel"}),
+    # The custom menu waits for a value, so it owns the pending key. It keeps
+    # the channel: the channel_hold key names the channel to change.
+    "custom": frozenset({"channel", "custom"}),
+    # The DNS step reads the hostname that the hostname step stored.
+    "kick_cloudflare_dns": frozenset({"cloudflare_hostname"}),
+}
+
+#: Menu that owns each custom value setting.
+_CUSTOM_PARENT: dict[str, str] = {
+    "retention": "storage",
+    "maxrec": "storage",
+    "maxyt": "storage",
+    "disk_maxsize": "disk",
+    "channel_hold": "channel",
+}
+
+
+def custom_parent(custom: str) -> str:
+    """Return the menu that owns the custom setting ``custom``.
+
+    An unknown key goes to the root menu. A value menu that holds a key of
+    an older version can then never open an unrelated menu.
+    """
+    return _CUSTOM_PARENT.get(custom, "root")
+
+
 async def open_menu(
     ctrl: TelegramController,
     menu: str,
     chat_id: ChatId,
     *,
     channel: str | None = None,
-    state: MenuState | None = None,
 ) -> MenuResult:
     """Open ``menu`` for one chat and answer with its text and keyboard.
 
-    Pass ``state`` to move that chat into the menu. Without ``channel``
-    the keyboard and the text fall back to the channel of the chat state.
+    Without ``channel`` the text and the keyboard fall back to the channel
+    of the chat state. Both read that state, so they render the same channel.
     """
-    if state is not None:
-        state.menu = menu
-    return await ctrl.menu_text(menu, channel, chat_id=chat_id), ctrl.reply_keyboard(menu, chat_id=chat_id)
+    ctrl._enter_menu(chat_id, menu, channel=channel)
+    return await ctrl.menu_text(menu, channel, chat_id=chat_id), ctrl.reply_keyboard(menu, channel, chat_id=chat_id)
 
 
 async def pick_preset(
     ctrl: TelegramController,
-    state: MenuState,
     text: str,
     choices: dict[str, str],
     apply: Callable[[str], str],
@@ -108,7 +139,7 @@ async def pick_preset(
     else:
         return None
     result = apply(value)
-    state.menu = back
+    ctrl._enter_menu(chat_id, back)
     return result, ctrl.reply_keyboard(back, chat_id=chat_id)
 
 
@@ -136,17 +167,43 @@ class ChatStateMixin:
         self._pending_audio_switch = {}  # (chat id, nonce) -> (quality change, channels) awaiting confirm
         self._apply_warnings_sent = set()  # pending keys already messaged
 
-    def _mark_confirm_done(self, chat_id: ChatId, data: str) -> None:
-        """Remember one handled press. Keep only the newest markers of the chat.
+    def _mark_confirm_done(self, chat_id: ChatId, nonce: str) -> None:
+        """Remember one handled prompt. Keep only the newest markers of the chat.
 
-        The key holds the nonce of one prompt, so a marker can never match a
-        later press. The bound stops the store from growing for the whole
-        process lifetime.
+        The key holds the nonce of one prompt, so both buttons of that prompt
+        share it: a Confirm retires the Cancel of the same message and the
+        other way round. A marker never matches a later message, whose nonce
+        differs. The bound stops the store from growing for the whole process
+        lifetime.
         """
-        self._confirm_done[(chat_id, data)] = None
+        self._confirm_done[(chat_id, nonce)] = None
         keys = [key for key in self._confirm_done if key[0] == chat_id]
         for key in keys[:-_CONFIRM_DONE_LIMIT]:
             del self._confirm_done[key]
+
+    def _press_handled(self, chat_id: ChatId, nonce: str) -> bool:
+        """True when that chat already handled a prompt with this nonce."""
+        return (chat_id, nonce) in self._confirm_done
+
+    def _enter_menu(self, chat_id: ChatId, menu: str, *, channel: str | None = None) -> MenuState:
+        """Move one chat into ``menu`` and clear the fields that menu does not own.
+
+        Every navigation goes through here, so a value of an earlier flow (a
+        pending custom key or a tunnel hostname) can never reach the next
+        menu. See ``_OWNED_FIELDS`` for the fields of each menu.
+        """
+        state = self._state_for(chat_id)
+        if channel is not None:
+            state.channel = channel
+        owned = _OWNED_FIELDS.get(menu, frozenset())
+        if "channel" not in owned:
+            state.channel = None
+        if "custom" not in owned:
+            state.custom = None
+        if "cloudflare_hostname" not in owned:
+            state.cloudflare_hostname = None
+        state.menu = menu
+        return state
 
     def _state_for(self, chat_id: ChatId) -> MenuState:
         """Return the menu of ``chat_id``, creating the root menu on first use."""
@@ -190,8 +247,4 @@ class ChatStateMixin:
 
     def _show_root(self, chat_id: ChatId) -> MenuState:
         """Reset one chat to the root menu and drop its per-flow fields."""
-        state = self._state_for(chat_id)
-        state.menu, state.channel = "root", None
-        state.custom = None
-        state.cloudflare_hostname = None
-        return state
+        return self._enter_menu(chat_id, "root")

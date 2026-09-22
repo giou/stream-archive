@@ -34,10 +34,18 @@ The hold/reuse recorder tests spawn `ffmpeg`; install it before you run the suit
 
 ## CI gates
 
-CI runs on every push and PR (`ci.yml`). It runs exactly:
-`uv sync --frozen`, `ruff format --check .`, `ruff check .`, `mypy`, then `pytest -q`.
-Treat these five steps as the definition of done.
-`--frozen` means dependency changes require a matching `uv.lock` update.
+CI runs on every push and PR (`ci.yml`). The `test` job runs, in order:
+`uv sync --locked`; a check that the vendored streamlink-ttvlol plugin matches
+its Dockerfile digest; a check that the workflow's uv version and the
+Dockerfile uv stage agree; a check that the Dockerfile healthcheck port equals
+`_HEALTH_PORT`; `ruff format --check .`; `ruff check .`; `mypy`; then
+`pytest -q`. Treat these as the definition of done. `--locked` means dependency
+changes require a matching `uv.lock` update. The image build uses `--frozen`,
+because it installs the shipped lock as it is.
+
+A second job, `image`, builds the container image, but only on a Dependabot
+pull request: nothing else in CI builds it, and a base-image bump should fail
+before the merge instead of at release time.
 
 ## Conventions
 

@@ -263,6 +263,16 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 channel,
                 raw_mode,
             )
+        if mode != "disk" and self._youtube is None:
+            # Fail before the resolve. Without a streamer the task list stays
+            # empty, the entry comes straight back out, and every monitor tick
+            # repeats the same silent start.
+            logger.error(
+                "[recorder] [%s] Output mode is %s but no YouTube streamer is configured. Check the YouTube settings.",
+                channel,
+                mode,
+            )
+            return False
         loop = asyncio.get_running_loop()
 
         try:
@@ -384,6 +394,15 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 to_cancel.append(watchdog)
             for t in to_cancel:
                 t.cancel()
+            # Await the cancelled tasks before the chat writers close. cancel()
+            # only requests the stop, and a task still inside its body can
+            # write into a writer that the discards below already closed and
+            # unlinked. A second cancellation must not skip the cleanup either.
+            cancelled: asyncio.CancelledError | None = None
+            try:
+                await asyncio.gather(*to_cancel, return_exceptions=True)
+            except asyncio.CancelledError as e2:
+                cancelled = e2
             state = entry.get("kick_chat")
             if state is not None:
                 # The entry drops the state below, so nothing else can close
@@ -401,11 +420,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 recorder.discard()
                 self._release_chat_paths(recorder.chat_path)
             self._recordings.pop(channel, None)
+            if cancelled is not None:
+                raise cancelled from None
             if not isinstance(e, Exception):
                 # CancelledError and the like: the caller does not want a
                 # result, so clean up and let the caller handle it.
                 raise
-            await asyncio.gather(*to_cancel, return_exceptions=True)
             logger.error("[recorder] [%s] Failed to start recording: %s", channel, e)
             return False
         else:
@@ -434,15 +454,18 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         filepath = entry.get("filepath")
         file_info = None
-        if filepath and os.path.exists(filepath):
-            st = os.stat(filepath)
-            size_mb = st.st_size / (1024 * 1024)
-            mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
-            file_info = {
-                "name": os.path.basename(filepath),
-                "size_mb": round(size_mb, 2),
-                "date": mtime.astimezone(ZoneInfo(self._config.timezone)).strftime("%d-%m-%Y %H:%M"),
-            }
+        if filepath:
+            # One guarded stat. A separate exists() check is a race: the
+            # retention and archive passes can unlink the file in between.
+            with suppress(OSError):
+                st = os.stat(filepath)
+                size_mb = st.st_size / (1024 * 1024)
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=UTC)
+                file_info = {
+                    "name": os.path.basename(filepath),
+                    "size_mb": round(size_mb, 2),
+                    "date": mtime.astimezone(ZoneInfo(self._config.timezone)).strftime("%d-%m-%Y %H:%M"),
+                }
 
         return {"file_info": file_info, "youtube_info": youtube_info}
 
@@ -495,7 +518,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             cancelled = e
         for ch, held in list(self._held.items()):
             # One bad entry must not skip the rest: every remaining
-            # keep-alive process and broadcast needs its own teardown.
+            # keep-alive process and broadcast needs its own teardown. The
+            # shutdown deadline can cancel this loop as easily as the code
+            # above, so a cancellation is deferred here too.
             try:
                 end_task = held.get("end_task")
                 if end_task is not None:
@@ -506,10 +531,15 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 broadcast_id = youtube_info.get("broadcast_id")
                 if broadcast_id:
                     await self._end_broadcast(ch, broadcast_id)
+            except asyncio.CancelledError as e:
+                cancelled = e
+                logger.warning("[recorder] teardown of held broadcast %s was interrupted; finishing the rest first", ch)
             except Exception:
                 logger.error("[recorder] held broadcast cleanup failed for %s", ch, exc_info=True)
         self._reserved_channels.clear()
-        if self._bg_tasks:
+        # A finalizer can start another one, so drain until the set stays
+        # empty. A single snapshot would drop those tasks unawaited.
+        while self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if cancelled is not None:
             raise cancelled
@@ -519,11 +549,26 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         The event loop keeps only a weak reference, so a bare task can be
         garbage-collected in flight and its exception never retrieved. The
-        set holds the task, and close() drains it.
+        set holds the task, close() drains it, and the done callback below
+        logs a failure.
         """
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+        task.add_done_callback(self._bg_done)
+
+    def _bg_done(self, task: asyncio.Task[Any]) -> None:
+        """Release a finished background task, and log its failure.
+
+        The discard alone leaves a failing finalizer (a malformed
+        youtube_info, a disk error) visible only as "Task exception was
+        never retrieved".
+        """
+        self._bg_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("[recorder] background finalize failed: %s", exc, exc_info=exc)
 
     def _track(self, channel: str, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -531,45 +576,53 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         return task
 
     def _on_task_finished(self, channel: str, task: asyncio.Task[Any]) -> None:
+        """Note a finished capture task, and release its entry when it was the last one.
+
+        A done callback runs on the loop thread, outside the per-channel lock.
+        The teardown below mutates the entry, so it must not interleave with
+        an await inside the start/stop/abort critical section: that leaves a
+        stale True return, a lost file_info, or a second watchdog. Scheduling
+        it as a finalizer lets it wait for the same lock instead.
+        """
         if task.cancelled():
             return
-        exc = task.exception()
-        entry = self._recordings.get(channel)
-        if entry is None or task not in entry.get("tasks", []):
-            return
-        entry["tasks"].remove(task)
-        if exc is not None:
-            logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
-            entry["failed"] = True
-        else:
-            # A clean stream end (for example, the HLS feed stalls and streamlink
-            # closes it) must also release the entry once all tasks finish.
-            # Otherwise the monitor sees the channel as recording and never
-            # restarts, and the broadcast lingers until YouTube auto-ends it.
-            logger.info("[recorder] [%s] Recording task ended", channel)
-        if entry["tasks"]:
-            return  # other recording tasks (for example the disk fallback) still running
-        chat_recorder = entry.pop("chat_recorder", None)
-        if chat_recorder:
-            self._spawn_bg(self._finalize_chat(channel, chat_recorder))
-        self._spawn_bg(self._finalize_kick_chat(entry))
-        youtube_info = entry.get("youtube_info")
-        if youtube_info:
-            self._spawn_bg(self._release_broadcast(channel, youtube_info, entry))
-        if entry.get("mode") in ("youtube", "both"):
-            self._note_youtube_end(channel, entry)
-        # Cancel the watchdog here too, like the stop and abort paths. It only
-        # stops once it sees no entry for the channel, and a restart inside
-        # that window would leave a second, untracked watchdog behind.
-        wd = entry.pop("watchdog", None)
-        if wd is not None:
-            wd.cancel()
-        # Remember that the stream ended on its own, not through a task failure.
-        # The monitor then skips restart attempts until the offline event catches
-        # up. Otherwise a dead stream just resolves to a 404.
-        if not entry.get("failed"):
-            self._ended_clean[channel] = time.monotonic()
-        del self._recordings[channel]
+        self._spawn_bg(self._finish_task(channel, task, task.exception()))
+
+    async def _finish_task(self, channel: str, task: asyncio.Task[Any], exc: BaseException | None) -> None:
+        async with self._lock_for(channel):
+            entry = self._recordings.get(channel)
+            if entry is None or task not in entry.get("tasks", []):
+                # An end path that took the entry already released it, or this
+                # task belongs to an older capture.
+                return
+            entry["tasks"].remove(task)
+            if exc is not None:
+                logger.error("[recorder] [%s] Recording task failed: %s", channel, exc)
+                entry["failed"] = True
+            else:
+                # A clean stream end (for example, the HLS feed stalls and streamlink
+                # closes it) must also release the entry once all tasks finish.
+                # Otherwise the monitor sees the channel as recording and never
+                # restarts, and the broadcast lingers until YouTube auto-ends it.
+                logger.info("[recorder] [%s] Recording task ended", channel)
+            if entry["tasks"]:
+                return  # other recording tasks (for example the disk fallback) still running
+            self._recordings.pop(channel, None)
+            # Cancel the watchdog here too, like the stop and abort paths. It
+            # only stops once it sees no entry for the channel, and a restart
+            # inside that window would leave a second, untracked watchdog
+            # behind.
+            wd = entry.pop("watchdog", None)
+            if wd is not None:
+                wd.cancel()
+            await self._finalize_entry(channel, entry, entry.pop("chat_recorder", None))
+            if entry.get("mode") in ("youtube", "both"):
+                self._note_youtube_end(channel, entry)
+            # Remember that the stream ended on its own, not through a task failure.
+            # The monitor then skips restart attempts until the offline event catches
+            # up. Otherwise a dead stream just resolves to a 404.
+            if not entry.get("failed"):
+                self._ended_clean[channel] = time.monotonic()
 
     def ended_clean(self, channel: str) -> bool:
         """True when the channel's last recording ended cleanly and recently."""

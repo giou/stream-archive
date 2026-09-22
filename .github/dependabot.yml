@@ -3,30 +3,38 @@ updates:
   # The app and its tools ship in the image, so every ecosystem below feeds
   # the same release. CI gates each pull request on the uv and github-actions
   # ecosystems (uv sync --locked, ruff format --check, ruff check, mypy,
-  # pytest). It does not build the image: publish.yml builds it on a v* tag,
-  # so review a docker bump by eye.
+  # pytest). The docker ecosystem has no such gate, so the image job of ci.yml
+  # builds the image for a Dependabot pull request.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
     open-pull-requests-limit: 5
     groups:
       github-actions:
         patterns: ["*"]
-  # Dockerfile base images: python, cloudflared, uv.
+  # Dockerfile base images: python, cloudflared, uv. A uv bump also moves the
+  # version input of setup-uv in both workflows, which the ci.yml check enforces
+  # because the github-actions ecosystem does not touch that input.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "tuesday"
     open-pull-requests-limit: 5
     groups:
       docker:
         patterns: ["*"]
+        # Majors arrive as their own pull request, as in the uv block below: a
+        # broken base major would otherwise hold back the other two images.
+        update-types: ["minor", "patch"]
   # Python dependencies from uv.lock (streamlink, aiohttp, pydantic, ...).
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "wednesday"
     open-pull-requests-limit: 5
     groups:
       uv:

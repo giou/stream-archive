@@ -32,11 +32,12 @@ README.
 - The container runs as the owner of the data directory. Recorded files stay
   manageable on the host. Set `USER_UID` and `USER_GID` in `.env` to force a
   specific identity. If Docker created the data directory as root, fix the
-  ownership once with `sudo chown -R "$(id -u):$(id -g)" <data-dir>`.
+  ownership once with `sudo chown -R "$(id -u):$(id -g)" <data-dir>`. The
+  entrypoint refuses to start as root: a root-owned data directory exits with
+  an error that names the `chown` to run.
 - Log timestamps follow the container timezone (`UTC` by default). Set
   `TZ=America/New_York` in the same `.env` to match the `timezone` setting.
 - Compose rotates the logs (10 MB, 3 files).
-
 ## Docker networking
 
 A host tailscale funnel forwards to the host loopback. The compose file

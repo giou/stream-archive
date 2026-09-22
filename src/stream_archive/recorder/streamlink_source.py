@@ -123,14 +123,16 @@ class _AudioOnlyStream:
             with suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
             raise
-        return _PipedFd(proc)
+        return _PipedFd(proc, stdin, src)
 
 
 class _PipedFd:
     """read()/close() facade over ffmpeg stdout. close() reaps the process."""
 
-    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+    def __init__(self, proc: subprocess.Popen[bytes], stdin: Any, src: Any) -> None:
         self._proc = proc
+        self._stdin = stdin
+        self._src = src
         stdout = proc.stdout
         assert stdout is not None
         self._stdout = stdout
@@ -140,6 +142,15 @@ class _PipedFd:
         return data
 
     def close(self) -> None:
+        # Wake the pump thread first. Closing stdin raises in a blocked
+        # write, and closing the source raises in a blocked read, so the
+        # thread reaches its finally and releases the rest. terminate()
+        # alone leaves it parked in read() forever, with the network
+        # connection and the stdin pipe still open.
+        with suppress(BaseException):
+            self._stdin.close()
+        with suppress(BaseException):
+            self._src.close()
         with suppress(BaseException):
             self._stdout.close()
         stderr = self._proc.stderr

@@ -20,8 +20,9 @@ async def _send_key_reply(ctrl: TelegramController, chat_id: ChatId, text: str) 
     The handler sends the message itself: the dispatcher sends plain text,
     and HTML renders the key as a code span. The ``None`` return then means
     "already answered" as well as "press not handled", so the dispatcher
-    skips its apply-warning flush for these presses. No API change defers
-    onto a running recording, so there is nothing to flush.
+    skips its apply-warning flush for these presses. Flush them here
+    instead: Enable and Rotate key go through the shared apply path, which
+    can stash a warning for a running recording.
     """
     await ctrl._app.bot.send_message(
         chat_id=chat_id,
@@ -29,6 +30,7 @@ async def _send_key_reply(ctrl: TelegramController, chat_id: ChatId, text: str) 
         parse_mode=ParseMode.HTML,
         reply_markup=ctrl.reply_keyboard("api", chat_id=chat_id),
     )
+    await ctrl._maybe_send_apply_warnings()
 
 
 async def menu_api(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:

@@ -120,55 +120,86 @@ class EventSubClient:
         return kinds is not None and all(kind in kinds for kind in _EVENT_KINDS)
 
     async def add_channel(self, channel: str) -> None:
-        async with self._subs_lock:
-            await self._add_channel(channel)
+        await self._add_channels([channel])
 
-    async def _add_channel(self, channel: str) -> None:
+    async def _add_channels(self, channels: list[str]) -> None:
+        """Subscribe every channel of the list that misses an event type.
+
+        Every network call stays outside ``_subs_lock``. The lock covers the
+        merge of one channel only, so add_channel, remove_channel and
+        sync_channels never wait for the subscription round trips.
+        """
         if self._conduit_id is None or self._session_id is None:
-            logger.debug("[eventsub] no live session, not subscribing %s", channel)
+            logger.debug("[eventsub] no live session, not subscribing %s", ", ".join(channels))
             return
-        if self._subscribed_fully(channel):
-            return
-        try:
-            uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
-        except Exception as e:
-            logger.error("[eventsub] resolve_user_ids failed for %s: %s", channel, e)
-            return
-        if uid is None:
-            logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
-            return
-        self._user_ids[channel] = uid
-        self._id_to_channel[uid] = channel
-        created = await self._create_channel_subs(channel, uid)
-        if created:
-            self._subs.setdefault(channel, {}).update(created)
+        for channel in channels:
+            async with self._subs_lock:
+                if self._subscribed_fully(channel):
+                    continue
+            try:
+                uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
+            except Exception as e:
+                logger.error("[eventsub] resolve_user_ids failed for %s: %s", channel, e)
+                continue
+            if uid is None:
+                logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
+                continue
+            created = await self._create_channel_subs(channel, uid)
+            async with self._subs_lock:
+                self._user_ids[channel] = uid
+                self._id_to_channel[uid] = channel
+                # Record the channel even when no event type landed. An empty
+                # entry reads as not subscribed, so a later pass retries it.
+                # A skipped entry would hide the channel from every retry.
+                self._subs.setdefault(channel, {}).update(created)
 
     async def remove_channel(self, channel: str) -> None:
-        async with self._subs_lock:
-            await self._remove_channel(channel)
+        await self._remove_channels([channel])
 
-    async def _remove_channel(self, channel: str) -> None:
+    async def _remove_channels(self, channels: list[str]) -> None:
+        """Delete the tracked subscriptions of the given channels.
+
+        An id stays tracked until its delete succeeds, so a failed call is
+        retried by the next sync instead of leaking a live subscription.
+        """
         if self._conduit_id is None or self._session_id is None:
-            logger.debug("[eventsub] no live session, not unsubscribing %s", channel)
+            logger.debug("[eventsub] no live session, not unsubscribing %s", ", ".join(channels))
             return
-        for sub_id in self._subs.pop(channel, {}).values():
+        async with self._subs_lock:
+            work = [(ch, kind, sid) for ch in channels for kind, sid in self._subs.get(ch, {}).items()]
+        for channel, kind, sub_id in work:
             try:
                 await self._api.delete_eventsub_subscription(sub_id)
             except Exception as e:
                 logger.error("[eventsub] failed to delete subscription for %s: %s", channel, e)
+                continue
+            async with self._subs_lock:
+                self._forget_sub(channel, kind, sub_id)
+
+    def _forget_sub(self, channel: str, kind: str, sub_id: str) -> None:
+        """Drop one deleted subscription from the maps. The caller holds the lock."""
+        kinds = self._subs.get(channel)
+        if kinds is None or kinds.get(kind) != sub_id:
+            # A reconnect replaced the entry while the delete ran.
+            return
+        del kinds[kind]
+        if kinds:
+            return
+        del self._subs[channel]
         uid = self._user_ids.pop(channel, None)
         if uid is not None:
             self._id_to_channel.pop(uid, None)
 
     async def sync_channels(self, channels: list[str]) -> None:
+        """Match the live subscriptions to the given channel list."""
+        channels = [c for c in channels if not is_kick_channel(c)]
+        # Take the work list under the lock, then run the round trips without
+        # it, so a concurrent add_channel or remove_channel is not blocked.
         async with self._subs_lock:
-            channels = [c for c in channels if not is_kick_channel(c)]
-            for ch in list(self._subs):
-                if ch not in channels:
-                    await self._remove_channel(ch)
-            for ch in channels:
-                if not self._subscribed_fully(ch):
-                    await self._add_channel(ch)
+            stale = [ch for ch in self._subs if ch not in channels]
+            missing = [ch for ch in channels if not self._subscribed_fully(ch)]
+        await self._remove_channels(stale)
+        await self._add_channels(missing)
 
     async def _run(self) -> None:
         backoff = 5.0
@@ -374,7 +405,10 @@ class EventSubClient:
                     s for s in subs if s["type"] == sub_type and s["condition"].get("broadcaster_user_id") == uid
                 )
                 return str(existing["id"])
-            except (StopIteration, KeyError, httpx.HTTPError) as e:
+            except Exception as e:
+                # A malformed entry or a failed call must not escape: this
+                # method never raises, and the caller must keep subscribing
+                # the remaining channels of the session.
                 logger.error("[eventsub] could not resolve existing subscription id for %s: %s", channel, e)
                 return None
         if status in (400, 403):

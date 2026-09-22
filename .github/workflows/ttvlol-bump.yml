@@ -1,0 +1,95 @@
+name: ttvlol bump
+
+# The plugin is vendored, so nothing downloads it at build time. This workflow
+# is what keeps the pin current: it resolves the newest upstream release, and
+# when the tag differs from the pin it opens a pull request with the new file,
+# the updated Dockerfile arguments, and the upstream diff in the body.
+#
+# A human reads that diff. The plugin is imported into the recorder process, so
+# it runs with the bot token, the Twitch and Kick secrets, and the YouTube
+# token. See vendor/streamlink-ttvlol/README.md.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Resolve the newest tag through the release asset redirect. This needs
+      # no API call: the unauthenticated GitHub API is rate limited per address
+      # and answered 403 on a shared runner, and GITHUB_TOKEN cannot read
+      # another repository.
+      - name: Compare the newest release with the pin
+        id: check
+        run: |
+          RELEASE_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+            https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py)"
+          TAG="${RELEASE_URL%/*}"
+          TAG="${TAG##*/}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9A-Za-z._-]+$'; then
+            echo "unexpected streamlink-ttvlol tag: $TAG" >&2; exit 1
+          fi
+          PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
+          if [ -z "$PINNED" ]; then
+            echo "the Dockerfile is missing the streamlink-ttvlol pin" >&2; exit 1
+          fi
+          echo "newest ${TAG}, pinned ${PINNED}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" = "$PINNED" ]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fetch the new release, repin the Dockerfile, build the diff
+        if: steps.check.outputs.bump == 'true'
+        run: |
+          set -eu
+          TAG="${{ steps.check.outputs.tag }}"
+          PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
+          mkdir -p "vendor/streamlink-ttvlol/${TAG}"
+          curl -fsSL -o "vendor/streamlink-ttvlol/${TAG}/twitch.py" \
+            "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py"
+          SHA="$(sha256sum "vendor/streamlink-ttvlol/${TAG}/twitch.py" | cut -d' ' -f1)"
+          if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "cannot hash the streamlink-ttvlol asset" >&2; exit 1
+          fi
+          # A plugin that does not parse must never reach a pull request.
+          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
+            "vendor/streamlink-ttvlol/${TAG}/twitch.py"
+          sed -i "s|^ARG TTVLOL_PLUGIN_VERSION=.*|ARG TTVLOL_PLUGIN_VERSION=${TAG}|" Dockerfile
+          sed -i "s|^ARG TTVLOL_PLUGIN_SHA256=.*|ARG TTVLOL_PLUGIN_SHA256=${SHA}|" Dockerfile
+          {
+            echo "Upstream release \`${TAG}\`, replacing \`${PINNED}\`."
+            echo
+            echo "The plugin runs inside the recorder process with the bot token,"
+            echo "the Twitch and Kick secrets, and the YouTube token. Read this"
+            echo "diff before merging."
+            echo
+            echo '```diff'
+            diff -u "vendor/streamlink-ttvlol/${PINNED}/twitch.py" \
+              "vendor/streamlink-ttvlol/${TAG}/twitch.py" | head -c 60000 || true
+            echo '```'
+          } > /tmp/pr-body.md
+      - name: Open the pull request
+        if: steps.check.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="${{ steps.check.outputs.tag }}"
+          BRANCH="ttvlol/${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Dockerfile "vendor/streamlink-ttvlol/${TAG}"
+          git commit -m "chore(deps): bump the streamlink-ttvlol plugin to ${TAG}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "Bump the streamlink-ttvlol plugin to ${TAG}" \
+            --body-file /tmp/pr-body.md

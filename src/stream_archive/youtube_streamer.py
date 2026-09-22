@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -24,8 +25,40 @@ _API_BASE = "https://www.googleapis.com/youtube/v3"
 def save_token(credentials: Credentials, path: Path) -> None:
     """Write credentials as a JSON token file with mode 0600."""
     data = json.loads(credentials.to_json())  # type: ignore[no-untyped-call]
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-        json.dump(data, f)
+    # Write a sibling file and rename it over the token. A crash in the middle
+    # of the write can then never leave a truncated token behind, which would
+    # break every later refresh. mkstemp creates the file with mode 0600, and
+    # the rename gives the token that mode even when it was world-readable.
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _required_field(payload: Any, path: str, what: str) -> str:
+    """Return a string field of a YouTube API payload, or raise.
+
+    A 200 answer can still carry an error body or a new shape. The caller
+    needs a clear error before it uses the value, and it needs the ids it
+    already created, so it can remove them again.
+    """
+    *parents, leaf = path.split(".")
+    node: Any = payload
+    for key in parents:
+        node = node.get(key) if isinstance(node, dict) else None
+    node = node.get(leaf) if isinstance(node, dict) else None
+    if not isinstance(node, str):
+        msg = f"YouTube returned no {what}: {payload!r}"
+        raise RuntimeError(msg)
+    value: str = node
+    return value
 
 
 def build_video_description(author: str, channel: str, game: str) -> str:
@@ -72,9 +105,19 @@ class YouTubeStreamer:
                 msg = "YouTube token not found. Run 'python setup_youtube.py' first to authenticate."
                 raise RuntimeError(msg)
 
-            with open(self._token_path) as f:
-                data = json.load(f)
-            creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
+            try:
+                with open(self._token_path) as f:
+                    data = json.load(f)
+                creds = Credentials.from_authorized_user_info(data, SCOPES)  # type: ignore[no-untyped-call]
+            except (OSError, ValueError) as err:
+                # A corrupt or unreadable token file is an operator problem,
+                # not a code fault, so it must not surface as a bare
+                # JSONDecodeError traceback.
+                msg = (
+                    f"YouTube token file {self._token_path} is unreadable or corrupt ({err}). "
+                    "Run 'python setup_youtube.py' again to authenticate."
+                )
+                raise RuntimeError(msg) from err
             if creds is None:
                 msg = "YouTube token could not be loaded."
                 raise RuntimeError(msg)
@@ -170,7 +213,7 @@ class YouTubeStreamer:
             params = {"part": "snippet,status,contentDetails"}
             logger.info("[youtube] Creating live broadcast: %s", broadcast_title)
             broadcast = await self._request("POST", "liveBroadcasts", params=params, json=broadcast_body)
-            broadcast_id = broadcast["id"]
+            broadcast_id = _required_field(broadcast, "id", "broadcast id")
             logger.info("[youtube] Broadcast created: %s", broadcast_id)
 
             stream_body = {
@@ -186,10 +229,9 @@ class YouTubeStreamer:
             params = {"part": "snippet,cdn,status"}
             logger.info("[youtube] Creating live stream")
             live_stream = await self._request("POST", "liveStreams", params=params, json=stream_body)
-            stream_id = live_stream["id"]
-            ingestion = live_stream["cdn"]["ingestionInfo"]
-            ingestion_address = ingestion["ingestionAddress"]
-            stream_name = ingestion["streamName"]
+            stream_id = _required_field(live_stream, "id", "live stream id")
+            ingestion_address = _required_field(live_stream, "cdn.ingestionInfo.ingestionAddress", "ingestion address")
+            stream_name = _required_field(live_stream, "cdn.ingestionInfo.streamName", "stream name")
             logger.info("[youtube] Stream created: %s -> %s", stream_id, ingestion_address)
 
             params = {"id": broadcast_id, "streamId": stream_id, "part": "id,snippet,status"}
@@ -243,6 +285,11 @@ class YouTubeStreamer:
     async def close(self) -> None:
         # Let an in-flight rollback finish first: it is removing resources that
         # would otherwise stay on the account with nothing tracking them.
-        if self._rollback_tasks:
-            await asyncio.gather(*self._rollback_tasks, return_exceptions=True)
-        await self._client.aclose()
+        # The snapshot and the shield keep a cancellation of this call from
+        # abandoning that rollback, and the finally always releases the client.
+        pending = list(self._rollback_tasks)
+        try:
+            if pending:
+                await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+        finally:
+            await self._client.aclose()

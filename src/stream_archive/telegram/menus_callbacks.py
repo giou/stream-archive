@@ -86,51 +86,53 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
     or already handled press. Wire format (from ``confirm_keyboard``):
     ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Apply-now
     warnings use ``apply_now:<nonce>``, audio-only switches use
-    ``audio_confirm:<nonce>``. The nonce makes every confirm message's
-    buttons unique, so the double-tap guard covers only the same message.
+    ``audio_confirm:<nonce>``. The nonce is the last field of every form, and
+    it guards the whole prompt: the two buttons of one message are mutually
+    exclusive, so a Cancel retires the Confirm of its message and the other
+    way round. A later message carries a new nonce and still works.
     """
-    state = ctrl._state_for(chat_id)
     parts = data.split(":")
     action = parts[0]
+    nonce = parts[-1]
     if action == "cancel" and len(parts) == 2:
-        if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
-        pending_key = (chat_id, parts[1])
+        pending_key = (chat_id, nonce)
         ctrl._pending_audio_switch.pop(pending_key, None)  # a later confirm press is harmless
         # The caller drops the inline keyboard after a cancel, so the
         # Apply-now button of the same nonce is gone. Do not keep its entry.
         ctrl._pending_apply.pop(pending_key, None)
         ctrl._apply_warnings_sent.discard(pending_key)
-        ctrl._mark_confirm_done(chat_id, data)
+        ctrl._mark_confirm_done(chat_id, nonce)
         return "Cancelled \u2014 nothing changed", None
     if action == "confirm_remove" and len(parts) >= 3:
-        if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
         # The channel sits between the action and the nonce. The channel
         # name can itself contain ':' (kick:<slug>), so rejoin the middle parts.
         value = ":".join(parts[1:-1])
+        ctrl._mark_confirm_done(chat_id, nonce)  # a re-tap must not re-edit the message
         if value not in ctrl._config.channels:
             return f"{value} is no longer monitored", None  # stale confirm message
-        ctrl._mark_confirm_done(chat_id, data)
         result = await ctrl.handle_remove([value], chat_id=chat_id)  # stops recording + eventsub, clears override
-        state.menu, state.channel = "channels", None
+        ctrl._enter_menu(chat_id, "channels")
         return result, None
     if action == "confirm_delete_oldest" and len(parts) == 3 and parts[1] == "on":
-        if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
-        ctrl._mark_confirm_done(chat_id, data)
+        ctrl._mark_confirm_done(chat_id, nonce)
         result = ctrl.handle_disk(["delete_oldest", "on"], chat_id=chat_id)
-        state.menu = "disk"
+        ctrl._enter_menu(chat_id, "disk")
         return result, None
     if action == "apply_now" and len(parts) == 2:
-        if (chat_id, data) in ctrl._confirm_done:  # double-tap on the same message
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
-        key = (chat_id, parts[1])
+        key = (chat_id, nonce)
         pending = ctrl._pending_apply.pop(key, None)
         if pending is None:
             return None  # stale message: the bot restarted or handled it
         ctrl._apply_warnings_sent.discard(key)
-        ctrl._mark_confirm_done(chat_id, data)
+        ctrl._mark_confirm_done(chat_id, nonce)
         summary, channels = pending
         lines = []
         failed = False
@@ -148,13 +150,13 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         head = "\u26a0\ufe0f Applied with errors" if failed else "\u2705 Applied"
         return f"{head}: {summary}\n" + "\n".join(lines), None
     if action == "audio_confirm" and len(parts) == 2:
-        if (chat_id, data) in ctrl._confirm_done:
+        if ctrl._press_handled(chat_id, nonce):
             return None
-        key = (chat_id, parts[1])
+        key = (chat_id, nonce)
         audio_pending = ctrl._pending_audio_switch.pop(key, None)
         if audio_pending is None:
             return None  # the message is stale: the bot handled it or restarted
-        ctrl._mark_confirm_done(chat_id, data)
+        ctrl._mark_confirm_done(chat_id, nonce)
         ctrl._apply_warnings_sent.discard(key)
         quality_mutate, channels = audio_pending
 
@@ -224,8 +226,6 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
         )
         await _send_prompt(ctrl, key, chat_id, text, markup, "apply-now warning")
     for key in list(ctrl._pending_audio_switch):
-        if key in ctrl._apply_warnings_sent:
-            continue
         chat_id, nonce = key
         # A cancel or confirm press can pop the entry during the awaits of
         # this loop, so read it and never raise on a missing key.
@@ -233,6 +233,18 @@ async def maybe_send_apply_warnings(ctrl: TelegramController) -> None:
         if audio_entry is None:
             continue
         _mutate, channels = audio_entry
+        # The conflict list is a config list, not a list of running streams:
+        # a channel stays a conflict while it is monitored. A channel that
+        # left the monitoring list can no longer be switched to disk.
+        channels = [ch for ch in channels if ch in ctrl._config.channels]
+        if not channels:
+            # Every conflicting channel left the monitoring list, so the
+            # prompt names no channel. Drop it instead of sending it.
+            ctrl._pending_audio_switch.pop(key, None)
+            ctrl._apply_warnings_sent.discard(key)
+            continue
+        if key in ctrl._apply_warnings_sent:
+            continue
         text = (
             f"\u26a0\ufe0f Setting audio_only quality will set output mode to disk for: {', '.join(channels)}\n"
             "Audio-only cannot be restreamed to YouTube."

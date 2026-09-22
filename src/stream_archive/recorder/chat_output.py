@@ -17,6 +17,24 @@ from stream_archive.recorder.types import KickChatState, Recording
 logger = logging.getLogger(__name__)
 
 
+def _valid_kick_message(payload: Any) -> bool:
+    """True when a kick chat payload has the field types the converter assumes.
+
+    Kick delivers JSON, so any field can carry any type. The webhook normalizes
+    the shape first (see kick_webhook); this check stops a malformed delivery
+    from raising out of the best-effort ingest path.
+    """
+    if not isinstance(payload, dict):
+        return False
+    content = payload.get("content")
+    if content and not isinstance(content, str):
+        return False
+    if any(payload.get(key) and not isinstance(payload[key], dict) for key in ("sender", "broadcaster")):
+        return False
+    badges = payload.get("badges")
+    return not badges or (isinstance(badges, list) and all(isinstance(b, dict) for b in badges))
+
+
 class ChatOutputMixin:
     _recordings: dict[str, Recording]
     #: Chat captures whose writer is still open, keyed by channel.
@@ -72,16 +90,29 @@ class ChatOutputMixin:
 
         The video itself keeps recording. platform=None stops both recorders,
         "twitch" stops only the IRC recorder, and "kick" stops only kick chat.
+
+        A cancellation is deferred until both finalizers ran. CancelledError
+        is a BaseException, so letting it through would skip the second
+        writer, and its tmp file is then the only copy of the messages.
         """
         entry = self._recordings.get(channel)
         if entry is None:
             return
+        cancelled: asyncio.CancelledError | None = None
         if platform in (None, "twitch"):
             chat_recorder = entry.pop("chat_recorder", None)
             if chat_recorder:
-                await self._finalize_chat(channel, chat_recorder)
+                try:
+                    await self._finalize_chat(channel, chat_recorder)
+                except asyncio.CancelledError as e:
+                    cancelled = e
         if platform in (None, "kick"):
-            await self._finalize_kick_chat(entry)
+            try:
+                await self._finalize_kick_chat(entry)
+            except asyncio.CancelledError as e:
+                cancelled = e
+        if cancelled is not None:
+            raise cancelled
 
     async def add_kick_chat(self, channel: str, payload: dict[str, Any]) -> None:
         """Write one normalized kick chat message to the active recording's file.
@@ -101,6 +132,9 @@ class ChatOutputMixin:
             state = self._open_chat.get(channel)
         if state is None:
             return
+        if not _valid_kick_message(payload):
+            logger.warning("[recorder] [%s] malformed kick chat message, dropping it", channel)
+            return
         if state.get("streamer_id") is None:
             streamer_id, username = streamer_identity(payload, state["slug"])
             if streamer_id is not None:
@@ -118,6 +152,19 @@ class ChatOutputMixin:
                 )
             state["emote_skipped"] = state.get("emote_skipped", 0) + skipped
 
+    def _kick_chat_trailer(self, entry: Recording, state: KickChatState) -> dict[str, Any]:
+        """Build the ChatRoot trailer with the capture age at call time."""
+        duration_s = time.monotonic() - entry.get("started_at", time.monotonic())
+        return chat_root_trailer(
+            state["slug"],
+            state.get("title"),
+            state["started_wall"],
+            state["start"],
+            duration_s,
+            state.get("streamer_id"),
+            state.get("streamer_username") or state["slug"],
+        )
+
     async def _finalize_kick_chat(self, entry: Recording) -> None:
         """Write the kick chat trailer, then rename the file into place.
 
@@ -125,7 +172,8 @@ class ChatOutputMixin:
         TwitchDownloader ChatRoot JSON with embedded emote images (see
         kick_chat.embedded_data). The state stays in the entry until the
         trailer is written, so a message that arrives during the emote fetch
-        still lands in the file. The finalizing flag blocks a second run.
+        still lands in the file, and the trailer length then covers it. The
+        finalizing flag blocks a second run.
 
         The writer never stays open: every path either writes the trailer,
         discards the file, or reports the failure that closed it. A cancelled
@@ -143,26 +191,20 @@ class ChatOutputMixin:
             if writer.comments == 0:
                 writer.discard()
                 return
-            duration_s = time.monotonic() - entry.get("started_at", time.monotonic())
-            trailer = chat_root_trailer(
-                state["slug"],
-                state.get("title"),
-                state["started_wall"],
-                state["start"],
-                duration_s,
-                state.get("streamer_id"),
-                state.get("streamer_username") or state["slug"],
-            )
             try:
                 embedded = await embedded_data(state.get("emote_names") or {})
             except asyncio.CancelledError:
                 # Write the trailer now, without the emote images. The
                 # comments must not stay in an open, unusable tmp file.
-                writer.close(trailer)
+                writer.close(self._kick_chat_trailer(entry, state))
                 raise
             except Exception as e:
                 logger.warning("[recorder] kick chat emote fetch failed: %s", e)
                 embedded = None
+            # The duration is read after the fetch: the state stays in the
+            # entry for the whole await, so a message that lands there pushes
+            # the last comment past a duration frozen before it.
+            trailer = self._kick_chat_trailer(entry, state)
             if embedded is not None:
                 trailer["embeddedData"] = embedded
             if writer.close(trailer):

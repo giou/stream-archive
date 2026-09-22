@@ -42,7 +42,7 @@ class ApiCommands:
         """One-line state of the control API."""
         return "on" if self._config.api.enabled else "off"
 
-    async def _notify_api_changes(self, lines: list[str]) -> None:
+    async def notify_api_changes(self, lines: list[str]) -> None:
         """Tell the admin what the control API changed. Never raises.
 
         The API replies to its client and sends this message in parallel,

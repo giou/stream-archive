@@ -221,7 +221,7 @@ class Monitor:
             self._live_channels.discard(channel)
             file_info = result.get("file_info") if result else None
             yt_info = result.get("youtube_info") if result else None
-            youtube_url = yt_info["youtube_url"] if yt_info else None
+            youtube_url = yt_info.get("youtube_url") if yt_info else None
         logger.info("[monitor] %s is OFFLINE", channel)
         # The send is network I/O. Keep it out of the per-channel critical
         # section, so a slow Telegram call cannot stall start/stop handling.

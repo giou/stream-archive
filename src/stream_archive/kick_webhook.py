@@ -7,11 +7,12 @@ import math
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from aiohttp import web
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -147,14 +148,18 @@ def _parse_timestamp(value: str) -> float | None:
 
     A non-finite value is rejected: ``float('nan')`` parses, and every
     comparison against it is false, which would make the freshness check
-    pass instead of fail.
+    pass instead of fail. An offset-less ISO value is UTC: ``timestamp()``
+    would otherwise read it in the local zone of the host.
     """
     value = value.strip()
     try:
-        parsed = datetime.fromisoformat(value).timestamp()
+        parsed_dt = datetime.fromisoformat(value)
     except ValueError:
         pass
     else:
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=UTC)
+        parsed = parsed_dt.timestamp()
         return parsed if math.isfinite(parsed) else None
     try:
         seconds = float(value)
@@ -328,7 +333,6 @@ class KickWebhook:
                 self._sync_failing_since = now
             if now - self._sync_failing_since < _SYNC_SERVER_ERROR_DELAY_S:
                 return
-        self._sync_failed_notified = True
         detail = str(e).strip() or e.__class__.__name__
         try:
             await self._notifier.notify(
@@ -340,6 +344,10 @@ class KickWebhook:
             )
         except Exception:
             logger.error("[kick_webhook] sync-failure notification failed", exc_info=True)
+            return
+        # Only a sent notification marks the episode as notified. An earlier
+        # flag would silence every later failure of the same episode.
+        self._sync_failed_notified = True
 
     async def _handle(self, request: Any) -> Any:
         if not self._config.kick.webhook.enabled:
@@ -493,8 +501,15 @@ class KickWebhook:
         self._next_key_fetch = 0.0
         try:
             self._verify_signature(public_key, message, signature)
-        except Exception:
+        except InvalidSignature:
+            # A wrong key and a rotated key look the same here, so the
+            # refetch below decides between them.
             pass
+        except Exception as e:
+            # A bad PEM or a non-RSA key is a misconfiguration, not a
+            # rotation. Take the log line, and keep the delivery retryable.
+            logger.error("[kick_webhook] signature check failed: %s", e)
+            return "unavailable"
         else:
             return "ok"
         # The failure can mean that Kick rotated the key. Refetch
@@ -519,10 +534,15 @@ class KickWebhook:
             return "unavailable"
         try:
             self._verify_signature(public_key, message, signature)
-        except Exception:
+        except InvalidSignature:
             # The key was fetched and the signature still does not match, so
             # this delivery is not authentic.
             return "bad"
+        except Exception as e:
+            # The check itself failed, so there is no verdict on the
+            # signature. Do not tell the sender that it is forged.
+            logger.error("[kick_webhook] signature check failed: %s", e)
+            return "unavailable"
         return "ok"
 
     def _verify_signature(self, public_key_pem: Any, message: bytes, signature: bytes) -> None:
@@ -693,19 +713,22 @@ class KickWebhook:
         This notifies once per enable (enabling re-arms ``setup_notified``)
         and then persists the flag, so it stays silent afterwards.
         """
+        wh = self._config.kick.webhook
+        if not wh.enabled or wh.setup_notified:
+            return
+        # Set the flag before the await. Two first events can arrive
+        # together, and both would pass the check above otherwise.
+        wh.setup_notified = True
         try:
-            wh = self._config.kick.webhook
-            if not wh.enabled or wh.setup_notified:
-                return
-            # Set the flag before the await. Two first events can arrive
-            # together, and both would pass the check above otherwise.
-            wh.setup_notified = True
             if self._notifier:
                 await self._notifier.notify("\u2705 Kick webhook is working \u2014 first event received from Kick.")
             # save_config writes and fsyncs the file, so keep it off the event
             # loop. This handler serves every webhook request.
             await asyncio.to_thread(save_config, self._config)
         except Exception as e:
+            # Nothing was announced and nothing was persisted, so clear the
+            # flag: the next event retries the confirmation.
+            wh.setup_notified = False
             logger.error("[kick_webhook] setup confirmation failed: %s", e)
 
     async def add_channel(self, channel: str) -> None:
@@ -731,13 +754,18 @@ class KickWebhook:
         if not is_kick_channel(channel):
             return
         bare = bare_name(channel)
-        ids = self._subs.pop(bare, set())
+        ids = self._subs.get(bare)
         if not ids:
+            self._subs.pop(bare, None)
             return
         try:
             await self._api.delete_event_subscriptions(list(ids))
         except Exception as e:
+            # The ids stay tracked, so a later sync retries the delete. A pop
+            # before the call would lose the only record of live subs.
             logger.error("[kick_webhook] remove_channel failed for %s: %s", channel, e)
+            return
+        self._subs.pop(bare, None)
 
     async def sync_channels(self, channels: list[str]) -> None:
         """Run one reconcile now. /reload and the post-enable path call this."""

@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import logging
 import os
 import time
@@ -81,8 +80,12 @@ class DiskOutputMixin:
                     f.close()
                 except OSError as e:
                     logger.error("[recorder] [disk] %s close failed: %s", channel, e)
-            with contextlib.suppress(Exception):
-                fd.close()
+            # _open_stream failed, so fd stays None and there is nothing to close.
+            if fd is not None:
+                try:
+                    fd.close()
+                except Exception as e:
+                    logger.error("[recorder] [disk] %s stream close failed: %s", channel, e)
 
     async def _read_ffmpeg_stderr(self, channel: str, process: Any) -> None:
         if process.stderr is None:

@@ -10,6 +10,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
+# The uv version of this workflow. The image build uses the uv stage of the
+# Dockerfile, and the check below fails until the two move together: Dependabot
+# bumps the Dockerfile stage only, because the github-actions ecosystem does not
+# touch the version input of setup-uv.
+env:
+  UV_VERSION: "0.12.15"
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20,8 +26,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          # Same uv version as the image build (Dockerfile uv stage).
-          version: "0.12.15"
+          # Same uv version as the image build (Dockerfile uv stage). The check
+          # below keeps the two equal.
+          version: ${{ env.UV_VERSION }}
           # 3.14 means the newest 3.14.x, while the image pins 3.14.7. A patch
           # pin would download that interpreter on every run, so the drift is
           # deliberate.
@@ -41,7 +48,56 @@ jobs:
       # --locked fails when uv.lock is out of step with pyproject.toml. The
       # image build keeps --frozen: it installs the shipped lock as it is.
       - run: uv sync --locked
+      # The vendored plugin runs with the app's secrets authority, so its bytes
+      # and the Dockerfile pin must move together. This needs no network: it
+      # hashes the file in the checkout.
+      - name: Verify the vendored streamlink-ttvlol plugin
+        run: |
+          TAG=$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)
+          SHA=$(sed -n 's/^ARG TTVLOL_PLUGIN_SHA256=//p' Dockerfile)
+          if [ -z "$TAG" ] || [ -z "$SHA" ]; then
+            echo "the Dockerfile is missing the streamlink-ttvlol pin" >&2; exit 1
+          fi
+          printf '%s  %s\n' "$SHA" "vendor/streamlink-ttvlol/${TAG}/twitch.py" | sha256sum -c -
+      # The Dockerfile uv stage installs the lock and this workflow's uv builds
+      # it, so the two must not drift apart. Dependabot bumps the image tag and
+      # leaves the version input alone.
+      - name: Check the uv version against the Dockerfile
+        run: |
+          IMAGE_UV=$(sed -n 's|^FROM ghcr.io/astral-sh/uv:\([^ ]*\) AS uv$|\1|p' Dockerfile)
+          if [ -z "$IMAGE_UV" ]; then
+            echo "cannot read the uv version from the Dockerfile" >&2; exit 1
+          fi
+          if [ "$IMAGE_UV" != "$UV_VERSION" ]; then
+            echo "the Dockerfile uv $IMAGE_UV does not match $UV_VERSION" >&2; exit 1
+          fi
+      # The healthcheck and scheduler.py hold the same port number. Compare them
+      # here, so a change to one of them fails instead of leaving the container
+      # permanently unhealthy.
+      - name: Check the healthcheck port against scheduler.py
+        run: |
+          DOC_PORT=$(sed -n 's|.*127\.0\.0\.1:\([0-9]*\)/healthz.*|\1|p' Dockerfile)
+          CODE_PORT=$(uv run python -c 'from stream_archive.scheduler import _HEALTH_PORT; print(_HEALTH_PORT)')
+          if [ -z "$DOC_PORT" ] || [ -z "$CODE_PORT" ]; then
+            echo "cannot read the healthcheck port: Dockerfile '$DOC_PORT', scheduler.py '$CODE_PORT'" >&2
+            exit 1
+          fi
+          if [ "$DOC_PORT" != "$CODE_PORT" ]; then
+            echo "the Dockerfile healthcheck port $DOC_PORT is not _HEALTH_PORT $CODE_PORT" >&2; exit 1
+          fi
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run pytest -q
+  # Nothing else in CI builds the image: the test job installs the dependencies
+  # and publish.yml builds on a v* tag. A Dependabot pull request bumps a base
+  # image (python, cloudflared, uv), so build the image there and fail before
+  # the merge instead of at release time.
+  image:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build the image
+        run: docker build --tag stream-archive:ci .

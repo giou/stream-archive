@@ -1874,7 +1874,8 @@ class _LineStream:
 
 
 class _CloudflaredFakeProc:
-    def __init__(self, lines, returncode=0, hang=False):
+    def __init__(self, lines, returncode=None, hang=False):
+        # A live child reports returncode None, exactly like a real process.
         self.stdout = _LineStream(lines, hang=hang)
         self.returncode = returncode
         self.killed = False
@@ -1987,7 +1988,8 @@ def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
     assert ctrl._cloudflared.running is False
 
 
-def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
+def test_cloudflared_named_start_timeout_kills_proc(tmp_path, monkeypatch):
+    """A silent process has not registered: report a failed start, not a running tunnel."""
     monkeypatch.setattr("stream_archive.tunnels._CLOUDFLARED_RUN_TIMEOUT", 0.01)
     proc = _CloudflaredFakeProc(lines=[], hang=True, returncode=None)
     scripted_exec(monkeypatch, cloudflared=proc)
@@ -1995,8 +1997,10 @@ def test_cloudflared_named_start_timeout_alive_is_ok(tmp_path, monkeypatch):
 
     ok, hint = asyncio.run(ctrl._cloudflared_named_start("tok"))
 
-    assert ok is True
-    assert ctrl._cloudflared.running is True
+    assert ok is False
+    assert "did not register" in hint
+    assert proc.killed
+    assert ctrl._cloudflared.running is False
 
 
 def test_cloudflared_token_and_url_helpers():

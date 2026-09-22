@@ -4,7 +4,8 @@ on:
     tags: ["v*"]
 concurrency:
   # One group for every tag, so two tag pushes serialize instead of racing on
-  # the shared :latest image tag.
+  # the shared :latest image tag. Serialization alone does not keep an older
+  # re-run from moving :latest, so the tag step also compares versions.
   group: publish
   cancel-in-progress: false
 # Only the release job writes. The test job runs third-party install scripts,
@@ -65,52 +66,35 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve the newest streamlink-ttvlol release and its digest
-        id: ttvlol
-        run: |
-          # Resolve the tag through the release asset redirect. This needs no
-          # API call: the unauthenticated GitHub API is rate limited per
-          # address and answered 403 on a shared runner, and GITHUB_TOKEN
-          # cannot read another repository. The Dockerfile resolves the release
-          # the same way, so both name the same tag.
-          RELEASE_URL="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
-            https://github.com/2bc4/streamlink-ttvlol/releases/latest/download/twitch.py)"
-          TAG="${RELEASE_URL%/*}"
-          TAG="${TAG##*/}"
-          if [ -z "$TAG" ]; then
-            echo "cannot resolve the streamlink-ttvlol tag" >&2; exit 1
-          fi
-          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9A-Za-z._-]+$'; then
-            echo "unexpected streamlink-ttvlol tag: $TAG" >&2; exit 1
-          fi
-          # Hash the asset here and pass the digest to the build, which then
-          # refuses to install any other bytes. This keeps the digest in the
-          # release log equal to the digest inside the published image, and it
-          # fails the build if the asset changes between the two downloads.
-          # The build would compute and record the digest on its own when the
-          # argument is empty; passing it is what makes the published artifact
-          # verifiable against this log line.
-          curl -fsSL -o /tmp/twitch.py \
-            "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py"
-          SHA=$(sha256sum /tmp/twitch.py | cut -d' ' -f1)
-          if [ -z "$SHA" ]; then
-            echo "cannot hash the streamlink-ttvlol asset" >&2; exit 1
-          fi
-          echo "streamlink-ttvlol ${TAG} sha256 ${SHA}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
       - name: Resolve the image tags
         id: image
+        shell: bash
+        env:
+          IMAGE: ghcr.io/giou/stream-archive
         run: |
-          # A "-" in the tag marks a prerelease (semver), so it does not move
-          # :latest. The assert step ties the tag to the pyproject version, so
-          # no date-style tag reaches this rule. The list holds only real tags:
-          # an empty entry would reach the builder as an empty --tag.
-          TAGS="ghcr.io/giou/stream-archive:${GITHUB_REF_NAME}"
-          case "${GITHUB_REF_NAME}" in
-            *-*) ;;
-            *) TAGS="${TAGS}"$'\n'"ghcr.io/giou/stream-archive:latest" ;;
-          esac
+          # Only a stable tag moves :latest. A PEP 440 prerelease (1.0rc1) and a
+          # hyphenated semver prerelease (1.0-rc1) both have a non-numeric
+          # version, so the pattern below rejects both. The assert step ties the
+          # tag to the pyproject version. The list holds only real tags: an empty
+          # entry would reach the builder as an empty --tag.
+          TAGS="${IMAGE}:${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            # :latest follows the newest stable release. The published tags come
+            # from the registry, because a re-run of an older tag would
+            # otherwise move :latest backwards.
+            REPOSITORY="${IMAGE#ghcr.io/}"
+            TOKEN=$(curl -fsS --retry 3 --max-time 60 \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull" | jq -r .token)
+            PUBLISHED=$(curl -fsS --retry 3 --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${REPOSITORY}/tags/list?n=1000" | jq -r '.tags[]?' \
+              | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1)
+            NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | sort -V | tail -1)
+            if [ "$NEWEST" = "${GITHUB_REF_NAME}" ]; then
+              TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+            else
+              echo "::warning::${GITHUB_REF_NAME} is not newer than ${PUBLISHED}, so :latest stays there" >&2
+            fi
+          fi
           {
             echo "tags<<EOF"
             printf '%s\n' "$TAGS"
@@ -121,9 +105,6 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: |
-            TTVLOL_PLUGIN_VERSION=${{ steps.ttvlol.outputs.tag }}
-            TTVLOL_PLUGIN_SHA256=${{ steps.ttvlol.outputs.sha256 }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ steps.image.outputs.tags }}

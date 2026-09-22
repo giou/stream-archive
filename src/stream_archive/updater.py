@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from stream_archive.config import AppConfig
 
@@ -17,9 +17,13 @@ _APP_RELEASES_URL = "https://api.github.com/repos/giou/stream-archive/releases/l
 _MAX_CHANGELOG_CHARS = 600
 
 
-def _changelog_lines(body: str | None, limit: int = _MAX_CHANGELOG_CHARS) -> list[str]:
-    """Normalize a release-notes body into a truncated list of non-empty lines."""
-    lines = [ln.strip() for ln in (body or "").splitlines()]
+def _changelog_lines(body: Any, limit: int = _MAX_CHANGELOG_CHARS) -> list[str]:
+    """Normalize a release-notes body into a truncated list of non-empty lines.
+
+    The GitHub payload is untyped, so a body that is not text gives no lines.
+    """
+    text = body if isinstance(body, str) else ""
+    lines = [ln.strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
     out: list[str] = []
     total = 0
@@ -123,7 +127,8 @@ class UpdateChecker:
             return {"status": "unknown", "current": None, "latest": tag}
         try:
             status = "update" if Version(tag) > Version(local) else "up_to_date"
-        except Exception:
+        except InvalidVersion as e:
+            logger.warning("[updater] cannot compare release %r with installed %r: %s", tag, local, e)
             status = "unknown"
         changelog = _changelog_lines(data.get("body")) if status == "update" else None
         return {"status": status, "current": local, "latest": tag, "changelog": changelog}
@@ -139,9 +144,10 @@ class UpdateChecker:
         data = report["app"]
         latest = data.get("latest")
         lines: list[str] = []
-        record = False
         # The state file is small, but the read and the write are blocking
-        # I/O. Keep them off the event loop.
+        # I/O. Keep them off the event loop. The lock also spans the send:
+        # two overlapping checks must not notify for the same release, and a
+        # check that waits for the lock then sees the recorded version.
         async with self._lock:
             await asyncio.to_thread(self._load_state)
             # Record every version that the check resolved. Thus a version
@@ -154,30 +160,22 @@ class UpdateChecker:
                     if cl:
                         lines.append("  Changelog:")
                         lines.extend(f"  • {ln}" for ln in cl)
-                record = True
-            previous = self._state.get("app")
-
-        if lines:
-            text = (
-                "📦 Update available for stream-archive\n"
-                + "\n".join(lines)
-                + "\nApply: docker compose pull && docker compose up -d"
-            )
-            try:
-                await self._notifier.notify(text)
-            except Exception:
-                # Keep the release unrecorded. A failed send must retry on the
-                # next check, or the alert for this release is lost.
-                logger.error("[updater] update notification failed", exc_info=True)
-                return report
-
-        if record:
-            async with self._lock:
-                await asyncio.to_thread(self._load_state)
-                # Another check can have recorded a newer release meanwhile.
-                if self._state.get("app") == previous:
-                    self._state["app"] = latest
-                    await asyncio.to_thread(self._save_state)
+                if lines:
+                    text = (
+                        "📦 Update available for stream-archive\n"
+                        + "\n".join(lines)
+                        + "\nApply: docker compose pull && docker compose up -d"
+                    )
+                    try:
+                        await self._notifier.notify(text)
+                    except Exception:
+                        # Keep the release unrecorded. A failed send must
+                        # retry on the next check, or the alert for this
+                        # release is lost.
+                        logger.error("[updater] update notification failed", exc_info=True)
+                        return report
+                self._state["app"] = latest
+                await asyncio.to_thread(self._save_state)
         return report
 
     # ---- loop / lifecycle --------------------------------------------------

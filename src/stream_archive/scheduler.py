@@ -10,7 +10,7 @@ from aiohttp import web
 from stream_archive.api import ControlAPI
 from stream_archive.config import AppConfig, get_config
 from stream_archive.eventsub import EventSubClient
-from stream_archive.http import build_shared_client
+from stream_archive.http import build_http_client
 from stream_archive.kick_api import KickAPI
 from stream_archive.kick_webhook import KickWebhook
 from stream_archive.monitor import Monitor
@@ -107,7 +107,7 @@ async def run_scheduler() -> None:
     logger.info("Monitoring interval: %gs", config.monitoring_interval)
     logger.info("Output mode: %s", output_mode)
 
-    shared_http = build_shared_client()
+    shared_http = build_http_client()
 
     # The guard starts before the first constructor. A constructor that
     # raises must still release what already exists: the shared client, the
@@ -202,6 +202,17 @@ async def run_scheduler() -> None:
         )
 
 
+async def _pause(seconds: float) -> None:
+    """Sleep, but wake at once when shutdown starts.
+
+    A plain sleep holds the poll loop past a signal, and the teardown then
+    runs into the container stop grace period.
+    """
+    assert _shutdown_event is not None
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(_shutdown_event.wait(), timeout=seconds)
+
+
 async def _run_loop(
     monitor: Monitor,
     twitch_api: TwitchAPI,
@@ -217,7 +228,7 @@ async def _run_loop(
             await monitor.check_channels(twitch_api, kick_api, config)
         except Exception as e:
             logger.error("[scheduler] Error in check_channels: %s", e, exc_info=True)
-            await asyncio.sleep(5)
+            await _pause(5)
             continue
 
         retention_days = config.retention_days
@@ -244,12 +255,15 @@ async def _run_loop(
                     logger.info("[scheduler] Retention cleanup removed %d expired recording(s)", removed)
                     next_cleanup = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
             else:
-                # Shutdown won. Do not cancel the sweep in the middle of a
-                # deletion. It ends on its own while the teardown runs.
+                # Shutdown won. Stop the sweep before the teardown closes the
+                # recorder: an orphaned sweep would keep unlinking files
+                # through the close, and nothing would read its result.
+                # Cancellation lands between two deletions, never inside one.
+                cleanup_task.cancel()
+                await asyncio.gather(cleanup_task, return_exceptions=True)
                 logger.info("[scheduler] Shutdown during retention cleanup")
 
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(_shutdown_event.wait(), timeout=config.monitoring_interval)
+        await _pause(config.monitoring_interval)
 
 
 async def _shutdown(
@@ -320,6 +334,7 @@ async def _shutdown(
         except Exception:
             logger.error("[scheduler] kick api close failed", exc_info=True)
     if recorder is not None:
+        deadline = asyncio.timeout(_SHUTDOWN_DEADLINE_S)
         try:
             # Bound the capture teardown. The chat finalizer writes its trailer
             # after awaiting the emote fetch, which is bounded per request and
@@ -327,13 +342,19 @@ async def _shutdown(
             # stop grace period and be killed with the file still a .tmp. A
             # timeout cancels the finalizer, whose CancelledError path writes
             # the trailer without the emote images and renames the file.
-            await asyncio.wait_for(recorder.close(), timeout=_SHUTDOWN_DEADLINE_S)
+            async with deadline:
+                await recorder.close()
         except TimeoutError:
-            logger.error(
-                "[scheduler] recorder close exceeded the %.0fs shutdown deadline; "
-                "open chat captures were finalized without their emote images",
-                _SHUTDOWN_DEADLINE_S,
-            )
+            if deadline.expired():
+                logger.error(
+                    "[scheduler] recorder close exceeded the %.0fs shutdown deadline; "
+                    "open chat captures were finalized without their emote images",
+                    _SHUTDOWN_DEADLINE_S,
+                )
+            else:
+                # The close raised its own TimeoutError (IRC read, HTTP
+                # request). That is its failure, not our deadline.
+                logger.error("[scheduler] recorder close failed", exc_info=True)
         except Exception:
             logger.error("[scheduler] recorder close failed", exc_info=True)
     if youtube_streamer is not None:

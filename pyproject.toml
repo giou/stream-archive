@@ -1,6 +1,7 @@
 [build-system]
-# hatchling >= 1.27 accepts the SPDX string form of `license` (PEP 639).
-requires = ["hatchling>=1.27"]
+# hatchling >= 1.27 accepts the SPDX string form of `license` (PEP 639), and
+# <3 keeps an untested major out of the isolated build environment.
+requires = ["hatchling>=1.27,<3"]
 build-backend = "hatchling.build"
 
 [project]
@@ -9,7 +10,9 @@ version = "1.2.6"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.14"
+# 3.15 is not validated yet. The cap fails an install on an untested
+# interpreter instead of failing at runtime. uv.lock records the same bound.
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "httpx>=0.27",
     "google-auth>=2.0",
@@ -36,16 +39,22 @@ filterwarnings = [
     "error",
     # Third-party deprecations on a new interpreter floor are not ours to fix,
     # and the list of them is open (every dependency and its own dependencies).
-    # The blanket ignore drops them, and the entry below keeps our modules
-    # strict, so a new warning from our own code still fails.
+    # The blanket ignores drop them, and the entries below keep our modules
+    # strict, so a new warning from our own code still fails. FutureWarning and
+    # PendingDeprecationWarning are separate classes, so each needs its own
+    # pair of entries.
     "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore::FutureWarning",
     "error::DeprecationWarning:stream_archive.*",
+    "error::PendingDeprecationWarning:stream_archive.*",
+    "error::FutureWarning:stream_archive.*",
 ]
 
 [tool.ruff]
 line-length = 120
 target-version = "py314"
-extend-exclude = ["/plugins"]  # dev-only plugin dir, not shipped in this repo
+extend-exclude = ["plugins", "vendor"]  # dev-only plugin dir, and the vendored upstream plugin
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "TRY", "EM", "RUF100", "TID"]

@@ -26,7 +26,7 @@ from stream_archive.telegram.commands_settings import (
     QUALITY_CHOICES,
     RETENTION_CHOICES,
 )
-from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult, MenuState
+from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult, MenuState, custom_parent
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -497,35 +497,23 @@ PARENT: dict[str, str] = {
 }
 
 
-def _custom_parent(custom: str) -> str:
-    """Back-button target for the custom value menu."""
-    if custom == "channel_hold":
-        return "channel"
-    if custom in ("retention", "maxrec", "maxyt"):
-        return "storage"
-    return "disk"
-
-
 async def menu_back(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
-    """Move one chat up one menu level."""
+    """Move one chat up one menu level.
+
+    Every step clears the state fields that the parent menu does not own, so
+    a pending custom value or a tunnel hostname never outlives its flow.
+    """
     state = ctrl._state_for(chat_id)
     if state.menu == "custom":
-        parent: str | None = _custom_parent(state.custom or "")
+        parent: str | None = custom_parent(state.custom or "")
     else:
         parent = PARENT.get(state.menu)
     if parent is None:
-        if state.menu != "root":  # unknown menu: fall back to root, like dispatch_text
-            state.menu, state.channel = "root", None
-            return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
-        return None  # no Back button on root
-    if state.menu in ("kick_cloudflare_hostname", "kick_cloudflare_dns"):
-        state.cloudflare_hostname = None
-    if parent == "channel":
-        state.menu = "channel"
-        return await ctrl.menu_text("channel", state.channel, chat_id=chat_id), ctrl.reply_keyboard(
-            "channel", chat_id=chat_id
-        )
-    state.menu, state.channel = parent, None
+        if state.menu == "root":
+            return None  # no Back button on root
+        ctrl._show_root(chat_id)  # unknown menu: fall back to root, like dispatch_text
+        return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
+    ctrl._enter_menu(chat_id, parent)
     return await ctrl.menu_text(parent, chat_id=chat_id), ctrl.reply_keyboard(parent, chat_id=chat_id)
 
 
@@ -541,7 +529,7 @@ async def dispatch_text(ctrl: TelegramController, chat_id: ChatId, text: str) ->
     state = ctrl._state_for(chat_id)
     handler = HANDLERS.get(state.menu)
     if handler is None:  # unknown menu: reset to root instead of going silent
-        state.menu, state.channel = "root", None
+        ctrl._show_root(chat_id)
         return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
     return await handler(ctrl, chat_id, text)
 

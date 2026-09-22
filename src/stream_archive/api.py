@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 from aiohttp import web
 
 from stream_archive.config import AppConfig, api_base_url, effective_quality, endpoint_base_url, normalize_channel_name
+from stream_archive.telegram.menu_state import is_error
 from stream_archive.updater import installed_app_version
 
 if TYPE_CHECKING:
@@ -258,6 +259,14 @@ class ControlAPI:
             except _ApiError as e:
                 headers = {"WWW-Authenticate": "Bearer"} if e.status == 401 else None
                 return web.json_response({"error": e.message}, status=e.status, headers=headers)
+            except web.HTTPException:
+                raise
+            except Exception:
+                # A handler awaits the command layer, which touches the
+                # network and the disk. Such a failure must answer in JSON
+                # like every other failure of this API, not as an HTML 500.
+                logger.exception("[api] %s failed", handler.__name__)
+                return web.json_response({"error": "internal error"}, status=500)
 
         wrapper.__name__ = handler.__name__
         return wrapper
@@ -316,7 +325,7 @@ class ControlAPI:
 
     async def _notify(self, messages: Iterable[str]) -> None:
         """Tell the admin about applied API changes. A failure never fails the request."""
-        await self._ctrl._notify_api_changes(list(messages))
+        await self._ctrl.notify_api_changes(list(messages))
 
     async def _run(self, method: Any, args: list[Any]) -> str:
         """Run one Telegram command method and return its message.
@@ -329,7 +338,7 @@ class ControlAPI:
         if inspect.isawaitable(out):
             out = await out
         text = str(out)
-        if text.startswith(_ERROR_MARK):
+        if is_error(text):
             raise _ApiError(400, _plain(text))
         if text.startswith(_CONFLICT_MARK):
             raise _ApiError(409, _plain(text))
@@ -392,18 +401,28 @@ class ControlAPI:
         """Run one command per key. One failure never blocks the other keys.
 
         Returns ``(applied, errors, status)``. The status is 200 when every
-        key applied, 409 when every failure is the audio-only prompt, and
-        400 otherwise.
+        key applied, 500 when a key failed on its own error, 409 when every
+        failure is the audio-only prompt, and 400 otherwise.
         """
         applied: dict[str, str] = {}
         errors: dict[str, str] = {}
         conflicts_only = True
+        internal = False
         for key, value in payload.items():
             try:
                 applied[key] = await apply(key, value)
             except _ApiError as e:
                 errors[key] = e.message
                 conflicts_only = conflicts_only and e.status == 409
+            except Exception:
+                # A command method touches the network and the disk after it
+                # writes the config. Report that key and run the rest, so one
+                # failure never blocks the other keys.
+                logger.exception("[api] applying %r failed", key)
+                errors[key] = "internal error"
+                internal = True
+        if internal:
+            return applied, errors, 500
         if not errors:
             return applied, errors, 200
         return applied, errors, 409 if conflicts_only else 400

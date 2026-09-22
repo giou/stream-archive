@@ -8,9 +8,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from google_auth_oauthlib.flow import InstalledAppFlow
+from oauthlib.oauth2.rfc6749 import errors as oauth2_errors  # type: ignore[import-untyped]
 
 from stream_archive.config import get_config
 from stream_archive.youtube_streamer import SCOPES, TOKEN_NAME, save_token
+
+
+def _server_lock(server: Any) -> Any:
+    """Return the lock that guards the callback state, or a no-op context.
+
+    A bare test server sets no lock, so the handler then runs unlocked, as it
+    already does for a missing ``auth_state``.
+    """
+    return getattr(server, "auth_lock", None) or contextlib.nullcontext()
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -31,10 +41,13 @@ class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         query = parse_qs(urlparse(self.path).query)
         if query.get("code") and self._state_accepted(query):
-            self.server.auth_code = query["code"][0]  # type: ignore[attr-defined]
-            event = getattr(self.server, "auth_event", None)
-            if event is not None:
-                event.set()
+            # Store the code and wake the waiter as one step, so main() cannot
+            # compare-and-clear this code while a newer one lands.
+            with _server_lock(self.server):
+                self.server.auth_code = query["code"][0]  # type: ignore[attr-defined]
+                event = getattr(self.server, "auth_event", None)
+                if event is not None:
+                    event.set()
             body = (
                 b"<html><body><h2>Authorization successful!</h2>"
                 b"<p>You can close this tab and return to the terminal.</p></body></html>"
@@ -104,6 +117,9 @@ def main() -> None:
     server.auth_code = None  # type: ignore[attr-defined]
     server.auth_state = None  # type: ignore[attr-defined]
     server.auth_event = threading.Event()  # type: ignore[attr-defined]
+    # The callback thread and this thread share auth_code and auth_event, so
+    # every read and write of them takes this lock.
+    server.auth_lock = threading.Lock()  # type: ignore[attr-defined]
     flow.redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
 
     auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
@@ -123,7 +139,16 @@ def main() -> None:
     print()
 
     for _ in range(3):
-        pasted = input("   Press Enter after authorizing, or paste the redirect URL: ").strip()
+        try:
+            pasted = input("   Press Enter after authorizing, or paste the redirect URL: ").strip()
+        except EOFError, KeyboardInterrupt:
+            # Closed or non-interactive stdin (Ctrl-D, a pipe, SSH), or the
+            # operator pressed Ctrl-C: stop the callback server and leave with
+            # a plain error instead of a traceback.
+            print("\nERROR: no input received. Run the script in an interactive terminal.", file=sys.stderr)
+            server.shutdown()
+            server.server_close()
+            sys.exit(1)
         try:
             candidate, pasted_state = extract_code_and_state(pasted)
         except ValueError as exc:
@@ -147,36 +172,36 @@ def main() -> None:
         if not candidate:
             # The browser callback can land just after the user pressed Enter.
             server.auth_event.wait(timeout=1.0)  # type: ignore[attr-defined]
-            candidate = server.auth_code  # type: ignore[attr-defined]
+            with _server_lock(server):
+                candidate = server.auth_code  # type: ignore[attr-defined]
         if not candidate:
             print("   No code found — wait for the success page, or paste the full redirect URL.")
             continue
         try:
             flow.fetch_token(code=candidate)
             break
-        except Exception as exc:
-            detail = str(exc)
-            if "invalid_client" in detail or "unauthorized_client" in detail:
-                print(
-                    f"ERROR: Google rejected the OAuth client ({detail}).\n"
-                    "Check client_secret.json and create a desktop OAuth client again.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            if "invalid_grant" not in detail:
-                # A network or server problem is not a stale code. Keep the
-                # code and the callback event for the next attempt.
-                print(f"   The token exchange failed ({exc}). Press Enter to try again.")
-                continue
+        except (oauth2_errors.InvalidClientError, oauth2_errors.UnauthorizedClientError) as exc:
+            print(
+                f"ERROR: Google rejected the OAuth client ({exc}).\n"
+                "Check client_secret.json and create a desktop OAuth client again.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except oauth2_errors.InvalidGrantError as exc:
             # Google refused the code: it is stale, used, or belongs to an
             # older attempt. Drop it, but only while it is still the code of
             # this attempt. A newer callback can have stored a fresh one.
-            if server.auth_code == candidate:  # type: ignore[attr-defined]
-                server.auth_code = None  # type: ignore[attr-defined]
-                # Clear the event too, so the one-second grace below applies
-                # to the retry that follows this failed exchange.
-                server.auth_event.clear()  # type: ignore[attr-defined]
+            with _server_lock(server):
+                if server.auth_code == candidate:  # type: ignore[attr-defined]
+                    server.auth_code = None  # type: ignore[attr-defined]
+                    # Clear the event too, so the one-second grace below applies
+                    # to the retry that follows this failed exchange.
+                    server.auth_event.clear()  # type: ignore[attr-defined]
             print(f"   Could not exchange the code ({exc}); paste the full URL from the address bar.")
+        except Exception as exc:
+            # A network or server problem is not a stale code. Keep the code
+            # and the callback event for the next attempt.
+            print(f"   The token exchange failed ({exc}). Press Enter to try again.")
     else:
         print("ERROR: no valid token after 3 attempts. Re-run the script.", file=sys.stderr)
         sys.exit(1)

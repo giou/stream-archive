@@ -127,11 +127,13 @@ def build_comment(
     msg_time = parse_time(created_at)
     offset = 0.0
     if msg_time and start:
+        # Kick can send an offset-less timestamp, and the recording start can
+        # be offset-less too. Both sides are UTC then, so the subtraction is
+        # defined and a naive value is not read as local time.
         if msg_time.tzinfo is None:
-            # Kick can send an offset-less timestamp. datetime.fromisoformat
-            # returns a naive datetime then, and the subtraction below would
-            # raise TypeError and lose the message.
             msg_time = msg_time.replace(tzinfo=UTC)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
         offset = max(0.0, (msg_time - start).total_seconds())
 
     user_badges = []
@@ -224,7 +226,7 @@ async def fetch_emote_images(
     A failed download is skipped, so the returned dict can be partial. The
     function stops at max_emotes ids, drops one image larger than
     max_bytes_each, and returns at most max_total_bytes of image data. It
-    also drops a body whose content type is not an image.
+    also drops an empty body and a body whose content type is not an image.
     """
     out: dict[str, bytes] = {}
     selected = ids[:max_emotes]
@@ -256,14 +258,25 @@ async def fetch_emote_images(
                         )
                         return
                     body = bytearray()
-                    oversized = False
+                    rejected = ""
                     async for chunk in resp.aiter_bytes():
                         body.extend(chunk)
+                        # A sibling download fills the total while this one
+                        # waits for its headers or its body, so both limits
+                        # are tested against the live total: the check at the
+                        # permit is not enough on its own.
                         if len(body) > max_bytes_each:
-                            oversized = True
+                            rejected = f"image larger than {max_bytes_each} bytes"
                             break
-                    if oversized:
-                        logger.warning("[kick_chat] emote %s skipped: image larger than %d bytes", eid, max_bytes_each)
+                        if total + len(body) > max_total_bytes:
+                            rejected = "total download limit reached"
+                            break
+                    if rejected:
+                        logger.warning("[kick_chat] emote %s skipped: %s", eid, rejected)
+                    elif not body:
+                        # A 200 with an empty body carries no image. Storing
+                        # it would embed an empty base64 value.
+                        logger.warning("[kick_chat] emote %s skipped: empty body", eid)
                     else:
                         total += len(body)
                         out[eid] = bytes(body)
@@ -277,11 +290,14 @@ async def fetch_emote_images(
             await http.aclose()
     if total > max_total_bytes:
         # Up to _EMOTE_FETCH_CONCURRENCY requests can be in flight when the
-        # limit is reached. Drop downloads until the result fits the limit.
-        for eid in list(out):
+        # limit is reached. Drop the downloads in first-use order, so the
+        # same recording always keeps the same emote images.
+        for eid in selected:
             if total <= max_total_bytes:
                 break
-            total -= len(out.pop(eid))
+            dropped = out.pop(eid, None)
+            if dropped is not None:
+                total -= len(dropped)
     return out
 
 

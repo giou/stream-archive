@@ -34,6 +34,10 @@ _TUNNEL_LABELS = {"cloudflare": "Cloudflare tunnel", "tailscale": "Tailscale fun
 #: Reply for a Cloudflare API body that is not the documented JSON object.
 _CLOUDFLARE_BAD_BODY = "\u274c Cloudflare API request failed: unexpected response from Cloudflare."
 
+#: Pages the zone lookup reads before it stops. The API lists 50 zones per
+#: page, so this covers 1000 zones. A body that claims more pages is broken.
+_CLOUDFLARE_MAX_ZONE_PAGES = 20
+
 
 def _json_body(response: httpx.Response) -> dict[str, Any]:
     """JSON body of a Cloudflare API response. A wrong shape reads as an empty object.
@@ -192,6 +196,46 @@ class WebhookCommands:
         ep = self._config.endpoint
         return write_ingress_config(self._config._workdir, host, ep.listen_port, ep.cloudflare_token)
 
+    async def _cloudflare_zone(
+        self, client: httpx.AsyncClient, headers: dict[str, str], host: str
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Find the longest-suffix zone of ``host`` in the account's zones.
+
+        Read every page of the zone list. Return (zone, None) on a match,
+        (None, None) when no zone matches, and (None, error) on a failed
+        request or a broken body. Never raises.
+        """
+        best: dict[str, Any] | None = None
+        best_name = ""
+        page = 1
+        while True:
+            try:
+                resp = await client.get(f"{_CLOUDFLARE_API}/zones?per_page=50&page={page}", headers=headers)
+            except (httpx.HTTPError, ValueError) as e:
+                return None, f"\u274c Cloudflare API request failed: {e}"
+            if resp.status_code != 200:
+                return None, (
+                    "\u274c The token can't list zones \u2014 it needs Zone read (use the 'Edit zone DNS' template)."
+                )
+            body = _json_body(resp)
+            zones = body.get("result") or []
+            if not isinstance(zones, list):
+                return None, _CLOUDFLARE_BAD_BODY
+            for zone in zones:
+                # A zone without a usable name selects nothing and reads as
+                # a broken reply, not as a zone that misses.
+                name = zone.get("name") if isinstance(zone, dict) else None
+                if not isinstance(name, str) or not name:
+                    return None, _CLOUDFLARE_BAD_BODY
+                lowered = name.lower()
+                if (host == lowered or host.endswith("." + lowered)) and len(lowered) > len(best_name):
+                    best, best_name = zone, lowered
+            info = body.get("result_info")
+            total_pages = info.get("total_pages") if isinstance(info, dict) else None
+            if not isinstance(total_pages, int) or page >= total_pages or page >= _CLOUDFLARE_MAX_ZONE_PAGES:
+                return best, None
+            page += 1
+
     async def _create_cloudflare_dns(self, api_token: str, chat_id: int | None = None) -> tuple[bool, str]:
         """Create the CNAME for the named tunnel's hostname via the Cloudflare API.
 
@@ -227,30 +271,17 @@ class WebhookCommands:
         )
         if not verify_active:
             return False, "\u274c That Cloudflare API token is not valid."
-        try:
-            zones_resp = await client.get(f"{_CLOUDFLARE_API}/zones?per_page=50", headers=headers)
-        except (httpx.HTTPError, ValueError) as e:
-            return False, f"\u274c Cloudflare API request failed: {e}"
-        if zones_resp.status_code != 200:
-            return False, (
-                "\u274c The token can't list zones \u2014 it needs Zone read (use the 'Edit zone DNS' template)."
-            )
-        zones_result = _json_body(zones_resp).get("result") or []
-        if not isinstance(zones_result, list):
-            return False, _CLOUDFLARE_BAD_BODY
-        zone: dict[str, Any] | None = None
-        for z in zones_result:
-            if not isinstance(z, dict):
-                return False, _CLOUDFLARE_BAD_BODY
-            name = (z.get("name") or "").lower()
-            if (host == name or host.endswith("." + name)) and (zone is None or len(name) > len(zone["name"])):
-                zone = z
+        zone, zone_error = await self._cloudflare_zone(client, headers, host)
+        if zone_error is not None:
+            return False, zone_error
         if zone is None:
             return False, (
                 f"\u274c No Cloudflare zone matches {host} \u2014 is the domain "
                 "on the Cloudflare account of this API token?"
             )
-        zone_id = zone["id"]
+        zone_id = zone.get("id")
+        if not isinstance(zone_id, str) or not zone_id:
+            return False, _CLOUDFLARE_BAD_BODY
         try:
             existing_resp = await client.get(
                 f"{_CLOUDFLARE_API}/zones/{zone_id}/dns_records?name={host}&type=CNAME", headers=headers
@@ -265,8 +296,12 @@ class WebhookCommands:
         if not isinstance(existing, list) or any(not isinstance(record, dict) for record in existing):
             return False, _CLOUDFLARE_BAD_BODY
         if existing:
-            if existing[0].get("content") == target:
-                return True, "\u2705 DNS record already points at your tunnel."
+            # The lookup returns every record with this name. A record that
+            # already points at the tunnel is enough; any other one blocks
+            # the create call with a duplicate-record error.
+            for record in existing:
+                if record.get("content") == target:
+                    return True, "\u2705 DNS record already points at your tunnel."
             return False, (f"\u274c {host} is already used by another DNS record ({existing[0].get('content')}).")
         try:
             created = await client.post(
@@ -512,6 +547,29 @@ class WebhookCommands:
         note = await self._reachability_note(url, tunnel)
         return f"{result}\n\n{public_url_note(self._config)}{note}"
 
+    def _restore_endpoint_state(self, before: dict[str, Any], notified: bool, chat_id: int | None) -> None:
+        """Put a saved endpoint state back after a failed reconcile.
+
+        The listener did not take the change. The state before the change
+        is the true state, so save it again.
+        """
+
+        def mutate(candidate: AppConfig) -> None:
+            target = candidate.endpoint
+            # Turn the flag off first: the model rejects a public URL that
+            # goes away while enabled is true. Set it back last, when the
+            # URL it needs is in place.
+            target.enabled = False
+            for key, value in before.items():
+                if key != "enabled":
+                    setattr(target, key, value)
+            target.enabled = before["enabled"]
+            candidate.kick.webhook.setup_notified = notified
+
+        result: str = self._apply(mutate, lambda c: "endpoint state restored", chat_id)
+        if is_error(result):
+            logger.error("[telegram] could not restore the saved endpoint state: %s", result)
+
     async def _apply_endpoint_state(
         self,
         enabled: bool,
@@ -537,6 +595,11 @@ class WebhookCommands:
         old_tunnel = ep.tunnel
         old_managed = ep.cloudflare_managed
         was_enabled = ep.enabled
+        # Snapshot for the rollback: a failed reconcile must leave the saved
+        # state as it was. Keep it as the new state, and config would claim
+        # an endpoint that nothing serves.
+        before = ep.model_dump()
+        notified_before = self._config.kick.webhook.setup_notified
 
         def mutate(candidate: AppConfig) -> None:
             ce = candidate.endpoint
@@ -562,14 +625,16 @@ class WebhookCommands:
         if self._kick_webhook is not None:
             # The listener also serves the control API, so this reconciles
             # both features instead of a plain start or stop. apply_state
-            # raises when the listener cannot bind: report it as a failure
-            # so the caller stops the tunnel that it just started.
+            # raises when the listener cannot bind: put the state back and
+            # report the failure, so the caller stops the tunnel that it
+            # started and config claims only what the listener serves.
             try:
                 await self._kick_webhook.apply_state()
                 if enabled:
                     await self._kick_webhook.sync_channels(self._config.channels)
             except Exception as e:
                 logger.exception("[telegram] endpoint reconcile failed")
+                self._restore_endpoint_state(before, notified_before, chat_id)
                 return f"\u274c The listener could not be reconfigured: {e}"
         if enabled:
             # A managed cloudflared must go when this enable no longer runs

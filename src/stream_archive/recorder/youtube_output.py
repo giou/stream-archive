@@ -225,11 +225,14 @@ class YoutubeOutputMixin:
             # dead broadcast, so holding it would only loop.
             await self._end_broadcast(channel, youtube_info["broadcast_id"])
             return
-        old = self._held.get(channel)
-        if old:
+        old = self._held.pop(channel, None)
+        if old is not None:
+            # A replaced hold loses its timer, and nothing else still knows
+            # its broadcast. End it here, or it stays live on YouTube.
             end_task = old.get("end_task")
             if end_task is not None:
                 end_task.cancel()
+            await self._end_broadcast(channel, old["youtube_info"]["broadcast_id"])
         hold: HoldState = {"youtube_info": youtube_info, "end_task": None, "keepalive": None}
         self._held[channel] = hold
         hold["end_task"] = asyncio.create_task(self._hold_then_end(channel, delay, hold))
@@ -241,12 +244,20 @@ class YoutubeOutputMixin:
         )
 
     async def _hold_then_end(self, channel: str, delay: float, hold: HoldState) -> None:
-        """Feed the held broadcast for the delay, or end early if the feed dies."""
-        keepalive = await self._start_keepalive(hold["youtube_info"]["rtmp_url"])
-        hold["keepalive"] = keepalive
-        sleep_task = asyncio.create_task(asyncio.sleep(delay))
-        ka_task = asyncio.create_task(keepalive.wait()) if keepalive is not None else None
+        """Feed the held broadcast for the delay, or end early if the feed dies.
+
+        This task ends its own broadcast. A cancellation only drops the hold
+        and stops the keep-alive: the canceller took the hold over (reuse), or
+        it ends the broadcast itself (close).
+        """
+        keepalive: asyncio.subprocess.Process | None = None
+        sleep_task: asyncio.Task[Any] | None = None
+        ka_task: asyncio.Task[Any] | None = None
         try:
+            keepalive = await self._start_keepalive(hold["youtube_info"]["rtmp_url"])
+            hold["keepalive"] = keepalive
+            sleep_task = asyncio.create_task(asyncio.sleep(delay))
+            ka_task = asyncio.create_task(keepalive.wait()) if keepalive is not None else None
             done, _ = await asyncio.wait(
                 [t for t in (sleep_task, ka_task) if t is not None],
                 return_when=asyncio.FIRST_COMPLETED,
@@ -258,10 +269,12 @@ class YoutubeOutputMixin:
                 await self._stop_keepalive(keepalive)
                 logger.warning("[recorder] [youtube] %s keep-alive feed stopped early, ending broadcast", channel)
                 sleep_task.cancel()  # the hold is over; do not leave the timer pending
+                await asyncio.gather(sleep_task, return_exceptions=True)
                 await self._end_broadcast(channel, hold["youtube_info"]["broadcast_id"])
                 return
             if ka_task is not None:
-                ka_task.cancel()
+                ka_task.cancel()  # the feed outlived the hold; stop watching it
+                await asyncio.gather(ka_task, return_exceptions=True)
             if self._held.get(channel) is not hold:
                 await self._stop_keepalive(keepalive)
                 return  # a new stream consumed the hold while we slept
@@ -272,6 +285,13 @@ class YoutubeOutputMixin:
             for t in (sleep_task, ka_task):
                 if t is not None:
                     t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                # A cancelled task that nobody awaits warns at teardown.
+                await asyncio.gather(*(t for t in (sleep_task, ka_task) if t is not None), return_exceptions=True)
+            if self._held.get(channel) is hold:
+                # Nobody took the hold over, so drop it: the next start must
+                # not reuse a broadcast that no task feeds any more.
+                self._held.pop(channel, None)
             await self._stop_keepalive(keepalive)
             raise
 
@@ -343,6 +363,10 @@ class YoutubeOutputMixin:
                 raise
             entry = self._recordings.get(channel)
             if entry is None:
+                # The recording vanished while the broadcast was created, so
+                # nothing can feed it. End it here: a broadcast left live and
+                # unowned costs quota and shows on the channel.
+                await self._end_broadcast(channel, youtube_info["broadcast_id"])
                 return
             entry["youtube_info"] = youtube_info
 
@@ -391,9 +415,13 @@ class YoutubeOutputMixin:
         try:
             results = await asyncio.gather(pipe_task, stderr_task)
         except asyncio.CancelledError:
-            pipe_task.cancel()
+            # Both readers hold the ffmpeg pipes, so both must stop and be
+            # awaited here. A task left pending masks the ffmpeg stderr and
+            # warns "Task was destroyed but it is pending" at shutdown.
+            for task in (pipe_task, stderr_task):
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await pipe_task
+                await asyncio.gather(pipe_task, stderr_task, return_exceptions=True)
             logger.info("[recorder] [youtube] %s cancelled", channel)
             raise
         finally:

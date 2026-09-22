@@ -23,7 +23,7 @@ from stream_archive.config import (
     effective_quality,
     is_kick_channel,
 )
-from stream_archive.http import build_shared_client
+from stream_archive.http import build_http_client
 from stream_archive.telegram import menus
 from stream_archive.telegram import menus_callbacks as callbacks
 from stream_archive.telegram.commands_api import ApiCommands
@@ -83,6 +83,7 @@ class TelegramController(
     _app: Application[Any, Any, Any, Any, Any, Any]
     _admin_id: int
     _cloudflared: CloudflaredTunnel
+    _cloudflared_lock: asyncio.Lock
     _restore_task: asyncio.Task[None] | None
 
     def __init__(
@@ -107,7 +108,7 @@ class TelegramController(
             self._http = http
             self._owns_http = False
         else:
-            self._http = build_shared_client()
+            self._http = build_http_client()
             self._owns_http = True
         self._admin_id = config.telegram_user_id
         # One filter object gates every command handler, so a reload can
@@ -116,6 +117,9 @@ class TelegramController(
         self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
         self._cloudflared = CloudflaredTunnel()
+        # One managed cloudflared process serves the whole app, so a tunnel
+        # press must not interleave with another one. See menu_kick_cloudflare.
+        self._cloudflared_lock = asyncio.Lock()
         self._restore_task = None
         self._callback_handler: Any = None
 
@@ -203,13 +207,20 @@ class TelegramController(
         failure is logged and does not stop the remaining steps.
         """
         # A restore task that still runs can start a cloudflared process
-        # after this teardown, so cancel it and wait for it first.
+        # after this teardown, so cancel it and wait for it first. A failure
+        # in the task is not a reason to skip the remaining steps.
         if self._restore_task is not None:
             self._restore_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._restore_task
+                try:
+                    await self._restore_task
+                except Exception:
+                    logger.warning("[telegram] cloudflared restore task failed at stop", exc_info=True)
             self._restore_task = None
-        self._cloudflared_stop()
+        try:
+            self._cloudflared_stop()
+        except Exception:
+            logger.warning("[telegram] Failed to stop cloudflared", exc_info=True)
         updater = self._app.updater
         if updater is not None:
             try:
@@ -225,7 +236,10 @@ class TelegramController(
         except Exception:
             logger.warning("[telegram] Failed to shut down the bot", exc_info=True)
         if self._owns_http:
-            await self._http.aclose()
+            try:
+                await self._http.aclose()
+            except Exception:
+                logger.warning("[telegram] Failed to close the HTTP session", exc_info=True)
 
     def _apply(
         self, mutate: Callable[[AppConfig], Any], ok_text: Callable[[AppConfig], str], chat_id: ChatId | None = None
@@ -251,6 +265,23 @@ class TelegramController(
     async def _maybe_send_apply_warnings(self) -> None:
         await callbacks.maybe_send_apply_warnings(self)
 
+    async def _replace_callback_text(self, query: Any, context: Any, text: str) -> None:
+        """Replace the pressed message with ``text``, or resend it if it went away.
+
+        A Telegram error must not escape: the press is already answered, and
+        the remaining steps of the handler still run.
+        """
+        try:
+            await query.edit_message_text(text, reply_markup=None)
+        except BadRequest:
+            # The message vanished, or its text did not change: send a fresh one.
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text=text)
+            except Exception:
+                logger.warning("[telegram] Failed to send the callback reply", exc_info=True)
+        except Exception:
+            logger.warning("[telegram] Failed to edit the callback message", exc_info=True)
+
     async def _on_callback(self, update: Any, context: Any) -> None:
         # The handler filter already drops non-admin presses, so no check here.
         query = update.callback_query
@@ -264,10 +295,7 @@ class TelegramController(
             error_text = "\u274c Unexpected error \u2014 see logs"
             with contextlib.suppress(BadRequest):
                 await query.answer()
-            try:
-                await query.edit_message_text(error_text, reply_markup=None)
-            except BadRequest:  # confirm message vanished -> send a fresh one
-                await context.bot.send_message(chat_id=query.from_user.id, text=error_text)
+            await self._replace_callback_text(query, context, error_text)
             return
         if result is None:  # double-tap or unknown data: silent ack, no toast
             with contextlib.suppress(BadRequest):
@@ -276,10 +304,7 @@ class TelegramController(
         text, _ = result
         with contextlib.suppress(BadRequest):
             await query.answer()
-        try:
-            await query.edit_message_text(text, reply_markup=None)
-        except BadRequest:  # message vanished mid-flight -> resend
-            await context.bot.send_message(chat_id=query.from_user.id, text=text)
+        await self._replace_callback_text(query, context, text)
         # A callback can apply a change that defers onto a running
         # recording (the audio-only confirm). Send its prompt now, as the
         # text paths do, instead of waiting for the next typed message.

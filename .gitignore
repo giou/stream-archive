@@ -1,13 +1,15 @@
 # Runtime state of a checkout deployment. The app resolves these paths against
 # the config file (config.py _find_config): the repo root in a checkout, or the
-# directory of a config.json that lives elsewhere (data/). config.json.tmp and
-# update_state.json.tmp are the atomic-write temp files.
-/config.json
-/config.json.tmp
+# directory of a config.json that lives elsewhere (data/). The patterns are
+# therefore depth-independent. config.py and updater.py write "<name>.json.tmp";
+# youtube_streamer.py writes a hidden ".<name>.<random>.tmp".
+config.json
 update_state.json
-update_state.json.tmp
 youtube_token.json
-/cloudflared/
+*.chat.json
+*.json.tmp
+.*.tmp
+cloudflared/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
@@ -19,18 +21,18 @@ build/
 *.pyo
 *.pyd
 .tz
-/recordings/
-/chat/
-*.chat.json
-*.chat.json.tmp
+recordings/
+chat/
 *:Zone.Identifier
 client_secret*.json
 credentials*.json
 .venv/
 *.bak
-# Deployment settings (docs/running.md). No .env template ships with the repo.
+# Deployment settings (docs/running.md). No .env template ships yet; the
+# negation keeps a future .env.example addable without `git add -f`.
 .env
 .env.*
+!.env.example
 .DS_Store
 *.log
 .coverage
