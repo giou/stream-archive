@@ -67,8 +67,8 @@ jobs:
       - name: Check the uv version against the Dockerfile
         run: |
           IMAGE_UV=$(sed -n 's|^FROM ghcr.io/astral-sh/uv:\([^ ]*\) AS uv$|\1|p' Dockerfile)
-          CI_UV=$(grep -oP "^  UV_VERSION: \"\K[0-9.]+(?=\")" .github/workflows/ci.yml)
-          PUB_UV=$(grep -oP "^ +version: \"\K[0-9.]+(?=\")" .github/workflows/publish.yml | head -1)
+          CI_UV="${UV_VERSION}"
+          PUB_UV=$(sed -n '/astral-sh\/setup-uv/,+3p' .github/workflows/publish.yml | sed -n 's|^ *version: "\(.*\)"$|\1|p')
           if [ -z "$IMAGE_UV" ] || [ -z "$CI_UV" ] || [ -z "$PUB_UV" ]; then
             echo "cannot read a uv version: Dockerfile '$IMAGE_UV', ci.yml '$CI_UV', publish.yml '$PUB_UV'" >&2; exit 1
           fi

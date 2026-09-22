@@ -52,6 +52,7 @@ jobs:
           set -eu
           TAG="${{ steps.check.outputs.tag }}"
           PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
+          echo "pinned=${PINNED}" >> "$GITHUB_OUTPUT"
           mkdir -p "vendor/streamlink-ttvlol/${TAG}"
           curl -fsSL -o "vendor/streamlink-ttvlol/${TAG}/twitch.py" \
             "https://github.com/2bc4/streamlink-ttvlol/releases/download/${TAG}/twitch.py"
@@ -62,8 +63,15 @@ jobs:
           # A plugin that does not parse must never reach a pull request. The
           # runner's python3 can be older than the 3.14 the image and CI pin,
           # so the ast.parse gate would fail a plugin that uses 3.14-only
-          # syntax. Run it through the same interpreter that CI uses.
-          uvx --python 3.14 --with . python -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
+          # syntax. Run it with the project's own pinned interpreter.
+          PY="$(command -v uvx || true)"
+          if [ -z "$PY" ]; then
+            echo "uvx is not installed on this runner" >&2; exit 1
+          fi
+          uvx --python 3.14 python -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
+            "vendor/streamlink-ttvlol/${TAG}/twitch.py"
+          sed -i "s|^ARG TTVLOL_PLUGIN_VERSION=.*|ARG TTVLOL_PLUGIN_VERSION=${TAG}|" Dockerfile
+          sed -i "s|^ARG TTVLOL_PLUGIN_SHA256=.*|ARG TTVLOL_PLUGIN_SHA256=${SHA}|" Dockerfile
           {
             echo "Upstream release \`${TAG}\`, replacing \`${PINNED}\`."
             echo
@@ -72,14 +80,21 @@ jobs:
             echo "diff before merging."
             echo
             echo '```diff'
+            # diff exits 1 when the files differ, which is the normal bump
+            # case, and 2 on a real error. pipefail would abort on the 1
+            # before the status is read, so disable errexit for the pipeline
+            # and fail only on an error.
+            set +e
             diff -u "vendor/streamlink-ttvlol/${PINNED}/twitch.py" \
               "vendor/streamlink-ttvlol/${TAG}/twitch.py" | head -c 60000
             DIFF_STATUS="${PIPESTATUS[0]}"
+            set -e
             if [ "$DIFF_STATUS" -gt 1 ]; then
               echo "cannot diff the plugin versions" >&2; exit 1
             fi
             echo '```'
           } > /tmp/pr-body.md
+        id: fetch
       - name: Open the pull request
         if: steps.check.outputs.bump == 'true'
         env:
@@ -87,17 +102,21 @@ jobs:
         run: |
           set -eu
           TAG="${{ steps.check.outputs.tag }}"
+          PINNED="${{ steps.fetch.outputs.pinned }}"
           BRANCH="ttvlol/${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if gh pr view "$BRANCH" --json number -q .number >/dev/null 2>&1; then
+          # A rerun must not fail or duplicate: an open pull request for this
+          # branch already carries the bump, and a leftover branch from a run
+          # with no open pull request is reset instead of recreated.
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" -gt 0 ]; then
             echo "a pull request for ${TAG} is already open, skipping" >&2
             exit 0
           fi
-          # A previous weekly run can leave the branch behind even without an
-          # open pull request, so reset it instead of failing on creation.
           git checkout -B "$BRANCH"
-          git rm -r -q "vendor/streamlink-ttvlol/${PINNED}" 2>/dev/null || true
+          if [ -n "$PINNED" ] && [ "$PINNED" != "$TAG" ]; then
+            git rm -r -q "vendor/streamlink-ttvlol/${PINNED}"
+          fi
           git add Dockerfile "vendor/streamlink-ttvlol/${TAG}"
           git commit -m "chore(deps): bump the streamlink-ttvlol plugin to ${TAG}"
           git push --force-with-lease -u origin "$BRANCH"

@@ -102,13 +102,14 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
  && rm -rf /root/.cache/uv
 
 # HOME must be writable by the (non-root) runtime user: Streamlink's plugin
-# cache defaults to $HOME/.cache. /tmp is a tmpfs under compose and world-
-# writable in the image, so this value works even when the entrypoint cannot
-# create a home of its own. The entrypoint moves HOME to /tmp/stream-archive and
-# gives that directory to the app uid, so another uid cannot pre-create the
-# cache path of the in-process plugin from a shared location. The cache is
-# per-container, which is fine because it is a cache: the ttvlol plugin
-# re-fetches on restart.
+# cache defaults to $HOME/.cache. /tmp is a tmpfs under compose. The image
+# value is only a fallback: the entrypoint moves HOME to /tmp/stream-archive
+# and gives that directory to the app uid, so another uid cannot pre-create
+# the cache path of the in-process plugin from a shared location. The
+# entrypoint refuses to start when it cannot make that home private, instead
+# of running the app with this shared value. The cache is per-container,
+# which is fine because it is a cache: the ttvlol plugin re-fetches on
+# restart.
 # This ENV stays after `uv sync`: at build time HOME=/root, so the build's
 # caches do not pollute /tmp with root-owned dirs.
 ENV HOME=/tmp

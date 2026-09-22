@@ -85,15 +85,26 @@ jobs:
             REPOSITORY="${IMAGE#ghcr.io/}"
             TOKEN=$(curl -fsS --retry 3 --max-time 60 \
               "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull" | jq -r .token)
-            PUBLISHED=$(curl -fsS --retry 3 --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
-              "https://ghcr.io/v2/${REPOSITORY}/tags/list?n=1000" | jq -r '.tags[]?' \
-              | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
-            # A first stable release has no published tags to compare with, so
-            # an empty PUBLISHED means this tag is the newest by definition.
+            # The grep can match nothing on a first or prerelease-only
+            # registry, but curl and jq errors must stay fatal: a transient
+            # outage that looks like "no published tags" would otherwise
+            # promote :latest on a stale assumption. Read the tag list, fail
+            # on an empty or null list, then filter to stable tags only.
+            REGISTRY_TAGS=$(curl -fsS --retry 3 --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
+              "https://ghcr.io/v2/${REPOSITORY}/tags/list?n=1000" | jq -r '.tags // empty | .[]?')
+            if [ -z "$REGISTRY_TAGS" ]; then
+              echo "the registry returned no tags at all, failing instead of guessing :latest" >&2; exit 1
+            fi
+            # An empty stable match is not an error: a first stable release
+            # has no earlier stable tag, so this tag is the newest by
+            # definition.
+            PUBLISHED=$(printf '%s\n' "$REGISTRY_TAGS" | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -1 || true)
             NEWEST=$(printf '%s\n' "$PUBLISHED" "${GITHUB_REF_NAME}" | grep . | sort -V | tail -1)
-          fi
-          {
-            echo "tags<<EOF"
+            if [ "$NEWEST" = "${GITHUB_REF_NAME}" ]; then
+              TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
+            else
+              echo "::warning::${GITHUB_REF_NAME} is not newer than ${PUBLISHED}, so :latest stays there" >&2
+            fi
             printf '%s\n' "$TAGS"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
