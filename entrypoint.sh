@@ -110,9 +110,25 @@ case "$app_home" in
     /tmp/*) ;;
     *) echo "entrypoint: STREAM_ARCHIVE_HOME must stay under /tmp, refusing '$app_home'" >&2; exit 1 ;;
 esac
-if [ -L "$app_home" ] || [ -e "$app_home" ] && [ ! -d "$app_home" ]; then
+if [ -L "$app_home" ]; then
+    echo "entrypoint: '$app_home' is a symlink, refusing to adopt it as HOME" >&2; exit 1
+fi
+if [ -e "$app_home" ] && [ ! -d "$app_home" ]; then
     echo "entrypoint: '$app_home' exists and is not a directory, refusing" >&2; exit 1
 fi
+probe="$app_home"
+while [ -n "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
+    if [ -L "$probe" ]; then
+        echo "entrypoint: '$probe' is a symlink, refusing to create '$app_home' under it" >&2; exit 1
+    fi
+    if [ -e "$probe" ]; then
+        break
+    fi
+    case "$probe" in
+        */*) probe="${probe%/*}" ;;
+        *) probe="" ;;
+    esac
+done
 if ! mkdir -p "$app_home" 2>/dev/null || [ ! -d "$app_home" ]; then
     echo "entrypoint: cannot create '$app_home', and the app must not run with a shared home" >&2; exit 1
 fi
