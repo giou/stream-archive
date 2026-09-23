@@ -12,14 +12,9 @@ reasons:
 
 ## Contents
 
-| Tag | sha256 |
-|---|---|
-| `8.3.0-20260701` | `4d465380159ec59f7caef6cb6a28368bbbbd3abcf80886138182184c30f2fad0` |
-
-The same tag and digest are pinned in the `TTVLOL_PLUGIN_VERSION` and
-`TTVLOL_PLUGIN_SHA256` arguments of the `Dockerfile`. The build verifies the
-copy against that digest, and CI verifies the vendored file against it, so an
-edit to the file fails until the digest is updated with it.
+The plugin file lives under `<tag>/twitch.py`. The Dockerfile names that
+directory with `TTVLOL_PLUGIN_VERSION`, records the digest of the copied
+file, and CI checks the vendored file against `TTVLOL_PLUGIN_SHA256`.
 
 ## Updating
 
@@ -43,9 +38,6 @@ mkdir -p "vendor/streamlink-ttvlol/${TAG}"
 cp /tmp/twitch.py "vendor/streamlink-ttvlol/${TAG}/twitch.py"
 # Then set both ARG lines in the Dockerfile to the tag and the digest.
 ```
-
-The digest, not the tag, pins the content: a GitHub release asset is mutable,
-so the same tag can serve different bytes later.
 
 ## License
 

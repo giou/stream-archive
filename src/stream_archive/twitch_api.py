@@ -195,9 +195,8 @@ class TwitchAPI:
         must handle it.
         """
         resp = await self._request("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", json=payload)
-        if resp.status_code in (202, 400, 403, 409):
-            return resp.status_code, _json_or_empty(resp)
-        resp.raise_for_status()
+        if resp.status_code not in (202, 400, 403, 409):
+            resp.raise_for_status()
         return resp.status_code, _json_or_empty(resp)
 
     async def delete_eventsub_subscription(self, sub_id: str) -> None:

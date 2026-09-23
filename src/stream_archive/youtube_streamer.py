@@ -70,7 +70,7 @@ def build_video_description(author: str, channel: str, game: str) -> str:
         f"{platform} stream by {author}\n"
         f"Game: {game}\n"
         f"Originally streamed at: {channel_url(channel)}\n"
-        f"Recorded by StreamArchive"
+        "Recorded by StreamArchive"
     )
 
 
@@ -142,16 +142,12 @@ class YouTubeStreamer:
             if refresh or not creds.valid:
                 if (refresh or creds.expired) and creds.refresh_token:
                     await asyncio.to_thread(creds.refresh, Request())
-                    self._save_token()
+                    save_token(self._credentials, self._token_path)
                 else:
                     msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
                     raise RuntimeError(msg)
 
             return self._credentials
-
-    def _save_token(self) -> None:
-        if self._credentials is not None:
-            save_token(self._credentials, self._token_path)
 
     async def _rollback_create(self, stream_id: str | None, broadcast_id: str | None) -> None:
         """Remove the live stream and broadcast a failed create left behind.

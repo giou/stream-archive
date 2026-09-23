@@ -65,10 +65,9 @@ break the lockfile or the tests.
 
 The recorder imports the streamlink-ttvlol plugin into its own process. The
 file is vendored at `vendor/streamlink-ttvlol/<tag>/twitch.py`, so the build
-reads it from the context and needs no network. The build checks the copy
-against `TTVLOL_PLUGIN_SHA256` from the Dockerfile, parses it, and records the
-digest in `/app/plugins/twitch.py.sha256`, so a running image can be identified
-without a build log:
+reads it from the context and needs no network. The build parses the copy and
+records its digest in `/app/plugins/twitch.py.sha256`, so a running image can
+be identified without a build log:
 
 ```sh
 docker run --rm --entrypoint cat ghcr.io/giou/stream-archive:latest /app/plugins/twitch.py.sha256
@@ -78,18 +77,6 @@ A plain `docker build` needs no arguments and installs the reviewed bytes:
 
 ```sh
 docker build -t stream-archive:dev .
-```
-
-The digest, not the tag, pins the content: a GitHub release asset is mutable,
-so the same tag can serve different bytes later. To install a different release
-without editing the Dockerfile, pass both values, and the build refuses any
-file that does not match the digest:
-
-```sh
-TAG=8.3.0-20260701
-docker build \
-  --build-arg TTVLOL_PLUGIN_VERSION="${TAG}" \
-  --build-arg TTVLOL_PLUGIN_SHA256=<digest from vendor/streamlink-ttvlol/README.md> .
 ```
 
 Dependabot cannot watch a release asset. The `ttvlol bump` workflow runs every
