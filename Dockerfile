@@ -56,9 +56,10 @@ WORKDIR /app
 # bytes a reviewer read in the pull request. TTVLOL_PLUGIN_VERSION names that
 # directory. See vendor/streamlink-ttvlol/README.md.
 #
-# TTVLOL_PLUGIN_SHA256 pins the content of that file. CI checks the vendored
-# file against it, so an edit fails until both move together. A GitHub release
-# asset is mutable: the digest, not the tag, is what pins the bytes.
+# TTVLOL_PLUGIN_SHA256 pins the content of that file. The build fails when the
+# copied bytes do not match it, and CI checks the vendored file too, so an
+# edit fails until both move together. A GitHub release asset is mutable: the
+# digest, not the tag, is what pins the bytes.
 #
 # To bump: the scheduled workflow .github/workflows/ttvlol-bump.yml opens a
 # pull request that adds the new file, updates both arguments, and shows the
@@ -66,9 +67,10 @@ WORKDIR /app
 ARG TTVLOL_PLUGIN_VERSION=8.3.0-20260701
 ARG TTVLOL_PLUGIN_SHA256=4d465380159ec59f7caef6cb6a28368bbbbd3abcf80886138182184c30f2fad0
 COPY vendor/streamlink-ttvlol/${TTVLOL_PLUGIN_VERSION}/twitch.py /app/plugins/twitch.py
-RUN sha256sum /app/plugins/twitch.py > /app/plugins/twitch.py.sha256 \
+RUN printf '%s  twitch.py\n' "${TTVLOL_PLUGIN_SHA256}" > /app/plugins/twitch.py.sha256 \
+ && (cd /app/plugins && sha256sum -c twitch.py.sha256) \
  && python -c "import ast; ast.parse(open('/app/plugins/twitch.py').read())" \
- && echo "TTVLOL plugin: ${TTVLOL_PLUGIN_VERSION} sha256 $(cut -d' ' -f1 /app/plugins/twitch.py.sha256)"
+ && echo "TTVLOL plugin: ${TTVLOL_PLUGIN_VERSION} sha256 ${TTVLOL_PLUGIN_SHA256}"
 
 # Two-stage dependency install so source edits do not invalidate the dep layer.
 # Stage 1 resolves and installs third-party deps only. Build caches it until

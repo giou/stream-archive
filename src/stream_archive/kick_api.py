@@ -6,7 +6,6 @@ from typing import Any
 import httpx
 
 from stream_archive.config import AppConfig
-from stream_archive.http import build_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,14 @@ class KickAPI:
 
     def __init__(self, config: AppConfig, http: httpx.AsyncClient | None = None):
         kick = config.kick
-        self.client = http if http is not None else build_http_client()
+        self.client = (
+            http
+            if http is not None
+            else httpx.AsyncClient(
+                timeout=httpx.Timeout(10, connect=5),
+                headers={"User-Agent": _USER_AGENT},
+            )
+        )
         self._owns_client = http is None
         self._client_id = kick.client_id
         self._client_secret = kick.client_secret
