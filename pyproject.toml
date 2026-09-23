@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stream-archive"
-version = "1.2.6"
+version = "1.2.7"
 description = "StreamArchive - Twitch and Kick stream monitor, recorder, and YouTube restreamer"
 readme = "README.md"
 license = "MIT"
