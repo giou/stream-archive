@@ -753,13 +753,15 @@ async function playRecording(entry, collapse = true) {
   wrapEl.scrollIntoView({ block: "nearest" });
   loadChat(entry.id, entry.name).catch(() => {});
   player.src = "/api/recordings/stream?id=" + encodeURIComponent(entry.id);
-  const resume = savedPosition(entry.id, player.duration);
-  if (resume > 0) {
+  const stored = loadPositions()[entry.id];
+  if (stored && stored.t > 10) {
     // Metadata is not loaded yet, so an immediate seek is ignored.
-    // Defer it until the stream reports its length.
+    // Defer it until the stream reports its length. The guard reruns
+    // then: a rapid switch or close retires this listener silently.
     player.addEventListener(
       "loadedmetadata",
       () => {
+        if (my !== playToken || currentPlayId !== entry.id) return;
         try {
           player.currentTime = savedPosition(entry.id, player.duration);
         } catch (e) {}
