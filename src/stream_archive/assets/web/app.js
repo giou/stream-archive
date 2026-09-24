@@ -632,7 +632,7 @@ function timeAgo(ts) {
 function layoutStage() {
   const playing = !$("player-wrap").hidden;
   document.querySelector(".rec-stage").classList.toggle("no-player", !playing);
-  const toggle = document.querySelector(".rec-listpane .list-toggle");
+  const toggle = document.querySelector(".player-bar .list-toggle");
   if (toggle) toggle.hidden = !playing;
   if (!playing) setListHidden(false);
 }
@@ -755,9 +755,17 @@ async function playRecording(entry, collapse = true) {
   player.src = "/api/recordings/stream?id=" + encodeURIComponent(entry.id);
   const resume = savedPosition(entry.id, player.duration);
   if (resume > 0) {
-    try {
-      player.currentTime = resume;
-    } catch (e) {}
+    // Metadata is not loaded yet, so an immediate seek is ignored.
+    // Defer it until the stream reports its length.
+    player.addEventListener(
+      "loadedmetadata",
+      () => {
+        try {
+          player.currentTime = savedPosition(entry.id, player.duration);
+        } catch (e) {}
+      },
+      { once: true }
+    );
   }
   try {
     await player.play();
@@ -1354,8 +1362,12 @@ document.addEventListener("DOMContentLoaded", () => {
   setInterval(pollEventAlerts, 30000);
   $("clear-events").addEventListener("click", async () => {
     if (!window.confirm("Clear all events?")) return;
-    await api("/api/events", { method: "DELETE" });
-    loadEvents().catch(() => {});
+    try {
+      await api("/api/events", { method: "DELETE" });
+      await loadEvents();
+    } catch (e) {
+      toast(String(e.message || e), true);
+    }
   });
   let recFilterTimer = null;
   $("rec-filter").addEventListener("input", () => {

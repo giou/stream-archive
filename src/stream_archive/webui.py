@@ -1116,12 +1116,12 @@ class WebUI:
         if target is None:
             msg = "not a recording"
             raise _WebError(404, msg)
-        if not target.exists():
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, target.exists):
             # The cache fills on demand: old recordings never captured one.
-            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, capture_thumbnail, path, target)
         try:
-            body = target.read_bytes()
+            body = await loop.run_in_executor(None, target.read_bytes)
         except OSError:
             missing = web.json_response({"error": "not found"}, status=404)
             self._secure_headers(missing, request)

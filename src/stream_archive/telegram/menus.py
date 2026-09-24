@@ -184,7 +184,8 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         rows = [[rec_menus.SEND_LABEL, rec_menus.DELETE_LABEL]]
         if state.rec_path and not rec_menus.sendable_path(state.rec_path):
             rows = [[rec_menus.DELETE_LABEL]]
-        rows.append(["Back"])
+        rows.insert(0, ["Back"])
+        return _frame(rows)
         return _frame(rows)
     if menu == "kick_webhook":
         return _frame([[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"], ["Back"]])

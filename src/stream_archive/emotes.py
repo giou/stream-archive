@@ -128,6 +128,8 @@ def parse_ffz(payload: Any) -> dict[str, tuple[str, str]]:
             eid = emote.get("id")
             if not isinstance(name, str) or not name or not isinstance(urls, dict):
                 continue
+            if isinstance(eid, bool) or (not isinstance(eid, (str, int)) or not str(eid)):
+                continue
             raw = urls.get("1") or urls.get("2") or urls.get("4")
             if not isinstance(raw, str) or not raw:
                 continue

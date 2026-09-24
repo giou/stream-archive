@@ -147,7 +147,6 @@ input, select {
 .files-list .rec-card { background: var(--panel-2); margin-bottom: 0.5rem; }
 .files-list .rec-card:last-child { margin-bottom: 0; }
 .rec-name, .channel-name { font-weight: 600; overflow-wrap: anywhere; }
-.rec-name.playable, img.rec-thumb { cursor: pointer; }
 .rec-name.playable, .rec-thumb { cursor: pointer; }
 .rec-thumb { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 8px; display: block; margin-bottom: 0.5rem; background: #000; }
 .rec-meta { color: var(--muted); font-size: 0.9rem; margin: 0.2rem 0 0.6rem; }
