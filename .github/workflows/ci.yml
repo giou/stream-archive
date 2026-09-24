@@ -15,7 +15,7 @@ permissions:
 # bumps the Dockerfile stage only, because the github-actions ecosystem does not
 # touch the version input of setup-uv.
 env:
-  UV_VERSION: "0.12.15"
+  UV_VERSION: "0.12.18"
 jobs:
   test:
     runs-on: ubuntu-latest
