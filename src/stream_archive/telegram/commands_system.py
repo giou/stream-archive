@@ -37,6 +37,7 @@ class SystemCommands:
     _webhook_state_text: Any
     _endpoint_state_text: Any
     _mtproto_state_text: Any
+    _web_state_text: Any
 
     def handle_help(self) -> str:
         return (
@@ -126,6 +127,7 @@ class SystemCommands:
             f"Endpoint: {endpoint_state}\n"
             f"Kick webhook: {webhook_state}\n"
             f"MTProto upload: {self._mtproto_state_text()}\n"
+            f"Web panel: {self._web_state_text()}\n"
             f"Quality: {c.preferred_quality}\n"
             f"Simultaneous recordings: {rec_limit}\n"
             f"YouTube re-streams: {yt_limit}\n"
@@ -144,6 +146,9 @@ class SystemCommands:
         except RuntimeError:
             return "Restart is not available (no running event loop)"
         loop.call_later(0.5, self._on_restart)
+        from stream_archive import events as _events
+
+        _events.record("config", None, "Restart requested")
         return "\U0001f504 Restarting... the service will come back in a few seconds"
 
     async def handle_update(self) -> str:
@@ -155,7 +160,7 @@ class SystemCommands:
         if status == "up_to_date":
             return f"✅ Up to date\n• stream-archive: v{data.get('current')}"
         if status != "update":
-            return "❌ Update check failed — try again later."
+            return "❌ Update check failed - try again later."
         lines = [f"• stream-archive: v{data.get('current')} → v{data.get('latest')}"]
         cl = data.get("changelog") or []
         if cl:

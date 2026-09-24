@@ -210,8 +210,8 @@ class KickWebhook:
         register(self._app)
 
     def listening_needed(self) -> bool:
-        """True when the listener must run: the endpoint or the control API is on."""
-        return self._config.endpoint.enabled or self._config.api.enabled
+        """True when the listener must run: the endpoint, the API, or the web panel is on."""
+        return self._config.endpoint.enabled or self._config.api.enabled or self._config.web.enabled
 
     async def apply_state(self) -> None:
         """Match the live listener and sync loop to the config. Idempotent.
@@ -336,7 +336,7 @@ class KickWebhook:
         detail = str(e).strip() or e.__class__.__name__
         try:
             await self._notifier.notify(
-                "\u26a0\ufe0f Kick webhook subscriptions out of sync \u2014 is the "
+                "\u26a0\ufe0f Kick webhook subscriptions out of sync - is the "
                 "public URL configured in the Kick app (Settings \u2192 Developer \u2192 "
                 "your app \u2192 Enable webhooks)? "
                 f"{webhook_public_url(self._config)}\n"
@@ -721,7 +721,7 @@ class KickWebhook:
         wh.setup_notified = True
         try:
             if self._notifier:
-                await self._notifier.notify("\u2705 Kick webhook is working \u2014 first event received from Kick.")
+                await self._notifier.notify("\u2705 Kick webhook is working - first event received from Kick.")
             # save_config writes and fsyncs the file, so keep it off the event
             # loop. This handler serves every webhook request.
             await asyncio.to_thread(save_config, self._config)

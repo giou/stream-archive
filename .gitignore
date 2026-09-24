@@ -27,6 +27,9 @@ chat/
 client_secret*.json
 credentials*.json
 *.session
+*.session-journal
+*.session-wal
+*.session-shm
 .venv/
 *.bak
 # Deployment settings (docs/running.md). No .env template ships yet; the

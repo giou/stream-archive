@@ -104,7 +104,7 @@ class EventSubClient:
         if not self._config.eventsub.enabled:
             return "EventSub: disabled (polling only)"
         if self._status_error:
-            return f"EventSub: unavailable ({self._status_error}) \u2014 polling only"
+            return f"EventSub: unavailable ({self._status_error}) - polling only"
         if not self._subscribed:
             return "EventSub: connecting\u2026"
         return f"EventSub: connected via conduit ({len(self._subs)} channels subscribed)"

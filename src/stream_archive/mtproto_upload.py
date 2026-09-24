@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 from collections.abc import Callable
@@ -90,8 +91,14 @@ def _report_progress(progress: ProgressCallback | None, sent: int, total: int, n
         progress(sent, total)
         return
     try:
+        takes_note = len(inspect.signature(progress).parameters) >= 3
+    except TypeError, ValueError:
+        takes_note = True
+    # Never retry on TypeError: an error inside the callback must reach
+    # the caller instead of running the callback twice with fewer args.
+    if takes_note:
         progress(sent, total, note)
-    except TypeError:
+    else:
         progress(sent, total)
 
 
@@ -188,7 +195,12 @@ class MtprotoUploader:
         """Return a playable path for ``path``: cached .mp4 beside a .ts."""
         if path.suffix.lower() != ".ts":
             return path
-        from stream_archive.recorder.remux import ffmpeg_available, remux_target, remux_ts_to_mp4_async
+        from stream_archive.recorder.remux import (
+            _probe_ok,
+            ffmpeg_available,
+            remux_target,
+            remux_ts_to_mp4_async,
+        )
 
         if not ffmpeg_available():
             return path
@@ -196,11 +208,20 @@ class MtprotoUploader:
         try:
             if target.is_file():
                 try:
-                    if target.resolve() != path.resolve():
-                        path.unlink(missing_ok=True)
+                    same = target.resolve() == path.resolve()
                 except OSError:
-                    logger.warning("[mtproto] Cleanup of %s failed", path, exc_info=True)
-                return target
+                    return path
+                # Trust a cached .mp4 only when it probes clean, like the
+                # remuxer does: a stale file must not cost the good .ts.
+                if not same:
+                    loop = asyncio.get_running_loop()
+                    if await loop.run_in_executor(None, _probe_ok, target):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            logger.warning("[mtproto] Cleanup of %s failed", path, exc_info=True)
+                        return target
+                    logger.warning("[mtproto] Cached %s failed its probe, keeping %s", target, path)
         except OSError:
             return path
         made = await remux_ts_to_mp4_async(path)
@@ -253,6 +274,7 @@ class MtprotoUploader:
         ready: asyncio.Queue[tuple[int, int, Path] | None] = asyncio.Queue()
         state: dict[str, Any] = {"failed": None}
         queued: list[str] = []
+        stop = asyncio.Event()
 
         async def _on_chunk(chunk: Path, index: int, total: int) -> None:
             ready.put_nowait((index, total, chunk))
@@ -261,7 +283,7 @@ class MtprotoUploader:
 
         async def _produce() -> list[Path] | None:
             try:
-                return await split_parts_streaming(path, on_chunk=_on_chunk)
+                return await split_parts_streaming(path, on_chunk=_on_chunk, cancel=stop)
             except Exception as e:
                 state["failed"] = e
                 return None
@@ -298,6 +320,7 @@ class MtprotoUploader:
         try:
             chunks = await producer
         except asyncio.CancelledError:
+            stop.set()
             producer.cancel()
             consumer.cancel()
             await asyncio.gather(producer, consumer, return_exceptions=True)
@@ -305,10 +328,14 @@ class MtprotoUploader:
         if state["failed"] is not None:
             await ready.put(None)
             await consumer
+            # The cutter owns reported chunks only while it runs. On a
+            # failed split the caller deletes what was already reported.
+            cleanup_split([Path(p) for p in queued])
             raise state["failed"]
         if not chunks:
             await ready.put(None)
             await consumer
+            cleanup_split([Path(p) for p in queued])
             msg = f"Cannot send {path.name}: the split failed, see logs."
             raise ValueError(msg)
         # A cutter that returns paths without reporting them (or a test
@@ -320,8 +347,14 @@ class MtprotoUploader:
         try:
             await consumer
         except asyncio.CancelledError:
+            stop.set()
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
+            raise
+        except Exception:
+            # A failed upload leaves partial chunks: delete them, so a
+            # retry cuts fresh ones. A cancelled send keeps them instead.
+            cleanup_split(chunks)
             raise
         cleanup_split(chunks)
 
@@ -342,7 +375,7 @@ class MtprotoUploader:
             raise RuntimeError(msg)
         ok, note = check_sendable(Path(path))
         if not ok:
-            if "gone" in note:
+            if not Path(path).exists():
                 raise FileNotFoundError(str(path))
             msg = f"Cannot send {Path(path).name}: {note}"
             raise ValueError(msg)

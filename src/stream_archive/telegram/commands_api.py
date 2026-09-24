@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 #: Reply for a chat that is not the admin's private chat. The key is a secret:
 #: anyone in the chat can read it and then control the app.
-_KEY_ELSEWHERE = "\U0001f512 I show the API key only in our private chat \u2014 open the bot there and press Show key."
+_KEY_ELSEWHERE = "\U0001f512 I show the API key only in our private chat - open the bot there and press Show key."
 
 
 def _html(text: str) -> str:
@@ -42,17 +42,19 @@ class ApiCommands:
         """One-line state of the control API."""
         return "on" if self._config.api.enabled else "off"
 
-    async def notify_api_changes(self, lines: list[str]) -> None:
-        """Tell the admin what the control API changed. Never raises.
+    async def notify_api_changes(self, lines: list[str], origin: str = "Control API") -> None:
+        """Tell the admin what a control surface changed. Never raises.
 
         The API replies to its client and sends this message in parallel,
         so the admin always sees API-driven changes beside bot-driven ones.
+        The web panel passes its own origin. Without the bot the message
+        is dropped and logged instead.
         """
         if not lines:
             return
         body = "\n".join(f"\u2022 {line}" for line in lines)
         try:
-            await self._send_admin(f"\U0001f310 Control API\n{body}")
+            await self._send_admin(f"\U0001f310 {origin}\n{body}")
         except Exception:
             logger.warning("[telegram] Failed to notify the admin about API changes", exc_info=True)
 
@@ -77,7 +79,7 @@ class ApiCommands:
             return _html(_KEY_ELSEWHERE)
         key = self._config.api.key
         if not key:
-            return _html("No API key yet \u2014 enable the API to generate one.")
+            return _html("No API key yet - enable the API to generate one.")
         return (
             f"{_html('API key:')}\n{_code_span(key)}\n\n"
             f"{_html('Send it as an Authorization header (Bearer <key>) or an X-API-Key header.')}\n"
@@ -106,7 +108,7 @@ class ApiCommands:
                 await self._kick_webhook.apply_state()
             except Exception:
                 logger.warning("[telegram] Failed to reconcile the webhook listener", exc_info=True)
-                lines.append(_html("\u26a0\ufe0f The listener could not be reconfigured \u2014 check the logs."))
+                lines.append(_html("\u26a0\ufe0f The listener could not be reconfigured - check the logs."))
         if enabled:
             # The base URL guides the setup of an enabled API. It is
             # noise on the disable path, where no reachability matters.
@@ -120,11 +122,11 @@ class ApiCommands:
             else:
                 lines.append(
                     _html(
-                        "No public URL yet \u2014 set up a tunnel under Settings, then Remote access to reach the API from outside."
+                        "No public URL yet - set up a tunnel under Settings, then Remote access to reach the API from outside."
                     )
                 )
         if created:
-            lines.append(self._key_reveal("API key (keep it secret \u2014 Show key shows it again):", key, chat_id))
+            lines.append(self._key_reveal("API key (keep it secret - Show key shows it again):", key, chat_id))
         return "\n\n".join(lines)
 
     async def _rotate_api_key(self, chat_id: int | None = None) -> str:
@@ -135,7 +137,7 @@ class ApiCommands:
         def mutate(candidate: AppConfig) -> None:
             candidate.api.key = key
 
-        summary = "API key rotated \u2014 the old key stopped working" if existed else "API key generated"
+        summary = "API key rotated - the old key stopped working" if existed else "API key generated"
         result: str = self._apply(mutate, lambda c: summary, chat_id)
         if is_error(result):
             return _html(result)

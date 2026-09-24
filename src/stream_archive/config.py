@@ -72,6 +72,15 @@ def is_kick_channel(channel: str) -> bool:
     return channel.startswith(KICK_PREFIX)
 
 
+def telegram_enabled(config: AppConfig) -> bool:
+    """True when the Telegram bot has its admin id and its token.
+
+    A zero id or a blank token disables the bot. The web panel then
+    controls the app, and both can run at once when all values exist.
+    """
+    return config.telegram_user_id > 0 and bool(config.bot_telegram_api.strip())
+
+
 def bare_name(channel: str) -> str:
     """Channel identity without the platform prefix, for example kick:xqc -> xqc."""
     for prefix in (KICK_PREFIX, TWITCH_PREFIX):
@@ -224,6 +233,24 @@ class ApiConfig(BaseModel):
     key: str = ""
 
 
+class WebConfig(BaseModel):
+    """Browser control panel served on the shared listener under /web/.
+
+    The panel replaces the Telegram bot: it needs no Telegram token. It
+    shares the listener with the Kick webhook and the control API, so it
+    runs while any of them is enabled. The password never reaches disk:
+    only its PBKDF2 hash is stored. Use ``stream-archive-setup-web`` to
+    set it. An empty session secret means a random one per boot, which
+    ends every session on restart.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: StrictBool = False
+    password_hash: StrictStr = ""
+    session_secret: StrictStr = ""
+
+
 class MtprotoConfig(BaseModel):
     """MTProto uploader: send recordings over MTProto, past the Bot API limit.
 
@@ -258,8 +285,10 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, allow_inf_nan=False)
 
     # required
+    # telegram_user_id 0 and an empty bot_telegram_api disable the bot.
+    # The web panel then controls the app. Both can run at once.
     telegram_user_id: StrictInt
-    bot_telegram_api: str = Field(min_length=1)
+    bot_telegram_api: str
     twitch_client_id: str = Field(min_length=1)
     twitch_client_secret: str = Field(min_length=1)
     channels: list[str] = Field(min_length=1)
@@ -288,6 +317,7 @@ class AppConfig(BaseModel):
     mtproto: MtprotoConfig = MtprotoConfig()
     kick: KickConfig = KickConfig()
     api: ApiConfig = ApiConfig()
+    web: WebConfig = WebConfig()
     _workdir: Path = PrivateAttr()
     _config_path: Path = PrivateAttr()
     #: Config path -> (placeholder text, value at load time, after validation).

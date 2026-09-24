@@ -404,6 +404,101 @@ def test_detail_hides_send_over_cap(tmp_path):
         assert "Cannot send" in text
 
 
+def test_detail_shows_send_for_splittable_file(tmp_path):
+    from unittest import mock
+
+    from stream_archive import mtproto_upload as mtproto_mod
+    from stream_archive.telegram import menus_recordings as rec
+
+    _, ctrl = make_bot(tmp_path, files=[("big.mp4", 20)])
+    _, markup = _open_only_channel(ctrl)
+    labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+    first = next(label for label in labels if "big.mp4" in label)
+    with (
+        mock.patch.object(rec, "MAX_UPLOAD_BYTES", 10),
+        mock.patch.object(mtproto_mod, "MAX_UPLOAD_BYTES", 10),
+    ):
+        text, markup = asyncio.run(ctrl.handle_reply_text(first))
+        labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+        assert "\U0001f4e4 Send" in labels
+        assert "Cannot send" not in text
+
+
+def test_channel_tap_lands_despite_size_drift(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
+    _, markup = asyncio.run(ctrl.handle_reply_text("Recordings"))
+    labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+    stale = next(label for label in labels if "twitch:channel1" in label)
+    # Grow the archive after the list rendered: the stale row must still open.
+    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+    with open(rec_dir / "b.ts", "wb") as f:
+        f.write(b"x" * 5000)
+    text, _ = asyncio.run(ctrl.handle_reply_text(stale))
+    assert ctrl._state_for(12345).menu == "rec_channel"
+    assert ctrl._state_for(12345).rec_channel == "twitch:channel1"
+
+
+def _bulk_confirm_data(markup):
+    inline = markup.to_dict()["inline_keyboard"]
+    confirm = next(b for row in inline for b in row if b["text"] == "Confirm")
+    assert len(confirm["callback_data"]) <= 64
+    return confirm["callback_data"]
+
+
+def test_channel_bulk_delete_flow(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
+    _, markup = _open_only_channel(ctrl)
+    labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+    assert labels[-2:] == ["\U0001f5d1 Delete channel files", "Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    assert "Delete 2 files" in text
+    assert "cannot be undone" in text
+    result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
+    assert result is not None and "Deleted 2 files" in result[0]
+    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+    assert list(rec_dir.iterdir()) == []
+    assert disk._snapshot_cache == {}
+
+
+def test_root_bulk_delete_flow(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
+    text, markup = asyncio.run(ctrl.handle_reply_text("Recordings"))
+    labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+    assert labels[-2:] == ["\U0001f5d1 Delete all files", "Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete all files"))
+    assert "Delete 2 files" in text
+    result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
+    assert result is not None and "Deleted 2 files" in result[0]
+    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+    assert list(rec_dir.iterdir()) == []
+
+
+def test_bulk_delete_skips_live_captures(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("live.ts", 10), ("old.ts", 20)])
+    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+    ctrl._recorder._active_paths = lambda: {os.path.realpath(rec_dir / "live.ts")}  # type: ignore[method-assign]
+    _, markup = _open_only_channel(ctrl)
+    _, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
+    assert result is not None and "Deleted 1 file " in result[0]
+    assert "1 live capture stays" in result[0]
+    assert (rec_dir / "live.ts").exists()
+    assert not (rec_dir / "old.ts").exists()
+
+
+def test_bulk_confirm_expires_after_repick(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
+    _, markup = _open_only_channel(ctrl)
+    _, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    cb = _bulk_confirm_data(markup)
+    # Pick another channel before Confirm: the stale prompt must not delete.
+    ctrl._state_for(12345).rec_channel = "kick:other"
+    result = asyncio.run(ctrl.handle_callback(cb, 12345))
+    assert result is not None and "expired" in result[0]
+    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+    assert (rec_dir / "a.ts").exists()
+
+
 def _open_only_channel(ctrl):
     """Open Recordings, then its single channel. Returns the file keyboard."""
     import asyncio

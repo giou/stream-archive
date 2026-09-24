@@ -7,8 +7,8 @@ keyboard.
 The root menu holds **Channels**, **Recordings**, and **Settings**.
 **Settings** holds **Output mode**, **Quality**, **Chat recording**,
 **Storage & limits** (retention, disk, and the two concurrency limits),
-**Remote access** (the public URL tunnels, the Kick webhook toggle, and the
-HTTP control API), and **MTProto upload** (send recordings up to 2 GB to this
+**Remote access** (the public URL tunnels, the Kick webhook toggle, the
+HTTP control API, and the web panel), and **MTProto upload** (send recordings up to 2 GB to this
 chat). A submenu holds four buttons at most, plus **Back**. A toggle button
 names the action that applies now, for example **Disable Kick webhook**. The
 current value of a preset list carries a check mark, for example **✓ 1080p**.
@@ -81,7 +81,10 @@ untouched.
 - `/restart` replies first, then triggers the scheduler shutdown. The compose
   policy `restart: unless-stopped` relaunches the container.
 - `Recordings` lists stored recordings newest first, five per page. A
-  tap opens the file with **Send** and **Delete**. A file that records
+  tap opens the file with **Send** and **Delete**. A channel page ends with
+  **Delete channel files**, and the channel list ends with **Delete all
+  files**: both ask for confirm, skip live captures, and report what went.
+  A file that records
   now carries a red marker and cannot be deleted. **Send** needs MTProto
   upload (**Settings** → **MTProto upload**). The Bot API allows 50 MB.
   MTProto allows files under 2 GB. Files over the cap split into parts.
@@ -97,3 +100,7 @@ untouched.
 
 - [Kick webhook](kick-webhook.md) explains the **Remote access** menu.
 - [Control API](control-api.md) makes the same changes over HTTP.
+- [Web control panel](web-control.md) replaces the bot in the browser. Turn
+  it on under **Settings → Remote access → Web panel**: the first enable
+  generates the panel password and shows it once. **New password** replaces
+  it and ends all browser sessions.

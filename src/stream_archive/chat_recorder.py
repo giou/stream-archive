@@ -73,7 +73,7 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
     pos = 0
     for begin, end, emote_id in ranges:
         if begin >= len(body) or begin < pos or end < begin:
-            continue  # malformed, inverted or overlapping — drop
+            continue  # malformed, inverted or overlapping - drop
         if begin > pos:
             fragments.append({"text": body[pos:begin]})
         emote_text = body[begin : min(end + 1, len(body))]

@@ -384,7 +384,7 @@ def test_add_channel_subscribes_and_rejects_duplicates(tmp_path):
     assert ctrl._eventsub.added == ["twitch:newch"]
     assert dup_status == 400
     assert "already monitored" in dup_body["error"]
-    assert sent_messages(ctrl) == ["\U0001f310 Control API\n\u2022 Added twitch:newch \u2014 3 channel(s) monitored"]
+    assert sent_messages(ctrl) == ["\U0001f310 Control API\n\u2022 Added twitch:newch - 3 channel(s) monitored"]
     assert read_file(tmp_path)["channels"] == ["twitch:channel1", "kick:xqc", "twitch:newch"]
 
 
@@ -433,9 +433,7 @@ def test_remove_channel_stops_recording_and_unsubscribes(tmp_path):
     assert ctrl._kick_webhook.removed == ["kick:xqc"]
     assert read_file(tmp_path)["channels"] == ["twitch:channel1"]
     assert again_status == 404
-    assert sent_messages(ctrl)[0].startswith(
-        "\U0001f310 Control API\n\u2022 Removed kick:xqc \u2014 1 channel(s) monitored"
-    )
+    assert sent_messages(ctrl)[0].startswith("\U0001f310 Control API\n\u2022 Removed kick:xqc - 1 channel(s) monitored")
 
 
 def test_remove_twitch_channel_unsubscribes_eventsub(tmp_path):

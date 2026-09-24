@@ -1,3 +1,4 @@
+import logging
 import math
 import secrets
 from collections.abc import Callable
@@ -12,6 +13,8 @@ from stream_archive.config import (
     reload_config,
 )
 from stream_archive.telegram.menu_state import AudioSwitch, PendingKey, is_error
+
+logger = logging.getLogger(__name__)
 
 #: Button labels for the settings menus. Each table maps a label to its config
 #: value. The keyboards mark the label of the current value, the handlers turn
@@ -400,15 +403,14 @@ class SettingsCommands:
                 await self._kick_webhook.sync_channels(self._config.channels)
             mtproto = getattr(self, "_mtproto", None)
             if mtproto is None and self._config.mtproto.enabled:
-                notes.append(
-                    "\u26a0\ufe0f MTProto enabled in the file, but no client exists \u2014 restart to create it."
-                )
+                notes.append("\u26a0\ufe0f MTProto enabled in the file, but no client exists - restart to create it.")
             if mtproto is not None:
                 if self._config.mtproto.enabled:
                     try:
                         await mtproto.connect()
                     except Exception:
-                        notes.append("\u26a0\ufe0f MTProto login failed \u2014 check the logs.")
+                        logger.warning("[telegram] MTProto connect failed after reload", exc_info=True)
+                        notes.append("\u26a0\ufe0f MTProto login failed - check the logs.")
                 else:
                     await mtproto.rebind()
         except Exception as e:
@@ -426,11 +428,16 @@ class SettingsCommands:
         after = self._config.model_dump()
         stale = [key for key in _RESTART_REQUIRED if _dotted(before, key) != _dotted(after, key)]
         if stale:
-            return (
+            text = (
                 "\u26a0\ufe0f Config reloaded, but these keys need a restart: "
                 + ", ".join(stale)
                 + ("\n" + "\n".join(notes) if notes else "")
             )
-        if notes:
-            return "\u2705 Config reloaded from config.json\n" + "\n".join(notes)
-        return "\u2705 Config reloaded from config.json"
+        elif notes:
+            text = "\u2705 Config reloaded from config.json\n" + "\n".join(notes)
+        else:
+            text = "\u2705 Config reloaded from config.json"
+        from stream_archive import events as _events
+
+        _events.record("config", None, text.split("\n")[0])
+        return text

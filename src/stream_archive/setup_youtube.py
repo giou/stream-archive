@@ -175,7 +175,7 @@ def main() -> None:
             with _server_lock(server):
                 candidate = server.auth_code  # type: ignore[attr-defined]
         if not candidate:
-            print("   No code found — wait for the success page, or paste the full redirect URL.")
+            print("   No code found - wait for the success page, or paste the full redirect URL.")
             continue
         try:
             flow.fetch_token(code=candidate)

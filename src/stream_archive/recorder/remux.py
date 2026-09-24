@@ -103,11 +103,20 @@ def remux_ts_to_mp4(source: str | Path) -> Path | None:
     target = remux_target(src)
     if target.exists():
         try:
-            if target.resolve() != src.resolve():
-                src.unlink(missing_ok=True)
-        except OSError as e:
-            logger.warning("[remux] cleanup of %s failed: %s", src, e)
-        return target
+            same = target.resolve() == src.resolve()
+        except OSError:
+            return None
+        if not same:
+            # A same-stem .mp4 from an earlier run counts only when it
+            # probes clean: a stale or partial file must never cost the
+            # original capture. A bad cache falls through to a fresh remux.
+            if _probe_ok(target):
+                try:
+                    src.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning("[remux] cleanup of %s failed: %s", src, e)
+                return target
+            logger.warning("[remux] cached %s failed its probe, remuxing again", target)
     tmp = src.with_name(src.stem + ".remux.tmp.mp4")
     try:
         if not _run_ffmpeg(src, tmp):
@@ -124,7 +133,11 @@ def remux_ts_to_mp4(source: str | Path) -> Path | None:
             tmp.unlink(missing_ok=True)
     try:
         size = target.stat().st_size
-        logger.info("[remux] %s -> %s (%d bytes)", src.name, target.name, size)
+    except OSError as e:
+        logger.warning("[remux] verify of %s failed: %s", target, e)
+        return None
+    logger.info("[remux] %s -> %s (%d bytes)", src.name, target.name, size)
+    try:
         src.unlink(missing_ok=True)
     except OSError as e:
         logger.warning("[remux] cleanup of %s failed: %s", src, e)
@@ -149,7 +162,8 @@ def split_parts(source: str | Path, chunk_bytes: int | None = None) -> list[Path
     """Split ``source`` into stream-copy .mp4 chunks under the protocol cap.
 
     Returns the chunk paths in play order, or None when ffmpeg is missing,
-    the file is gone, or a chunk fails its probe. The source file stays: the
+    the file is gone, or a chunk fails its probe or exceeds the cap. A
+    failed split deletes its partial chunks. The source file stays: the
     caller deletes the chunks when the upload of every chunk succeeds.
     """
     from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES, SPLIT_BYTES
@@ -186,13 +200,17 @@ def split_parts(source: str | Path, chunk_bytes: int | None = None) -> list[Path
         for index in range(count):
             out = tmpdir / f"{src.stem}.part{index + 1:02d}of{count:02d}.mp4"
             if not _run_split(src, out, index * seg_time, seg_time if index + 1 < count else None):
+                cleanup_split(chunks, tmpdir)
                 return None
-            if not _probe_ok(out):
-                logger.warning("[remux] probe failed for chunk %s", out)
+            if not _chunk_usable(out, MAX_UPLOAD_BYTES):
+                with contextlib.suppress(OSError):
+                    out.unlink(missing_ok=True)
+                cleanup_split(chunks, tmpdir)
                 return None
             chunks.append(out)
     except Exception:
         logger.warning("[remux] split failed for %s", src, exc_info=True)
+        cleanup_split(chunks, tmpdir)
         return None
     if not chunks:
         return None
@@ -209,11 +227,12 @@ async def split_parts_streaming(
     """Split like :func:`split_parts`, reporting each finished chunk.
 
     Calls ``on_chunk(path, index, total)`` (sync or async) after each chunk
-    probes clean, so the uploader starts chunk 1 while ffmpeg still cuts
-    chunk 2. ``cancel`` is an optional ``threading.Event``-like with
-    ``is_set()``: when set, the split stops after the current chunk and
-    already-cut chunks stay for retry. Returns all chunk paths, or None on
-    failure like :func:`split_parts`.
+    probes clean and fits under the cap, so the uploader starts chunk 1
+    while ffmpeg still cuts chunk 2. ``cancel`` is an optional
+    ``threading.Event``-like with ``is_set()``: when set, the split stops
+    after the current chunk and already-cut chunks stay for retry. A
+    failure deletes its partial chunks. Returns all chunk paths, or None
+    on failure like :func:`split_parts`.
     """
     import asyncio as _asyncio
 
@@ -232,8 +251,9 @@ async def split_parts_streaming(
         return [src]
     if not ffmpeg_available():
         return None
+    loop = _asyncio.get_running_loop()
     try:
-        duration = _media_duration(src)
+        duration = await loop.run_in_executor(None, _media_duration, src)
     except Exception:
         duration = None
     if not duration or duration <= 0:
@@ -253,14 +273,21 @@ async def split_parts_streaming(
                 logger.info("[remux] split of %s cancelled after %d chunks", src.name, len(chunks))
                 return chunks or None
             out = tmpdir / f"{src.stem}.part{index + 1:02d}of{count:02d}.mp4"
-            loop = _asyncio.get_running_loop()
             ok = await loop.run_in_executor(
                 None, _run_split, src, out, index * seg_time, seg_time if index + 1 < count else None
             )
             if not ok:
+                # The failed chunk never reached the consumer: drop it, but
+                # keep reported chunks. The consumer may still upload them,
+                # and the caller owns their cleanup on failure.
+                with contextlib.suppress(OSError):
+                    out.unlink(missing_ok=True)
+                cleanup_split([], tmpdir)
                 return None
-            if not _probe_ok(out):
-                logger.warning("[remux] probe failed for chunk %s", out)
+            if not await loop.run_in_executor(None, _chunk_usable, out, MAX_UPLOAD_BYTES):
+                with contextlib.suppress(OSError):
+                    out.unlink(missing_ok=True)
+                cleanup_split([], tmpdir)
                 return None
             chunks.append(out)
             if on_chunk is not None:
@@ -269,6 +296,7 @@ async def split_parts_streaming(
                     await result
     except Exception:
         logger.warning("[remux] split failed for %s", src, exc_info=True)
+        cleanup_split([], tmpdir)
         return None
     if not chunks:
         return None
@@ -276,12 +304,38 @@ async def split_parts_streaming(
     return chunks
 
 
-def cleanup_split(chunks: list[Path]) -> None:
-    """Delete split chunks and their temp dir. Never raises."""
-    tmpdir: Path | None = None
+def _chunk_usable(out: Path, cap: int) -> bool:
+    """True when ``out`` probes clean and fits under the upload cap.
+
+    Time-proportional cuts assume constant bitrate, but VBR spikes and
+    keyframe rounding can push one chunk over the cap, and Telegram then
+    rejects it at upload time. Fail fast here instead.
+    """
+    if not _probe_ok(out):
+        logger.warning("[remux] probe failed for chunk %s", out)
+        return False
+    try:
+        size = out.stat().st_size
+    except OSError:
+        logger.warning("[remux] chunk vanished: %s", out)
+        return False
+    if size > cap:
+        logger.warning("[remux] chunk %s over the cap (%d bytes)", out, size)
+        return False
+    return True
+
+
+def cleanup_split(chunks: list[Path], tmpdir: Path | None = None) -> None:
+    """Delete split chunks and their temp dir. Never raises.
+
+    ``tmpdir`` drops the dir even when ``chunks`` is empty: a failure
+    before the first finished chunk would otherwise leave an empty
+    ``<stem>.split/`` behind. Callers with a live consumer pass no
+    chunks, so in-flight files are never unlinked from under it.
+    """
+    if tmpdir is None and chunks:
+        tmpdir = chunks[0].parent
     for chunk in chunks:
-        if tmpdir is None:
-            tmpdir = chunk.parent
         with contextlib.suppress(OSError):
             chunk.unlink(missing_ok=True)
     if tmpdir is not None and tmpdir.name.endswith(".split"):

@@ -1020,6 +1020,28 @@ def test_remux_skips_non_ts(tmp_path):
     assert remux_ts_to_mp4(tmp_path / "missing.ts") is None
 
 
+def test_remux_retries_stale_cached_mp4(tmp_path):
+    """A cached .mp4 that fails its probe must not cost the .ts source."""
+    from unittest import mock
+
+    from stream_archive.recorder import remux as remux_mod
+
+    src = tmp_path / "cap.ts"
+    src.write_bytes(b"v" * 100)
+    stale = tmp_path / "cap.mp4"
+    stale.write_bytes(b"junk")
+    # The mocked ffmpeg run produces no file: stand in for its output.
+    (tmp_path / "cap.remux.tmp.mp4").write_bytes(b"v" * 100)
+    with (
+        mock.patch.object(remux_mod, "_probe_ok", side_effect=[False, True]),
+        mock.patch.object(remux_mod, "_run_ffmpeg", return_value=True),
+    ):
+        out = remux_mod.remux_ts_to_mp4(src)
+    assert out == stale
+    assert stale.exists()
+    assert not src.exists()
+
+
 def test_finalize_points_entry_at_mp4(tmp_path):
     """_finalize_entry remuxes the disk file and updates the entry path."""
     from stream_archive.recorder.remux import remux_target

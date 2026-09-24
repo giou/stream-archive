@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>StreamArchive</title>
+<link rel="stylesheet" href="/web/styles.css">
+<link rel="manifest" href="/web/manifest.webmanifest">
+<link rel="icon" href="/web/icon.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="top">
+  <div class="brandrow">
+    <h1>StreamArchive</h1>
+    <span id="update-chip" class="pill" role="button" tabindex="0" hidden></span>
+    <button id="logout" class="ghost" hidden>Logout</button>
+  </div>
+  <div id="offline-banner" hidden>Connection lost. <button id="offline-retry">Retry</button></div>
+  <nav class="tabs" id="nav" hidden>
+    <button data-tab="channels" class="active">Channels</button>
+    <button data-tab="recordings">Recordings</button>
+    <button data-tab="status">Status</button>
+    <button data-tab="events">Events</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="ops">Ops</button>
+  </nav>  <div id="rec-banner" role="button" tabindex="0" hidden></div>
+</header>
+<main>
+  <section id="tab-status" hidden>
+    <div class="grid" id="status-cards"></div>
+    <div class="card">
+      <h3>Recording now</h3>
+      <div id="rec-now"><span class="muted">None</span></div>
+    </div>
+    <p><button id="refresh-status" class="ghost">Refresh</button>
+    <span class="muted" id="status-updated"></span></p>
+  </section>
+
+  <section id="tab-channels" hidden>
+    <div class="card">
+      <h2>Channels</h2>
+      <form id="add-form">
+        <input id="add-input" placeholder="twitch:name, kick:name, or profile URL" aria-label="Channel name or profile URL" required>
+        <button type="submit" class="primary">Add</button>
+      </form>
+    </div>
+    <ul id="channels-list"></ul>
+  </section>
+
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>Settings</h2>
+      <form id="settings-form" class="settings-grid"></form>
+      <p><button id="save-settings" class="primary">Save</button></p>
+    </div>
+  </section>
+
+  <section id="tab-recordings" hidden>
+    <div class="rec-stage">
+      <div class="rec-listpane">
+        <div class="toolbar">
+          <input type="search" id="rec-filter" placeholder="Filter by name" aria-label="Filter recordings by name">
+          <select id="rec-channel" aria-label="Channel filter">
+            <option value="">All channels</option>
+          </select>
+          <select id="rec-sort" aria-label="Sort order">
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="largest">Largest first</option>
+          </select>
+          <button id="refresh-rec" class="ghost">Refresh</button>
+          <button id="rec-delete-selected" class="danger" hidden>Delete selected</button>
+        </div>
+        <p class="muted">Finished recordings are MP4 (M4A for audio-only). A file that still records shows a REC badge and unlocks when the stream ends.</p>
+        <p class="muted" id="rec-count" hidden></p>
+        <ul id="rec-list"></ul>
+      </div>
+      <div class="rec-playerpane">
+        <div id="player-wrap" hidden>
+          <video id="player" controls preload="none" playsinline></video>
+          <div id="seek-flash" hidden></div>
+          <p class="player-bar">
+            <label>Speed
+              <select id="player-speed" aria-label="Playback speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+                <option value="1.75">1.75×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <button id="player-close">Close player</button>
+          </p>
+          <p class="muted">Double-tap left to skip back 10 s, right to skip ahead 10 s.</p>
+        </div>
+      </div>
+      <aside class="rec-chatpane" id="chat-panel" hidden>
+        <div class="card">
+          <h3 id="chat-title">Chat</h3>
+          <label class="checkline"><input type="checkbox" id="chat-follow" checked> Follow video</label>
+          <div id="chat-log"></div>
+          <p class="muted" id="chat-note" hidden></p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="tab-events" hidden>
+    <div class="toolbar">
+      <button id="refresh-events" class="ghost">Refresh</button>
+    </div>
+    <ul id="events-list"></ul>
+  </section>
+
+  <section id="tab-ops" hidden>
+    <div class="card">
+      <h2>Service</h2>
+      <div class="toolbar">
+        <button id="op-reload">Reload config</button>
+        <button id="op-restart">Restart service</button>
+        <button id="op-update">Check for updates</button>
+      </div>
+      <pre class="out" id="ops-out">No operation yet.</pre>
+    </div>
+    <div class="card">
+      <h2>Change password</h2>
+      <form id="pw-form" class="settings-grid">
+        <label>Current <input type="password" id="pw-current" autocomplete="current-password" required></label>
+        <label>New (12+ characters) <input type="password" id="pw-new" autocomplete="new-password" required minlength="12"></label>
+        <p><button id="pw-submit" type="submit" class="primary">Change (ends all sessions)</button></p>
+      </form>
+    </div>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+<script src="/web/app.js"></script>
+</body>
+</html>

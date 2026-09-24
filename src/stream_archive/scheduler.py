@@ -8,18 +8,19 @@ from typing import Any
 from aiohttp import web
 
 from stream_archive.api import ControlAPI
-from stream_archive.config import AppConfig, get_config
+from stream_archive.config import AppConfig, get_config, telegram_enabled
 from stream_archive.eventsub import EventSubClient
 from stream_archive.http import build_http_client
 from stream_archive.kick_api import KickAPI
 from stream_archive.kick_webhook import KickWebhook
 from stream_archive.monitor import Monitor
 from stream_archive.mtproto_upload import MtprotoUploader
-from stream_archive.notifier import Notifier
+from stream_archive.notifier import Notifier, NullNotifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
 from stream_archive.twitch_api import TwitchAPI
 from stream_archive.updater import UpdateChecker, installed_app_version
+from stream_archive.webui import WebUI
 from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,9 @@ async def run_scheduler() -> None:
     # YouTube broadcast behind.
     try:
         twitch_api = TwitchAPI(config, http=shared_http)
-        notifier = Notifier(config)
+        # Without Telegram tokens the null object drops alerts and the
+        # web panel controls the app. Both can run at once otherwise.
+        notifier = Notifier(config) if telegram_enabled(config) else NullNotifier()
         health_runner = await _start_health_server()
 
         # Constructed unconditionally so a live /mode youtube|both always has a
@@ -174,6 +177,9 @@ async def run_scheduler() -> None:
         )
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)
+        webui = WebUI(config, telegram, recorder)
+        webui.register_routes(kick_webhook)
+        telegram.bind_live_check(twitch_api, kick_api)
 
         await eventsub.start()
         await kick_webhook.apply_state()
@@ -181,6 +187,10 @@ async def run_scheduler() -> None:
             logger.info("[kick_webhook] started (public: %s)", config.endpoint.public_url or "(none)")
 
         await telegram.start()
+        if not telegram_enabled(config):
+            logger.info("[scheduler] Telegram bot disabled, the web panel at /web/ controls the app")
+        elif config.web.enabled:
+            logger.info("[scheduler] Web panel enabled at /web/, Telegram bot stays on")
 
         version = installed_app_version() or "unknown"
         try:

@@ -61,10 +61,10 @@ class MtprotoCommands:
                 await self._mtproto.connect()
             except Exception:
                 logger.warning("[telegram] MTProto connect failed after enable", exc_info=True)
-                return result + "\n\u26a0\ufe0f Enabled, but the MTProto login failed \u2014 check the logs."
+                return result + "\n\u26a0\ufe0f Enabled, but the MTProto login failed - check the logs."
             if self._mtproto.connected:
                 return result + "\nMTProto connected. Recordings can now be sent from the Recordings menu."
-            return result + "\n\u26a0\ufe0f Enabled, but not connected yet \u2014 check the logs."
+            return result + "\n\u26a0\ufe0f Enabled, but not connected yet - check the logs."
         if not enabled and self._mtproto is not None:
             try:
                 for task in list(self._mtproto_tasks):
@@ -135,6 +135,8 @@ class MtprotoCommands:
                 last_frac = -1.0
                 last_edit = 0.0
                 last_phase: str | None = None
+                phase_started = started
+                phase_base = 0
                 while True:
                     try:
                         sample = await asyncio.get_running_loop().run_in_executor(None, updates.get)
@@ -154,12 +156,19 @@ class MtprotoCommands:
                         continue
                     last_frac = frac
                     last_edit = now
+                    # Speed and ETA measure the current phase, not the whole
+                    # send: a new part restarts its own bar and its own rate.
+                    if note != last_phase:
+                        phase_started = now
+                        phase_base = sent
                     last_phase = note
                     # A 100% sample only edits when the upload really finished:
                     # the None sentinel wakes the watcher without an edit.
                     if frac >= 1.0 and not done.is_set():
                         continue
-                    line = _progress_line(name, size, sent, total, frac, now - started, note)
+                    line = _progress_line(
+                        name, size, sent - phase_base, total - phase_base, frac, now - phase_started, note
+                    )
                     try:
                         # Re-attach the keyboard: a text edit without markup drops it.
                         await notice.edit_text(line, reply_markup=stop_keyboard)
@@ -189,13 +198,13 @@ class MtprotoCommands:
                 stopped = True
             except Exception:
                 logger.exception("[telegram] MTProto upload failed for %s", path)
-                failed = f"\u274c Upload of {name} failed \u2014 see logs."
+                failed = f"\u274c Upload of {name} failed - see logs."
             finally:
                 self._mtproto_sends.pop((chat_id, nonce), None)
             if stopped:
                 # Final edits drop the keyboard by omitting the markup.
                 with contextlib.suppress(Exception):
-                    await notice.edit_text(f"\u23f9 Stopped {name} \u2014 nothing was deleted.")
+                    await notice.edit_text(f"\u23f9 Stopped {name} - nothing was deleted.")
                 return
             if failed is not None:
                 try:
@@ -208,6 +217,10 @@ class MtprotoCommands:
                 except Exception:
                     logger.debug("[telegram] Done edit failed", exc_info=True)
 
+        # Check and add run as one synchronous block (no awaits between
+        # them), so two rapid Send presses cannot both start an upload.
+        if path in self._sending_paths:
+            return
         self._sending_paths.add(path)
         task = asyncio.create_task(_run())
         self._mtproto_tasks.add(task)

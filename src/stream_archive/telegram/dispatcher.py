@@ -31,6 +31,7 @@ from stream_archive.telegram.commands_channels import ChannelsCommands
 from stream_archive.telegram.commands_mtproto import MtprotoCommands
 from stream_archive.telegram.commands_settings import SettingsCommands
 from stream_archive.telegram.commands_system import SystemCommands
+from stream_archive.telegram.commands_web import WebCommands
 from stream_archive.telegram.commands_webhook import WebhookCommands
 from stream_archive.telegram.menu_state import ChatId, ChatStateMixin, MenuResult
 from stream_archive.telegram.menus_commands import CommandsMixin
@@ -76,6 +77,7 @@ class TelegramController(
     ChannelsCommands,
     SettingsCommands,
     ApiCommands,
+    WebCommands,
     WebhookCommands,
     SystemCommands,
     MtprotoCommands,
@@ -86,14 +88,18 @@ class TelegramController(
     _eventsub: Any
     _updater: Any
     _kick_webhook: Any
+    _twitch_api: Any
+    _kick_api: Any
     _mtproto: Any
     _mtproto_tasks: set[asyncio.Task[None]]
     _sending_paths: set[str]
     _mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]]
     _http: Any
     _owns_http: bool
-    _app: Application[Any, Any, Any, Any, Any, Any]
+    _app: Any
     _admin_id: int
+    _admin_filter: Any
+    _enabled: bool
     _cloudflared: CloudflaredTunnel
     _cloudflared_lock: asyncio.Lock
     _restore_task: asyncio.Task[None] | None
@@ -118,6 +124,8 @@ class TelegramController(
         self._updater = updater
         self._kick_webhook = kick_webhook
         self._mtproto = mtproto
+        self._twitch_api: Any = None
+        self._kick_api: Any = None
         if http is not None:
             self._http = http
             self._owns_http = False
@@ -125,15 +133,21 @@ class TelegramController(
             self._http = build_http_client()
             self._owns_http = True
         self._admin_id = config.telegram_user_id
+        # An empty token or a zero id disables the bot. The web panel
+        # then controls the app through the same command methods.
+        self._enabled = bool(config.telegram_user_id > 0 and config.bot_telegram_api.strip())
         # One filter object gates every command handler, so a reload can
         # re-point the whole gate at a changed telegram_user_id in place.
-        self._admin_filter = filters.User(user_id=self._admin_id)
-        self._app = Application.builder().token(config.bot_telegram_api).build()
+        self._admin_filter = filters.User(user_id=self._admin_id) if self._enabled else None
+        self._app: Any = None
+        if self._enabled:
+            self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
         self._mtproto_tasks: set[asyncio.Task[None]] = set()
         self._sending_paths: set[str] = set()
         self._mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]] = {}
         self._pending_delete: dict[tuple[ChatId, str], str] = {}
+        self._pending_bulk_delete: dict[tuple[ChatId, str], str | None] = {}
         self._cloudflared = CloudflaredTunnel()
         # One managed cloudflared process serves the whole app, so a tunnel
         # press must not interleave with another one. See menu_kick_cloudflare.
@@ -141,20 +155,37 @@ class TelegramController(
         self._restore_task = None
         self._callback_handler: Any = None
 
+    @property
+    def enabled(self) -> bool:
+        """True when the bot polls Telegram. False means web-panel control."""
+        return self._enabled
+
+    def bind_live_check(self, twitch_api: Any, kick_api: Any) -> None:
+        """Give /add an immediate live check through one monitor sweep.
+
+        The scheduler calls this once the API clients exist. Without it
+        a new channel waits for the next poll cycle to start recording.
+        """
+        self._twitch_api = twitch_api
+        self._kick_api = kick_api
+
     def rebind_admin(self) -> None:
         """Point every admin gate at the current config.
 
         The handler filters and the callback gate are built once, from the
         admin id the process started with. A config reload that changes
         ``telegram_user_id`` must reach them here, or the previous identity
-        keeps every operation and the new one is authorized nowhere.
+        keeps every operation and the new one is authorized nowhere. A
+        reload never starts or stops the bot: enabling or disabling it
+        needs a restart, like a changed bot token.
         """
         new_id = self._config.telegram_user_id
         if new_id == self._admin_id:
             return
         logger.info("[telegram] Admin identity changed to %s", new_id)
         self._admin_id = new_id
-        self._admin_filter.user_ids = frozenset({new_id})
+        if self._admin_filter is not None:
+            self._admin_filter.user_ids = frozenset({new_id})
         if self._callback_handler is not None:
             self._callback_handler.rebind(new_id)
 
@@ -165,6 +196,8 @@ class TelegramController(
         has a handler. Keep the order: a command handler comes before the
         text handler, and the text handler before the buttons.
         """
+        if not self._enabled:
+            return []
         admin = self._admin_filter
         self._callback_handler = callbacks.AdminCallbackQueryHandler(self._on_callback, admin_id=self._admin_id)
         return [
@@ -191,6 +224,9 @@ class TelegramController(
         ]
 
     async def start(self) -> None:
+        if not self._enabled:
+            logger.info("[telegram] Bot disabled (no token), web panel controls the app")
+            return
         self._app.add_handlers(self.command_handlers())
         await self._app.initialize()
         await self._app.start()
@@ -223,7 +259,9 @@ class TelegramController(
 
         Every step runs, even when an earlier one fails: the updater raises
         when it never started, and the owned session must still close. A
-        failure is logged and does not stop the remaining steps.
+        failure is logged and does not stop the remaining steps. The bot
+        steps run only when polling started; the tunnel and the owned
+        session close in every mode, since __init__ owns them regardless.
         """
         # A restore task that still runs can start a cloudflared process
         # after this teardown, so cancel it and wait for it first. A failure
@@ -236,24 +274,25 @@ class TelegramController(
                 except Exception:
                     logger.warning("[telegram] cloudflared restore task failed at stop", exc_info=True)
             self._restore_task = None
+        if self._enabled and self._app is not None:
+            updater = self._app.updater
+            if updater is not None:
+                try:
+                    await updater.stop()
+                except Exception:
+                    logger.warning("[telegram] Failed to stop the updater", exc_info=True)
+            try:
+                await self._app.stop()
+            except Exception:
+                logger.warning("[telegram] Failed to stop the bot", exc_info=True)
+            try:
+                await self._app.shutdown()
+            except Exception:
+                logger.warning("[telegram] Failed to shut down the bot", exc_info=True)
         try:
             self._cloudflared_stop()
         except Exception:
             logger.warning("[telegram] Failed to stop cloudflared", exc_info=True)
-        updater = self._app.updater
-        if updater is not None:
-            try:
-                await updater.stop()
-            except Exception:
-                logger.warning("[telegram] Failed to stop the updater", exc_info=True)
-        try:
-            await self._app.stop()
-        except Exception:
-            logger.warning("[telegram] Failed to stop the bot", exc_info=True)
-        try:
-            await self._app.shutdown()
-        except Exception:
-            logger.warning("[telegram] Failed to shut down the bot", exc_info=True)
         if self._owns_http:
             try:
                 await self._http.aclose()
@@ -272,7 +311,13 @@ class TelegramController(
             chat = chat_id if chat_id is not None else self._admin_id
             self._pending_apply[(chat, secrets.token_hex(4))] = (ok_text(candidate), affected)
             self._prune_pending(self._pending_apply, chat)
-        return ok_text(candidate)
+        text = ok_text(candidate)
+        # Every applied change lands in the operator event feed, so the web
+        # panel shows bot, API, and panel changes alike.
+        from stream_archive import events as _events
+
+        _events.record("config", None, text)
+        return text
 
     def _confirm_keyboard(self, action: str, value: str) -> Any:
         return callbacks.confirm_keyboard(action, value)
@@ -287,9 +332,22 @@ class TelegramController(
     async def _replace_callback_text(self, query: Any, context: Any, text: str, reply_markup: Any = None) -> None:
         """Replace the pressed message with ``text``, or resend it if it went away.
 
-        A Telegram error must not escape: the press is already answered, and
-        the remaining steps of the handler still run.
+        A reply keyboard cannot edit an inline message in place, so a
+        ReplyKeyboardMarkup answer goes out as a fresh message (with the
+        inline prompt removed) instead of failing into BadRequest and a
+        duplicate. Any other Telegram error must not escape either: the
+        press is already answered, and the remaining steps still run.
         """
+        from telegram import ReplyKeyboardMarkup as _RKM
+
+        if isinstance(reply_markup, _RKM):
+            with contextlib.suppress(Exception):
+                await query.edit_message_text(text, reply_markup=None)
+            try:
+                await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup)
+            except Exception:
+                logger.warning("[telegram] Failed to send the callback reply", exc_info=True)
+            return
         try:
             await query.edit_message_text(text, reply_markup=reply_markup)
         except BadRequest:
@@ -311,7 +369,7 @@ class TelegramController(
             return
         except Exception:
             logger.error("[telegram] Callback %s failed", query.data, exc_info=True)
-            error_text = "\u274c Unexpected error \u2014 see logs"
+            error_text = "\u274c Unexpected error - see logs"
             with contextlib.suppress(BadRequest):
                 await query.answer()
             await self._replace_callback_text(query, context, error_text)
@@ -364,9 +422,12 @@ class TelegramController(
         except Exception:
             logger.error("[telegram] Text handler failed", exc_info=True)
             with contextlib.suppress(BadRequest):
-                await message.reply_text("\u274c Unexpected error \u2014 see logs")
+                await message.reply_text("\u274c Unexpected error - see logs")
 
     async def _send_admin(self, text: str) -> None:
+        if not self._enabled or self._app is None:
+            logger.debug("[telegram] Admin notice dropped (bot disabled)")
+            return
         try:
             await self._app.bot.send_message(chat_id=self._admin_id, text=text)
         except Exception:
@@ -390,7 +451,14 @@ class TelegramController(
     async def menu_text(self, menu: str = "root", channel: str | None = None, chat_id: ChatId | None = None) -> str:
         """Return the status or instruction body shown above the reply keyboard for ``menu``."""
         state = self._state_for(chat_id if chat_id is not None else self._admin_id)
-        return await menus.render_text(self, menu, channel if channel is not None else state.channel, state.custom)
+        return await menus.render_text(
+            self,
+            menu,
+            channel if channel is not None else state.channel,
+            state.custom,
+            rec_channel=state.rec_channel,
+            rec_path=state.rec_path,
+        )
 
     async def handle_reply_text(self, text: str, chat_id: ChatId | None = None) -> MenuResult:
         """Route one reply-keyboard press or typed value for ``chat_id`` (admin by default)."""

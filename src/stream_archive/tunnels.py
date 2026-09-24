@@ -189,14 +189,14 @@ class CloudflaredTunnel:
             )
             return None, (
                 "cloudflared did not publish a trycloudflare URL within "
-                f"{_CLOUDFLARED_QUICK_TIMEOUT}s \u2014 tap Quick tunnel again."
+                f"{_CLOUDFLARED_QUICK_TIMEOUT}s - tap Quick tunnel again."
             )
         if url is None:
             await self._kill(proc)
             logger.warning("[tunnels] cloudflared exited before publishing a URL:\n%s", "\n".join(tail[-8:]))
             return None, "cloudflared exited before publishing a URL:\n" + "\n".join(tail[-8:])
         if not self._adopt(proc):
-            return None, "a newer tunnel start replaced this one \u2014 tap Quick tunnel again."
+            return None, "a newer tunnel start replaced this one - tap Quick tunnel again."
         return url, None
 
     async def start_named(self, token: str, config_path: Path | None = None) -> tuple[bool, str | None]:
@@ -241,7 +241,7 @@ class CloudflaredTunnel:
             await self._kill(proc)
             logger.warning("[tunnels] cloudflared did not register within %ss", _CLOUDFLARED_RUN_TIMEOUT)
             return False, (
-                f"cloudflared did not register the tunnel within {_CLOUDFLARED_RUN_TIMEOUT}s \u2014 "
+                f"cloudflared did not register the tunnel within {_CLOUDFLARED_RUN_TIMEOUT}s - "
                 "check the token and the network, then start it again."
             )
         if not registered:
@@ -249,7 +249,7 @@ class CloudflaredTunnel:
             logger.warning("[tunnels] cloudflared exited before registering:\n%s", "\n".join(tail[-8:]))
             return False, "cloudflared exited:\n" + "\n".join(tail[-8:])
         if not self._adopt(proc):
-            return False, "a newer tunnel start replaced this one \u2014 start the named tunnel again."
+            return False, "a newer tunnel start replaced this one - start the named tunnel again."
         return True, None
 
     async def _kill(self, proc: Any) -> None:
@@ -359,7 +359,7 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
     except TimeoutError:
         await _kill_proc(proc)
         logger.warning("[tunnels] tailscale status timed out after %ss", _TAILSCALE_STATUS_TIMEOUT)
-        return None, "tailscale status timed out \u2014 is the tailscale daemon running on the host?"
+        return None, "tailscale status timed out - is the tailscale daemon running on the host?"
     except FileNotFoundError as exc:
         logger.error("[tunnels] tailscale is not available: %s", exc)
         return None, (
@@ -386,7 +386,7 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
     dns_name = dns.rstrip(".").lower() if isinstance(dns, str) else ""
     if not dns_name:
         logger.warning("[tunnels] tailscale status shows no machine DNS name")
-        return None, "tailscale status shows no machine DNS name \u2014 is this machine in a tailnet?"
+        return None, "tailscale status shows no machine DNS name - is this machine in a tailnet?"
     proc = None
     try:
         # --bg registers the funnel with the daemon and exits. The plain
@@ -410,7 +410,7 @@ async def tailscale_funnel_url(port: int) -> tuple[str | None, str | None]:
         logger.warning("[tunnels] tailscale funnel timed out after %ss", _TAILSCALE_FUNNEL_TIMEOUT)
         return None, (
             "tailscale funnel timed out (first enable provisions HTTPS certificates and can take "
-            "a minute) \u2014 tap Tailscale funnel again in a moment."
+            "a minute) - tap Tailscale funnel again in a moment."
         )
     except OSError as exc:
         logger.error("[tunnels] tailscale funnel could not run: %s", exc)

@@ -176,7 +176,7 @@ class WebhookCommands:
             return False, (
                 "\u274c That doesn't look like a cloudflared tunnel token.\n\n"
                 "Send the token from the Cloudflare dashboard command "
-                "(cloudflared service install <TOKEN>) \u2014 or paste the whole command."
+                "(cloudflared service install <TOKEN>) - or paste the whole command."
             )
         result: str = self._apply(
             lambda candidate: setattr(candidate.endpoint, "cloudflare_token", token),
@@ -187,7 +187,7 @@ class WebhookCommands:
             return False, result
         return True, (
             "\u2705 Tunnel token accepted.\n\n"
-            "Send the public hostname to use for the webhook, e.g. kick.example.com \u2014 "
+            "Send the public hostname to use for the webhook, e.g. kick.example.com - "
             "I'll point your tunnel at this app automatically."
         )
 
@@ -215,7 +215,7 @@ class WebhookCommands:
                 return None, f"\u274c Cloudflare API request failed: {e}"
             if resp.status_code != 200:
                 return None, (
-                    "\u274c The token can't list zones \u2014 it needs Zone read (use the 'Edit zone DNS' template)."
+                    "\u274c The token can't list zones - it needs Zone read (use the 'Edit zone DNS' template)."
                 )
             body = _json_body(resp)
             zones = body.get("result") or []
@@ -249,12 +249,12 @@ class WebhookCommands:
         tunnel_id = (data or {}).get("t") or ""
         account_id = (data or {}).get("a") or ""
         if not host or not tunnel_id:
-            return False, "\u274c Missing hostname or tunnel token \u2014 start the Named tunnel flow again."
+            return False, "\u274c Missing hostname or tunnel token - start the Named tunnel flow again."
         headers = {"Authorization": f"Bearer {api_token}"}
         target = f"{tunnel_id}.cfargotunnel.com"
         client = self._http
         if client is None:
-            return False, "\u274c HTTP client is not ready \u2014 try again in a moment."
+            return False, "\u274c HTTP client is not ready - try again in a moment."
         # Account-owned tokens (cfat_ prefix) reject the user-scoped
         # verify endpoint. Fall back to the account-scoped endpoint.
         # _json_body never raises and never returns another shape than a
@@ -276,8 +276,7 @@ class WebhookCommands:
             return False, zone_error
         if zone is None:
             return False, (
-                f"\u274c No Cloudflare zone matches {host} \u2014 is the domain "
-                "on the Cloudflare account of this API token?"
+                f"\u274c No Cloudflare zone matches {host} - is the domain on the Cloudflare account of this API token?"
             )
         zone_id = zone.get("id")
         if not isinstance(zone_id, str) or not zone_id:
@@ -291,7 +290,7 @@ class WebhookCommands:
         if existing_resp.status_code != 200:
             # A 403, 429, or 5xx is not an empty result. Treat the lookup
             # as failed instead of posting a second record.
-            return False, "\u274c The token can't read DNS records \u2014 it needs Zone\u2192DNS edit rights."
+            return False, "\u274c The token can't read DNS records - it needs Zone\u2192DNS edit rights."
         existing = _json_body(existing_resp).get("result") or []
         if not isinstance(existing, list) or any(not isinstance(record, dict) for record in existing):
             return False, _CLOUDFLARE_BAD_BODY
@@ -316,7 +315,7 @@ class WebhookCommands:
             first_error = errors[0] if isinstance(errors, list) and errors and isinstance(errors[0], dict) else None
             err = (first_error or {}).get("message", created.text)
             return False, f"\u274c Could not create the DNS record: {err}"
-        return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
+        return True, "\u2705 DNS record created - the hostname now points at your tunnel."
 
     async def _finish_named_setup(self, dns_note: str | None, chat_id: int | None = None) -> tuple[str, Any]:
         """Wire up the named tunnel: local ingress config, run, enable the webhook.
@@ -328,7 +327,7 @@ class WebhookCommands:
         state = self._state_for(chat)
         host = state.cloudflare_hostname or ""
         if not host:
-            return "\u274c No hostname \u2014 start the Named tunnel flow again.", self.reply_keyboard(
+            return "\u274c No hostname - start the Named tunnel flow again.", self.reply_keyboard(
                 "kick_cloudflare", chat_id=chat
             )
         token = self._config.endpoint.cloudflare_token
@@ -413,9 +412,9 @@ class WebhookCommands:
         if tunnel == "tailscale":
             return ""
         if await self._probe_webhook_url(url):
-            return "\n\n\u2705 URL is reachable \u2014 save it in Kick and I'll confirm when the first event arrives."
+            return "\n\n\u2705 URL is reachable - save it in Kick and I'll confirm when the first event arrives."
         return (
-            "\n\n\u26a0\ufe0f The URL doesn't respond yet \u2014 if you skipped the DNS step, "
+            "\n\n\u26a0\ufe0f The URL doesn't respond yet - if you skipped the DNS step, "
             "add the DNS record first; otherwise check the tunnel logs."
         )
 

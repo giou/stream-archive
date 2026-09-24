@@ -32,6 +32,12 @@ class Notifier:
         return self._config.telegram_user_id
 
     async def notify(self, message: str) -> None:
+        from stream_archive import events as _events
+
+        _events.record("notice", None, message)
+        await self._send(message)
+
+    async def _send(self, message: str) -> None:
         attempt = 0
         flood_waits = 0
         flood_seconds = 0.0
@@ -82,6 +88,8 @@ class Notifier:
                 return
 
     async def notify_live(self, channel: str, title: str, game: str, url: str, youtube_url: str | None = None) -> None:
+        from stream_archive import events as _events
+
         # The title and the game name come from the streamer, and this message
         # is line-structured, so both are canonicalized to one line each.
         title = sanitize_metadata_text(title)
@@ -89,11 +97,14 @@ class Notifier:
         text = f"🔴 LIVE: {channel}\nTitle: {title}\nGame: {game}\nUrl: {url}"
         if youtube_url:
             text += f"\nYouTube: {youtube_url}"
-        await self.notify(text)
+        _events.record("live", channel, f"{title} · {game}")
+        await self._send(text)
 
     async def notify_offline(
         self, channel: str, file_info: dict[str, Any] | None = None, youtube_url: str | None = None
     ) -> None:
+        from stream_archive import events as _events
+
         parts = [f"⚫ Offline: {channel}"]
         if file_info:
             name = file_info.get("name")
@@ -110,7 +121,9 @@ class Notifier:
                 parts.append(f"Date: {date}")
         if youtube_url:
             parts.append(f"YouTube: {youtube_url}")
-        await self.notify("\n".join(parts))
+        text = "\n".join(parts)
+        _events.record("offline", channel, text)
+        await self._send(text)
 
     async def notify_startup(self, channels: list[str], version: str) -> None:
         text = f"▶️ StreamArchive started\nMonitoring: {', '.join(channels)}\nVersion: {version}"
@@ -121,3 +134,63 @@ class Notifier:
 
     async def close(self) -> None:
         await self.bot.shutdown()
+
+
+class NullNotifier(Notifier):
+    """No-op alerts for runs without the Telegram bot.
+
+    The monitor, the recorder, the webhook sync, and the update check
+    all take a notifier. This object keeps their calls unchanged while
+    the web panel controls the app. It never builds a Telegram Bot.
+    """
+
+    def __init__(self) -> None:
+        return None
+
+    @property
+    def chat_id(self) -> int:
+        return 0
+
+    async def notify(self, message: str) -> None:
+        from stream_archive import events as _events
+
+        _events.record("notice", None, message)
+        logger.debug("[notifier] dropped (no Telegram bot): %s", message[:120])
+
+    async def notify_live(
+        self,
+        channel: str,
+        title: str,
+        game: str,
+        url: str,
+        youtube_url: str | None = None,
+    ) -> None:
+        from stream_archive import events as _events
+
+        # Same single-line rule as the Telegram path: titles come from the
+        # streamer, and the feed renders them with line breaks intact.
+        _events.record("live", channel, f"{sanitize_metadata_text(title)} · {sanitize_metadata_text(game)}")
+        logger.debug("[notifier] dropped live alert for %s", channel)
+
+    async def notify_offline(
+        self, channel: str, file_info: dict[str, Any] | None = None, youtube_url: str | None = None
+    ) -> None:
+        from stream_archive import events as _events
+
+        _events.record("offline", channel, "stream ended")
+        logger.debug("[notifier] dropped offline alert for %s", channel)
+
+    async def notify_startup(self, channels: list[str], version: str) -> None:
+        from stream_archive import events as _events
+
+        _events.record("notice", None, f"StreamArchive started (v{version})")
+        logger.info("[notifier] startup without Telegram bot: %d channel(s)", len(channels))
+
+    async def notify_shutdown(self) -> None:
+        from stream_archive import events as _events
+
+        _events.record("notice", None, "StreamArchive stopping")
+        logger.info("[notifier] shutdown without Telegram bot")
+
+    async def close(self) -> None:
+        return None

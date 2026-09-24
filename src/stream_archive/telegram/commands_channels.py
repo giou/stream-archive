@@ -52,9 +52,7 @@ class ChannelsCommands:
                 raise ValueError(msg)
             candidate.channels.append(ch)
 
-        result: str = self._apply(
-            mutate, lambda c: f"Added {ch} \u2014 {len(c.channels)} channel(s) monitored", chat_id
-        )
+        result: str = self._apply(mutate, lambda c: f"Added {ch} - {len(c.channels)} channel(s) monitored", chat_id)
         if is_error(result):
             return result
         if is_kick_channel(ch):
@@ -62,7 +60,27 @@ class ChannelsCommands:
                 await self._kick_webhook.add_channel(ch)
         else:
             await self._eventsub.add_channel(ch)
-        return result
+        note = await self._check_channel_now(ch)
+        return f"{result}\n{note}" if note else result
+
+    async def _check_channel_now(self, channel: str) -> str | None:
+        """Run one monitor sweep so a live channel records at once.
+
+        Returns a note when the sweep started a recording, else None.
+        Without bound API clients (tests) it stays silent.
+        """
+        twitch_api = getattr(self, "_twitch_api", None)
+        kick_api = getattr(self, "_kick_api", None)
+        if twitch_api is None or kick_api is None:
+            return None
+        try:
+            await self._monitor.check_channels(twitch_api, kick_api, self._config)
+        except Exception:
+            logger.warning("[telegram] Immediate check failed for %s", channel, exc_info=True)
+            return None
+        if self._recorder.is_recording(channel):
+            return f"{channel} is live - recording started."
+        return None
 
     async def handle_remove(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 1:
@@ -80,9 +98,7 @@ class ChannelsCommands:
             candidate.channel_youtube_hold_seconds.pop(ch, None)
             candidate.channel_preferred_qualities.pop(ch, None)
 
-        result: str = self._apply(
-            mutate, lambda c: f"Removed {ch} \u2014 {len(c.channels)} channel(s) monitored", chat_id
-        )
+        result: str = self._apply(mutate, lambda c: f"Removed {ch} - {len(c.channels)} channel(s) monitored", chat_id)
         if is_error(result):
             return result
         note = await self._release_channel(ch)
@@ -119,7 +135,7 @@ class ChannelsCommands:
                 note = "Recording stopped."
             except Exception:
                 logger.exception("[telegram] Failed to stop the recording of %s", ch)
-                note = "\u26a0\ufe0f Recording stop failed \u2014 see logs."
+                note = "\u26a0\ufe0f Recording stop failed - see logs."
         # The monitor keeps live state and a per-channel lock when the stop
         # fails, so tell it about the removal either way.
         self._monitor.remove_channel(ch)

@@ -31,6 +31,7 @@ async def menu_remote_access(ctrl: TelegramController, chat_id: ChatId, text: st
         "Tailscale funnel": "kick_tailscale",
         "Kick webhook": "kick_webhook",
         "API": "api",
+        "Web panel": "web",
     }.get(text)
     if new_menu is None:
         return None
@@ -71,7 +72,7 @@ async def menu_kick_cloudflare(ctrl: TelegramController, chat_id: ChatId, text: 
         async with ctrl._cloudflared_lock:
             url, hint = await ctrl._cloudflared_quick_start()
             if url is None:
-                detail = hint or "cloudflared published no tunnel URL \u2014 see logs"
+                detail = hint or "cloudflared published no tunnel URL - see logs"
                 return f"\u274c {detail}", ctrl.reply_keyboard("kick_cloudflare", chat_id=chat_id)
             result = await ctrl._apply_endpoint_state(True, url, "cloudflare", cloudflare_managed=True, chat_id=chat_id)
             if is_error(result):
@@ -126,7 +127,7 @@ async def menu_kick_hostname(ctrl: TelegramController, chat_id: ChatId, text: st
     ctrl._enter_menu(chat_id, "kick_cloudflare_dns")
     state.cloudflare_hostname = host
     return (
-        f"Hostname {host} \u2014 " + await ctrl.menu_text("kick_cloudflare_dns", chat_id=chat_id),
+        f"Hostname {host} - " + await ctrl.menu_text("kick_cloudflare_dns", chat_id=chat_id),
         ctrl.reply_keyboard("kick_cloudflare_dns", chat_id=chat_id),
     )
 

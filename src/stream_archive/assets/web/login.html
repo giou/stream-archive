@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>StreamArchive - Login</title>
+<link rel="stylesheet" href="/web/styles.css">
+<link rel="manifest" href="/web/manifest.webmanifest">
+<link rel="icon" href="/web/icon.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="top">
+  <div class="brandrow">
+    <h1>StreamArchive</h1>
+  </div>
+</header>
+<main>
+  <div class="card login-card">
+    <h2>Login</h2>
+    <p id="setup-hint" class="muted" hidden>The panel has no password yet. Run
+      <code>stream-archive-setup-web</code> on the host, then reload.</p>
+    <form id="login-form">
+      <label>Password
+        <input type="password" id="password" autocomplete="current-password" required>
+      </label>
+      <label class="checkline"><input type="checkbox" id="show-password"> Show password</label>
+      <p id="caps-hint" class="muted" hidden>Caps Lock is on.</p>
+      <button type="submit" class="primary">Login</button>
+    </form>
+    <p id="login-error" class="muted" hidden></p>
+  </div>
+</main>
+<div id="toast" role="status"></div>
+<script src="/web/login.js"></script>
+</body>
+</html>

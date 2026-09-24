@@ -46,6 +46,11 @@
         "enabled": false,
         "key": ""
     },
+    "web": {
+        "enabled": false,
+        "password_hash": "",
+        "session_secret": ""
+    },
     "mtproto": {
         "enabled": false,
         "api_id": 0,

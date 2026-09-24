@@ -126,7 +126,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         ctrl._pending_apply.pop(pending_key, None)
         ctrl._apply_warnings_sent.discard(pending_key)
         ctrl._mark_confirm_done(chat_id, nonce)
-        return "Cancelled \u2014 nothing changed", None
+        return "Cancelled - nothing changed", None
     if action == "confirm_recdel" and len(parts) >= 3:
         if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
@@ -134,6 +134,13 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         from stream_archive.telegram import menus_recordings as rec
 
         return await rec.handle_rec_callback(ctrl, data, chat_id)
+    if action == "confirm_recbulk" and len(parts) >= 3:
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
+            return None
+        ctrl._mark_confirm_done(chat_id, nonce)  # a re-tap must not re-delete
+        from stream_archive.telegram import menus_recordings as rec
+
+        return await rec.handle_bulk_callback(ctrl, data, chat_id)
     if action == "confirm_remove" and len(parts) >= 3:
         if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None
@@ -172,7 +179,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
                 # One failed restart must not discard the other channels of the
                 # prompt, and must not escape as a plain "Unexpected error".
                 logger.exception("[telegram] Failed to restart the recording of %s", ch)
-                lines.append(f"{ch}: restart failed \u2014 see logs")
+                lines.append(f"{ch}: restart failed - see logs")
                 failed = True
                 continue
             lines.append(f"{ch}: {'restarted with the new settings' if ok else 'no longer recording'}")
@@ -206,7 +213,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
             # The press is already marked handled, so report the failure
             # instead of escaping with a generic error and no explanation.
             logger.exception("[telegram] Failed to apply the audio-only switch")
-            return "\u274c The change failed \u2014 see logs", None
+            return "\u274c The change failed - see logs", None
         return result, None
     return None
 

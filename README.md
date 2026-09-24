@@ -50,7 +50,8 @@ Two fast paths deliver the signals:
   Kick webhook, status, reload, and restart. Other users get no reply. The
   **Remote access** menu holds the Kick webhook and the HTTP control API. The
   app validates each change and writes it atomically to `config.json`. The
-  change applies on the next poll cycle.
+  change applies on the next poll cycle. The [web panel](docs/web-control.md)
+  replaces the bot in the browser and needs no Telegram token.
 
 ## Architecture
 
@@ -64,10 +65,11 @@ chat file and the broadcast. The notifier sends Telegram messages.
 Two services feed the monitor directly. The EventSub client holds one
 authenticated WebSocket for Twitch events. The Kick webhook receiver verifies
 and deduplicates incoming HTTP events and keeps the subscriptions in sync. Its
-listener also serves the control API under `/api/v1`. The Telegram bot runs
+listener also serves the control API under `/api/v1` and the web panel under
+`/web/`. The Telegram bot runs
 alongside as an admin-only polling bot. It validates each change on a copy,
 writes `config.json` atomically, and applies the change on the next cycle. The
-control API calls the same command layer, so both paths behave in the same way.
+control API and the web panel call the same command layer, so all paths behave in the same way.
 See [Development](docs/development.md) for the module map.
 
 ## Requirements
@@ -78,7 +80,8 @@ See [Development](docs/development.md) for the module map.
 - Kick app credentials for `kick:` channels. Create an app in the Kick
   Developer portal (client id and client secret).
 - A Telegram bot token from [BotFather](https://t.me/BotFather), and your user
-  or chat id.
+  or chat id. Optional: set the id to `0` and the token to `""` to disable
+  the bot and use the [web panel](docs/web-control.md) instead.
 - A Google Cloud OAuth client (`client_secret.json`) for `output_mode: youtube`
   or `both`. See [YouTube setup](docs/youtube-setup.md).
 - `cloudflared` or Tailscale for the Kick webhook tunnel. Both ship in the

@@ -39,7 +39,7 @@ _YOUTUBE_DAILY_BUDGET = 10
 _YOUTUBE_BUDGET_WINDOW_S = 86400
 
 # Pre-encoded 1920x1080@60 "Reconnecting..." interstitial (animated dots,
-# 3s loop) fed into a held broadcast with `-c copy` — no runtime encoding.
+# 3s loop) fed into a held broadcast with `-c copy` - no runtime encoding.
 _RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect_clip.mp4"
 
 
@@ -74,7 +74,7 @@ class YoutubeOutputMixin:
             wait = min(_BACKOFF_BASE_S * (2 ** (n - 1)), _BACKOFF_MAX_S)
             self._backoff_until[channel] = time.monotonic() + wait
             logger.warning(
-                "[recorder] [%s] Recording ended after %.0fs — backing off restarts for %ds",
+                "[recorder] [%s] Recording ended after %.0fs - backing off restarts for %ds",
                 channel,
                 lifetime,
                 wait,
@@ -351,7 +351,7 @@ class YoutubeOutputMixin:
                         safe_title = sanitize_filename(f"{author} - {title}")
                         filepath = os.path.join(recording_dir, f"{safe_title}-{now}.ts")
                         entry["filepath"] = filepath
-                        logger.info("[recorder] Rate limited — falling back to disk recording for %s", channel)
+                        logger.info("[recorder] Rate limited - falling back to disk recording for %s", channel)
                         disk_task = self._track(channel, self._record_disk(channel, filepath, stream))
                         entry["tasks"].append(disk_task)
                         if self._notifier and notify:

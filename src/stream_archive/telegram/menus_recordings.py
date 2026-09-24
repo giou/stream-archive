@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from telegram import ReplyKeyboardMarkup
 
 from stream_archive import disk
-from stream_archive.mtproto_upload import check_sendable
+from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES, check_sendable
 from stream_archive.telegram.menu_state import ChatId, MenuResult
 
 if TYPE_CHECKING:
@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 #: Reply labels of the per-file detail submenu.
 SEND_LABEL = "📤 Send"
 DELETE_LABEL = "🗑 Delete"
+
+#: Bulk delete of a channel file page, above Back.
+DELETE_CHANNEL_LABEL = "🗑 Delete channel files"
+
+#: Bulk delete of the whole archive, above Back on the channel list.
+DELETE_ALL_LABEL = "🗑 Delete all files"
 
 #: Files per recordings page. Five rows keep one page below the tap limit.
 PAGE_SIZE = 5
@@ -119,6 +125,8 @@ def _page_buttons(count: int, offset: int, live: set[str], files: list[tuple[flo
         nav.append("Next ▶")
     if nav:
         rows.append(nav)
+    if count:
+        rows.append([DELETE_CHANNEL_LABEL])
     rows.append(["Back"])
     return rows
 
@@ -146,12 +154,14 @@ def channel_label(channel: str, files: list[tuple[float, int, Path]], live: set[
 
 
 def _channel_keyboard(ctrl: TelegramController) -> Any:
-    """Channel list keyboard: one row per channel plus Back."""
+    """Channel list keyboard: one row per channel, bulk delete, plus Back."""
     from telegram import ReplyKeyboardMarkup
 
     ordered, by_channel = channel_rows(ctrl)
     live = _live_paths(ctrl)
     rows = [[channel_label(ch, by_channel[ch], live)] for ch in ordered]
+    if ordered:
+        rows.append([DELETE_ALL_LABEL])
     rows.append(["Back"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -175,6 +185,24 @@ async def open_recordings(ctrl: TelegramController, chat_id: ChatId) -> MenuResu
     state.rec_path = None
     state.rec_channel = None
     return _channel_list_text(ctrl), _channel_keyboard(ctrl)
+
+
+def _match_channel_row(ordered: list[str], text: str) -> str | None:
+    """Channel tag of a channel-list row press, or None.
+
+    The row carries the live marker, the file count, and the total size,
+    and all three move while a channel records. Match the stable tag
+    only, so a tap still lands after the numbers change.
+    """
+    want = text
+    if want.startswith("\U0001f534 "):
+        want = want[len("\U0001f534 ") :]
+    if not want.startswith(CHANNEL_PREFIX):
+        return None
+    want = want[len(CHANNEL_PREFIX) :]
+    if " (" in want and want.endswith(")"):
+        want = want.rsplit(" (", 1)[0]
+    return want if want in ordered else None
 
 
 def _strip_row(text: str) -> str:
@@ -224,15 +252,16 @@ def sendable_path(path: str | Path) -> bool:
     """True when ``path`` passes the MTProto size gate or splits below it."""
     from stream_archive.recorder.remux import ffmpeg_available
 
-    ok, note = check_sendable(Path(path))
+    ok, _ = check_sendable(Path(path))
     if ok:
         return True
-    if "4000-part cap" not in note:
-        return False
+    # Only an over-cap file can still go as split parts. Gate on the size
+    # itself, not on the wording of the rejection note.
     try:
-        return Path(path).stat().st_size > 0 and ffmpeg_available()
+        over = Path(path).stat().st_size > MAX_UPLOAD_BYTES
     except OSError:
         return False
+    return over and ffmpeg_available()
 
 
 def _detail_body(ctrl: TelegramController, path: Path) -> tuple[str, Any] | None:
@@ -242,8 +271,7 @@ def _detail_body(ctrl: TelegramController, path: Path) -> tuple[str, Any] | None
     except OSError:
         return None
     live = os.path.realpath(path) in _live_paths(ctrl)
-    ok, _ = check_sendable(path)
-    return _detail_text(path, st.st_size, st.st_mtime, live), _detail_keyboard(sendable=ok)
+    return _detail_text(path, st.st_size, st.st_mtime, live), _detail_keyboard(sendable=sendable_path(path))
 
 
 def _clamp_offset(ctrl: TelegramController, chat_id: ChatId, count: int) -> int:
@@ -260,6 +288,7 @@ def _list_keyboard(ctrl: TelegramController, chat_id: ChatId) -> Any:
         return ctrl.reply_keyboard("recordings", chat_id=chat_id)
     live = _live_paths(ctrl)
     rows = [[channel_label(ch, by_channel[ch], live)] for ch in ordered]
+    rows.append([DELETE_ALL_LABEL])
     rows.append(["Back"])
     from telegram import ReplyKeyboardMarkup
 
@@ -351,6 +380,137 @@ async def _ask_delete(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
     )
 
 
+def _store_pending_bulk(ctrl: TelegramController, chat_id: ChatId, channel: str | None) -> str:
+    """Stash a bulk-delete scope for ``chat_id``. Returns its nonce.
+
+    ``channel`` is one channel tag, or None for the whole archive. The
+    callback carries a nonce only: channel tags overflow Telegram's
+    64-byte callback_data cap.
+    """
+    import secrets
+
+    store = ctrl._pending_bulk_delete
+    for _ in range(16):
+        nonce = secrets.token_hex(4)
+        if (chat_id, nonce) not in store:
+            store[(chat_id, nonce)] = channel
+            break
+    else:
+        nonce = secrets.token_hex(8)
+        store[(chat_id, nonce)] = channel
+    ctrl._prune_pending(store, chat_id)
+    return nonce
+
+
+def _bulk_targets(ctrl: TelegramController, channel: str | None) -> list[tuple[float, int, Path]]:
+    """Files a bulk delete covers: one channel, or the whole archive."""
+    if channel is None:
+        return _scan(ctrl)
+    return _channel_files(ctrl, channel)
+
+
+async def _ask_bulk_delete(ctrl: TelegramController, chat_id: ChatId, channel: str | None) -> MenuResult:
+    """Ask for confirm before deleting a channel or the whole archive."""
+    from stream_archive.telegram.menus_callbacks import confirm_keyboard
+
+    files = _bulk_targets(ctrl, channel)
+    if not files:
+        if channel is None:
+            return "No recordings stored yet.", ctrl.reply_keyboard("recordings", chat_id=chat_id)
+        return _channel_list_text(ctrl), _channel_keyboard(ctrl)
+    total = sum(size for _, size, _ in files)
+    n = len(files)
+    where = "the archive" if channel is None else channel
+    nonce = _store_pending_bulk(ctrl, chat_id, channel)
+    return (
+        f"Delete {n} file{'s' if n != 1 else ''} ({disk.format_bytes(total)}) from {where}? "
+        "Live captures stay. This cannot be undone.",
+        confirm_keyboard("confirm_recbulk", nonce),
+    )
+
+
+def _bulk_scope(ctrl: TelegramController, chat_id: ChatId, nonce: str) -> tuple[bool, str | None]:
+    """Scope a bulk-delete confirm targets: ``(expired, scope)``.
+
+    Scope is one channel tag, or None for the whole archive. A channel
+    scope must still equal the picked channel: a re-pick between Delete
+    and Confirm targets the new pick, never the stale prompt.
+    """
+    store = ctrl._pending_bulk_delete
+    if (chat_id, nonce) not in store:
+        return True, None
+    scope = store.pop((chat_id, nonce))
+    if scope is not None and ctrl._state_for(chat_id).rec_channel != scope:
+        return True, None
+    return False, scope
+
+
+async def handle_bulk_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
+    """Apply one bulk-delete inline-button press for ``chat_id``."""
+    rest = data.split(":", 1)[1] if ":" in data else ""
+    nonce = rest.split(":")[0] if rest else ""
+    expired, scope = _bulk_scope(ctrl, chat_id, nonce)
+    if expired:
+        return "That button expired. Open Recordings again.", None
+    return await _delete_bulk(ctrl, chat_id, scope)
+
+
+async def _delete_bulk(ctrl: TelegramController, chat_id: ChatId, channel: str | None) -> tuple[str, Any] | None:
+    """Delete every finished recording in scope. Live captures stay.
+
+    Returns the channel file page (or the channel list when the channel
+    emptied or the scope was the whole archive).
+    """
+    from stream_archive import disk as disk_mod
+
+    files = _bulk_targets(ctrl, channel)
+    if not files:
+        if channel is None:
+            return "No recordings stored yet.", None
+        return _channel_list_text(ctrl), _channel_keyboard(ctrl)
+    live = _live_paths(ctrl)
+    recorder = ctrl._recorder
+    deleted = 0
+    freed = 0
+    skipped = 0
+    for _, _, path in files:
+        if os.path.realpath(path) in live:
+            skipped += 1
+            continue
+        if hasattr(recorder, "_remove_if_inactive"):
+            try:
+                got = recorder._remove_if_inactive(path, live)
+            except OSError:
+                logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
+                continue
+            if got is None:
+                skipped += 1
+                continue
+            freed += got
+            deleted += 1
+            continue
+        try:
+            freed += path.stat().st_size
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
+            continue
+        deleted += 1
+    disk_mod.invalidate_snapshot()
+    parts = [f"Deleted {deleted} file{'s' if deleted != 1 else ''} ({disk.format_bytes(freed)})."]
+    if skipped:
+        parts.append(f"{skipped} live capture{'s stay' if skipped != 1 else ' stays'}.")
+    state = ctrl._state_for(chat_id)
+    state.rec_path = None
+    if channel is not None and _channel_files(ctrl, channel):
+        ctrl._enter_menu(chat_id, "rec_channel")
+        state.rec_channel = channel
+        return " ".join(parts), _channel_page_keyboard(ctrl, chat_id)
+    ctrl._enter_menu(chat_id, "recordings")
+    state.rec_channel = None
+    return " ".join(parts), _list_keyboard(ctrl, chat_id)
+
+
 def _channel_files(ctrl: TelegramController, channel: str) -> list[tuple[float, int, Path]]:
     """Newest-first files of ``channel`` (empty when the channel is gone)."""
     _, by_channel = channel_rows(ctrl)
@@ -374,17 +534,22 @@ async def menu_recordings(ctrl: TelegramController, chat_id: ChatId, text: str) 
         ctrl._enter_menu(chat_id, "recordings")
         return "No recordings stored yet.", ctrl.reply_keyboard("recordings", chat_id=chat_id)
     live = _live_paths(ctrl)
-    # A channel row opens its file page (Back returns here).
-    for ch in ordered:
-        if channel_label(ch, by_channel[ch], live) == text:
-            ctrl._enter_menu(chat_id, "rec_channel")
-            st = ctrl._state_for(chat_id)
-            st.rec_channel = ch
-            st.rec_offset = 0
-            st.rec_path = None
-            files = by_channel[ch]
-            rows = _page_buttons(len(files), 0, live, files)
-            return _file_page_text(ch, files), ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    if text == DELETE_ALL_LABEL:
+        return await _ask_bulk_delete(ctrl, chat_id, None)
+    # A channel row carries the live marker, the file count, and the
+    # total size, and all three move while a channel records. Match the
+    # stable tag only, so a tap still lands after the numbers change.
+    picked = _match_channel_row(ordered, text)
+    if picked is not None:
+        ch = picked
+        ctrl._enter_menu(chat_id, "rec_channel")
+        st = ctrl._state_for(chat_id)
+        st.rec_channel = ch
+        st.rec_offset = 0
+        st.rec_path = None
+        files = by_channel[ch]
+        rows = _page_buttons(len(files), 0, live, files)
+        return _file_page_text(ch, files), ReplyKeyboardMarkup(rows, resize_keyboard=True)
     files = _scan(ctrl)
     if text == "Next ▶":
         state.rec_offset = min(state.rec_offset + PAGE_SIZE, last_page_start(len(files)))
@@ -416,6 +581,8 @@ async def menu_rec_channel(ctrl: TelegramController, chat_id: ChatId, text: str)
         ctrl._state_for(chat_id).rec_channel = None
         return _channel_list_text(ctrl), _channel_keyboard(ctrl)
     live = _live_paths(ctrl)
+    if text == DELETE_CHANNEL_LABEL:
+        return await _ask_bulk_delete(ctrl, chat_id, channel)
     if text == "Next ▶":
         state.rec_offset = min(state.rec_offset + PAGE_SIZE, last_page_start(len(files)))
         rows = _page_buttons(len(files), state.rec_offset, live, files)

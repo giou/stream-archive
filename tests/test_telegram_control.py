@@ -79,9 +79,13 @@ class FakeRecorder:
 class FakeMonitor:
     def __init__(self):
         self.remove_calls = []
+        self.sweeps = []
 
     def remove_channel(self, channel):
         self.remove_calls.append(channel)
+
+    async def check_channels(self, twitch_api, kick_api, config):
+        self.sweeps.append(1)
 
 
 class FakeEventSub:
@@ -615,7 +619,7 @@ def test_apply_now_callback_restarts(tmp_path):
     ctrl._pending_apply[(ADMIN_ID, "wxyz")] = ("Output mode set to youtube", ["twitch:channel1"])
     ctrl._apply_warnings_sent.add((ADMIN_ID, "wxyz"))
     result = asyncio.run(ctrl.handle_callback("cancel:wxyz"))
-    assert result == ("Cancelled \u2014 nothing changed", None)
+    assert result == ("Cancelled - nothing changed", None)
     assert recorder.restart_calls == ["twitch:channel1"]
     assert ctrl._pending_apply == {}
     assert ctrl._apply_warnings_sent == set()
@@ -711,7 +715,7 @@ def test_update_all_unknown_fails(tmp_path):
 
     async def scenario():
         text = await ctrl.handle_update()
-        assert "\u274c Update check failed — try again later." in text
+        assert "\u274c Update check failed - try again later." in text
 
     asyncio.run(scenario())
 
@@ -1090,8 +1094,13 @@ def remote_labels(enabled):
         "Tailscale funnel",
         "Kick webhook",
         "API",
+        "Web panel",
         "Back",
     ]
+
+
+def web_labels(enabled):
+    return [f"{toggle_action(enabled)} Web panel", "New password", "Back"]
 
 
 def mtproto_labels(enabled):
@@ -1213,6 +1222,27 @@ def test_reply_text_add_channel_invalid_stays(tmp_path):
     assert text.startswith("\u274c")
     assert menu_of(ctrl).menu == "add_channel"
     assert read_file(tmp_path) == before
+
+
+def test_add_checks_live_status_at_once(tmp_path):
+    from stream_archive import events as events_mod
+
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path)
+    events_mod.reset()
+    ctrl.bind_live_check(object(), object())
+
+    async def live_sweep(twitch_api, kick_api, config):
+        monitor.sweeps.append(1)
+        recorder._recording.add("twitch:newch")
+
+    monitor.check_channels = live_sweep  # type: ignore[method-assign]
+    text = asyncio.run(ctrl.handle_add(["twitch:newch"]))
+    assert text.startswith("Added twitch:newch")
+    assert "is live - recording started." in text
+    assert monitor.sweeps == [1]
+    kinds = [e["kind"] for e in events_mod.list_events()]
+    assert "config" in kinds  # the add itself lands in the event feed
+    events_mod.reset()
 
 
 def test_reply_text_channel_submenu_mode(tmp_path):
@@ -1556,10 +1586,10 @@ def test_callback_cancel_works_per_confirm_message(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text, markup = asyncio.run(ctrl.handle_callback("cancel:aaaa1111"))
-    assert text == "Cancelled \u2014 nothing changed"
+    assert text == "Cancelled - nothing changed"
     # A second confirm message has a different nonce, so its cancel still works.
     text, markup = asyncio.run(ctrl.handle_callback("cancel:bbbb2222"))
-    assert text == "Cancelled \u2014 nothing changed"
+    assert text == "Cancelled - nothing changed"
     assert read_file(tmp_path) == before
 
 
@@ -1605,7 +1635,7 @@ def test_callback_cancel(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text, markup = asyncio.run(ctrl.handle_callback("cancel:deadbeef"))
-    assert text == "Cancelled \u2014 nothing changed"
+    assert text == "Cancelled - nothing changed"
     assert markup is None
     assert read_file(tmp_path) == before
 
@@ -1676,7 +1706,7 @@ def test_callback_error_surfaces_instead_of_silent_failure(tmp_path):
     update.callback_query.data = "confirm_remove:twitch:channel1:deadbeef"
     asyncio.run(ctrl._on_callback(update, ctx))
     assert update.callback_query.answers == [None]
-    assert update.callback_query.edits == ["\u274c Unexpected error \u2014 see logs"]
+    assert update.callback_query.edits == ["\u274c Unexpected error - see logs"]
     assert ctx.bot.sent == []  # failed tap does not re-render the menu
 
 
@@ -2667,7 +2697,7 @@ def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path):
         return True, None
 
     async def fake_dns(api_token, chat_id=None):
-        return True, "\u2705 DNS record created \u2014 the hostname now points at your tunnel."
+        return True, "\u2705 DNS record created - the hostname now points at your tunnel."
 
     ctrl._cloudflared_named_start = fake_named
     ctrl._create_cloudflare_dns = fake_dns

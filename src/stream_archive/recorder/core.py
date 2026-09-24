@@ -260,7 +260,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         mode = self._effective_mode(channel)
         if raw_mode != mode:
             logger.warning(
-                "[recorder] [%s] audio_only selected but output mode is %s — recording to disk instead",
+                "[recorder] [%s] audio_only selected but output mode is %s - recording to disk instead",
                 channel,
                 raw_mode,
             )
