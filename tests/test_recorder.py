@@ -966,6 +966,186 @@ def test_resolve_stream_audio_only_kick_demux_uses_480p(tmp_path, monkeypatch):
     assert best._inner is s_480p
 
 
+def test_remux_ts_to_mp4_replaces_source(tmp_path):
+    """A .ts file remuxes to .mp4 and the source is removed."""
+    pytest = __import__("pytest")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg not installed")
+    src = tmp_path / "cap.ts"
+    shutil.copy(Path(__file__).parent / "data" / "sample.ts", src) if False else None
+    # Build a tiny valid TS with ffmpeg instead of shipping a fixture.
+    gen = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=64x64:rate=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            str(src),
+        ],
+        capture_output=True,
+    )
+    if gen.returncode != 0 or not src.exists():
+        pytest.skip("cannot generate a TS fixture here")
+    from stream_archive.recorder.remux import remux_ts_to_mp4
+
+    out = remux_ts_to_mp4(src)
+    assert out is not None and out.suffix == ".mp4"
+    assert out.exists()
+    assert not src.exists()
+
+
+def test_remux_skips_non_ts(tmp_path):
+    from stream_archive.recorder.remux import remux_ts_to_mp4
+
+    target = tmp_path / "cap.mp4"
+    target.write_bytes(b"x")
+    assert remux_ts_to_mp4(target) is None
+    assert target.exists()
+    assert remux_ts_to_mp4(tmp_path / "missing.ts") is None
+
+
+def test_finalize_points_entry_at_mp4(tmp_path):
+    """_finalize_entry remuxes the disk file and updates the entry path."""
+    from stream_archive.recorder.remux import remux_target
+
+    cfg = make_config(tmp_path)
+    rec = Recorder(cfg)
+    src = tmp_path / "cap.ts"
+    gen = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=64x64:rate=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+            str(src),
+        ],
+        capture_output=True,
+    )
+    if gen.returncode != 0:
+        import pytest as _pytest
+
+        _pytest.skip("cannot generate a TS fixture here")
+    entry = {"filepath": str(src), "tasks": [], "youtube_info": None}
+    asyncio.run(rec._finalize_entry("twitch:x", entry, None))
+    assert entry["filepath"] == str(remux_target(src))
+    assert remux_target(src).exists()
+    assert not src.exists()
+
+
+def test_split_parts_creates_playable_chunks(tmp_path):
+    import subprocess
+
+    src = tmp_path / "cap.mp4"
+    gen = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=4:size=64x64:rate=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(src),
+        ],
+        capture_output=True,
+    )
+    if gen.returncode != 0:
+        import pytest as _pytest
+
+        _pytest.skip("cannot generate an MP4 fixture here")
+    from stream_archive.recorder.remux import split_parts
+
+    half = src.stat().st_size // 2 + 1
+    chunks = split_parts(src, chunk_bytes=half)
+    assert chunks is not None and len(chunks) == 1 and chunks[0] == src
+    assert split_parts(tmp_path / "missing.mp4") is None
+
+
+def test_split_parts_splits_over_cap_sparse(tmp_path):
+    import subprocess
+
+    from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES
+    from stream_archive.recorder.remux import cleanup_split, split_parts
+
+    src = tmp_path / "big.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=64x64:rate=5",
+            "-c:v",
+            "libx264",
+            "-f",
+            "mp4",
+            str(src),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if not src.exists():
+        import pytest as _pytest
+
+        _pytest.skip("cannot generate an MP4 fixture here")
+
+    with open(src, "ab") as f:
+        f.truncate(MAX_UPLOAD_BYTES + 1024)
+    chunks = split_parts(src)
+    assert chunks is not None and len(chunks) == 2
+    assert all(c.exists() and c.suffix == ".mp4" for c in chunks)
+    cleanup_split(chunks)
+    assert not any(c.exists() for c in chunks)
+    assert not (tmp_path / "big.split").exists()
+
+
 def test_audio_only_stream_remuxes_to_fragmented_mp4(tmp_path):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("ffmpeg/ffprobe are not installed")

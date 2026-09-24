@@ -46,6 +46,12 @@
         "enabled": false,
         "key": ""
     },
+    "mtproto": {
+        "enabled": false,
+        "api_id": 0,
+        "api_hash": "",
+        "session": "mtproto.session"
+    },
     "retention_days": 0,
     "preferred_quality": "best",
     "max_concurrent_recordings": 0,

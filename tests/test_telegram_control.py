@@ -186,8 +186,14 @@ def probe_ok(ctrl):
     ctrl._probe_webhook_url = probe
 
 
+def open_settings(ctrl):
+    """Open the Settings menu, which owns every global setting."""
+    return asyncio.run(ctrl.handle_reply_text("Settings"))
+
+
 def open_remote_access(ctrl):
     """Open the Remote access menu, which owns the public URL and its tunnels."""
+    open_settings(ctrl)
     return asyncio.run(ctrl.handle_reply_text("Remote access"))
 
 
@@ -199,6 +205,7 @@ def open_webhook_menu(ctrl):
 
 def open_storage(ctrl):
     """Open Storage & limits, which owns retention, disk, and the two limits."""
+    open_settings(ctrl)
     return asyncio.run(ctrl.handle_reply_text("Storage & limits"))
 
 
@@ -880,6 +887,7 @@ def test_help_lists_new_commands(tmp_path):
     assert "/maxyoutube <n>" in text
     assert "/disk <maxsize|delete_oldest> <value>" in text
     assert "/chat [on|off]" in text
+    assert "/recordings" in text
     assert "/settings" in text
     assert "/start" in text
 
@@ -1044,13 +1052,15 @@ def assert_valid_html(text):
         raise AssertionError(msg)
 
 
-ROOT_LABELS = [
-    "Channels",
+ROOT_LABELS = ["Channels", "Recordings", "Settings"]
+SETTINGS_LABELS = [
     "Output mode",
     "Quality",
     "Chat recording",
     "Storage & limits",
     "Remote access",
+    "MTProto upload",
+    "Back",
 ]
 STORAGE_LABELS = ["Retention", "Disk limits", "Max recordings", "Max restreams", "Back"]
 KICK_TOKEN_LABELS = ["Back"]
@@ -1082,6 +1092,10 @@ def remote_labels(enabled):
         "API",
         "Back",
     ]
+
+
+def mtproto_labels(enabled):
+    return [f"{toggle_action(enabled)} MTProto upload", "Back"]
 
 
 def webhook_labels(enabled):
@@ -1116,6 +1130,7 @@ def test_command_list_covers_all_handlers(tmp_path):
         "maxyoutube",
         "disk",
         "chat",
+        "recordings",
         "settings",
     }
 
@@ -1124,9 +1139,8 @@ def test_reply_keyboard_root_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     d = ctrl.reply_keyboard("root").to_dict()
     assert d["keyboard"] == [
-        [{"text": "Channels"}, {"text": "Output mode"}],
-        [{"text": "Quality"}, {"text": "Chat recording"}],
-        [{"text": "Storage & limits"}, {"text": "Remote access"}],
+        [{"text": "Channels"}, {"text": "Recordings"}],
+        [{"text": "Settings"}],
     ]
     assert d["resize_keyboard"] is True
 
@@ -1251,6 +1265,7 @@ def test_reply_text_channel_delete_asks_confirm(tmp_path):
 
 def test_reply_text_chat_menu_shows_both_toggles(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    text, markup = asyncio.run(ctrl.handle_reply_text("Settings"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Chat recording"))
     assert "Chat recording (Twitch): on" in text
     assert "Kick chat recording: on" in text
@@ -1262,6 +1277,7 @@ def test_reply_text_chat_disable_twitch_only(tmp_path):
     config, ctrl, recorder, _, eventsub = make_controller(
         tmp_path, channels=["twitch:channel1", "kick:xqc"], recording=["twitch:channel1", "kick:xqc"]
     )
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Disable Twitch chat"))
     assert text == "Twitch chat recording disabled"
@@ -1275,6 +1291,7 @@ def test_reply_text_chat_disable_twitch_only(tmp_path):
 def test_reply_text_chat_enable_kick_only(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     asyncio.run(ctrl.handle_chat(["off"]))  # both off via command
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Enable Kick chat"))
     assert text == "Kick chat recording enabled"
@@ -1286,7 +1303,11 @@ def test_reply_text_chat_enable_kick_only(tmp_path):
 
 def test_reply_text_chat_back_navigation(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Chat recording"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert menu_of(ctrl).menu == "settings"
+    assert kb_labels(markup) == SETTINGS_LABELS
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "root"
     assert kb_labels(markup) == ROOT_LABELS
@@ -1294,20 +1315,22 @@ def test_reply_text_chat_back_navigation(tmp_path):
 
 def test_reply_text_mode_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Output mode"))
     text, markup = asyncio.run(ctrl.handle_reply_text("YouTube"))
     assert read_file(tmp_path)["output_mode"] == "youtube"
     assert config.output_mode == "youtube"
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == SETTINGS_LABELS
 
 
 def test_reply_text_quality_quick(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Quality"))
     text, markup = asyncio.run(ctrl.handle_reply_text("1080p"))
     assert read_file(tmp_path)["preferred_quality"] == "1080p"
     assert config.preferred_quality == "1080p"
-    assert kb_labels(markup) == ROOT_LABELS
+    assert kb_labels(markup) == SETTINGS_LABELS
 
 
 def test_reply_text_retention_quick(tmp_path):
@@ -1363,6 +1386,7 @@ def test_menu_marks_the_current_value(tmp_path):
 
 def test_menu_quality_audio_only_maps_to_value(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Settings"))
     asyncio.run(ctrl.handle_reply_text("Quality"))
     text, markup = asyncio.run(ctrl.handle_reply_text("Audio only"))
     assert read_file(tmp_path)["preferred_quality"] == "audio_only"
@@ -2261,7 +2285,7 @@ def test_reply_text_kick_webhook_menu_flow(tmp_path):
 
 def test_reply_text_remote_access_menu(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Remote access"))
+    text, markup = open_remote_access(ctrl)
     assert "Endpoint: off" in text
     assert "Kick webhook: off" in text
     assert "Control API: off" in text
@@ -2272,8 +2296,7 @@ def test_reply_text_remote_access_menu(tmp_path):
 
 def test_reply_text_remote_access_back_navigation(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote access"))
-    asyncio.run(ctrl.handle_reply_text("Kick webhook"))
+    open_webhook_menu(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "remote_access"
     assert kb_labels(markup) == remote_labels(False)
@@ -2282,6 +2305,9 @@ def test_reply_text_remote_access_back_navigation(tmp_path):
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "remote_access"
     assert kb_labels(markup) == remote_labels(False)
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert menu_of(ctrl).menu == "settings"
+    assert kb_labels(markup) == SETTINGS_LABELS
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "root"
     assert kb_labels(markup) == ROOT_LABELS
@@ -2322,7 +2348,7 @@ def test_reply_text_remote_access_toggle_off_keeps_the_setup(tmp_path):
 
 def test_reply_text_api_enable_shows_generated_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    asyncio.run(ctrl.handle_reply_text("Remote access"))
+    open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("API"))
     assert "Control API: off" in text
     assert kb_labels(markup) == api_labels(False)
@@ -2350,7 +2376,7 @@ def test_reply_text_api_shows_base_url_and_key(tmp_path):
     config.endpoint.public_url = "https://kick.example.com/kick/webhook"
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
-    asyncio.run(ctrl.handle_reply_text("Remote access"))
+    open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("API"))
     asyncio.run(ctrl.handle_reply_text("Enable API"))
     sent, _, _ = api_sent(bot)
@@ -2373,6 +2399,7 @@ def test_reply_text_api_hides_the_key_in_a_group(tmp_path):
     group_id = -1001234567890  # a group chat that holds the bot
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
+    asyncio.run(ctrl.handle_reply_text("Settings", chat_id=group_id))
     asyncio.run(ctrl.handle_reply_text("Remote access", chat_id=group_id))
     asyncio.run(ctrl.handle_reply_text("API", chat_id=group_id))
     asyncio.run(ctrl.handle_reply_text("Enable API", chat_id=group_id))
@@ -2394,7 +2421,7 @@ def test_reply_text_api_disable_keeps_key(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
-    asyncio.run(ctrl.handle_reply_text("Remote access"))
+    open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("API"))
     asyncio.run(ctrl.handle_reply_text("Enable API"))
     key = read_file(tmp_path)["api"]["key"]
@@ -2414,7 +2441,7 @@ def test_reply_text_api_rotate_key_replaces_it(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
-    asyncio.run(ctrl.handle_reply_text("Remote access"))
+    open_remote_access(ctrl)
     asyncio.run(ctrl.handle_reply_text("API"))
     assert asyncio.run(ctrl.handle_reply_text("Rotate key")) is None
     sent, parse_mode, _ = api_sent(bot)

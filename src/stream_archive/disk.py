@@ -68,8 +68,12 @@ def _iter_suffixed(base: Path, suffixes: tuple[str, ...]) -> Iterator[Path]:
     """Yield every file under base whose name ends with one of the suffixes.
 
     One walk covers every suffix, so the archive is read once per scan.
+    Split temp dirs (`<name>.split`) stay out: their chunks are not
+    recordings, and they vanish when the upload finishes.
     """
     for path in base.rglob("*"):
+        if any(part.endswith(".split") for part in path.parts[len(base.parts) : -1]):
+            continue
         if path.name.endswith(suffixes) and path.is_file():
             yield path
 

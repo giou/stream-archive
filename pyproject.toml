@@ -19,6 +19,7 @@ dependencies = [
     "google-auth-oauthlib>=1.0",
     "python-telegram-bot>=20.0",
     "streamlink>=8.4.0",
+    "telethon>=1.44",
     "packaging>=24",
     "websockets>=14",
     "aiohttp>=3.9",

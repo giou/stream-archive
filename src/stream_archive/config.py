@@ -224,6 +224,29 @@ class ApiConfig(BaseModel):
     key: str = ""
 
 
+class MtprotoConfig(BaseModel):
+    """MTProto uploader: send recordings over MTProto, past the Bot API limit.
+
+    The Bot API allows 50 MB uploads. The MTProto client logs in with the
+    same bot token and sends files up to 2 GiB. The api id and the api hash
+    identify the app: keep them in env vars, like the bot token.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: StrictBool = False
+    api_id: int = Field(0, ge=0)
+    api_hash: StrictStr = ""
+    session: str = Field("mtproto.session", min_length=1)
+
+    @model_validator(mode="after")
+    def _require_creds_when_enabled(self) -> MtprotoConfig:
+        if self.enabled and (self.api_id <= 0 or not self.api_hash.strip()):
+            msg = "mtproto.api_id and mtproto.api_hash are required when mtproto.enabled is true"
+            raise ValueError(msg)
+        return self
+
+
 class AppConfig(BaseModel):
     """Typed, validated view of config.json.
 
@@ -262,9 +285,9 @@ class AppConfig(BaseModel):
     disk: DiskConfig = DiskConfig()
     eventsub: EventSubConfig = EventSubConfig()
     endpoint: EndpointConfig = EndpointConfig()
+    mtproto: MtprotoConfig = MtprotoConfig()
     kick: KickConfig = KickConfig()
     api: ApiConfig = ApiConfig()
-
     _workdir: Path = PrivateAttr()
     _config_path: Path = PrivateAttr()
     #: Config path -> (placeholder text, value at load time, after validation).

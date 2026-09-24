@@ -37,7 +37,7 @@ async def menu_chat(ctrl: TelegramController, chat_id: ChatId, text: str) -> Men
 async def menu_mode(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route the output-mode pick."""
     return await pick_preset(
-        ctrl, text, MODE_CHOICES, lambda value: ctrl.handle_mode([value], chat_id=chat_id), "root", chat_id
+        ctrl, text, MODE_CHOICES, lambda value: ctrl.handle_mode([value], chat_id=chat_id), "settings", chat_id
     )
 
 
@@ -48,7 +48,7 @@ async def menu_quality(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
         text,
         QUALITY_CHOICES,
         lambda value: ctrl.handle_quality([value], chat_id=chat_id),
-        "root",
+        "settings",
         chat_id,
     )
 
@@ -93,6 +93,21 @@ async def menu_storage(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
         "Disk limits": "disk",
         "Max recordings": "maxrec",
         "Max restreams": "maxyt",
+    }.get(text)
+    if new_menu is None:
+        return None
+    return await open_menu(ctrl, new_menu, chat_id)
+
+
+async def menu_settings(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route the Settings menu: recording prefs, storage, access, uploads."""
+    new_menu = {
+        "Output mode": "mode",
+        "Quality": "quality",
+        "Chat recording": "chat",
+        "Storage & limits": "storage",
+        "Remote access": "remote_access",
+        "MTProto upload": "mtproto",
     }.get(text)
     if new_menu is None:
         return None

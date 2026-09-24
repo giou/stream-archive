@@ -36,6 +36,7 @@ class SystemCommands:
     _on_restart: Any
     _webhook_state_text: Any
     _endpoint_state_text: Any
+    _mtproto_state_text: Any
 
     def handle_help(self) -> str:
         return (
@@ -56,6 +57,7 @@ class SystemCommands:
             "/disk <maxsize|delete_oldest> <value> - set disk limit\n"
             "/disk - show disk limits\n"
             "/chat [on|off] [twitch|kick] - enable or disable live chat recording (add twitch or kick for one platform; off stops in-flight capture)\n"
+            "/recordings - browse stored recordings (send or delete)\n"
             "/settings - open the settings menu (reply keyboard buttons)\n"
             "/start - this help"
         )
@@ -123,6 +125,7 @@ class SystemCommands:
             f"Kick chat recording: {'enabled' if k.record_chat else 'disabled'}\n"
             f"Endpoint: {endpoint_state}\n"
             f"Kick webhook: {webhook_state}\n"
+            f"MTProto upload: {self._mtproto_state_text()}\n"
             f"Quality: {c.preferred_quality}\n"
             f"Simultaneous recordings: {rec_limit}\n"
             f"YouTube re-streams: {yt_limit}\n"

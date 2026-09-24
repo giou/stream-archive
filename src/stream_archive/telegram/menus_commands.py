@@ -11,7 +11,7 @@ from telegram import BotCommand
 
 
 class CommandsMixin:
-    """The 17 /command entries of the controller."""
+    """The 18 /command entries of the controller."""
 
     _chat_of: Any
     _show_root: Any
@@ -31,6 +31,7 @@ class CommandsMixin:
     handle_maxyoutube: Any
     handle_disk: Any
     handle_chat: Any
+    _open_recordings: Any
     menu_text: Any
     reply_keyboard: Any
 
@@ -53,6 +54,7 @@ class CommandsMixin:
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
             BotCommand("chat", "Toggle live chat recording"),
+            BotCommand("recordings", "Browse stored recordings"),
             BotCommand("settings", "Open the settings menu (reply keyboard buttons)"),
         ]
 
@@ -130,3 +132,10 @@ class CommandsMixin:
             await self.handle_chat(context.args or [], chat_id=self._chat_of(update))
         )
         await self._maybe_send_apply_warnings()
+
+    async def _cmd_recordings(self, update: Any, context: Any) -> None:
+        result = await self._open_recordings(self._chat_of(update))
+        if result is None:
+            return
+        text, markup = result
+        await update.effective_message.reply_text(text, reply_markup=markup)

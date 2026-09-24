@@ -36,13 +36,13 @@ def _channel_gone(ctrl: TelegramController, state: MenuState) -> str | None:
 
 async def menu_root(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
     """Route a press on the root menu."""
+    from stream_archive.telegram import menus_recordings as rec
+
+    if text == "Recordings":
+        return await rec.open_recordings(ctrl, chat_id)
     new_menu = {
         "Channels": "channels",
-        "Output mode": "mode",
-        "Quality": "quality",
-        "Chat recording": "chat",
-        "Storage & limits": "storage",
-        "Remote access": "remote_access",
+        "Settings": "settings",
     }.get(text)
     if new_menu is None:
         return None

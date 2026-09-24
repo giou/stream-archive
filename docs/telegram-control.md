@@ -4,17 +4,19 @@ Only the admin user (`telegram_user_id`) gets replies from the bot. The bot
 registers a command menu (type `/`). It also offers a `/settings` reply
 keyboard.
 
-The root menu holds **Channels**, **Output mode**, **Quality**, **Chat
-recording**, **Storage & limits** (retention, disk, and the two concurrency
-limits), and **Remote access** (the public URL tunnels, the Kick webhook
-toggle, and the HTTP control API). A submenu holds four buttons at most, plus
-**Back**. A toggle button names the action that applies now, for example
-**Disable Kick webhook**. The current value of a preset list carries a check
-mark, for example **✓ 1080p**. A value outside the presets marks **Custom**.
-The channel list keeps **Back** in the first row, because the list can grow
-long. Destructive actions (remove a channel, enable delete-oldest) use inline
-confirmation buttons. The bot re-sends the settings menu after every restart,
-so the reply keyboard survives updates and reboots.
+The root menu holds **Channels**, **Recordings**, and **Settings**.
+**Settings** holds **Output mode**, **Quality**, **Chat recording**,
+**Storage & limits** (retention, disk, and the two concurrency limits),
+**Remote access** (the public URL tunnels, the Kick webhook toggle, and the
+HTTP control API), and **MTProto upload** (send recordings up to 2 GB to this
+chat). A submenu holds four buttons at most, plus **Back**. A toggle button
+names the action that applies now, for example **Disable Kick webhook**. The
+current value of a preset list carries a check mark, for example **✓ 1080p**.
+A value outside the presets marks **Custom**. The channel list keeps **Back**
+in the first row, because the list can grow long. Destructive actions (remove
+a channel, enable delete-oldest, delete a recording) use inline confirmation
+buttons. The bot re-sends the settings menu after every restart, so the reply
+keyboard survives updates and reboots.
 
 The app validates each change and writes it atomically to `config.json`. The
 change applies on the next poll cycle. A failed command leaves memory and disk
@@ -39,9 +41,8 @@ untouched.
 | `/quality [channel] <value\|default>` | Show the preferred quality, or set it globally or for one channel (`best`, `1080p`, `720p`, …, `audio_only`). `default` clears the per-channel override |
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` = unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube re-stream limit (`0` = unlimited) |
-| `/disk` | Show disk limits |
-| `/disk <maxsize\|delete_oldest> <value>` | Set a disk limit. `maxsize` takes GB. `delete_oldest` takes `on`/`off` |
 | `/chat [on\|off] [twitch\|kick]` | Show whether chat recording is on, or set it (globally, or for one platform with `twitch`/`kick`). `off` stops chat capture in flight and finalizes it. Video recordings continue |
+| `/recordings` | Browse stored recordings. Tap a file to send it over MTProto (up to 2 GB) or delete it |
 
 ## Notes
 
@@ -79,9 +80,18 @@ untouched.
   restart.
 - `/restart` replies first, then triggers the scheduler shutdown. The compose
   policy `restart: unless-stopped` relaunches the container.
+- `Recordings` lists stored recordings newest first, five per page. A
+  tap opens the file with **Send** and **Delete**. A file that records
+  now carries a red marker and cannot be deleted. **Send** needs MTProto
+  upload (**Settings** → **MTProto upload**). The Bot API allows 50 MB.
+  MTProto allows files under 2 GB. Files over the cap split into parts.
+  Each part shows its own bar: `(split)`, then `(part 1/5)`. The bar
+  carries a Stop button. If you press Stop, the upload stops and the
+  files stay on disk. A delete asks for confirm and then frees disk
+  space at once.
 - Secrets (bot token, Twitch credentials, proxy credentials, Kick credentials,
-  tunnel tokens) are never printed by `/status`. You cannot change them over
-  Telegram.
+  tunnel tokens, MTProto api id and hash) are never printed by `/status`. You
+  cannot change them over Telegram.
 
 ## Related guides
 

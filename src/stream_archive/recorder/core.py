@@ -29,6 +29,7 @@ from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
 from stream_archive.recorder.common import _open_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
+from stream_archive.recorder.remux import ffmpeg_available, remux_ts_to_mp4_async
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YoutubeOutputMixin
@@ -691,6 +692,19 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         youtube_info = entry.get("youtube_info")
         if youtube_info:
             await self._release_broadcast(channel, youtube_info, entry)
+        await self._remux_finished_file(entry)
+
+    async def _remux_finished_file(self, entry: Recording) -> None:
+        """Stream-copy a finished .ts capture to .mp4 and point the entry at it."""
+        filepath = entry.get("filepath")
+        if not filepath or not str(filepath).lower().endswith(".ts"):
+            return
+        if not ffmpeg_available():
+            logger.warning("[recorder] ffmpeg missing, keeping %s as .ts", filepath)
+            return
+        target = await remux_ts_to_mp4_async(filepath)
+        if target is not None:
+            entry["filepath"] = str(target)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings

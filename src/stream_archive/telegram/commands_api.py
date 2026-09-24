@@ -119,7 +119,9 @@ class ApiCommands:
                     )
             else:
                 lines.append(
-                    _html("No public URL yet \u2014 set up a tunnel under Remote access to reach the API from outside.")
+                    _html(
+                        "No public URL yet \u2014 set up a tunnel under Settings, then Remote access to reach the API from outside."
+                    )
                 )
         if created:
             lines.append(self._key_reveal("API key (keep it secret \u2014 Show key shows it again):", key, chat_id))

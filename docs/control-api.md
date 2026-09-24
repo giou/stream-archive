@@ -9,7 +9,7 @@ The API is off by default.
 ## Enable the API
 
 1. Open `/settings` in Telegram.
-2. Choose **Remote access → API**.
+2. Choose **Settings → Remote access → API**.
 3. Tap **Enable API**.
 
 The bot generates the API key and shows it with the base URL. Tap
@@ -30,7 +30,7 @@ The bot sends the key as code text. Tap the key to put it on the clipboard.
 | Base URL | `<endpoint.public_url>/api/v1/` |
 | Kick webhook URL | `<endpoint.public_url>/kick/webhook` |
 
-The endpoint is the listener plus its tunnel. Open **Remote access** in
+The endpoint is the listener plus its tunnel. Open **Settings → Remote access** in
 Telegram to see its state and to turn it on. While the endpoint is off, the
 API answers on the local address only.
 

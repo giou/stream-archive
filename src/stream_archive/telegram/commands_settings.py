@@ -398,6 +398,19 @@ class SettingsCommands:
                 # and a changed API state from the reloaded file.
                 await self._kick_webhook.apply_state()
                 await self._kick_webhook.sync_channels(self._config.channels)
+            mtproto = getattr(self, "_mtproto", None)
+            if mtproto is None and self._config.mtproto.enabled:
+                notes.append(
+                    "\u26a0\ufe0f MTProto enabled in the file, but no client exists \u2014 restart to create it."
+                )
+            if mtproto is not None:
+                if self._config.mtproto.enabled:
+                    try:
+                        await mtproto.connect()
+                    except Exception:
+                        notes.append("\u26a0\ufe0f MTProto login failed \u2014 check the logs.")
+                else:
+                    await mtproto.rebind()
         except Exception as e:
             # The file is reloaded already, so report the failure instead of
             # leaving the admin without a reply and the state out of sync. A
@@ -410,7 +423,6 @@ class SettingsCommands:
         # Some values are held by an object the process built at startup and
         # cannot be swapped in place: the bot application polls with its own
         # token, and the API clients hold their credentials and cached tokens.
-        # Say so, instead of reporting a revocation or a rotation as applied.
         after = self._config.model_dump()
         stale = [key for key in _RESTART_REQUIRED if _dotted(before, key) != _dotted(after, key)]
         if stale:

@@ -9,6 +9,7 @@ menu branches of its own.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telegram import ReplyKeyboardMarkup
@@ -16,6 +17,8 @@ from telegram import ReplyKeyboardMarkup
 from stream_archive.config import api_base_url
 from stream_archive.telegram import menus_api as api_menus
 from stream_archive.telegram import menus_kick as kick_menus
+from stream_archive.telegram import menus_mtproto as mtproto_menus
+from stream_archive.telegram import menus_recordings as rec_menus
 from stream_archive.telegram import menus_root as root_menus
 from stream_archive.telegram import menus_settings as settings_menus
 from stream_archive.telegram.commands_settings import (
@@ -78,7 +81,13 @@ def _custom_mark(choices: dict[str, str], current: str | None) -> str:
 
 # Keyboards that do not read config state.
 _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
-    "root": [["Channels", "Output mode"], ["Quality", "Chat recording"], ["Storage & limits", "Remote access"]],
+    "root": [["Channels", "Recordings"], ["Settings"]],
+    "settings": [
+        ["Output mode", "Quality"],
+        ["Chat recording", "Storage & limits"],
+        ["Remote access", "MTProto upload"],
+        ["Back"],
+    ],
     "kick_cloudflare_dns": [["Skip DNS"], ["Back"]],
 }
 
@@ -155,6 +164,20 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         )
     if menu == "api":
         return _frame([[f"{_toggle_action(c.api.enabled)} API"], ["Show key", "Rotate key"], ["Back"]])
+    if menu == "mtproto":
+        return _frame([[f"{_toggle_action(c.mtproto.enabled)} MTProto upload"], ["Back"]])
+    if menu == "recordings":
+        ordered, by_channel = rec_menus.channel_rows(ctrl)
+        live = rec_menus._live_paths(ctrl)
+        rows = [[rec_menus.channel_label(ch, by_channel[ch], live)] for ch in ordered]
+        rows.append(["Back"])
+        return _frame(rows)
+    if menu == "rec_detail":
+        rows = [[rec_menus.SEND_LABEL, rec_menus.DELETE_LABEL]]
+        if state.rec_path and not rec_menus.sendable_path(state.rec_path):
+            rows = [[rec_menus.DELETE_LABEL]]
+        rows.append(["Back"])
+        return _frame(rows)
     if menu == "kick_webhook":
         return _frame([[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"], ["Back"]])
     if menu == "kick_cloudflare":
@@ -197,6 +220,62 @@ async def _text_remote_access(ctrl: TelegramController, state: MenuState) -> str
     )
 
 
+async def _text_settings(ctrl: TelegramController, state: MenuState) -> str:
+    return (
+        f"Output mode: {ctrl._config.output_mode}\n"
+        f"Quality: {ctrl._config.preferred_quality}\n"
+        f"Chat recording: {'on' if ctrl._config.record_chat else 'off'}\n"
+        f"Remote access: {ctrl._endpoint_state_text()}\n"
+        f"MTProto upload: {ctrl._mtproto_state_text()}\n\n"
+        "Choose what to change:"
+    )
+
+
+async def _text_mtproto(ctrl: TelegramController, state: MenuState) -> str:
+    if not ctrl._config.mtproto.enabled:
+        return (
+            "MTProto upload: off\n\n"
+            "MTProto sends recordings up to 2 GB to this chat. The Bot API allows 50 MB only.\n"
+            "Set mtproto.api_id and mtproto.api_hash in config.json first "
+            "(use ${TELEGRAM_API_ID} and ${TELEGRAM_API_HASH}), then enable it here."
+        )
+    return (
+        f"MTProto upload: {ctrl._mtproto_state_text()}\n\n"
+        "The client logs in with the bot token. Open Recordings and tap Send on a file."
+    )
+
+
+async def _text_recordings(ctrl: TelegramController, state: MenuState) -> str:
+    from stream_archive.telegram import menus_recordings as rec_menus
+
+    files = rec_menus._scan(ctrl)
+    if not files:
+        return "No recordings stored yet."
+    return f"Recordings ({len(files)}). Tap a file to manage it:"
+
+
+async def _text_rec_channel(ctrl: TelegramController, state: MenuState) -> str:
+    from stream_archive.telegram import menus_recordings as rec_menus
+
+    files = rec_menus._channel_files(ctrl, state.rec_channel or "")
+    if not files:
+        return rec_menus._channel_list_text(ctrl)
+    return rec_menus._file_page_text(state.rec_channel or "", files)
+
+
+async def _text_rec_detail(ctrl: TelegramController, state: MenuState) -> str:
+    from stream_archive.telegram import menus_recordings as rec_menus
+
+    if state.rec_path:
+        body = rec_menus._detail_body(ctrl, Path(state.rec_path))
+        if body is not None:
+            return body[0]
+    files = rec_menus._scan(ctrl)
+    if not files:
+        return "No recordings stored yet."
+    return f"Recordings ({len(files)}). Tap a file to manage it:"
+
+
 async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
     if not ctrl._config.api.enabled:
         return (
@@ -206,7 +285,9 @@ async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
             "Enable it and I generate the API key."
         )
     base = api_base_url(ctrl._config)
-    url_line = f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Remote access."
+    url_line = (
+        f"Base URL: {base}" if base else "Base URL: none yet \u2014 set up a tunnel under Settings, then Remote access."
+    )
     text = f"Control API: on\n{url_line}\nTap Show key to display the key. Changes apply on the next cycle."
     if not ctrl._config.endpoint.enabled:
         text += "\nThe public URL needs remote access. Turn it on to reach the API from outside."
@@ -431,6 +512,7 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "disk_maxsize": _text_disk_maxsize,
     "custom": _text_custom,
     "storage": _text_storage,
+    "settings": _text_settings,
     "remote_access": _text_remote_access,
     "api": _text_api,
     "kick_webhook": _text_kick_webhook,
@@ -439,6 +521,10 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "kick_cloudflare_token": _text_kick_cloudflare_token,
     "kick_cloudflare_hostname": _text_kick_cloudflare_hostname,
     "kick_cloudflare_dns": _text_kick_cloudflare_dns,
+    "mtproto": _text_mtproto,
+    "recordings": _text_recordings,
+    "rec_channel": _text_rec_channel,
+    "rec_detail": _text_rec_detail,
 }
 
 HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuResult]]] = {
@@ -459,8 +545,13 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "disk_maxsize": settings_menus.menu_disk_maxsize,
     "custom": settings_menus.menu_custom,
     "storage": settings_menus.menu_storage,
+    "settings": settings_menus.menu_settings,
     "remote_access": kick_menus.menu_remote_access,
     "api": api_menus.menu_api,
+    "mtproto": mtproto_menus.menu_mtproto,
+    "recordings": rec_menus.menu_recordings,
+    "rec_channel": rec_menus.menu_rec_channel,
+    "rec_detail": rec_menus.menu_rec_detail,
     "kick_webhook": kick_menus.menu_kick_webhook,
     "kick_cloudflare": kick_menus.menu_kick_cloudflare,
     "kick_tailscale": kick_menus.menu_kick_tailscale,
@@ -477,17 +568,22 @@ PARENT: dict[str, str] = {
     "channel_mode": "channel",
     "channel_hold": "channel",
     "channel_quality": "channel",
-    "chat": "root",
-    "mode": "root",
-    "quality": "root",
+    "chat": "settings",
+    "mode": "settings",
+    "quality": "settings",
+    "settings": "root",
     "retention": "storage",
     "maxrec": "storage",
     "maxyt": "storage",
-    "storage": "root",
+    "storage": "settings",
     "disk": "storage",
     "disk_maxsize": "disk",
-    "remote_access": "root",
+    "remote_access": "settings",
     "api": "remote_access",
+    "mtproto": "settings",
+    "recordings": "root",
+    "rec_channel": "recordings",
+    "rec_detail": "rec_channel",
     "kick_webhook": "remote_access",
     "kick_cloudflare": "remote_access",
     "kick_tailscale": "remote_access",
@@ -514,6 +610,30 @@ async def menu_back(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
         ctrl._show_root(chat_id)  # unknown menu: fall back to root, like dispatch_text
         return await ctrl.menu_text("root", chat_id=chat_id), ctrl.reply_keyboard("root", chat_id=chat_id)
     ctrl._enter_menu(chat_id, parent)
+    if parent == "recordings":
+        from stream_archive.telegram import menus_recordings as rec_menus
+
+        ordered, _ = rec_menus.channel_rows(ctrl)
+        if ordered:
+            return rec_menus._channel_list_text(ctrl), rec_menus._channel_keyboard(ctrl)
+    if parent == "rec_channel":
+        from stream_archive.telegram import menus_recordings as rec_menus
+
+        state = ctrl._state_for(chat_id)
+        files = rec_menus._channel_files(ctrl, state.rec_channel or "")
+        if files:
+            offset = rec_menus._clamp_offset(ctrl, chat_id, len(files))
+            live = rec_menus._live_paths(ctrl)
+            rows = rec_menus._page_buttons(len(files), offset, live, files)
+            from telegram import ReplyKeyboardMarkup
+
+            return rec_menus._file_page_text(state.rec_channel or "", files), ReplyKeyboardMarkup(
+                rows, resize_keyboard=True
+            )
+        ordered, _ = rec_menus.channel_rows(ctrl)
+        if ordered:
+            ctrl._enter_menu(chat_id, "recordings")
+            return rec_menus._channel_list_text(ctrl), rec_menus._channel_keyboard(ctrl)
     return await ctrl.menu_text(parent, chat_id=chat_id), ctrl.reply_keyboard(parent, chat_id=chat_id)
 
 
@@ -546,8 +666,10 @@ async def render_text(
     return await text_fn(ctrl, state)
 
 
-def render_keyboard(ctrl: TelegramController, menu: str, channel: str | None = None) -> ReplyKeyboardMarkup:
+def render_keyboard(
+    ctrl: TelegramController, menu: str, channel: str | None = None, rec_path: str | None = None
+) -> ReplyKeyboardMarkup:
     """Build the keyboard for ``menu``. An unknown menu gets the Back button."""
     if menu not in TEXT:
         return _frame([["Back"]])
-    return _keyboard(ctrl, MenuState(menu=menu, channel=channel), menu)
+    return _keyboard(ctrl, MenuState(menu=menu, channel=channel, rec_path=rec_path), menu)

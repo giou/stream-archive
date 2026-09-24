@@ -5,7 +5,7 @@ poll alone cannot deliver chat, because Kick has no chat replay.
 
 ## Set the public URL
 
-Open `/settings` in Telegram and choose **Remote access**. That menu sets the
+Open `/settings` in Telegram and choose **Settings → Remote access**. That menu sets the
 public URL. It offers these options:
 
 - **Cloudflare tunnel.** A *Quick tunnel* needs no account and gives a

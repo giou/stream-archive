@@ -63,6 +63,9 @@ class MenuState:
     channel: str | None = None
     custom: str | None = None
     cloudflare_hostname: str | None = None
+    rec_offset: int = 0
+    rec_path: str | None = None
+    rec_channel: str | None = None
 
 
 #: Fields of ``MenuState`` that one menu reads. Navigation clears every field
@@ -78,6 +81,11 @@ _OWNED_FIELDS: dict[str, frozenset[str]] = {
     "custom": frozenset({"channel", "custom"}),
     # The DNS step reads the hostname that the hostname step stored.
     "kick_cloudflare_dns": frozenset({"cloudflare_hostname"}),
+    # The recordings browser keeps its page and its picked file. The
+    # channel page keeps its channel too; the list owns neither file.
+    "recordings": frozenset({"rec_offset"}),
+    "rec_channel": frozenset({"rec_offset", "rec_channel"}),
+    "rec_detail": frozenset({"rec_offset", "rec_path", "rec_channel"}),
 }
 
 #: Menu that owns each custom value setting.
@@ -202,6 +210,12 @@ class ChatStateMixin:
             state.custom = None
         if "cloudflare_hostname" not in owned:
             state.cloudflare_hostname = None
+        if "rec_offset" not in owned:
+            state.rec_offset = 0
+        if "rec_path" not in owned:
+            state.rec_path = None
+        if "rec_channel" not in owned:
+            state.rec_channel = None
         state.menu = menu
         return state
 

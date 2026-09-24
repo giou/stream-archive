@@ -64,6 +64,11 @@ class AdminCallbackQueryHandler(CallbackQueryHandler[Any, Any]):
         self._admin_id = admin_id
 
 
+def single_keyboard(label: str, data: str) -> InlineKeyboardMarkup:
+    """Build a one-button inline keyboard. Used for the upload stop button."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=data)]])
+
+
 def confirm_keyboard(action: str, value: str) -> InlineKeyboardMarkup:
     """Build a confirm/cancel keyboard with a unique nonce per message."""
     # The nonce makes the callback data unique per confirm message, so the
@@ -79,18 +84,35 @@ def confirm_keyboard(action: str, value: str) -> InlineKeyboardMarkup:
     )
 
 
+async def handle_stop_upload(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
+    """Stop a running MTProto upload: ``mtproto_stop:<nonce>``."""
+    nonce = data.split(":", 1)[1] if ":" in data else ""
+    if ctrl._press_handled(chat_id, nonce):
+        return None
+    task = ctrl._mtproto_sends.pop((chat_id, nonce), None)
+    if task is None or task.done():
+        ctrl._mark_confirm_done(chat_id, nonce)
+        return "No upload runs for that button. Send the file again.", None
+    task.cancel()
+    ctrl._mark_confirm_done(chat_id, nonce)
+    return None
+
+
 async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
     """Apply one confirmation-button press for ``chat_id``.
 
     Return ``(reply_text, markup)`` on success or ``None`` for an unknown
     or already handled press. Wire format (from ``confirm_keyboard``):
-    ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Apply-now
-    warnings use ``apply_now:<nonce>``, audio-only switches use
-    ``audio_confirm:<nonce>``. The nonce is the last field of every form, and
-    it guards the whole prompt: the two buttons of one message are mutually
-    exclusive, so a Cancel retires the Confirm of its message and the other
-    way round. A later message carries a new nonce and still works.
+    ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Upload stop
+    buttons use ``mtproto_stop:<nonce>``. Apply-now warnings use
+    ``apply_now:<nonce>``, audio-only switches use ``audio_confirm:<nonce>``.
+    The nonce is the last field of every form, and it guards the whole
+    prompt: the two buttons of one message are mutually exclusive, so a
+    Cancel retires the Confirm of its message and the other way round. A
+    later message carries a new nonce and still works.
     """
+    if data.startswith("mtproto_stop:"):
+        return await handle_stop_upload(ctrl, data, chat_id)
     parts = data.split(":")
     action = parts[0]
     nonce = parts[-1]
@@ -105,6 +127,13 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         ctrl._apply_warnings_sent.discard(pending_key)
         ctrl._mark_confirm_done(chat_id, nonce)
         return "Cancelled \u2014 nothing changed", None
+    if action == "confirm_recdel" and len(parts) >= 3:
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
+            return None
+        ctrl._mark_confirm_done(chat_id, nonce)  # a re-tap must not re-delete
+        from stream_archive.telegram import menus_recordings as rec
+
+        return await rec.handle_rec_callback(ctrl, data, chat_id)
     if action == "confirm_remove" and len(parts) >= 3:
         if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None

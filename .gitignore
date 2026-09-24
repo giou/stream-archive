@@ -26,6 +26,7 @@ chat/
 *:Zone.Identifier
 client_secret*.json
 credentials*.json
+*.session
 .venv/
 *.bak
 # Deployment settings (docs/running.md). No .env template ships yet; the

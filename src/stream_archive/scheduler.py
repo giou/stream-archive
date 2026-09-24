@@ -14,6 +14,7 @@ from stream_archive.http import build_http_client
 from stream_archive.kick_api import KickAPI
 from stream_archive.kick_webhook import KickWebhook
 from stream_archive.monitor import Monitor
+from stream_archive.mtproto_upload import MtprotoUploader
 from stream_archive.notifier import Notifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
@@ -123,7 +124,7 @@ async def run_scheduler() -> None:
     updater: UpdateChecker | None = None
     updater_task: asyncio.Task[None] | None = None
     telegram: TelegramController | None = None
-
+    mtproto: MtprotoUploader | None = None
     # Every resource inside the try below shuts down in order. A failed
     # Telegram start, for example, must not leave a recording or a held
     # YouTube broadcast behind.
@@ -153,6 +154,13 @@ async def run_scheduler() -> None:
         else:
             logger.info("[updater] Update check disabled")
 
+        if config.mtproto.enabled:
+            mtproto = MtprotoUploader(config)
+            try:
+                await mtproto.connect()
+            except Exception:
+                logger.warning("[mtproto] Connect failed at startup", exc_info=True)
+
         telegram = TelegramController(
             config,
             recorder,
@@ -162,6 +170,7 @@ async def run_scheduler() -> None:
             updater=updater,
             kick_webhook=kick_webhook,
             http=shared_http,
+            mtproto=mtproto,
         )
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)
@@ -199,6 +208,7 @@ async def run_scheduler() -> None:
             telegram=telegram,
             youtube_streamer=youtube_streamer,
             shared_http=shared_http,
+            mtproto=mtproto,
         )
 
 
@@ -280,6 +290,7 @@ async def _shutdown(
     telegram: TelegramController | None,
     youtube_streamer: YouTubeStreamer | None,
     shared_http: Any,
+    mtproto: MtprotoUploader | None = None,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest.
 
@@ -307,6 +318,20 @@ async def _shutdown(
             await telegram.stop()
         except Exception:
             logger.error("[scheduler] telegram stop failed", exc_info=True)
+    active = telegram._mtproto if telegram is not None else None
+    if active is None:
+        active = mtproto
+    if active is not None or telegram is not None:
+        try:
+            tasks = list(telegram._mtproto_tasks) if telegram is not None else []
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if active is not None:
+                await active.disconnect()
+        except Exception:
+            logger.error("[scheduler] mtproto disconnect failed", exc_info=True)
     if health_runner is not None:
         try:
             await health_runner.cleanup()

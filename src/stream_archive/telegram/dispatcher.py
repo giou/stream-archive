@@ -28,6 +28,7 @@ from stream_archive.telegram import menus
 from stream_archive.telegram import menus_callbacks as callbacks
 from stream_archive.telegram.commands_api import ApiCommands
 from stream_archive.telegram.commands_channels import ChannelsCommands
+from stream_archive.telegram.commands_mtproto import MtprotoCommands
 from stream_archive.telegram.commands_settings import SettingsCommands
 from stream_archive.telegram.commands_system import SystemCommands
 from stream_archive.telegram.commands_webhook import WebhookCommands
@@ -70,7 +71,14 @@ def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, 
 
 
 class TelegramController(
-    ChatStateMixin, CommandsMixin, ChannelsCommands, SettingsCommands, ApiCommands, WebhookCommands, SystemCommands
+    ChatStateMixin,
+    CommandsMixin,
+    ChannelsCommands,
+    SettingsCommands,
+    ApiCommands,
+    WebhookCommands,
+    SystemCommands,
+    MtprotoCommands,
 ):
     _config: AppConfig
     _recorder: Any
@@ -78,6 +86,10 @@ class TelegramController(
     _eventsub: Any
     _updater: Any
     _kick_webhook: Any
+    _mtproto: Any
+    _mtproto_tasks: set[asyncio.Task[None]]
+    _sending_paths: set[str]
+    _mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]]
     _http: Any
     _owns_http: bool
     _app: Application[Any, Any, Any, Any, Any, Any]
@@ -96,6 +108,7 @@ class TelegramController(
         updater: Any = None,
         kick_webhook: Any = None,
         http: Any = None,
+        mtproto: Any = None,
     ) -> None:
         self._config = config
         self._recorder = recorder
@@ -104,6 +117,7 @@ class TelegramController(
         self._on_restart = on_restart
         self._updater = updater
         self._kick_webhook = kick_webhook
+        self._mtproto = mtproto
         if http is not None:
             self._http = http
             self._owns_http = False
@@ -116,6 +130,10 @@ class TelegramController(
         self._admin_filter = filters.User(user_id=self._admin_id)
         self._app = Application.builder().token(config.bot_telegram_api).build()
         self._init_chat_state()
+        self._mtproto_tasks: set[asyncio.Task[None]] = set()
+        self._sending_paths: set[str] = set()
+        self._mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]] = {}
+        self._pending_delete: dict[tuple[ChatId, str], str] = {}
         self._cloudflared = CloudflaredTunnel()
         # One managed cloudflared process serves the whole app, so a tunnel
         # press must not interleave with another one. See menu_kick_cloudflare.
@@ -165,6 +183,7 @@ class TelegramController(
             CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
+            CommandHandler("recordings", self._cmd_recordings, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
             CommandHandler("start", self._cmd_help, filters=admin),
             MessageHandler(filters.TEXT & ~filters.COMMAND & admin, self._on_text),
@@ -265,18 +284,18 @@ class TelegramController(
     async def _maybe_send_apply_warnings(self) -> None:
         await callbacks.maybe_send_apply_warnings(self)
 
-    async def _replace_callback_text(self, query: Any, context: Any, text: str) -> None:
+    async def _replace_callback_text(self, query: Any, context: Any, text: str, reply_markup: Any = None) -> None:
         """Replace the pressed message with ``text``, or resend it if it went away.
 
         A Telegram error must not escape: the press is already answered, and
         the remaining steps of the handler still run.
         """
         try:
-            await query.edit_message_text(text, reply_markup=None)
+            await query.edit_message_text(text, reply_markup=reply_markup)
         except BadRequest:
             # The message vanished, or its text did not change: send a fresh one.
             try:
-                await context.bot.send_message(chat_id=query.from_user.id, text=text)
+                await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup)
             except Exception:
                 logger.warning("[telegram] Failed to send the callback reply", exc_info=True)
         except Exception:
@@ -301,14 +320,18 @@ class TelegramController(
             with contextlib.suppress(BadRequest):
                 await query.answer()
             return
-        text, _ = result
+        text, markup = result
         with contextlib.suppress(BadRequest):
             await query.answer()
-        await self._replace_callback_text(query, context, text)
+        await self._replace_callback_text(query, context, text, reply_markup=markup)
         # A callback can apply a change that defers onto a running
         # recording (the audio-only confirm). Send its prompt now, as the
         # text paths do, instead of waiting for the next typed message.
         await self._maybe_send_apply_warnings()
+        from telegram import ReplyKeyboardMarkup as _RKM
+
+        if isinstance(markup, _RKM):
+            return
         await self._send_menu(context, self._callback_chat_of(update))
 
     async def _send_menu(self, context: Any, chat_id: ChatId) -> None:
@@ -319,6 +342,10 @@ class TelegramController(
             text=await self.menu_text(state.menu, state.channel, chat_id=chat_id),
             reply_markup=self.reply_keyboard(state.menu, state.channel, chat_id=chat_id),
         )
+
+    def _sending_rec_path(self, path: str) -> bool:
+        """True when an upload of ``path`` already runs."""
+        return path in self._sending_paths
 
     async def _on_text(self, update: Any, context: Any) -> None:
         message = update.effective_message
@@ -356,7 +383,9 @@ class TelegramController(
         passes none.
         """
         state = self._state_for(chat_id if chat_id is not None else self._admin_id)
-        return menus.render_keyboard(self, menu, channel if channel is not None else state.channel)
+        return menus.render_keyboard(
+            self, menu, channel if channel is not None else state.channel, rec_path=state.rec_path
+        )
 
     async def menu_text(self, menu: str = "root", channel: str | None = None, chat_id: ChatId | None = None) -> str:
         """Return the status or instruction body shown above the reply keyboard for ``menu``."""
@@ -366,3 +395,9 @@ class TelegramController(
     async def handle_reply_text(self, text: str, chat_id: ChatId | None = None) -> MenuResult:
         """Route one reply-keyboard press or typed value for ``chat_id`` (admin by default)."""
         return await menus.dispatch_text(self, chat_id if chat_id is not None else self._admin_id, text)
+
+    async def _open_recordings(self, chat_id: ChatId) -> MenuResult:
+        """Open the recordings browser for ``chat_id`` (slash command entry)."""
+        from stream_archive.telegram import menus_recordings as rec
+
+        return await rec.open_recordings(self, chat_id)
