@@ -38,6 +38,44 @@ def channel_recording_dir(config: AppConfig, channel_dir: str) -> Path:
     return resolve_recording_dir(config) / channel_dir
 
 
+#: Suffixes the thumbnail cache serves: video captures only, never audio.
+THUMBNAIL_SUFFIXES = (".mp4", ".ts")
+
+#: Suffix of the cached thumbnail images.
+THUMBNAIL_IMAGE_SUFFIX = ".jpg"
+
+
+def thumbnail_dir(config: AppConfig) -> Path:
+    """Thumbnail cache dir: ``.cache/thumbnails`` inside the data dir."""
+    return config.workdir / ".cache" / "thumbnails"
+
+
+def thumbnail_path(config: AppConfig, recording: Path) -> Path | None:
+    """Cache file of one recording thumbnail, or None outside the archive.
+
+    The cache mirrors the archive layout, so one channel removal drops one
+    subtree. Only video suffixes map; audio and foreign paths give None.
+    """
+    if recording.suffix.lower() not in THUMBNAIL_SUFFIXES:
+        return None
+    try:
+        rel = recording.resolve().relative_to(resolve_recording_dir(config).resolve())
+    except ValueError, OSError:
+        return None
+    return thumbnail_dir(config) / rel.parent / (recording.stem + THUMBNAIL_IMAGE_SUFFIX)
+
+
+def drop_thumbnail(config: AppConfig, recording: Path) -> None:
+    """Remove one cached thumbnail. Never raises."""
+    target = thumbnail_path(config, recording)
+    if target is None:
+        return
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("[disk] thumbnail cleanup failed for %s", target)
+
+
 #: File suffixes of the recording artifacts: video captures, then audio-only.
 _RECORDING_SUFFIXES = (".mp4", ".mkv", ".ts", ".m4a")
 

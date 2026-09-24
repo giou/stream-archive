@@ -157,8 +157,8 @@ def test_panel_login_works_with_bot_password(tmp_path):
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.post("/web/api/login", json={"password": password})
-            status = await (await client.get("/web/api/status")).json()
+            resp = await client.post("/api/login", json={"password": password})
+            status = await (await client.get("/api/status")).json()
             return resp.status, status["telegram_enabled"]
 
     login_status, telegram_on = asyncio.run(scenario())
@@ -191,15 +191,15 @@ def test_new_password_ends_browser_sessions(tmp_path):
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
-            login_resp = await client.post("/web/api/login", json={"password": first})
+            login_resp = await client.post("/api/login", json={"password": first})
             assert login_resp.status == 200
-            before = (await client.get("/web/api/status")).status
+            before = (await client.get("/api/status")).status
             rotated = await ctrl._new_web_password()
             second = password_of(rotated)
             assert second != first
-            after = (await client.get("/web/api/status")).status
-            old = (await client.post("/web/api/login", json={"password": first})).status
-            new = (await client.post("/web/api/login", json={"password": second})).status
+            after = (await client.get("/api/status")).status
+            old = (await client.post("/api/login", json={"password": first})).status
+            new = (await client.post("/api/login", json={"password": second})).status
             return before, after, old, new, second
 
     before, after, old, new, second = asyncio.run(scenario())

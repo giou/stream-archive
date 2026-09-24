@@ -1,4 +1,4 @@
-"""Browser control panel served on the shared listener under ``/web/``.
+"""Browser control panel served on the shared listener at the domain root.
 
 The panel replaces the Telegram bot: it needs no Telegram token. The bot
 and the panel can run at once. The panel shares the listener with the
@@ -13,18 +13,20 @@ Security model (the panel is exposed through a tunnel):
   local access). Each session owns a CSRF token, required on every
   state-changing call.
 * Failed logins are rate limited per address and answered slowly.
-* Every ``/web/*`` response carries hardening headers. No response
+* Every panel response carries hardening headers. No response
   carries a secret. Recording paths stay inside the archive dir.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections import deque
@@ -55,6 +57,16 @@ from stream_archive.config import (
     normalize_channel_name,
     telegram_enabled,
 )
+from stream_archive.emotes import (
+    TWITCH_EMOTE_URL as _TWITCH_EMOTE_URL,
+)
+from stream_archive.emotes import (
+    fetch_channel_emotes,
+    fetch_global_emotes,
+    sniff_mime,
+)
+from stream_archive.http import build_http_client
+from stream_archive.kick_chat import EMOTE_URL as _KICK_EMOTE_URL
 from stream_archive.updater import installed_app_version
 
 if TYPE_CHECKING:
@@ -95,6 +107,13 @@ MIN_PASSWORD_LEN = 12
 #: Cookie of the panel session.
 _COOKIE_NAME = "sa_session"
 
+#: File of the panel sessions, next to config.json. The data dir is a
+#: persistent volume, so logins survive restarts of the app and the container.
+_SESSIONS_FILENAME = "web_sessions.json"
+
+#: Cap of live and stored sessions. Login past it drops the oldest one.
+_SESSIONS_MAX = 512
+
 #: Video and audio suffixes the browser plays inline. Finished recordings
 #: are MP4 (M4A for audio-only): the recorder remuxes .ts at stop.
 _PLAYABLE_SUFFIXES = (".mp4", ".m4a")
@@ -118,9 +137,21 @@ _RECORDINGS_LIMIT_MAX = 1000
 
 _CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
-    "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
+    "img-src 'self' data: https://static-cdn.jtvnw.net https://cdn.7tv.app "
+    "https://cdn.betterttv.net https://cdn.frankerfacez.com https://files.kick.com; "
+    "media-src 'self' blob:; connect-src 'self'; "
     "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 )
+
+#: Cache lifetime of one channel emote set, in seconds.
+_EMOTE_SET_TTL_S = 3600
+
+#: Cache lifetime of the global emote sets, in seconds.
+_EMOTE_GLOBAL_TTL_S = 86400
+
+#: Cache lifetime of a failed emote lookup, in seconds. A short wait keeps
+#: a chat reopen from hammering a down provider.
+_EMOTE_FAIL_TTL_S = 300
 
 
 class _WebError(Exception):
@@ -161,7 +192,7 @@ def verify_password(password: str, stored: str) -> bool:
 
 @dataclass
 class _Session:
-    """One login: its CSRF token, its expiry (monotonic), and its password tag."""
+    """One login: its CSRF token, its expiry (wall-clock epoch seconds), and its password tag."""
 
     csrf: str
     expires: float
@@ -178,6 +209,118 @@ def _pwd_tag(password_hash: str) -> str:
 _CHAT_MAX_MESSAGES = 5000
 
 
+def _embedded_map(payload: dict[str, Any]) -> dict[str, str]:
+    """Emote id to data-URI image of the embeddedData block, or empty.
+
+    Entries with undecodable data or an unknown image type are skipped:
+    the caller falls back to the CDN and live lookups for those ids.
+    """
+    import base64
+
+    out: dict[str, str] = {}
+    block = payload.get("embeddedData")
+    entries = block.get("firstParty") if isinstance(block, dict) else None
+    if not isinstance(entries, list):
+        return out
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        eid, data = entry.get("id"), entry.get("data")
+        if not isinstance(eid, str) or not eid or not isinstance(data, str) or not data:
+            continue
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            continue
+        mime = sniff_mime(raw)
+        if mime is None:
+            continue
+        out[eid] = f"data:{mime};base64,{data}"
+    return out
+
+
+def _capture_spans(
+    fragments: Any, text: str, kick: bool, embedded: dict[str, str] | None = None
+) -> list[tuple[int, int, str]]:
+    """(start, end, image URL) of the captured emotes in ``text``.
+
+    Twitch fragments carry Twitch emote ids, Kick fragments carry Kick
+    ids, so the artwork URL follows the platform of the recording. Ids
+    with an embedded image use its data URI first: the replay then shows
+    the emotes of the recording, even offline. The capture stores
+    fragments in order, so positions follow the running offset. A
+    fragment that does not match stops the walk: the rest stays plain
+    words instead of pointing at the wrong slice.
+    """
+    template = _KICK_EMOTE_URL if kick else _TWITCH_EMOTE_URL
+    spans: list[tuple[int, int, str]] = []
+    if not isinstance(fragments, list):
+        return spans
+    pos = 0
+    for frag in fragments:
+        if not isinstance(frag, dict):
+            continue
+        piece = frag.get("text")
+        if not isinstance(piece, str) or not piece:
+            continue
+        emo = frag.get("emoticon")
+        eid = emo.get("emoticon_id") if isinstance(emo, dict) else None
+        if not isinstance(eid, str) or not eid:
+            pos += len(piece)
+            continue
+        if not text.startswith(piece, pos) or pos + len(piece) > len(text):
+            break
+        src = embedded.get(eid) if embedded else None
+        spans.append((pos, pos + len(piece), src or template.format(id=eid)))
+        pos += len(piece)
+    return spans
+
+
+#: Punctuation stripped around an emote word. Exact names match first,
+#: so wrapped codes like ``:tf:`` still resolve before stripping.
+_WORD_PUNCT = "!\"#$%&'()*+,-./:;=?@[\\]^_`{|}~"
+
+
+def _word_spans(text: str, names: dict[str, str], taken: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """(start, end, image URL) of third-party emotes in ``text``.
+
+    Whole whitespace-separated words, outside the captured spans. A word
+    with attached punctuation (``baseg!``) still resolves, and the span
+    covers the emote part only.
+    """
+    if not names:
+        return []
+    out: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"\S+", text):
+        token = match.group(0)
+        url = names.get(token)
+        word = token
+        if url is None:
+            word = token.strip(_WORD_PUNCT)
+            url = names.get(word) if word and word != token else None
+        if url is None:
+            continue
+        start = match.start() + (token.find(word) if word != token else 0)
+        end = start + len(word)
+        if any(s < end and start < e for s, e, _ in taken):
+            continue
+        out.append((start, end, url))
+    return out
+
+
+def _chat_channel_id(payload: dict[str, Any], comments: list[Any]) -> str:
+    """Twitch channel id of a chat file: first comment, else the trailer."""
+    for comment in comments:
+        if isinstance(comment, dict):
+            cid = comment.get("channel_id")
+            if cid:
+                return str(cid)
+    streamer = payload.get("streamer")
+    if isinstance(streamer, dict) and streamer.get("id"):
+        return str(streamer["id"])
+    return ""
+
+
 class WebUI:
     """Serve the browser panel on the shared listener."""
 
@@ -186,15 +329,22 @@ class WebUI:
         config: AppConfig,
         controller: TelegramController,
         recorder: Recorder,
+        http: Any = None,
     ) -> None:
         self._config = config
         self._ctrl = controller
         self._recorder = recorder
-        # The secret stays empty in fresh configs. An ephemeral secret then
-        # signs sessions, so every restart ends them. The live config value
-        # always wins: rotating it ends every session at once.
+        self._http = http if http is not None else build_http_client()
+        self._owns_http = http is None
+        self._emote_sets: dict[str, tuple[float, dict[str, str]]] = {}
+        self._emote_globals: tuple[float, dict[str, str]] | None = None
+        # A fresh config carries no secret. The panel stores a generated
+        # secret in config.json on first boot (see register_routes), so
+        # logins survive restarts. Until then an ephemeral secret signs
+        # sessions. Stored sessions return here, minus the expired ones.
         self._ephemeral = secrets.token_hex(32)
         self._sessions: dict[str, _Session] = {}
+        self._load_sessions()
         self._login_fails: dict[str, deque[float]] = {}
         self._assets = _load_assets()
 
@@ -203,44 +353,127 @@ class WebUI:
         configured = self._config.web.session_secret.strip()
         return configured or self._ephemeral
 
+    def _ensure_secret(self) -> None:
+        """Store a lasting session secret in config.json, once.
+
+        Fresh configs carry an empty secret. Without this step every
+        restart signs cookies with a new random secret and ends all
+        logins. A read-only config keeps the old behavior: logins work
+        until the next restart.
+        """
+        if self._config.web.session_secret.strip() or not self._config.web.enabled:
+            return
+        try:
+            secret = secrets.token_hex(32)
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.web.session_secret = secret
+
+            apply_config_change(self._config, mutate)
+        except Exception:
+            logger.warning("[web] Cannot store the session secret, sessions end on restart", exc_info=True)
+            return
+        logger.info("[web] Stored a session secret: logins survive restarts")
+
+    def _sessions_path(self) -> Path | None:
+        """File of the stored sessions, or None when the config is unbound."""
+        try:
+            return self._config.workdir / _SESSIONS_FILENAME
+        except RuntimeError:
+            return None
+
+    def _load_sessions(self) -> None:
+        """Read stored sessions into memory. A bad file starts empty."""
+        path = self._sessions_path()
+        if path is None:
+            return
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.warning("[web] Cannot read %s, sessions start empty", path)
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError, UnicodeDecodeError:
+            logger.warning("[web] %s is not valid JSON, sessions start empty", path)
+            return
+        if not isinstance(payload, dict):
+            logger.warning("[web] %s holds no session map, sessions start empty", path)
+            return
+        now = time.time()
+        loaded: dict[str, _Session] = {}
+        for sid, entry in payload.items():
+            if not isinstance(sid, str) or not isinstance(entry, dict):
+                continue
+            csrf = entry.get("csrf")
+            expires = entry.get("expires")
+            pwd = entry.get("pwd")
+            if not isinstance(csrf, str) or not csrf:
+                continue
+            if isinstance(expires, bool) or not isinstance(expires, (int, float)) or expires <= now:
+                continue
+            if not isinstance(pwd, str) or not pwd:
+                continue
+            if len(loaded) >= _SESSIONS_MAX:
+                break
+            loaded[sid] = _Session(csrf=csrf, expires=float(expires), pwd=pwd)
+        self._sessions = loaded
+        if loaded:
+            logger.info("[web] Restored %d session(s) after a restart", len(loaded))
+
+    def _save_sessions(self) -> None:
+        """Write the live sessions next to config.json. Never fails a request."""
+        path = self._sessions_path()
+        if path is None:
+            return
+        payload = {sid: {"csrf": s.csrf, "expires": s.expires, "pwd": s.pwd} for sid, s in self._sessions.items()}
+        try:
+            _write_private_json(path, payload)
+        except OSError:
+            logger.warning("[web] Cannot store sessions in %s", path)
+
     def register_routes(self, kick_webhook: Any) -> None:
         """Add the panel routes to the shared listener.
 
         Call before the listener starts. One application serves the
         webhook, the control API, and the panel.
         """
-        if not self._config.web.session_secret.strip():
-            logger.info("[web] Session secret is ephemeral: every restart ends all sessions")
+        self._ensure_secret()
         kick_webhook.add_routes(self._register)
 
     def _register(self, app: web.Application) -> None:
-        app.router.add_get("/web", self._web_redirect)
-        app.router.add_get("/web/", self._index)
-        app.router.add_get("/web/app.js", self._asset_js)
-        app.router.add_get("/web/login.js", self._asset_login_js)
-        app.router.add_get("/web/manifest.webmanifest", self._asset_manifest)
-        app.router.add_get("/web/icon.svg", self._asset_icon)
-        app.router.add_get("/web/styles.css", self._asset_css)
-        app.router.add_get("/web/api/session", self._session)
-        app.router.add_post("/web/api/login", self._login)
-        app.router.add_post("/web/api/logout", self._guarded_csrf(self._logout))
-        app.router.add_get("/web/api/status", self._guarded(self._status))
-        app.router.add_get("/web/api/settings", self._guarded(self._settings))
-        app.router.add_patch("/web/api/settings", self._guarded_csrf(self._patch_settings))
-        app.router.add_get("/web/api/channels", self._guarded(self._channels))
-        app.router.add_post("/web/api/channels", self._guarded_csrf(self._add_channel))
-        app.router.add_get("/web/api/channels/{channel}", self._guarded(self._channel))
-        app.router.add_patch("/web/api/channels/{channel}", self._guarded_csrf(self._patch_channel))
-        app.router.add_delete("/web/api/channels/{channel}", self._guarded_csrf(self._remove_channel))
-        app.router.add_get("/web/api/recordings", self._guarded(self._recordings))
-        app.router.add_get("/web/api/recordings/stream", self._guarded(self._stream))
-        app.router.add_get("/web/api/chat", self._guarded(self._chat))
-        app.router.add_delete("/web/api/recordings", self._guarded_csrf(self._delete_recording))
-        app.router.add_post("/web/api/reload", self._guarded_csrf(self._reload))
-        app.router.add_post("/web/api/restart", self._guarded_csrf(self._restart))
-        app.router.add_get("/web/api/update", self._guarded(self._update))
-        app.router.add_get("/web/api/events", self._guarded(self._events))
-        app.router.add_post("/web/api/password", self._guarded_csrf(self._password))
+        if self._owns_http:
+            app.on_cleanup.append(self._close_http)
+        app.router.add_get("/", self._index)
+        app.router.add_get("/app.js", self._asset_js)
+        app.router.add_get("/login.js", self._asset_login_js)
+        app.router.add_get("/manifest.webmanifest", self._asset_manifest)
+        app.router.add_get("/icon.svg", self._asset_icon)
+        app.router.add_get("/styles.css", self._asset_css)
+        app.router.add_get("/api/session", self._session)
+        app.router.add_post("/api/login", self._login)
+        app.router.add_post("/api/logout", self._guarded_csrf(self._logout))
+        app.router.add_get("/api/status", self._guarded(self._status))
+        app.router.add_get("/api/settings", self._guarded(self._settings))
+        app.router.add_patch("/api/settings", self._guarded_csrf(self._patch_settings))
+        app.router.add_get("/api/channels", self._guarded(self._channels))
+        app.router.add_post("/api/channels", self._guarded_csrf(self._add_channel))
+        app.router.add_get("/api/channels/{channel}", self._guarded(self._channel))
+        app.router.add_patch("/api/channels/{channel}", self._guarded_csrf(self._patch_channel))
+        app.router.add_delete("/api/channels/{channel}", self._guarded_csrf(self._remove_channel))
+        app.router.add_get("/api/recordings", self._guarded(self._recordings))
+        app.router.add_get("/api/recordings/stream", self._guarded(self._stream))
+        app.router.add_get("/api/recordings/thumb", self._guarded(self._thumb))
+        app.router.add_get("/api/chat", self._guarded(self._chat))
+        app.router.add_delete("/api/recordings", self._guarded_csrf(self._delete_recording))
+        app.router.add_post("/api/reload", self._guarded_csrf(self._reload))
+        app.router.add_post("/api/restart", self._guarded_csrf(self._restart))
+        app.router.add_get("/api/update", self._guarded(self._update))
+        app.router.add_get("/api/events", self._guarded(self._events))
+        app.router.add_delete("/api/events", self._guarded_csrf(self._clear_events))
+        app.router.add_post("/api/password", self._guarded_csrf(self._password))
 
     # ---- page and assets -------------------------------------------------
 
@@ -249,12 +482,6 @@ class WebUI:
         resp.headers["Cache-Control"] = "no-store"
         self._secure_headers(resp, request)
         return resp
-
-    async def _web_redirect(self, request: web.Request) -> web.StreamResponse:
-        if not self._config.web.enabled:
-            return self._public_json(request, {"error": "not found"}, status=404)
-        target = "/web/"
-        raise web.HTTPPermanentRedirect(target)
 
     async def _index(self, request: web.Request) -> web.Response:
         if not self._config.web.enabled:
@@ -313,27 +540,30 @@ class WebUI:
         session = self._sessions.get(sid)
         if session is None:
             return None
-        if session.expires <= time.monotonic():
+        if session.expires <= time.time():
             self._sessions.pop(sid, None)
+            self._save_sessions()
             return None
         if not hmac.compare_digest(session.pwd, _pwd_tag(self._config.web.password_hash)):
             # The password changed (here or over the bot): end the session.
             self._sessions.pop(sid, None)
+            self._save_sessions()
             return None
-        session.expires = time.monotonic() + _SESSION_TTL_S
+        session.expires = time.time() + _SESSION_TTL_S
         return session
 
     def _new_session(self) -> tuple[str, _Session]:
         sid = secrets.token_hex(32)
         session = _Session(
             csrf=secrets.token_hex(16),
-            expires=time.monotonic() + _SESSION_TTL_S,
+            expires=time.time() + _SESSION_TTL_S,
             pwd=_pwd_tag(self._config.web.password_hash),
         )
         self._sessions[sid] = session
-        if len(self._sessions) > 512:
+        if len(self._sessions) > _SESSIONS_MAX:
             oldest = min(self._sessions, key=lambda k: self._sessions[k].expires)
             self._sessions.pop(oldest, None)
+        self._save_sessions()
         return sid, session
 
     def _cookie_value(self, sid: str) -> str:
@@ -550,6 +780,7 @@ class WebUI:
         raw = request.cookies.get(_COOKIE_NAME, "")
         sid, _, _ = raw.partition(".")
         self._sessions.pop(sid, None)
+        self._save_sessions()
         logger.info("[web] logout from %s", request.remote)
         resp = web.json_response({"ok": True}, status=200)
         self._clear_cookie(resp, request)
@@ -583,6 +814,7 @@ class WebUI:
         except ValueError as e:
             raise _WebError(400, str(e)) from e
         self._sessions.clear()
+        self._save_sessions()
         logger.info("[web] password changed from %s, all sessions ended", request.remote)
         resp = web.json_response({"ok": True}, status=200)
         self._clear_cookie(resp, request)
@@ -695,6 +927,32 @@ class WebUI:
         )
         await self._notify([f"{v}" for v in applied.values()], origin="Web panel")
         return self._json(request, {"channel": channel, "applied": applied, "errors": errors}, status=status)
+
+    # ---- chat emotes --------------------------------------------------------
+
+    async def _close_http(self, app: web.Application) -> None:
+        """Close the owned HTTP client when the listener stops."""
+        if self._owns_http:
+            with contextlib.suppress(Exception):
+                await self._http.aclose()
+
+    async def _third_party_map(self, channel_id: str) -> dict[str, str]:
+        """Emote name to image URL for one channel: set first, then globals."""
+        now = time.monotonic()
+        cached = self._emote_sets.get(channel_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        merged = {
+            name: url for name, (_pid, url) in (await fetch_channel_emotes(self._http, "twitch", channel_id)).items()
+        }
+        if self._emote_globals is None or self._emote_globals[0] <= now:
+            glob = {name: url for name, (_pid, url) in (await fetch_global_emotes(self._http)).items()}
+            self._emote_globals = (now + _EMOTE_GLOBAL_TTL_S, glob)
+        for name, url in self._emote_globals[1].items():
+            merged.setdefault(name, url)
+        ttl = _EMOTE_SET_TTL_S if merged else _EMOTE_FAIL_TTL_S
+        self._emote_sets[channel_id] = (now + ttl, merged)
+        return merged
 
     # ---- recordings ------------------------------------------------------------
 
@@ -845,6 +1103,37 @@ class WebUI:
         await _send_file_range(path, start, end, resp)
         return resp
 
+    async def _thumb(self, request: web.Request, session: _Session) -> web.Response:
+        from stream_archive import disk as disk_mod
+        from stream_archive.recorder.remux import capture_thumbnail
+
+        rel = request.query.get("id", "")
+        path = self._recording_path(rel)
+        if self._is_live(path):
+            msg = f"{path.name} is recording now"
+            raise _WebError(409, msg)
+        target = disk_mod.thumbnail_path(self._config, path)
+        if target is None:
+            msg = "not a recording"
+            raise _WebError(404, msg)
+        if not target.exists():
+            # The cache fills on demand: old recordings never captured one.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, capture_thumbnail, path, target)
+        try:
+            body = target.read_bytes()
+        except OSError:
+            missing = web.json_response({"error": "not found"}, status=404)
+            self._secure_headers(missing, request)
+            return missing
+        resp = web.Response(body=body, content_type="image/jpeg")
+        self._secure_headers(resp, request)
+        # Thumbnails are immutable for one recording id (dated filenames),
+        # so the browser may cache them: without this the 30s list refresh
+        # re-downloads every image and the cards flicker.
+        resp.headers["Cache-Control"] = "private, max-age=86400"
+        return resp
+
     async def _chat(self, request: web.Request, session: _Session) -> web.Response:
         """Chat messages of one recording for the side panel.
 
@@ -872,6 +1161,10 @@ class WebUI:
         if not isinstance(comments, list):
             return self._json(request, {"messages": [], "truncated": False, "missing": True})
         messages: list[dict[str, Any]] = []
+        kick = rel.startswith("kick/")
+        embedded = _embedded_map(payload)
+        channel_id = "" if kick else _chat_channel_id(payload, comments)
+        names = await self._third_party_map(channel_id) if channel_id else {}
         for comment in comments:
             if not isinstance(comment, dict):
                 continue
@@ -889,7 +1182,14 @@ class WebUI:
             name = commenter.get("display_name") or commenter.get("name") or "?"
             if not isinstance(name, str):
                 name = "?"
-            messages.append({"t": offset, "user": name[:64], "text": body[:500]})
+            text = body[:500]
+            spans = _capture_spans(message.get("fragments"), text, kick, embedded)
+            spans.extend(_word_spans(text, names, spans))
+            entry: dict[str, Any] = {"t": offset, "user": name[:64], "text": text}
+            if spans:
+                spans.sort(key=lambda s: (s[0], s[1]))
+                entry["emotes"] = [{"start": s, "end": e, "src": u} for s, e, u in spans]
+            messages.append(entry)
         messages.sort(key=lambda m: m["t"])
         truncated = len(messages) > _CHAT_MAX_MESSAGES
         return self._json(
@@ -939,6 +1239,7 @@ class WebUI:
                 path.unlink(missing_ok=True)
             except OSError as e:
                 raise _WebError(500, "delete failed") from e
+        disk.drop_thumbnail(self._config, path)
         disk.invalidate_snapshot()
         logger.info("[web] deleted %s from %s", path.name, request.remote)
         return self._json(request, {"message": f"Deleted {path.name}", "freed": freed})
@@ -978,6 +1279,13 @@ class WebUI:
             msg = "limit must be a number"
             raise _WebError(400, msg) from None
         return self._json(request, {"events": _events_mod.list_events(limit)})
+
+    async def _clear_events(self, request: web.Request, session: _Session) -> web.Response:
+        from stream_archive import events as _events_mod
+
+        _events_mod.clear()
+        logger.info("[web] events cleared from %s", request.remote)
+        return self._json(request, {"message": "Events cleared."})
 
 
 class _ApiHelper:
@@ -1129,6 +1437,27 @@ async def _send_file_range(path: Path, start: int, end: int, resp: web.StreamRes
                     break
     except OSError:
         logger.warning("[web] stream read failed for %s", path.name)
+
+
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write ``payload`` as JSON with mode 0600. It holds bearer secrets."""
+    tmp = Path(str(path) + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        # A file left by a crashed run. Remove the entry itself (never
+        # a symlink target) and create it exclusively.
+        tmp.unlink()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # os.open applies its mode only when it creates the file, and the
+    # umask clears bits of that mode.
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _load_assets() -> dict[str, str]:

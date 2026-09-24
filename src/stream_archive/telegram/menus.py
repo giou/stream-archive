@@ -169,11 +169,16 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         return _frame([[f"{_toggle_action(c.web.enabled)} Web panel"], ["New password"], ["Back"]])
     if menu == "mtproto":
         return _frame([[f"{_toggle_action(c.mtproto.enabled)} MTProto upload"], ["Back"]])
-    if menu == "recordings":
+    if menu == "rec_channel":
+        files = rec_menus._channel_files(ctrl, state.rec_channel or "")
+        if files:
+            offset = max(0, min(state.rec_offset, rec_menus.last_page_start(len(files))))
+            return _frame(rec_menus._page_buttons(len(files), offset, files))
+    if menu in ("recordings", "rec_channel"):
         ordered, by_channel = rec_menus.channel_rows(ctrl)
-        live = rec_menus._live_paths(ctrl)
-        rows = [[rec_menus.channel_label(ch, by_channel[ch], live)] for ch in ordered]
-        rows.append(["Back"])
+        rows = [["Back"], *[[rec_menus.channel_label(ch, by_channel[ch])] for ch in ordered]]
+        if ordered:
+            rows.append([rec_menus.DELETE_ALL_LABEL])
         return _frame(rows)
     if menu == "rec_detail":
         rows = [[rec_menus.SEND_LABEL, rec_menus.DELETE_LABEL]]
@@ -302,7 +307,7 @@ async def _text_web(ctrl: TelegramController, state: MenuState) -> str:
     if not ctrl._config.web.enabled:
         return (
             "Web panel: off\n\n"
-            "The panel controls the app in the browser under /web/, on the same "
+            "The panel controls the app in the browser at the domain root, on the same "
             "listener and public URL as the Kick webhook.\n"
             "Enable it and I generate the panel password."
         )
@@ -651,8 +656,7 @@ async def menu_back(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
         files = rec_menus._channel_files(ctrl, state.rec_channel or "")
         if files:
             offset = rec_menus._clamp_offset(ctrl, chat_id, len(files))
-            live = rec_menus._live_paths(ctrl)
-            rows = rec_menus._page_buttons(len(files), offset, live, files)
+            rows = rec_menus._page_buttons(len(files), offset, files)
             from telegram import ReplyKeyboardMarkup
 
             return rec_menus._file_page_text(state.rec_channel or "", files), ReplyKeyboardMarkup(
@@ -700,9 +704,15 @@ async def render_text(
 
 
 def render_keyboard(
-    ctrl: TelegramController, menu: str, channel: str | None = None, rec_path: str | None = None
+    ctrl: TelegramController,
+    menu: str,
+    channel: str | None = None,
+    rec_path: str | None = None,
+    rec_channel: str | None = None,
+    rec_offset: int = 0,
 ) -> ReplyKeyboardMarkup:
     """Build the keyboard for ``menu``. An unknown menu gets the Back button."""
     if menu not in TEXT:
         return _frame([["Back"]])
-    return _keyboard(ctrl, MenuState(menu=menu, channel=channel, rec_path=rec_path), menu)
+    state = MenuState(menu=menu, channel=channel, rec_path=rec_path, rec_channel=rec_channel, rec_offset=rec_offset)
+    return _keyboard(ctrl, state, menu)

@@ -333,16 +333,16 @@ class TelegramController(
         """Replace the pressed message with ``text``, or resend it if it went away.
 
         A reply keyboard cannot edit an inline message in place, so a
-        ReplyKeyboardMarkup answer goes out as a fresh message (with the
-        inline prompt removed) instead of failing into BadRequest and a
-        duplicate. Any other Telegram error must not escape either: the
-        press is already answered, and the remaining steps still run.
+        ReplyKeyboardMarkup answer deletes the inline prompt and goes out
+        as one fresh message. Any other Telegram error must not escape
+        either: the press is already answered, and the remaining steps
+        still run.
         """
         from telegram import ReplyKeyboardMarkup as _RKM
 
         if isinstance(reply_markup, _RKM):
             with contextlib.suppress(Exception):
-                await query.edit_message_text(text, reply_markup=None)
+                await query.delete_message()
             try:
                 await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup)
             except Exception:
@@ -445,7 +445,12 @@ class TelegramController(
         """
         state = self._state_for(chat_id if chat_id is not None else self._admin_id)
         return menus.render_keyboard(
-            self, menu, channel if channel is not None else state.channel, rec_path=state.rec_path
+            self,
+            menu,
+            channel if channel is not None else state.channel,
+            rec_path=state.rec_path,
+            rec_channel=state.rec_channel,
+            rec_offset=state.rec_offset,
         )
 
     async def menu_text(self, menu: str = "root", channel: str | None = None, chat_id: ChatId | None = None) -> str:

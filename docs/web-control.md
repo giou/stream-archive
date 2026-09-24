@@ -5,7 +5,7 @@ status, channels, settings, recordings with a video player, reload,
 restart, update check, and password change. The bot and the panel can run
 at once.
 
-The panel lives on the shared listener under `/web/`. It runs while the
+The panel lives on the shared listener at the domain root. It runs while the
 endpoint, the control API, or the panel itself is on.
 
 ## Enable the panel
@@ -14,11 +14,11 @@ endpoint, the control API, or the panel itself is on.
 2. Set a password: open **Settings → Remote access → Web panel** in Telegram
    and tap **Enable Web panel** (the first enable generates the password and
    shows it once), or run `stream-archive-setup-web` on the host.
-   The command stores a hash only. The password never reaches disk or logs.
+   The command stores a hash, plus a session secret on first use. The password never reaches disk or logs.
    Docker: `docker compose exec stream-archive stream-archive-setup-web`.
 3. Set `web.enabled` to `true` in `config.json` (the setup command does
    this) and restart.
-4. Open `<endpoint.public_url>/web/` and log in.
+4. Open `<endpoint.public_url>/` and log in.
 
 Without Telegram tokens the bot stays off and the panel controls the app.
 Set `telegram_user_id` to `0` and `bot_telegram_api` to `""` for that
@@ -26,7 +26,9 @@ mode. With tokens set, both control surfaces work at once.
 
 ## Sessions
 
-A login creates a server-side session of 12 hours. The cookie is HttpOnly
+A login creates a server-side session of 12 hours. The app stores the
+session in `web_sessions.json` next to `config.json`, so the login
+survives restarts of the app and the container. The cookie is HttpOnly
 and SameSite=Lax (Secure outside local access). Every change call needs
 the CSRF token the login returns. Logout ends the session. A password
 change ends all sessions at once.

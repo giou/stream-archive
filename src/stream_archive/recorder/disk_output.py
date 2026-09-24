@@ -176,6 +176,7 @@ class DiskOutputMixin:
         except OSError as e:
             logger.warning("[recorder] Failed to delete %s: %s", path, e)
             return None
+        disk.drop_thumbnail(self._config, path)
         return size
 
     async def delete_oldest_to_cap(self) -> tuple[int, int]:

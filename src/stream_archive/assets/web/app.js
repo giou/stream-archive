@@ -1,6 +1,6 @@
 "use strict";
 let csrf = "";
-let currentTab = "channels";
+let currentTab = "recordings";
 
 const $ = (id) => document.getElementById(id);
 
@@ -39,7 +39,7 @@ async function api(path, opts = {}) {
   }
   hideOffline();
   if (resp.status === 401) {
-    window.location.replace("/web/");
+    window.location.replace("/");
     throw new Error("Session expired, login again");
   }
   const data = await resp.json().catch(() => ({}));
@@ -68,7 +68,7 @@ let settingsDirty = false;
 function showApp() {
   $("nav").hidden = false;
   $("logout").hidden = false;
-  switchTab("channels");
+  switchTab("recordings");
   layoutStage();
   loadStatus();
   loadChannels();
@@ -88,13 +88,13 @@ function activatable(el, fn) {
 }
 
 function checkPlayerSession() {
-  fetch("/web/api/session")
+  fetch("/api/session")
     .then((resp) => {
       if (!resp.ok) throw new Error("Session check failed: " + resp.status);
       return resp.json();
     })
     .then((s) => {
-      if (s && !s.authenticated) window.location.replace("/web/");
+      if (s && !s.authenticated) window.location.replace("/");
       else if (s) toast("Cannot play this file", true);
       else toast("Cannot play this file", true);
     })
@@ -111,7 +111,7 @@ function switchTab(name) {
   document.querySelectorAll("#nav button[data-tab]").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === name);
   });
-  for (const id of ["status", "channels", "settings", "recordings", "events", "ops"]) {
+  for (const id of ["status", "channels", "settings", "recordings", "events"]) {
     $("tab-" + id).hidden = id !== name;
   }
   if (name === "status") loadStatus();
@@ -123,7 +123,7 @@ function switchTab(name) {
 async function fetchUpdateChip() {
   const chip = $("update-chip");
   try {
-    const r = await api("/web/api/update", {});
+    const r = await api("/api/update", {});
     const first = String(r.message || "").split("\n")[0];
     chip.hidden = false;
     if (first.startsWith("✅")) {
@@ -180,7 +180,7 @@ document.addEventListener("visibilitychange", () => {
 
 async function loadEvents() {
   try {
-    const data = obj(await api("/web/api/events?limit=100"));
+    const data = obj(await api("/api/events?limit=100"));
     data.events = arr(data.events);
     const list = $("events-list");
     list.textContent = "";
@@ -223,12 +223,12 @@ async function loadEvents() {
 
 async function boot() {
   try {
-    const s = await api("/web/api/session");
+    const s = await api("/api/session");
     if (s.authenticated) {
       csrf = s.csrf || "";
       showApp();
     } else {
-      window.location.replace("/web/");
+      window.location.replace("/");
     }
   } catch (e) {
     toast(String(e.message || e), true);
@@ -263,7 +263,7 @@ function fmtGB(n) {
 
 async function loadStatus(quiet) {
   try {
-    const raw = await api("/web/api/status");
+    const raw = await api("/api/status");
     const s = Object.assign(
       { channels: [], recording: [], recordings_now: [] },
       raw
@@ -359,8 +359,8 @@ function actionBtn(label, cls, fn) {
 async function loadChannels() {
   try {
     const [data, feed] = await Promise.all([
-      api("/web/api/channels"),
-      api("/web/api/events?limit=200").catch(() => ({})),
+      api("/api/channels"),
+      api("/api/events?limit=200").catch(() => ({})),
     ]);
     const lastByChannel = new Map();
     for (const e of feed.events || []) {
@@ -405,7 +405,7 @@ async function loadChannels() {
       modeSel.setAttribute("aria-label", "Output mode for " + ch.channel);
       modeSel.addEventListener("change", async () => {
         try {
-          await api("/web/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ output_mode: modeSel.value }),
           });
@@ -430,7 +430,7 @@ async function loadChannels() {
       qInput.addEventListener("change", async () => {
         try {
           const v = qInput.value.trim() || "default";
-          await api("/web/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ quality: v }),
           });
@@ -464,7 +464,7 @@ async function loadChannels() {
             return;
           }
           const v = raw === "" ? "default" : Number(raw);
-          await api("/web/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ youtube_hold_seconds: v }),
           });
@@ -480,7 +480,7 @@ async function loadChannels() {
       wrap.className = "row-actions";
       wrap.appendChild(actionBtn("Remove", "danger", async () => {
         if (!window.confirm("Remove " + ch.channel + "?")) return;
-        await api("/web/api/channels/" + encodeURIComponent(ch.channel), { method: "DELETE" });
+        await api("/api/channels/" + encodeURIComponent(ch.channel), { method: "DELETE" });
         toast("Channel removed");
         loadChannels();
         loadStatus();
@@ -589,7 +589,7 @@ const settingGetters = {};
 
 async function loadSettings() {
   try {
-    const s = await api("/web/api/settings");
+    const s = await api("/api/settings");
     s.disk = obj(s.disk);
     const form = $("settings-form");
     form.textContent = "";
@@ -630,7 +630,11 @@ function timeAgo(ts) {
 }
 
 function layoutStage() {
-  document.querySelector(".rec-stage").classList.toggle("no-player", $("player-wrap").hidden);
+  const playing = !$("player-wrap").hidden;
+  document.querySelector(".rec-stage").classList.toggle("no-player", !playing);
+  const toggle = document.querySelector(".rec-listpane .list-toggle");
+  if (toggle) toggle.hidden = !playing;
+  if (!playing) setListHidden(false);
 }
 
 function stickPlayer() {
@@ -686,6 +690,119 @@ function channelOf(id) {
 }
 
 let selectedRecs = new Set();
+let playQueue = [];
+let currentPlayId = null;
+const recCards = new Map();
+const recGroups = new Map();
+
+const POS_KEY = "sa:positions";
+const POS_MAX = 200;
+
+function loadPositions() {
+  try {
+    return JSON.parse(localStorage.getItem(POS_KEY) || "{}");
+  } catch (e) {
+    return {};
+  }
+}
+
+function savePosition(id, t, d) {
+  if (!id || !(t > 10)) return;
+  const all = loadPositions();
+  delete all[id];
+  all[id] = { t: Math.floor(t), d: Math.floor(d || 0) };
+  const keys = Object.keys(all);
+  for (const k of keys.slice(0, Math.max(0, keys.length - POS_MAX))) delete all[k];
+  try {
+    localStorage.setItem(POS_KEY, JSON.stringify(all));
+  } catch (e) {}
+}
+
+function savedPosition(id, duration) {
+  const all = loadPositions();
+  const p = all[id];
+  if (!p || !(p.t > 10)) return 0;
+  const end = Number.isFinite(duration) && duration > 0 ? duration : p.d || 0;
+  if (end > 0 && p.t > end - 30) return 0;
+  return p.t;
+}
+
+function forgetPosition(id) {
+  if (!id) return;
+  const all = loadPositions();
+  if (id in all) {
+    delete all[id];
+    try {
+      localStorage.setItem(POS_KEY, JSON.stringify(all));
+    } catch (e) {}
+  }
+}
+
+let playToken = 0;
+
+async function playRecording(entry, collapse = true) {
+  const my = ++playToken;
+  const player = $("player");
+  currentPlayId = entry.id;
+  updatePlayerNav();
+  const wrapEl = $("player-wrap");
+  wrapEl.hidden = false;
+  if (collapse) setListHidden(true);
+  layoutStage();
+  stickPlayer();
+  wrapEl.scrollIntoView({ block: "nearest" });
+  loadChat(entry.id, entry.name).catch(() => {});
+  player.src = "/api/recordings/stream?id=" + encodeURIComponent(entry.id);
+  const resume = savedPosition(entry.id, player.duration);
+  if (resume > 0) {
+    try {
+      player.currentTime = resume;
+    } catch (e) {}
+  }
+  try {
+    await player.play();
+  } catch (e) {
+    if (my !== playToken) return;
+    toast("Cannot play this file: " + String((e && e.message) || e || "unknown error"), true);
+  }
+}
+
+function updatePlayerNav() {
+  const idx = playQueue.findIndex((e) => e.id === currentPlayId);
+  $("player-prev").disabled = idx <= 0;
+  $("player-next").disabled = idx < 0 || idx >= playQueue.length - 1;
+}
+
+function stepVideo(delta) {
+  const idx = playQueue.findIndex((e) => e.id === currentPlayId);
+  const next = playQueue[idx + delta];
+  if (next) playRecording(next, false);
+}
+
+function setRate(rate) {
+  const r = Math.min(4, Math.max(0.25, Math.round(rate * 10) / 10));
+  $("player").playbackRate = r;
+  const speedSel = $("player-speed");
+  const exact = [...speedSel.options].find((o) => Number(o.value) === r);
+  if (exact) {
+    speedSel.value = exact.value;
+  } else {
+    let custom = speedSel.querySelector("option[data-custom]");
+    if (!custom) {
+      custom = document.createElement("option");
+      custom.dataset.custom = "1";
+      speedSel.appendChild(custom);
+    }
+    custom.value = String(r);
+    custom.textContent = r.toFixed(1) + "×";
+    speedSel.value = String(r);
+  }
+}
+
+function setListHidden(hidden) {
+  if (hidden && $("player-wrap").hidden) return;
+  document.querySelector(".rec-stage").classList.toggle("list-hidden", hidden);
+}
 
 let chatMessages = [];
 let lastChatSecond = -1;
@@ -701,15 +818,14 @@ async function loadChat(id, name) {
   chatMessages = [];
   lastChatSecond = -1;
   try {
-    const data = await api("/web/api/chat?id=" + encodeURIComponent(id));
+    const data = await api("/api/chat?id=" + encodeURIComponent(id));
     chatMessages = data.messages || [];
     if (!chatMessages.length) {
-      const empty = document.createElement("p");
-      empty.className = "muted";
-      empty.textContent = data.missing ? "No chat recorded for this video." : "Chat is empty.";
-      log.appendChild(empty);
+      panel.hidden = true;
+      document.querySelector(".rec-stage").classList.add("no-chat");
       return;
     }
+    document.querySelector(".rec-stage").classList.remove("no-chat");
     for (const m of chatMessages) {
       const div = document.createElement("div");
       div.className = "chat-msg future";
@@ -732,7 +848,7 @@ async function loadChat(id, name) {
       user.className = "user";
       user.textContent = m.user + " ";
       div.appendChild(user);
-      div.appendChild(document.createTextNode(m.text));
+      appendChatText(div, m.text, m.emotes);
       log.appendChild(div);
     }
     if (data.truncated) {
@@ -740,11 +856,32 @@ async function loadChat(id, name) {
       note.hidden = false;
     }
   } catch (e) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "Chat unavailable.";
-    log.appendChild(empty);
+    panel.hidden = true;
+    document.querySelector(".rec-stage").classList.add("no-chat");
   }
+}
+
+function appendChatText(div, text, emotes) {
+  if (!emotes || !emotes.length) {
+    div.appendChild(document.createTextNode(text));
+    return;
+  }
+  const spans = [...emotes].sort((a, b) => a.start - b.start);
+  let pos = 0;
+  for (const s of spans) {
+    if (s.start < pos || s.start >= text.length) continue;
+    const end = Math.min(s.end, text.length);
+    if (end <= s.start || typeof s.src !== "string" || !/^https:\/\/|^data:image\//.test(s.src)) continue;
+    if (s.start > pos) div.appendChild(document.createTextNode(text.slice(pos, s.start)));
+    const img = document.createElement("img");
+    img.className = "chat-emote";
+    img.src = s.src;
+    img.alt = text.slice(s.start, end);
+    img.loading = "lazy";
+    div.appendChild(img);
+    pos = end;
+  }
+  if (pos < text.length) div.appendChild(document.createTextNode(text.slice(pos)));
 }
 
 function syncChat() {
@@ -780,6 +917,7 @@ function syncChat() {
 function buildRecCard(r, player) {
   const li = document.createElement("li");
   li.className = "rec-card";
+  li.dataset.live = r.live ? "1" : "";
   const top = document.createElement("div");
   top.className = "rec-top";
   if (!r.live) {
@@ -798,8 +936,23 @@ function buildRecCard(r, player) {
   const name = document.createElement("div");
   name.className = "rec-name";
   name.textContent = r.name;
+  name.setAttribute("title", "Play");
   top.appendChild(name);
   li.appendChild(top);
+  if (!r.live) {
+    const playIt = () => playRecording({ id: r.id, name: r.name });
+    name.classList.add("playable");
+    name.addEventListener("click", playIt);
+    const thumb = document.createElement("img");
+    thumb.className = "rec-thumb";
+    thumb.loading = "lazy";
+    thumb.src = "/api/recordings/thumb?id=" + encodeURIComponent(r.id);
+    thumb.alt = "";
+    thumb.setAttribute("title", "Play");
+    thumb.addEventListener("click", playIt);
+    thumb.addEventListener("error", () => thumb.remove());
+    li.appendChild(thumb);
+  }
   const meta = document.createElement("div");
   meta.className = "rec-meta";
   meta.textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
@@ -811,31 +964,19 @@ function buildRecCard(r, player) {
     pill.className = "pill live";
     pill.textContent = "REC";
     wrap.appendChild(pill);
-  } else {
-    if (r.playable) {
-      wrap.appendChild(actionBtn("Play", "", async () => {
-        const wrapEl = $("player-wrap");
-        player.src = "/web/api/recordings/stream?id=" + encodeURIComponent(r.id);
-        wrapEl.hidden = false;
-        layoutStage();
-        stickPlayer();
-        wrapEl.scrollIntoView({ block: "nearest" });
-        loadChat(r.id, r.name).catch(() => {});
-        try {
-          await player.play();
-        } catch (e) {
-          toast("Cannot play this file: " + String((e && e.message) || e || "unknown error"), true);
-        }
-      }));
-    }
+    } else {
+      if (r.playable) {
+        wrap.appendChild(actionBtn("Play", "", () => playRecording({ id: r.id, name: r.name }).catch(() => {})));
+      }
     const dl = document.createElement("a");
     dl.className = "btn";
-    dl.href = "/web/api/recordings/stream?id=" + encodeURIComponent(r.id) + "&download=1";
+    dl.href = "/api/recordings/stream?id=" + encodeURIComponent(r.id) + "&download=1";
     dl.textContent = "Download";
     wrap.appendChild(dl);
     wrap.appendChild(actionBtn("Delete", "danger", async () => {
       if (!window.confirm("Delete " + r.name + "?")) return;
-      await api("/web/api/recordings?id=" + encodeURIComponent(r.id), { method: "DELETE" });
+      await api("/api/recordings?id=" + encodeURIComponent(r.id), { method: "DELETE" });
+      forgetPosition(r.id);
       toast("Recording deleted");
       loadRecordings();
     }));
@@ -844,12 +985,66 @@ function buildRecCard(r, player) {
   return li;
 }
 
+function refreshRecCard(li, r, player) {
+  if (!!li.dataset.live !== !!r.live) {
+    const fresh = buildRecCard(r, player);
+    li.replaceWith(fresh);
+    recCards.set(r.id, fresh);
+    return;
+  }
+  li.querySelector(":scope > .rec-meta").textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+}
+
+function buildChannelGroup() {
+  const group = document.createElement("li");
+  group.className = "channel-group";
+  const head = document.createElement("div");
+  head.className = "channel-head";
+  const name = document.createElement("span");
+  name.className = "channel-name";
+  head.appendChild(name);
+  group.appendChild(head);
+  const filesList = document.createElement("ul");
+  filesList.className = "files-list";
+  group.appendChild(filesList);
+  return group;
+}
+
+function refreshChannelGroup(group, ch, files, player, wanted) {
+  const total = files.reduce((n, f) => n + f.size, 0);
+  group.querySelector(":scope > .channel-head > .channel-name").textContent =
+    ch + " (" + files.length + " file" + (files.length === 1 ? "" : "s") + ", " + fmtSize(total) + ")";
+  const head = group.querySelector(":scope > .channel-head");
+  const hasPill = !!head.querySelector(":scope > .pill");
+  if (files.some((f) => f.live) && !hasPill) {
+    const pill = document.createElement("span");
+    pill.className = "pill live";
+    pill.textContent = "REC";
+    head.appendChild(pill);
+  } else if (!files.some((f) => f.live) && hasPill) {
+    head.querySelector(":scope > .pill").remove();
+  }
+  const filesList = group.querySelector(":scope > ul.files-list");
+  for (const r of files) {
+    wanted.add(r.id);
+    let li = recCards.get(r.id);
+    if (!li) {
+      li = buildRecCard(r, player);
+      recCards.set(r.id, li);
+    } else {
+      refreshRecCard(li, r, player);
+      li = recCards.get(r.id);
+    }
+    filesList.appendChild(li);
+  }
+}
+
 async function loadRecordings() {
   try {
     const filter = $("rec-filter").value.trim().toLowerCase();
     const onlyChannel = $("rec-channel").value;
     const sort = $("rec-sort").value;
-    const data = obj(await api("/web/api/recordings?limit=500"));
+    const data = obj(await api("/api/recordings?limit=500"));
     data.recordings = arr(data.recordings);
     data.total = Number(data.total) || 0;
     const chanSel = $("rec-channel");
@@ -875,8 +1070,9 @@ async function loadRecordings() {
     });
     if (sort === "oldest") files = [...files].reverse();
     else if (sort === "largest") files = [...files].sort((a, b) => b.size - a.size);
+    playQueue = files.filter((r) => r.playable && !r.live).map((r) => ({ id: r.id, name: r.name }));
+    updatePlayerNav();
     const list = $("rec-list");
-    list.textContent = "";
     for (const id of [...selectedRecs]) {
       if (!data.recordings.some((r) => r.id === id)) selectedRecs.delete(id);
     }
@@ -889,32 +1085,32 @@ async function loadRecordings() {
       groups.get(ch).push(r);
     }
     let shown = 0;
-    for (const [ch, files] of groups) {
-      shown += files.length;
-      const group = document.createElement("li");
-      group.className = "channel-group";
-      const head = document.createElement("div");
-      head.className = "channel-head";
-      const name = document.createElement("span");
-      name.className = "channel-name";
-      const total = files.reduce((n, f) => n + f.size, 0);
-      name.textContent = ch + " (" + files.length + " file" + (files.length === 1 ? "" : "s") + ", " + fmtSize(total) + ")";
-      head.appendChild(name);
-      if (files.some((f) => f.live)) {
-        const pill = document.createElement("span");
-        pill.className = "pill live";
-        pill.textContent = "REC";
-        head.appendChild(pill);
+    const wantedGroups = new Set();
+    const wanted = new Set();
+    for (const [ch, chFiles] of groups) {
+      shown += chFiles.length;
+      wantedGroups.add(ch);
+      let group = recGroups.get(ch);
+      if (!group) {
+        group = buildChannelGroup();
+        recGroups.set(ch, group);
       }
-      group.appendChild(head);
-      const filesList = document.createElement("ul");
-      filesList.className = "files-list";
-      for (const r of files) {
-        filesList.appendChild(buildRecCard(r, player));
-      }
-      group.appendChild(filesList);
       list.appendChild(group);
+      refreshChannelGroup(group, ch, chFiles, player, wanted);
     }
+    for (const [ch, group] of [...recGroups]) {
+      if (!wantedGroups.has(ch)) {
+        group.remove();
+        recGroups.delete(ch);
+      }
+    }
+    for (const [id, li] of [...recCards]) {
+      if (!wanted.has(id)) {
+        li.remove();
+        recCards.delete(id);
+      }
+    }
+    list.querySelectorAll(":scope > li.rec-card.muted").forEach((li) => li.remove());
     const counter = $("rec-count");
     if (data.total > data.recordings.length) {
       counter.textContent = "Showing " + data.recordings.length + " of " + data.total + " recordings - narrow the filter to see the rest.";
@@ -939,12 +1135,65 @@ function updateBulkButton() {
   btn.textContent = "Delete selected (" + selectedRecs.size + ")";
 }
 
+const NOTIFY_KEY = "sa:notify";
+const SEEN_KEY = "sa:events-seen";
+let notifyOn = false;
+try {
+  notifyOn = localStorage.getItem(NOTIFY_KEY) === "1";
+} catch (e) {}
+
+function lastSeenTs() {
+  try {
+    return Number(localStorage.getItem(SEEN_KEY) || 0);
+  } catch (e) {
+    return 0;
+  }
+}
+
+function markSeen(ts) {
+  try {
+    localStorage.setItem(SEEN_KEY, String(ts));
+  } catch (e) {}
+}
+
+function paintNotifyButton() {
+  const btn = $("notify-toggle");
+  if (btn) btn.textContent = "Notify: " + (notifyOn ? "on" : "off");
+}
+
+async function pollEventAlerts() {
+  if (!notifyOn) return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  let data;
+  try {
+    data = obj(await api("/api/events?limit=20"));
+  } catch (e) {
+    return;
+  }
+  const events = arr(data.events).filter((e) => e && (e.kind === "live" || e.kind === "offline"));
+  if (!events.length) return;
+  const seen = lastSeenTs();
+  let max = seen;
+  for (const e of events) {
+    const ts = Number(e.ts) || 0;
+    if (ts > max) max = ts;
+    if (ts > seen) {
+      try {
+        new Notification(e.kind === "live" ? "Live" : "Stream ended", {
+          body: (e.channel ? e.channel + ": " : "") + (e.text || ""),
+        });
+      } catch (err) {}
+    }
+  }
+  markSeen(max);
+}
+
 async function deleteSelected() {
   const ids = [...selectedRecs];
   if (!ids.length) return;
   if (!window.confirm("Delete " + ids.length + " recording" + (ids.length === 1 ? "" : "s") + "?")) return;
   const results = await Promise.allSettled(
-    ids.map((id) => api("/web/api/recordings?id=" + encodeURIComponent(id), { method: "DELETE" }))
+    ids.map((id) => api("/api/recordings?id=" + encodeURIComponent(id), { method: "DELETE" }))
   );
   let ok = 0;
   let firstFailure = null;
@@ -952,6 +1201,7 @@ async function deleteSelected() {
     if (results[i].status === "fulfilled") {
       ok += 1;
       selectedRecs.delete(id);
+      forgetPosition(id);
     } else if (!firstFailure) {
       const reason = results[i].reason;
       firstFailure = String((reason && reason.message) || reason || "unknown error");
@@ -974,15 +1224,15 @@ document.addEventListener("DOMContentLoaded", () => {
     b.addEventListener("click", () => switchTab(b.dataset.tab));
   });
   activatable($("rec-banner"), () => switchTab("recordings"));
-  activatable($("update-chip"), () => switchTab("ops"));
+  activatable($("update-chip"), () => switchTab("settings"));
   $("logout").addEventListener("click", async () => {
     try {
-      await api("/web/api/logout", { method: "POST" });
+      await api("/api/logout", { method: "POST" });
     } catch (e) {
       toast(String(e.message || e), true);
       return;
     }
-    window.location.replace("/web/");
+    window.location.replace("/");
   });
   $("refresh-status").addEventListener("click", () => loadStatus());
   $("offline-retry").addEventListener("click", () => {
@@ -1003,7 +1253,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("add-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      await api("/web/api/channels", {
+      await api("/api/channels", {
         method: "POST",
         body: JSON.stringify({ channel: $("add-input").value }),
       });
@@ -1028,7 +1278,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         payload[def.key] = value;
       }
-      res = await api("/web/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
+      res = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
     } catch (err) {
       // A 400/409 still carries per-key results in the payload: show
       // them and keep the edits for retry instead of reloading.
@@ -1048,7 +1298,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   async function changePassword() {
     try {
-      await api("/web/api/password", {
+      await api("/api/password", {
         method: "POST",
         body: JSON.stringify({ current: $("pw-current").value, new: $("pw-new").value }),
       });
@@ -1065,7 +1315,48 @@ document.addEventListener("DOMContentLoaded", () => {
     saveSettings().catch((err) => toast(String(err.message || err), true));
   });
   $("refresh-rec").addEventListener("click", loadRecordings);
+  document.querySelectorAll(".list-toggle").forEach((b) => {
+    b.addEventListener("click", () => {
+      setListHidden(!document.querySelector(".rec-stage").classList.contains("list-hidden"));
+    });
+  });
+  $("player-prev").addEventListener("click", () => stepVideo(-1));
+  $("player-next").addEventListener("click", () => stepVideo(1));
   $("refresh-events").addEventListener("click", loadEvents);
+  paintNotifyButton();
+  $("notify-toggle").addEventListener("click", async () => {
+    if (!notifyOn) {
+      if (!("Notification" in window)) {
+        toast("Notifications not supported here", true);
+        return;
+      }
+      let perm = "default";
+      try {
+        perm = await Notification.requestPermission();
+      } catch (e) {}
+      if (perm !== "granted") {
+        toast("Notification permission denied", true);
+        return;
+      }
+      notifyOn = true;
+      try {
+        localStorage.setItem(NOTIFY_KEY, "1");
+      } catch (e) {}
+      markSeen(Date.now() / 1000);
+    } else {
+      notifyOn = false;
+      try {
+        localStorage.setItem(NOTIFY_KEY, "0");
+      } catch (e) {}
+    }
+    paintNotifyButton();
+  });
+  setInterval(pollEventAlerts, 30000);
+  $("clear-events").addEventListener("click", async () => {
+    if (!window.confirm("Clear all events?")) return;
+    await api("/api/events", { method: "DELETE" });
+    loadEvents().catch(() => {});
+  });
   let recFilterTimer = null;
   $("rec-filter").addEventListener("input", () => {
     clearTimeout(recFilterTimer);
@@ -1073,38 +1364,75 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("player-close").addEventListener("click", () => {
     const player = $("player");
+    playToken++;
+    savePosition(currentPlayId, player.currentTime, player.duration);
+    lastSavedAt = -1;
     player.pause();
     player.playbackRate = 1;
     $("player-speed").value = "1";
+    $("player-speed").querySelector("option[data-custom]")?.remove();
     player.removeAttribute("src");
     player.load();
     $("player-wrap").hidden = true;
     $("chat-panel").hidden = true;
+    document.querySelector(".rec-stage").classList.remove("no-chat");
     chatMessages = [];
+    currentPlayId = null;
+    updatePlayerNav();
+    setListHidden(false);
     layoutStage();
   });
   $("player").addEventListener("timeupdate", syncChat);
+  let lastSavedAt = -1;
+  $("player").addEventListener("timeupdate", () => {
+    const t = Math.floor($("player").currentTime);
+    if (currentPlayId && t >= lastSavedAt + 5) {
+      lastSavedAt = t;
+      savePosition(currentPlayId, t, $("player").duration);
+    }
+  });
+  $("player").addEventListener("ended", () => {
+    forgetPosition(currentPlayId);
+    lastSavedAt = -1;
+  });
   $("player-speed").addEventListener("change", () => {
-    $("player").playbackRate = Number($("player-speed").value) || 1;
+    setRate(Number($("player-speed").value) || 1);
+  });
+  $("player-speed").addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      setRate($("player").playbackRate + (e.deltaY < 0 ? 0.1 : -0.1));
+    },
+    { passive: false }
+  );
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "PageUp" && e.key !== "PageDown") return;
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if ($("player-wrap").hidden) return;
+    e.preventDefault();
+    stepVideo(e.key === "PageDown" ? 1 : -1);
   });
   initSeekTap();
+  if (window.matchMedia("(max-width: 1100px)").matches) $("chat-follow").checked = false;
   window.addEventListener("resize", stickPlayer);
   $("op-reload").addEventListener("click", async () => {
     try {
-      const r = await api("/web/api/reload", { method: "POST" });
+      const r = await api("/api/reload", { method: "POST" });
       out(r.message);
     } catch (err) { out(String(err.message || err)); }
   });
   $("op-restart").addEventListener("click", async () => {
     if (!window.confirm("Restart the service?")) return;
     try {
-      const r = await api("/web/api/restart", { method: "POST" });
+      const r = await api("/api/restart", { method: "POST" });
       out(r.message);
     } catch (err) { out(String(err.message || err)); }
   });
   $("op-update").addEventListener("click", async () => {
     try {
-      const r = await api("/web/api/update", {});
+      const r = await api("/api/update", {});
       out(r.message);
     } catch (err) { out(String(err.message || err)); }
   });

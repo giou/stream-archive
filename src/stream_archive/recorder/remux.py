@@ -144,6 +144,74 @@ def remux_ts_to_mp4(source: str | Path) -> Path | None:
     return target
 
 
+#: Width of the cached thumbnail images. Height follows the source ratio.
+THUMBNAIL_WIDTH = 640
+
+#: Seek positions tried for one thumbnail, in seconds. Short captures miss
+#: the first mark, so a second grab near the start covers them.
+_THUMBNAIL_SEEKS = (30, 1)
+
+
+def capture_thumbnail(source: str | Path, dest: str | Path) -> bool:
+    """Grab one 320px frame of ``source`` into ``dest``. True on success.
+
+    Best effort: a missing file, a missing ffmpeg, or a short capture
+    leaves no thumbnail and logs, so the recording never depends on it.
+    """
+    src = Path(source)
+    out = Path(dest)
+    try:
+        if not src.is_file():
+            return False
+        out.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    if not ffmpeg_available():
+        logger.warning("[remux] ffmpeg missing, no thumbnail for %s", src.name)
+        return False
+    for mark in _THUMBNAIL_SEEKS:
+        try:
+            proc = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    str(mark),
+                    "-i",
+                    str(src),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    f"scale={THUMBNAIL_WIDTH}:-1",
+                    str(out),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("[remux] thumbnail ffmpeg failed for %s: %s", src.name, e)
+            return False
+        if proc.returncode == 0 and _thumb_ok(out):
+            return True
+    with contextlib.suppress(OSError):
+        out.unlink(missing_ok=True)
+    logger.warning("[remux] thumbnail failed for %s", src.name)
+    return False
+
+
+def _thumb_ok(path: Path) -> bool:
+    """True when ``path`` is a non-empty JPEG file."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(3)
+        return head.startswith(b"\xff\xd8\xff") and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 async def remux_ts_to_mp4_async(source: str | Path) -> Path | None:
     """Executor offload of :func:`remux_ts_to_mp4`. Never raises."""
     try:

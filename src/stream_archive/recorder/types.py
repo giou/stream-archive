@@ -43,6 +43,11 @@ class KickChatState(TypedDict, total=False):
     streamer_username: str
     emote_names: dict[str, str]
     emote_skipped: int
+    #: Third-party emote set of the channel: name to (id, image URL).
+    #: None means not loaded yet; {} means none.
+    third_party: dict[str, tuple[str, str]] | None
+    #: Third-party emotes used by messages: id to (word, image URL).
+    tp_used: dict[str, tuple[str, str]]
 
 
 class Recording(TypedDict, total=False):

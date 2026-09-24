@@ -48,9 +48,9 @@ file with placeholders is safe to commit or to share.
 | `endpoint.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. The app restores it on boot |
 | `api.enabled` | no | `false` | Serve the HTTP control API under `/api/v1` on the Kick webhook listener. The bot sets this key |
 | `api.key` | no | `""` | API key (bearer token). The bot generates it on the first enable. Keep it secret |
-| `web.enabled` | no | `false` | Serve the browser control panel under `/web/` on the shared listener. See [Web control panel](web-control.md) |
+| `web.enabled` | no | `false` | Serve the browser control panel at the domain root on the shared listener. See [Web control panel](web-control.md) |
 | `web.password_hash` | no | `""` | PBKDF2 hash of the panel password. Set it with `stream-archive-setup-web`. Empty locks the panel |
-| `web.session_secret` | no | `""` | HMAC secret of the panel sessions. Empty means a random secret per boot (sessions end on restart) |
+| `web.session_secret` | no | `""` | HMAC secret of the panel sessions. The first boot with the panel on generates and stores one, so logins survive restarts |
 | `mtproto.enabled` | no | `false` | Send recordings over MTProto (up to 2 GB). The Bot API allows 50 MB only. The bot sets this key |
 | `mtproto.api_id` | yes³ | `0` | Telegram app api id from my.telegram.org. Use `${TELEGRAM_API_ID}`. Required when `mtproto.enabled` is true |
 | `mtproto.api_hash` | yes³ | `""` | Telegram app api hash from my.telegram.org. Use `${TELEGRAM_API_HASH}`. Required when `mtproto.enabled` is true |

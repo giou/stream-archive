@@ -85,7 +85,7 @@ untouched.
   **Delete channel files**, and the channel list ends with **Delete all
   files**: both ask for confirm, skip live captures, and report what went.
   A file that records
-  now carries a red marker and cannot be deleted. **Send** needs MTProto
+  now cannot be deleted. **Send** needs MTProto
   upload (**Settings** → **MTProto upload**). The Bot API allows 50 MB.
   MTProto allows files under 2 GB. Files over the cap split into parts.
   Each part shows its own bar: `(split)`, then `(part 1/5)`. The bar

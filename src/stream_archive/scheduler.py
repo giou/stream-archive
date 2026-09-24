@@ -7,6 +7,7 @@ from typing import Any
 
 from aiohttp import web
 
+from stream_archive import events
 from stream_archive.api import ControlAPI
 from stream_archive.config import AppConfig, get_config, telegram_enabled
 from stream_archive.eventsub import EventSubClient
@@ -100,6 +101,8 @@ async def run_scheduler() -> None:
     assert _shutdown_event is not None
 
     config = get_config()
+    # The feed survives restarts: entries recorded before this boot return.
+    events.load(events.feed_path(config.workdir))
     channels = config.channels
     output_mode = config.output_mode
 
@@ -177,7 +180,7 @@ async def run_scheduler() -> None:
         )
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)
-        webui = WebUI(config, telegram, recorder)
+        webui = WebUI(config, telegram, recorder, http=shared_http)
         webui.register_routes(kick_webhook)
         telegram.bind_live_check(twitch_api, kick_api)
 
@@ -188,9 +191,9 @@ async def run_scheduler() -> None:
 
         await telegram.start()
         if not telegram_enabled(config):
-            logger.info("[scheduler] Telegram bot disabled, the web panel at /web/ controls the app")
+            logger.info("[scheduler] Telegram bot disabled, the web panel at / controls the app")
         elif config.web.enabled:
-            logger.info("[scheduler] Web panel enabled at /web/, Telegram bot stays on")
+            logger.info("[scheduler] Web panel enabled at /, Telegram bot stays on")
 
         version = installed_app_version() or "unknown"
         try:

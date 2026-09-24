@@ -4,12 +4,12 @@ import os
 import time
 from typing import Any
 
+from stream_archive.emotes import MAX_EMOTES_PER_RECORDING, embed_images, fetch_channel_emotes
 from stream_archive.kick_chat import (
-    MAX_EMOTES_PER_RECORDING,
+    EMOTE_URL,
     build_comment,
     chat_root_trailer,
     collect_emote_names,
-    embedded_data,
     streamer_identity,
 )
 from stream_archive.recorder.types import KickChatState, Recording
@@ -140,8 +140,24 @@ class ChatOutputMixin:
             if streamer_id is not None:
                 state["streamer_id"] = streamer_id
                 state["streamer_username"] = username
-        comment = build_comment(payload, state.get("streamer_id"), state["video_id"], state["start"])
+        if state.get("third_party") is None and state.get("streamer_id") is not None:
+            # One fetch per recording: later messages split its words.
+            state["third_party"] = await fetch_channel_emotes(None, "kick", str(state["streamer_id"]))
+        third_party = state.get("third_party") or {}
+        comment = build_comment(payload, state.get("streamer_id"), state["video_id"], state["start"], third_party)
         state["writer"].add_comment(comment)
+        if third_party:
+            used = state.setdefault("tp_used", {})
+            for frag in comment["message"]["fragments"]:
+                if not isinstance(frag, dict):
+                    continue
+                emo = frag.get("emoticon")
+                pid = emo.get("emoticon_id") if isinstance(emo, dict) else None
+                if not isinstance(pid, str) or ":" not in pid or pid in used:
+                    continue
+                ref = third_party.get(frag.get("text", ""))
+                if ref is not None:
+                    used[pid] = (frag["text"], ref[1])
         skipped = collect_emote_names(state["emote_names"], payload.get("content") or "")
         if skipped:
             if not state.get("emote_skipped"):
@@ -170,7 +186,7 @@ class ChatOutputMixin:
 
         The method skips entries without messages. The output file is
         TwitchDownloader ChatRoot JSON with embedded emote images (see
-        kick_chat.embedded_data). The state stays in the entry until the
+        emotes.embed_images, fed with Kick and 7TV ids). The state stays in the entry until the
         trailer is written, so a message that arrives during the emote fetch
         still lands in the file, and the trailer length then covers it. The
         finalizing flag blocks a second run.
@@ -192,7 +208,12 @@ class ChatOutputMixin:
                 writer.discard()
                 return
             try:
-                embedded = await embedded_data(state.get("emote_names") or {})
+                items: dict[str, tuple[str, str]] = {
+                    eid: (name, EMOTE_URL.format(id=eid)) for eid, name in (state.get("emote_names") or {}).items()
+                }
+                for pid, (word, url) in (state.get("tp_used") or {}).items():
+                    items.setdefault(pid, (word, url))
+                embedded = await embed_images(None, items)
             except asyncio.CancelledError:
                 # Write the trailer now, without the emote images. The
                 # comments must not stay in an open, unusable tmp file.

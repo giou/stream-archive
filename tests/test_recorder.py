@@ -25,10 +25,10 @@ from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 def _no_network_emote_embed(monkeypatch):
     """Keep kick chat finalize offline in recorder tests (embedding is covered in test_kick_chat)."""
 
-    async def noop(emote_names, client=None):
+    async def noop(client, items):
         return None
 
-    monkeypatch.setattr("stream_archive.recorder.chat_output.embedded_data", noop)
+    monkeypatch.setattr("stream_archive.recorder.chat_output.embed_images", noop)
     # Clear the shared instance list before every test, so no test sees the
     # recorders of an earlier one.
     FakeChatRecorder.instances.clear()

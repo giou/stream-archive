@@ -19,8 +19,6 @@ chat file embeds. An over-limit emote keeps its text token, so
 TwitchDownloader renders plain text there, never a broken image.
 """
 
-import asyncio
-import base64
 import logging
 import re
 from datetime import UTC, datetime
@@ -29,21 +27,19 @@ from typing import Any
 import httpx
 
 from stream_archive.chat_writer import file_info
+from stream_archive.emotes import (
+    MAX_EMOTE_BYTES,
+    MAX_EMOTE_TOTAL_BYTES,
+    MAX_EMOTES_PER_RECORDING,
+    download_images,
+    embed_images,
+    find_words,
+)
 
 logger = logging.getLogger(__name__)
 
 EMOTE_URL = "https://files.kick.com/emotes/{id}/fullsize"
 _EMOTE_FIND_RE = re.compile(r"\[emote:(\d+):([^\]\[]+)\]")
-_EMOTE_FETCH_CONCURRENCY = 8
-
-#: Distinct emote ids fetched for one recording.
-MAX_EMOTES_PER_RECORDING = 1024
-#: Largest image accepted for one emote.
-MAX_EMOTE_BYTES = 512 * 1024
-#: Largest total download for one recording. The same value bounds the
-#: base64 text that the chat file embeds, because that text is held in
-#: memory while the trailer is written.
-MAX_EMOTE_TOTAL_BYTES = 16 * 1024 * 1024
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -56,22 +52,27 @@ def parse_time(value: Any) -> datetime | None:
         return None
 
 
-def _fragments(content: str) -> list[dict[str, Any]]:
-    """Split body into ChatRoot fragments. Each emote becomes an emoticon reference.
+def _fragments(
+    content: str, third_party: dict[str, tuple[str, str]] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split body into ChatRoot fragments plus third-party emoticon entries.
 
     Emote tokens are self-describing ("[emote:<id>:<name>]"), so the parser
     derives fragments by scanning the body itself. Kick's webhook "emotes"
     positions are not used for splitting. Live data shows that these positions
     are frequently absent or inconsistent with the actual body (offsets past
-    the string length), while the token text is always exact.
+    the string length), while the token text is always exact. Plain words
+    matching the third-party set become ``provider:id`` references when the
+    set is given. Positions are absolute in ``content``.
     """
     if not content:
-        return [{"text": ""}]
+        return [{"text": ""}], []
     parts: list[dict[str, Any]] = []
+    extra: list[dict[str, Any]] = []
     pos = 0
     for m in _EMOTE_FIND_RE.finditer(content):
         if m.start() > pos:
-            parts.append({"text": content[pos : m.start()]})
+            _split_plain(parts, extra, content, pos, m.start(), third_party)
         parts.append(
             {
                 "text": m.group(0),
@@ -80,8 +81,32 @@ def _fragments(content: str) -> list[dict[str, Any]]:
         )
         pos = m.end()
     if pos < len(content):
-        parts.append({"text": content[pos:]})
-    return parts
+        _split_plain(parts, extra, content, pos, len(content), third_party)
+    return parts, extra
+
+
+def _split_plain(
+    parts: list[dict[str, Any]],
+    extra: list[dict[str, Any]],
+    content: str,
+    begin: int,
+    end: int,
+    third_party: dict[str, tuple[str, str]] | None,
+) -> None:
+    """Append the plain span of [begin, end) plus its third-party word fragments."""
+    text = content[begin:end]
+    if not third_party:
+        parts.append({"text": text})
+        return
+    pos = 0
+    for start, finish, pid, _name, _url in find_words(text, third_party):
+        if start > pos:
+            parts.append({"text": text[pos:start]})
+        parts.append({"text": text[start:finish], "emoticon": {"emoticon_id": pid}})
+        extra.append({"_id": pid, "begin": begin + start, "end": begin + finish})
+        pos = finish
+    if pos < len(text):
+        parts.append({"text": text[pos:]})
 
 
 def video_id_for(slug: str, start: datetime | None) -> str:
@@ -120,6 +145,7 @@ def build_comment(
     streamer_id: int | None,
     video_id: str,
     start: datetime | None,
+    third_party: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Map one normalized kick message to a ChatRoot comment."""
     sender = message.get("sender") or {}
@@ -145,6 +171,7 @@ def build_comment(
             }
         )
     content = message.get("content") or ""
+    fragments, word_emos = _fragments(content, third_party)
     emoticons = [
         {
             "_id": t.group(1),
@@ -153,6 +180,8 @@ def build_comment(
         }
         for t in _EMOTE_FIND_RE.finditer(content)
     ]
+    emoticons.extend(word_emos)
+    emoticons.sort(key=lambda e: (e["begin"], e["end"]))
 
     comment = {
         "_id": message.get("message_id") or f"{sender.get('user_id')}-{created_at}",
@@ -173,7 +202,7 @@ def build_comment(
         "message": {
             "body": content,
             "bits_spent": 0,
-            "fragments": _fragments(content),
+            "fragments": fragments,
             "user_badges": user_badges,
             "user_color": sender.get("username_color") or "",
             "emoticons": emoticons,
@@ -228,77 +257,13 @@ async def fetch_emote_images(
     max_bytes_each, and returns at most max_total_bytes of image data. It
     also drops an empty body and a body whose content type is not an image.
     """
-    out: dict[str, bytes] = {}
-    selected = ids[:max_emotes]
-    if len(ids) > max_emotes:
-        logger.warning("[kick_chat] emote limit reached: fetching %d of %d ids", max_emotes, len(ids))
-    if not selected:
-        return out
-    own = client is None
-    http = client if client is not None else httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
-    sem = asyncio.Semaphore(_EMOTE_FETCH_CONCURRENCY)
-    total = 0
-
-    async def one(eid: str) -> None:
-        nonlocal total
-        async with sem:
-            if total >= max_total_bytes:
-                return
-            try:
-                async with http.stream("GET", EMOTE_URL.format(id=eid)) as resp:
-                    resp.raise_for_status()
-                    # An error page or JSON error body is 200 and small, but it
-                    # is not an image. TwitchDownloader cannot decode it. Reject
-                    # it here and keep the text token instead. A response with
-                    # no content type passes.
-                    content_type = resp.headers.get("content-type", "")
-                    if content_type and not content_type.lower().startswith("image/"):
-                        logger.warning(
-                            "[kick_chat] emote %s skipped: content type %r is not an image", eid, content_type
-                        )
-                        return
-                    body = bytearray()
-                    rejected = ""
-                    async for chunk in resp.aiter_bytes():
-                        body.extend(chunk)
-                        # A sibling download fills the total while this one
-                        # waits for its headers or its body, so both limits
-                        # are tested against the live total: the check at the
-                        # permit is not enough on its own.
-                        if len(body) > max_bytes_each:
-                            rejected = f"image larger than {max_bytes_each} bytes"
-                            break
-                        if total + len(body) > max_total_bytes:
-                            rejected = "total download limit reached"
-                            break
-                    if rejected:
-                        logger.warning("[kick_chat] emote %s skipped: %s", eid, rejected)
-                    elif not body:
-                        # A 200 with an empty body carries no image. Storing
-                        # it would embed an empty base64 value.
-                        logger.warning("[kick_chat] emote %s skipped: empty body", eid)
-                    else:
-                        total += len(body)
-                        out[eid] = bytes(body)
-            except Exception as e:
-                logger.warning("[kick_chat] emote %s download failed: %s", eid, e)
-
-    try:
-        await asyncio.gather(*(one(i) for i in selected))
-    finally:
-        if own:
-            await http.aclose()
-    if total > max_total_bytes:
-        # Up to _EMOTE_FETCH_CONCURRENCY requests can be in flight when the
-        # limit is reached. Drop the downloads in first-use order, so the
-        # same recording always keeps the same emote images.
-        for eid in selected:
-            if total <= max_total_bytes:
-                break
-            dropped = out.pop(eid, None)
-            if dropped is not None:
-                total -= len(dropped)
-    return out
+    return await download_images(
+        client,
+        {i: EMOTE_URL.format(id=i) for i in ids},
+        max_emotes=max_emotes,
+        max_bytes_each=max_bytes_each,
+        max_total_bytes=max_total_bytes,
+    )
 
 
 async def embedded_data(emote_names: dict[str, str], client: httpx.AsyncClient | None = None) -> dict[str, Any] | None:
@@ -311,42 +276,14 @@ async def embedded_data(emote_names: dict[str, str], client: httpx.AsyncClient |
     if not emote_names:
         return None
     try:
-        images = await fetch_emote_images(list(emote_names), client)
+        embedded = await embed_images(
+            client,
+            {eid: (name, EMOTE_URL.format(id=eid)) for eid, name in emote_names.items()},
+            max_total_bytes=MAX_EMOTE_TOTAL_BYTES,
+        )
     except Exception as e:
         logger.error("[kick_chat] emote embedding failed: %s", e)
         return None
-    if not images:
-        return None
-    # The embedded block is held as text while the trailer is written, so it
-    # is bounded separately from the download cap: base64 grows the data by a
-    # third, and the whole block is serialized into the file.
-    first_party: list[dict[str, Any]] = []
-    encoded_total = 0
-    skipped = 0
-    for eid in emote_names:
-        image = images.get(eid)
-        if image is None:
-            continue
-        encoded = base64.b64encode(image)
-        if encoded_total + len(encoded) > MAX_EMOTE_TOTAL_BYTES:
-            skipped += 1
-            continue
-        encoded_total += len(encoded)
-        first_party.append(
-            {
-                "id": eid,
-                "imageScale": 2,
-                "data": encoded.decode("ascii"),
-                "name": emote_names.get(eid, eid),
-            }
-        )
-    if skipped:
-        logger.warning(
-            "[kick_chat] embeddedData limit reached (%d bytes); %d emote image(s) stay as text",
-            MAX_EMOTE_TOTAL_BYTES,
-            skipped,
-        )
-    if not first_party:
-        return None
-    logger.info("[kick_chat] embedded %d emote image(s), %d bytes of encoded data", len(first_party), encoded_total)
-    return {"firstParty": first_party}
+    if embedded is not None:
+        logger.info("[kick_chat] embedded %d emote image(s)", len(embedded["firstParty"]))
+    return embedded

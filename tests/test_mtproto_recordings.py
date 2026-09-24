@@ -396,11 +396,11 @@ def test_detail_hides_send_over_cap(tmp_path):
     with mock.patch("stream_archive.telegram.menus_recordings.check_sendable", return_value=(False, "too big")):
         text, markup = asyncio.run(ctrl.handle_reply_text(first))
         labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-        assert "\U0001f4e4 Send" not in labels
-        assert "\U0001f5d1 Delete" in labels
+        assert "Send" not in labels
+        assert "Delete" in labels
         assert "Cannot send" in text
         # A typed Send press is refused too, not just hidden.
-        text, _ = asyncio.run(ctrl.handle_reply_text("\U0001f4e4 Send"))
+        text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
         assert "Cannot send" in text
 
 
@@ -420,7 +420,7 @@ def test_detail_shows_send_for_splittable_file(tmp_path):
     ):
         text, markup = asyncio.run(ctrl.handle_reply_text(first))
         labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-        assert "\U0001f4e4 Send" in labels
+        assert "Send" in labels
         assert "Cannot send" not in text
 
 
@@ -449,8 +449,9 @@ def test_channel_bulk_delete_flow(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
     _, markup = _open_only_channel(ctrl)
     labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-    assert labels[-2:] == ["\U0001f5d1 Delete channel files", "Back"]
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    assert labels[0] == "Back"
+    assert labels[-1] == "Delete channel files"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete channel files"))
     assert "Delete 2 files" in text
     assert "cannot be undone" in text
     result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
@@ -464,8 +465,9 @@ def test_root_bulk_delete_flow(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
     text, markup = asyncio.run(ctrl.handle_reply_text("Recordings"))
     labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-    assert labels[-2:] == ["\U0001f5d1 Delete all files", "Back"]
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete all files"))
+    assert labels[0] == "Back"
+    assert labels[-1] == "Delete all files"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete all files"))
     assert "Delete 2 files" in text
     result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
     assert result is not None and "Deleted 2 files" in result[0]
@@ -473,12 +475,76 @@ def test_root_bulk_delete_flow(tmp_path):
     assert list(rec_dir.iterdir()) == []
 
 
+def test_cancel_keeps_channel_keyboard(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
+    _, markup = _open_only_channel(ctrl)
+    _, markup = asyncio.run(ctrl.handle_reply_text("Delete channel files"))
+    inline = markup.to_dict()["inline_keyboard"]
+    cancel = next(b for row in inline for b in row if b["text"] == "Cancel")
+    sent = []
+
+    async def _send_message(chat_id=None, text=None, reply_markup=None, **kwargs):
+        sent.append((text, reply_markup))
+
+    async def _answer(text=None):
+        pass
+
+    async def _edit(text, reply_markup=None):
+        pass
+
+    query = SimpleNamespace(
+        data=cancel["callback_data"],
+        answer=_answer,
+        edit_message_text=_edit,
+        from_user=SimpleNamespace(id=12345),
+    )
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_message=_send_message))
+    asyncio.run(ctrl._on_callback(SimpleNamespace(callback_query=query), ctx))
+    assert len(sent) == 1 and sent[0][0].startswith("twitch:channel1")
+    labels = [b["text"] for row in sent[0][1].to_dict()["keyboard"] for b in row]
+    assert any("a.ts" in label for label in labels)
+    assert "Delete channel files" in labels
+    assert labels[0] == "Back"
+
+
+def test_cancel_keeps_delete_all_button(tmp_path):
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
+    asyncio.run(ctrl.handle_reply_text("Recordings"))
+    _, markup = asyncio.run(ctrl.handle_reply_text("Delete all files"))
+    inline = markup.to_dict()["inline_keyboard"]
+    cancel = next(b for row in inline for b in row if b["text"] == "Cancel")
+    sent = []
+
+    async def _send_message(chat_id=None, text=None, reply_markup=None, **kwargs):
+        sent.append((text, reply_markup))
+
+    async def _answer(text=None):
+        pass
+
+    async def _edit(text, reply_markup=None):
+        pass
+
+    query = SimpleNamespace(
+        data=cancel["callback_data"],
+        answer=_answer,
+        edit_message_text=_edit,
+        from_user=SimpleNamespace(id=12345),
+    )
+    ctx = SimpleNamespace(bot=SimpleNamespace(send_message=_send_message))
+    asyncio.run(ctrl._on_callback(SimpleNamespace(callback_query=query), ctx))
+    assert len(sent) == 1 and sent[0][0].startswith("Recordings")
+    labels = [b["text"] for row in sent[0][1].to_dict()["keyboard"] for b in row]
+    assert any("twitch:channel1" in label for label in labels)
+    assert "Delete all files" in labels
+    assert labels[0] == "Back"
+
+
 def test_bulk_delete_skips_live_captures(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("live.ts", 10), ("old.ts", 20)])
     rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
     ctrl._recorder._active_paths = lambda: {os.path.realpath(rec_dir / "live.ts")}  # type: ignore[method-assign]
     _, markup = _open_only_channel(ctrl)
-    _, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    _, markup = asyncio.run(ctrl.handle_reply_text("Delete channel files"))
     result = asyncio.run(ctrl.handle_callback(_bulk_confirm_data(markup), 12345))
     assert result is not None and "Deleted 1 file " in result[0]
     assert "1 live capture stays" in result[0]
@@ -489,7 +555,7 @@ def test_bulk_delete_skips_live_captures(tmp_path):
 def test_bulk_confirm_expires_after_repick(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
     _, markup = _open_only_channel(ctrl)
-    _, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete channel files"))
+    _, markup = asyncio.run(ctrl.handle_reply_text("Delete channel files"))
     cb = _bulk_confirm_data(markup)
     # Pick another channel before Confirm: the stale prompt must not delete.
     ctrl._state_for(12345).rec_channel = "kick:other"
@@ -529,14 +595,15 @@ def test_recordings_list_and_pick(tmp_path):
     assert any("b.ts" in label for label in labels)
     assert any("a.ts" in label for label in labels)
     # Pick the first file row whatever it is; the detail is a reply submenu.
-    first = [b["text"] for b in markup.to_dict()["keyboard"][0]][0]
+    rows = markup.to_dict()["keyboard"]
+    first = next(b["text"] for row in rows for b in row if b["text"] != "Back" and ".ts" in b["text"])
     text, markup = asyncio.run(ctrl.handle_reply_text(first))
     assert ctrl._state_for(12345).menu == "rec_detail"
     assert ctrl._state_for(12345).rec_path is not None
     assert "Sendable over MTProto" in text
     labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-    assert "\U0001f4e4 Send" in labels
-    assert "\U0001f5d1 Delete" in labels
+    assert "Send" in labels
+    assert "Delete" in labels
     assert "Back" in labels
 
 
@@ -599,7 +666,7 @@ def test_recordings_send_requires_mtproto(tmp_path):
     state = ctrl._state_for(12345)
     state.rec_path = str(disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1" / "a.ts")
     ctrl._enter_menu(12345, "rec_detail")
-    text, _ = asyncio.run(ctrl.handle_reply_text("\U0001f4e4 Send"))
+    text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
     assert "MTProto upload is off" in text
 
 
@@ -619,7 +686,7 @@ def test_recordings_send_starts_upload(tmp_path):
 
     ctrl._start_mtproto_send = _fake  # type: ignore[method-assign]
     try:
-        result = asyncio.run(ctrl.handle_reply_text("\U0001f4e4 Send"))
+        result = asyncio.run(ctrl.handle_reply_text("Send"))
     finally:
         ctrl._start_mtproto_send = orig
     assert result is None
@@ -634,7 +701,7 @@ def test_recordings_delete_flow(tmp_path):
     state.rec_path = str(target)
     ctrl._enter_menu(12345, "rec_detail")
     # Delete asks for confirm through the shared inline confirm buttons.
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     assert text is not None and "Delete a.ts" in text
     assert "confirm_recdel" in markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     # Cancel leaves the file alone.
@@ -643,7 +710,7 @@ def test_recordings_delete_flow(tmp_path):
     assert target.exists()
     # Confirm deletes and returns the list keyboard. Re-ask: cancel consumed
     # the first prompt's nonce, so take the fresh callback_data.
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     assert len(cb) <= 64, f"callback overflow: {cb!r}"
     text, markup = asyncio.run(ctrl.handle_callback(cb, 12345))
@@ -662,7 +729,7 @@ def test_recordings_delete_blocked_when_live(tmp_path):
     state.rec_path = str(target)
     ctrl._recorder._active_paths = lambda: {os.path.realpath(target)}  # type: ignore[method-assign]
     ctrl._enter_menu(12345, "rec_detail")
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     result = asyncio.run(ctrl.handle_callback(cb, 12345))
     assert result is not None and "recording now" in result[0]
@@ -720,7 +787,7 @@ def test_double_send_is_rejected(tmp_path):
     state.rec_path = target
     ctrl._enter_menu(12345, "rec_detail")
     ctrl._sending_paths.add(target)
-    text, _ = asyncio.run(ctrl.handle_reply_text("\U0001f4e4 Send"))
+    text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
     assert "already runs" in text
 
 
@@ -769,10 +836,10 @@ def test_repick_between_delete_and_confirm_cannot_retarget(tmp_path):
     state.rec_path = str(rec_dir / "b.ts")
     ctrl._enter_menu(12345, "rec_detail")
     state.rec_path = str(rec_dir / "a.ts")
-    text, _ = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, _ = asyncio.run(ctrl.handle_reply_text("Delete"))
     assert "Delete a.ts" in text
     state.rec_path = str(rec_dir / "b.ts")
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     state.rec_path = str(rec_dir / "a.ts")  # stale prompt targets a.ts, chat shows b.ts
     result = asyncio.run(ctrl.handle_callback(cb, 12345))
@@ -789,21 +856,30 @@ def test_confirm_markup_survives_callback_edit(tmp_path):
     state = ctrl._state_for(12345)
     state.rec_path = str(rec_dir / "a.ts")
     ctrl._enter_menu(12345, "rec_detail")
-    edited = []
+    sent = []
+    deleted = []
 
-    async def _edit(text, reply_markup=None):
-        edited.append((text, reply_markup))
+    async def _send_message(chat_id=None, text=None, reply_markup=None, **kwargs):
+        sent.append((text, reply_markup))
+
+    async def _delete_message():
+        deleted.append(True)
 
     async def _answer():
         pass
 
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     assert len(cb) <= 64, f"callback overflow: {cb!r}"
-    query = types.SimpleNamespace(data=cb, answer=_answer, edit_message_text=_edit)
-    ctx = types.SimpleNamespace(bot=SimpleNamespace(send_message=_noop_send()))
+    query = types.SimpleNamespace(
+        data=cb,
+        answer=_answer,
+        delete_message=_delete_message,
+        from_user=types.SimpleNamespace(id=12345),
+    )
+    ctx = types.SimpleNamespace(bot=SimpleNamespace(send_message=_send_message))
     asyncio.run(ctrl._on_callback(types.SimpleNamespace(callback_query=query), ctx))
-    assert edited and "Deleted a.ts" in edited[0][0]
+    assert deleted and len(sent) == 1 and "Deleted a.ts" in sent[0][0]
     assert not (rec_dir / "a.ts").exists()
 
 
@@ -1019,7 +1095,7 @@ def test_delete_returns_page_keyboard_not_bare_back(tmp_path):
     rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
     state.rec_path = str(rec_dir / "a.ts")
     ctrl._enter_menu(12345, "rec_detail")
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     assert len(cb) <= 64, f"callback overflow: {cb!r}"
     text, markup = asyncio.run(ctrl.handle_callback(cb, 12345))
@@ -1034,7 +1110,7 @@ def test_delete_returns_page_keyboard_not_bare_back(tmp_path):
     rec._channel_files(ctrl, "twitch:channel1")
     state.rec_channel = "twitch:channel1"
     ctrl._enter_menu(12345, "rec_detail")
-    text, markup = asyncio.run(ctrl.handle_reply_text("\U0001f5d1 Delete"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Delete"))
     cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
     text, markup = asyncio.run(ctrl.handle_callback(cb, 12345))
     assert "Deleted b.ts" in text

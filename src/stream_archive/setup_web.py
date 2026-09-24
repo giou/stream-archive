@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import logging
+import secrets
 import sys
 from pathlib import Path
 
@@ -38,6 +39,8 @@ def main() -> None:
     def mutate(candidate: AppConfig) -> None:
         candidate.web.password_hash = hashed
         candidate.web.enabled = True
+        if not candidate.web.session_secret.strip():
+            candidate.web.session_secret = secrets.token_urlsafe(32)
 
     try:
         apply_config_change(config, mutate)
@@ -46,4 +49,4 @@ def main() -> None:
         raise SystemExit(1) from e
     workdir = Path(config.config_path).parent
     print(f"Panel password set in {workdir / 'config.json'}.")
-    print("Open the panel at <endpoint.public_url>/web/ (enable the endpoint first).")
+    print("Open the panel at <endpoint.public_url>/ (enable the endpoint first).")

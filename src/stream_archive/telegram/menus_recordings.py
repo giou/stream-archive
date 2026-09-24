@@ -18,7 +18,7 @@ from telegram import ReplyKeyboardMarkup
 
 from stream_archive import disk
 from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES, check_sendable
-from stream_archive.telegram.menu_state import ChatId, MenuResult
+from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -26,14 +26,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: Reply labels of the per-file detail submenu.
-SEND_LABEL = "📤 Send"
-DELETE_LABEL = "🗑 Delete"
+SEND_LABEL = "Send"
+DELETE_LABEL = "Delete"
 
-#: Bulk delete of a channel file page, above Back.
-DELETE_CHANNEL_LABEL = "🗑 Delete channel files"
+#: Bulk delete of a channel file page, last row.
+DELETE_CHANNEL_LABEL = "Delete channel files"
 
-#: Bulk delete of the whole archive, above Back on the channel list.
-DELETE_ALL_LABEL = "🗑 Delete all files"
+#: Bulk delete of the whole archive, last row of the channel list.
+DELETE_ALL_LABEL = "Delete all files"
 
 #: Files per recordings page. Five rows keep one page below the tap limit.
 PAGE_SIZE = 5
@@ -96,13 +96,12 @@ def _detail_text(path: Path, size: int, mtime: float, live: bool) -> str:
 
 
 def _detail_keyboard(*, sendable: bool = True) -> ReplyKeyboardMarkup:
-    """Send / Delete / Back rows of the per-file detail submenu.
+    """Back / Send / Delete rows of the per-file detail submenu.
 
     Files at or over the 2 GiB cap get Delete / Back only, unless ffmpeg can
     split them into chunks below the cap.
     """
-    rows = [[SEND_LABEL, DELETE_LABEL]] if sendable else [[DELETE_LABEL]]
-    rows.append(["Back"])
+    rows = [["Back"], [SEND_LABEL, DELETE_LABEL]] if sendable else [["Back"], [DELETE_LABEL]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -111,13 +110,13 @@ def last_page_start(count: int) -> int:
     return ((count - 1) // PAGE_SIZE) * PAGE_SIZE if count else 0
 
 
-def _page_buttons(count: int, offset: int, live: set[str], files: list[tuple[float, int, Path]]) -> list[list[str]]:
+def _page_buttons(count: int, offset: int, files: list[tuple[float, int, Path]]) -> list[list[str]]:
     """Reply-keyboard rows for the page at ``offset`` plus paging rows."""
     offset = max(0, min(offset, last_page_start(count))) if count else 0
-    rows: list[list[str]] = []
+    rows: list[list[str]] = [["Back"]]
     for i in range(offset, min(offset + PAGE_SIZE, count)):
         _, size, path = files[i]
-        rows.append([_label(path, size, os.path.realpath(path) in live)])
+        rows.append([_label(path, size)])
     nav: list[str] = []
     if offset > 0:
         nav.append("◀ Prev")
@@ -127,12 +126,7 @@ def _page_buttons(count: int, offset: int, live: set[str], files: list[tuple[flo
         rows.append(nav)
     if count:
         rows.append([DELETE_CHANNEL_LABEL])
-    rows.append(["Back"])
     return rows
-
-
-#: Prefix of a channel row in the recordings channel list.
-CHANNEL_PREFIX = "\U0001f3a5 "
 
 
 def channel_rows(ctrl: TelegramController) -> tuple[list[str], dict[str, list[tuple[float, int, Path]]]]:
@@ -145,12 +139,11 @@ def channel_rows(ctrl: TelegramController) -> tuple[list[str], dict[str, list[tu
     return ordered, by_channel
 
 
-def channel_label(channel: str, files: list[tuple[float, int, Path]], live: set[str]) -> str:
-    """One channel row: tag, file count, total size, live marker when recording."""
+def channel_label(channel: str, files: list[tuple[float, int, Path]]) -> str:
+    """One channel row: tag, file count, and total size."""
     total = sum(size for _, size, _ in files)
-    mark = "\U0001f534 " if any(os.path.realpath(p) in live for _, _, p in files) else ""
     n = len(files)
-    return f"{mark}{CHANNEL_PREFIX}{channel} ({n} file{'s' if n != 1 else ''}, {disk.format_bytes(total)})"
+    return f"{CHANNEL_BUTTON_PREFIX}{channel} ({n} file{'s' if n != 1 else ''}, {disk.format_bytes(total)})"
 
 
 def _channel_keyboard(ctrl: TelegramController) -> Any:
@@ -158,11 +151,9 @@ def _channel_keyboard(ctrl: TelegramController) -> Any:
     from telegram import ReplyKeyboardMarkup
 
     ordered, by_channel = channel_rows(ctrl)
-    live = _live_paths(ctrl)
-    rows = [[channel_label(ch, by_channel[ch], live)] for ch in ordered]
+    rows = [["Back"], *[[channel_label(ch, by_channel[ch])] for ch in ordered]]
     if ordered:
         rows.append([DELETE_ALL_LABEL])
-    rows.append(["Back"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -190,48 +181,42 @@ async def open_recordings(ctrl: TelegramController, chat_id: ChatId) -> MenuResu
 def _match_channel_row(ordered: list[str], text: str) -> str | None:
     """Channel tag of a channel-list row press, or None.
 
-    The row carries the live marker, the file count, and the total size,
-    and all three move while a channel records. Match the stable tag
-    only, so a tap still lands after the numbers change.
+    The row carries the file count and the total size, and both move
+    while a channel records. Match the stable tag only, so a tap still
+    lands after the numbers change.
     """
     want = text
-    if want.startswith("\U0001f534 "):
-        want = want[len("\U0001f534 ") :]
-    if not want.startswith(CHANNEL_PREFIX):
+    if not want.startswith(CHANNEL_BUTTON_PREFIX):
         return None
-    want = want[len(CHANNEL_PREFIX) :]
+    want = want[len(CHANNEL_BUTTON_PREFIX) :]
     if " (" in want and want.endswith(")"):
         want = want.rsplit(" (", 1)[0]
     return want if want in ordered else None
 
 
 def _strip_row(text: str) -> str:
-    """Picker row text without the live marker and the trailing size."""
-    if text.startswith("\U0001f534 "):
-        text = text[len("\U0001f534 ") :]
+    """Picker row text without the trailing size."""
     if text.endswith(")") and " (" in text:
         text = text.rsplit(" (", 1)[0]
     return text
 
 
-def _label(path: Path, size: int, live: bool) -> str:
-    """One picker row: name, size, and a live marker when recording now."""
-    return f"{'\U0001f534 ' if live else ''}{_display_name(path)} ({disk.format_bytes(size)})"
+def _label(path: Path, size: int) -> str:
+    """One picker row: name and size."""
+    return f"{_display_name(path)} ({disk.format_bytes(size)})"
 
 
-def _find_pick(files: list[tuple[float, int, Path]], live: set[str], text: str) -> Path | None:
+def _find_pick(files: list[tuple[float, int, Path]], text: str) -> Path | None:
     """File whose picker row matches the pressed ``text``.
 
-    Exact row first: name, size, and live marker all match. Finished files
-    then stay distinct even when their truncated names collide. A live
-    capture grows between the list render and the tap, so a row with no
-    exact match retries size-insensitive, live files only. Truncated names
-    can still collide: then the pick is ambiguous, return None, and the
+    Exact row first: name and size both match. Finished files then stay
+    distinct even when their truncated names collide. Truncated names can
+    still collide: then the pick is ambiguous, return None, and the
     caller asks to re-open instead of touching the wrong file.
     """
     match: Path | None = None
     for _, size, path in files:
-        if _label(path, size, os.path.realpath(path) in live) != text:
+        if _label(path, size) != text:
             continue
         if match is not None:
             return None
@@ -286,10 +271,8 @@ def _list_keyboard(ctrl: TelegramController, chat_id: ChatId) -> Any:
     ordered, by_channel = channel_rows(ctrl)
     if not ordered:
         return ctrl.reply_keyboard("recordings", chat_id=chat_id)
-    live = _live_paths(ctrl)
-    rows = [[channel_label(ch, by_channel[ch], live)] for ch in ordered]
+    rows = [["Back"], *[[channel_label(ch, by_channel[ch])] for ch in ordered]]
     rows.append([DELETE_ALL_LABEL])
-    rows.append(["Back"])
     from telegram import ReplyKeyboardMarkup
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -495,6 +478,7 @@ async def _delete_bulk(ctrl: TelegramController, chat_id: ChatId, channel: str |
         except OSError:
             logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
             continue
+        disk_mod.drop_thumbnail(ctrl._config, path)
         deleted += 1
     disk_mod.invalidate_snapshot()
     parts = [f"Deleted {deleted} file{'s' if deleted != 1 else ''} ({disk.format_bytes(freed)})."]
@@ -533,12 +517,11 @@ async def menu_recordings(ctrl: TelegramController, chat_id: ChatId, text: str) 
     if not ordered:
         ctrl._enter_menu(chat_id, "recordings")
         return "No recordings stored yet.", ctrl.reply_keyboard("recordings", chat_id=chat_id)
-    live = _live_paths(ctrl)
     if text == DELETE_ALL_LABEL:
         return await _ask_bulk_delete(ctrl, chat_id, None)
-    # A channel row carries the live marker, the file count, and the
-    # total size, and all three move while a channel records. Match the
-    # stable tag only, so a tap still lands after the numbers change.
+    # A channel row carries the file count and the total size, and both
+    # move while a channel records. Match the stable tag only, so a tap
+    # still lands after the numbers change.
     picked = _match_channel_row(ordered, text)
     if picked is not None:
         ch = picked
@@ -548,23 +531,21 @@ async def menu_recordings(ctrl: TelegramController, chat_id: ChatId, text: str) 
         st.rec_offset = 0
         st.rec_path = None
         files = by_channel[ch]
-        rows = _page_buttons(len(files), 0, live, files)
+        rows = _page_buttons(len(files), 0, files)
         return _file_page_text(ch, files), ReplyKeyboardMarkup(rows, resize_keyboard=True)
     files = _scan(ctrl)
     if text == "Next ▶":
         state.rec_offset = min(state.rec_offset + PAGE_SIZE, last_page_start(len(files)))
-        rows = _page_buttons(len(files), state.rec_offset, live, files)
+        rows = _page_buttons(len(files), state.rec_offset, files)
         return f"Recordings ({len(files)}). Tap a file to manage it:", ReplyKeyboardMarkup(rows, resize_keyboard=True)
     if text == "◀ Prev":
         state.rec_offset = max(0, state.rec_offset - PAGE_SIZE)
-        rows = _page_buttons(len(files), state.rec_offset, live, files)
+        rows = _page_buttons(len(files), state.rec_offset, files)
         return f"Recordings ({len(files)}). Tap a file to manage it:", ReplyKeyboardMarkup(rows, resize_keyboard=True)
-    pick = _find_pick(files, live, text)
+    pick = _find_pick(files, text)
     if pick is not None:
         return _open_detail(ctrl, chat_id, pick)
-    if any(
-        _strip_row(_label(path, size, os.path.realpath(path) in live)) == _strip_row(text) for _, size, path in files
-    ):
+    if any(_strip_row(_label(path, size)) == _strip_row(text) for _, size, path in files):
         return "Two files share that label. Rename one file, then open Recordings again.", _list_keyboard(ctrl, chat_id)
     return None
 
@@ -580,23 +561,20 @@ async def menu_rec_channel(ctrl: TelegramController, chat_id: ChatId, text: str)
         ctrl._enter_menu(chat_id, "recordings")
         ctrl._state_for(chat_id).rec_channel = None
         return _channel_list_text(ctrl), _channel_keyboard(ctrl)
-    live = _live_paths(ctrl)
     if text == DELETE_CHANNEL_LABEL:
         return await _ask_bulk_delete(ctrl, chat_id, channel)
     if text == "Next ▶":
         state.rec_offset = min(state.rec_offset + PAGE_SIZE, last_page_start(len(files)))
-        rows = _page_buttons(len(files), state.rec_offset, live, files)
+        rows = _page_buttons(len(files), state.rec_offset, files)
         return _file_page_text(channel or "", files), ReplyKeyboardMarkup(rows, resize_keyboard=True)
     if text == "◀ Prev":
         state.rec_offset = max(0, state.rec_offset - PAGE_SIZE)
-        rows = _page_buttons(len(files), state.rec_offset, live, files)
+        rows = _page_buttons(len(files), state.rec_offset, files)
         return _file_page_text(channel or "", files), ReplyKeyboardMarkup(rows, resize_keyboard=True)
-    pick = _find_pick(files, live, text)
+    pick = _find_pick(files, text)
     if pick is not None:
         return _open_detail(ctrl, chat_id, pick)
-    if any(
-        _strip_row(_label(path, size, os.path.realpath(path) in live)) == _strip_row(text) for _, size, path in files
-    ):
+    if any(_strip_row(_label(path, size)) == _strip_row(text) for _, size, path in files):
         return "Two files share that label. Rename one file, then open Recordings again.", _channel_page_keyboard(
             ctrl, chat_id
         )
@@ -612,8 +590,7 @@ def _channel_page_keyboard(ctrl: TelegramController, chat_id: ChatId) -> Any:
     if not files:
         return _channel_keyboard(ctrl)
     offset = _clamp_offset(ctrl, chat_id, len(files))
-    live = _live_paths(ctrl)
-    rows = _page_buttons(len(files), offset, live, files)
+    rows = _page_buttons(len(files), offset, files)
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -701,6 +678,7 @@ async def _delete_picked(ctrl: TelegramController, chat_id: ChatId) -> tuple[str
     except OSError:
         logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
         return f"Could not delete {path.name}. See logs.", None
+    disk_mod.drop_thumbnail(ctrl._config, path)
     disk_mod.invalidate_snapshot()
     return f"Deleted {path.name} ({disk.format_bytes(size)}).", _after_delete_keyboard(ctrl, chat_id, channel)
 
@@ -718,7 +696,6 @@ def _after_delete_keyboard(ctrl: TelegramController, chat_id: ChatId, channel: s
             st = ctrl._state_for(chat_id)
             st.rec_channel = channel
             offset = _clamp_offset(ctrl, chat_id, len(files))
-            live = _live_paths(ctrl)
-            rows = _page_buttons(len(files), offset, live, files)
+            rows = _page_buttons(len(files), offset, files)
             return ReplyKeyboardMarkup(rows, resize_keyboard=True)
     return _list_keyboard(ctrl, chat_id)

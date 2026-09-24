@@ -5,7 +5,7 @@ const $ = (id) => document.getElementById(id);
 async function boot() {
   let s;
   try {
-    const resp = await fetch("/web/api/session");
+    const resp = await fetch("/api/session");
     if (!resp.ok) throw new Error("Service error: " + resp.status);
     s = await resp.json();
   } catch (e) {
@@ -15,7 +15,7 @@ async function boot() {
     return;
   }
   if (s.authenticated) {
-    window.location.replace("/web/");
+    window.location.replace("/");
     return;
   }
   $("setup-hint").hidden = !s.setup_required;
@@ -35,14 +35,14 @@ document.addEventListener("DOMContentLoaded", () => {
   $("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      const resp = await fetch("/web/api/login", {
+      const resp = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password: $("password").value }),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(data.error || ("Login failed: " + resp.status));
-      window.location.replace("/web/");
+      window.location.replace("/");
     } catch (err) {
       const el = $("login-error");
       el.textContent = String(err.message || err);

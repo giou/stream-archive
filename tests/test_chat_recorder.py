@@ -434,3 +434,71 @@ def test_open_failure_keeps_recording_and_reports(tmp_path):
         assert not (blocker / "chat.json").exists()
 
     asyncio.run(scenario())
+
+
+def test_parse_emotes_splits_third_party_words():
+    from stream_archive.chat_recorder import _parse_emotes
+
+    names = {"baseg": ("7tv:abc", "https://cdn.7tv.app/emote/abc/1x.webp")}
+    used: dict[str, tuple[str, str]] = {}
+    fragments, emoticons = _parse_emotes("", "hi baseg", names, used)
+    assert fragments == [{"text": "hi "}, {"text": "baseg", "emoticon": {"emoticon_id": "7tv:abc"}}]
+    assert emoticons == [{"_id": "7tv:abc", "begin": 3, "end": 8}]
+    assert used == {"7tv:abc": ("baseg", "https://cdn.7tv.app/emote/abc/1x.webp")}
+
+
+def test_parse_emotes_mixes_twitch_and_third_party():
+    from stream_archive.chat_recorder import _parse_emotes
+
+    names = {"baseg": ("7tv:abc", "https://cdn.7tv.app/emote/abc/1x.webp")}
+    used: dict[str, tuple[str, str]] = {}
+    fragments, emoticons = _parse_emotes("25:0-4", "Kappa baseg", names, used)
+    assert fragments == [
+        {"text": "Kappa", "emoticon": {"emoticon_id": "25"}},
+        {"text": " "},
+        {"text": "baseg", "emoticon": {"emoticon_id": "7tv:abc"}},
+    ]
+    assert {"_id": "7tv:abc", "begin": 6, "end": 11} in emoticons
+
+
+def test_finalize_embeds_used_third_party_images(tmp_path):
+    raw = b"\x89PNG\r\n\x1a\n" + b"\0" * 10
+    rec = ChatRecorder("ch", str(tmp_path / "chat.json"), "Title", "Game")
+    rec._tp_used = {"7tv:abc": ("baseg", "https://cdn.7tv.app/emote/abc/1x.webp")}
+    rec._tp_images = {"7tv:abc": raw}
+    rec._finalize_now()
+    with open(tmp_path / "chat.json") as f:
+        trailer = json.load(f)
+    (entry,) = trailer["embeddedData"]["firstParty"]
+    assert entry["id"] == "7tv:abc"
+    assert entry["name"] == "baseg"
+    import base64
+
+    assert base64.b64decode(entry["data"]) == raw
+
+
+def test_stop_cancel_finalizes_without_images(tmp_path, monkeypatch):
+    """A deadline cancel during the fetch still renames the file, imageless."""
+    import asyncio as _asyncio
+
+    async def boom(*args, **kwargs):
+        raise _asyncio.CancelledError()
+
+    monkeypatch.setattr("stream_archive.chat_recorder.download_images", boom)
+    rec = ChatRecorder("ch", str(tmp_path / "chat.json"), "Title", "Game")
+    rec._tp_used = {"7tv:abc": ("baseg", "https://cdn.7tv.app/emote/abc/1x.webp")}
+
+    async def scenario():
+        await rec.stop()
+
+    try:
+        _asyncio.run(scenario())
+    except _asyncio.CancelledError:
+        pass
+    else:
+        msg = "stop must reraise the cancellation"
+        raise AssertionError(msg)
+    assert (tmp_path / "chat.json").exists()
+    assert not (tmp_path / "chat.json.tmp").exists()
+    with open(tmp_path / "chat.json") as f:
+        assert "embeddedData" not in json.load(f)

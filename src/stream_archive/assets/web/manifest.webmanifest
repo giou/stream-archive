@@ -1,11 +1,11 @@
 {
   "name": "StreamArchive",
   "short_name": "StreamArchive",
-  "start_url": "/web/",
+  "start_url": "/",
   "display": "standalone",
   "background_color": "#101418",
   "theme_color": "#101418",
   "icons": [
-    { "src": "/web/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
   ]
 }

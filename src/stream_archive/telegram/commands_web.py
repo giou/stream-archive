@@ -2,9 +2,9 @@
 
 The panel is set up from the Remote access menu only. It runs on the
 shared listener, so every enable or disable reconciles that listener
-through ``KickWebhook.apply_state``. Only the password hash lives in
-``web.password_hash`` in config.json. A first enable generates a
-password and shows it once, like the API key flow.
+through ``KickWebhook.apply_state``. The password hash lives in
+``web.password_hash`` in config.json, plus a generated session secret.
+A first enable generates a password and shows it once, like the API key flow.
 """
 
 import html
@@ -46,7 +46,7 @@ class WebCommands:
     def _web_panel_url(self) -> str:
         """Public URL of the panel, or "" when no public URL is set."""
         base = endpoint_base_url(self._config)
-        return f"{base}/web/" if base else ""
+        return f"{base}/" if base else ""
 
     def _password_reveal(self, label: str, password: str, chat_id: int | None) -> str:
         """The password under ``label`` for the admin's private chat, or a pointer.
@@ -84,6 +84,8 @@ class WebCommands:
         def mutate(candidate: AppConfig) -> None:
             candidate.web.enabled = enabled
             candidate.web.password_hash = hashed
+            if not candidate.web.session_secret.strip():
+                candidate.web.session_secret = secrets.token_urlsafe(32)
 
         result: str = self._apply(mutate, lambda c: f"Web panel {'enabled' if enabled else 'disabled'}", chat_id)
         if is_error(result):
@@ -135,6 +137,8 @@ class WebCommands:
 
         def mutate(candidate: AppConfig) -> None:
             candidate.web.password_hash = hashed
+            if not candidate.web.session_secret.strip():
+                candidate.web.session_secret = secrets.token_urlsafe(32)
 
         summary = "Panel password replaced - all browser sessions ended"
         result: str = self._apply(mutate, lambda c: summary, chat_id)

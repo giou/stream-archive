@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Coroutine
 from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
@@ -29,7 +30,7 @@ from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
 from stream_archive.recorder.common import _open_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
-from stream_archive.recorder.remux import ffmpeg_available, remux_ts_to_mp4_async
+from stream_archive.recorder.remux import capture_thumbnail, ffmpeg_available, remux_ts_to_mp4_async
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YoutubeOutputMixin
@@ -240,6 +241,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 "streamer_username": slug,
                 "emote_names": {},
                 "emote_skipped": 0,
+                "third_party": None,
+                "tp_used": {},
             }
             entry["kick_chat"] = kick_state
             self._register_kick_chat(channel, kick_state, chat_path)
@@ -693,6 +696,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if youtube_info:
             await self._release_broadcast(channel, youtube_info, entry)
         await self._remux_finished_file(entry)
+        await self._thumbnail_finished_file(entry)
 
     async def _remux_finished_file(self, entry: Recording) -> None:
         """Stream-copy a finished .ts capture to .mp4 and point the entry at it."""
@@ -705,6 +709,17 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         target = await remux_ts_to_mp4_async(filepath)
         if target is not None:
             entry["filepath"] = str(target)
+
+    async def _thumbnail_finished_file(self, entry: Recording) -> None:
+        """Cache one thumbnail frame of the finished capture, best effort."""
+        filepath = entry.get("filepath")
+        if not filepath:
+            return
+        dest = disk.thumbnail_path(self._config, Path(filepath))
+        if dest is None or dest.exists():
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, capture_thumbnail, filepath, dest)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings

@@ -15,6 +15,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from stream_archive.chat_writer import ChatJsonWriter, file_info
+from stream_archive.emotes import (
+    build_first_party,
+    download_images,
+    fetch_channel_emotes,
+    fetch_global_emotes,
+    find_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +51,21 @@ def _unescape_tag(value: str) -> str:
     return "".join(out)
 
 
-def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _parse_emotes(
+    emotes_tag: str,
+    body: str,
+    third_party: dict[str, tuple[str, str]] | None = None,
+    used: dict[str, tuple[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split body into TwitchDownloader fragments/emoticons from an `emotes` tag value.
 
     Tag format: `25:0-4,12-16/1902:8-15`. Character ranges are inclusive.
     The return value is ([fragments], [emoticons]). The parser drops
-    malformed, inverted and overlapping ranges.
+    malformed, inverted and overlapping ranges. Plain words matching the
+    third-party set become ``provider:id`` references, collected into
+    ``used`` as {id: (word, image URL)} for the trailer embed.
     """
-    if not emotes_tag:
+    if not emotes_tag and not third_party:
         return [{"text": body}], []
 
     ranges = []
@@ -75,7 +89,7 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
         if begin >= len(body) or begin < pos or end < begin:
             continue  # malformed, inverted or overlapping - drop
         if begin > pos:
-            fragments.append({"text": body[pos:begin]})
+            _append_gap(fragments, emoticons, body, pos, begin, third_party, used)
         emote_text = body[begin : min(end + 1, len(body))]
         if not emote_text:
             continue
@@ -85,10 +99,37 @@ def _parse_emotes(emotes_tag: str, body: str) -> tuple[list[dict[str, Any]], lis
         emoticons.append({"_id": emote_id, "begin": begin, "end": begin + len(emote_text)})
         pos = begin + len(emote_text)
     if pos < len(body):
-        fragments.append({"text": body[pos:]})
+        _append_gap(fragments, emoticons, body, pos, len(body), third_party, used)
     if not fragments:
         fragments.append({"text": body})
     return fragments, emoticons
+
+
+def _append_gap(
+    fragments: list[dict[str, Any]],
+    emoticons: list[dict[str, Any]],
+    body: str,
+    start: int,
+    end: int,
+    third_party: dict[str, tuple[str, str]] | None,
+    used: dict[str, tuple[str, str]] | None,
+) -> None:
+    """Append the plain span of [start, end) plus its third-party word fragments."""
+    text = body[start:end]
+    if not third_party:
+        fragments.append({"text": text})
+        return
+    pos = 0
+    for s, e, pid, word, url in find_words(text, third_party):
+        if s > pos:
+            fragments.append({"text": text[pos:s]})
+        fragments.append({"text": text[s:e], "emoticon": {"emoticon_id": pid}})
+        emoticons.append({"_id": pid, "begin": start + s, "end": start + e})
+        if used is not None:
+            used.setdefault(pid, (word, url))
+        pos = e
+    if pos < len(text):
+        fragments.append({"text": text[pos:]})
 
 
 class ChatRecorder:
@@ -125,6 +166,14 @@ class ChatRecorder:
         self._use_ssl = use_ssl
         self._writer = ChatJsonWriter(chat_path, on_error=on_error)
         self._last_offset: float | None = None
+        # Third-party emote set of the channel: name to (id, image URL).
+        # None means not loaded yet; {} means none. Ids used by messages
+        # accumulate for the trailer embed, with their images downloaded
+        # at stop.
+        self._tp_names: dict[str, tuple[str, str]] | None = None
+        self._tp_used: dict[str, tuple[str, str]] = {}
+        self._tp_images: dict[str, bytes] = {}
+        self._tp_room: str | None = None
         self._start_mono = time.monotonic()
         self._start_z = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._task: asyncio.Task[Any] | None = None
@@ -156,6 +205,15 @@ class ChatRecorder:
                 # cancellation cannot interrupt it.
                 self._finalize_now()
                 raise
+        if self._tp_used:
+            try:
+                self._tp_images = await download_images(None, {pid: url for pid, (_name, url) in self._tp_used.items()})
+            except asyncio.CancelledError:
+                # Mirror the Kick path: a shutdown deadline cancels the
+                # fetch, but the trailer still goes out without the images
+                # instead of stranding the .tmp.
+                self._finalize_now()
+                raise
         self._finalize_now()
         return self._writer.comments
 
@@ -170,6 +228,8 @@ class ChatRecorder:
 
     async def _run(self) -> None:
         attempts = 0
+        if self._user_id is not None:
+            await self._load_tp(str(self._user_id))
         while True:
             try:
                 ok = await self._connect_and_read()
@@ -184,6 +244,17 @@ class ChatRecorder:
                 else:
                     attempts += 1
             await asyncio.sleep(min(30, 2**attempts))
+
+    async def _load_tp(self, channel_id: str) -> None:
+        """Fetch the third-party emote set once. Never raises."""
+        if self._tp_names is not None:
+            return
+        names = await fetch_channel_emotes(None, "twitch", channel_id)
+        for name, ref in (await fetch_global_emotes(None)).items():
+            names.setdefault(name, ref)
+        self._tp_names = names
+        if names:
+            logger.info("[chat:%s] loaded %d third-party emote(s)", self.channel, len(names))
 
     async def _connect_and_read(self) -> bool:
         context = ssl.create_default_context() if self._use_ssl else None
@@ -228,6 +299,11 @@ class ChatRecorder:
                     comment = self._parse_message(text, cmd)
                     if comment is not None and self._writer.add_comment(comment):
                         self._last_offset = comment["content_offset_seconds"]
+                if self._tp_names is None and self._tp_room is not None:
+                    # The numeric channel id arrived with the first tags.
+                    # Fetch the set once; later messages split its words.
+                    room, self._tp_room = self._tp_room, None
+                    await self._load_tp(room)
                 # ignore everything else (001/353/366/NOTICE/ROOMSTATE)
         finally:
             try:
@@ -249,6 +325,8 @@ class ChatRecorder:
             tags[key] = _unescape_tag(value)
         if "id" not in tags or "user-id" not in tags:
             return None
+        if self._tp_names is None and not self._tp_room:
+            self._tp_room = tags.get("room-id") or None
 
         header, _, body = rest.partition(" :")
         if not body:
@@ -282,7 +360,7 @@ class ChatRecorder:
         except ValueError:
             bits = 0
 
-        fragments, emoticons = _parse_emotes(tags.get("emotes", ""), body)
+        fragments, emoticons = _parse_emotes(tags.get("emotes", ""), body, self._tp_names, self._tp_used)
 
         badges = []
         if tags.get("badges"):
@@ -361,5 +439,10 @@ class ChatRecorder:
                 "game": self._game,
             },
         }
+        if self._tp_images:
+            names = {pid: name for pid, (name, _url) in self._tp_used.items() if pid in self._tp_images}
+            first_party = build_first_party(self._tp_images, names)
+            if first_party:
+                trailer["embeddedData"] = {"firstParty": first_party}
         if self._writer.close(trailer):
             logger.info("[chat] %s -> %s (%d messages)", self.channel, self.chat_path, self._writer.comments)

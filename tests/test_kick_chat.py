@@ -316,17 +316,17 @@ def test_embedded_data_without_images_or_names():
 def test_embedded_data_never_raises(monkeypatch, caplog):
     calls = []
 
-    async def boom(ids, client=None):
-        calls.append(list(ids))
+    async def boom(client, items, **kwargs):
+        calls.append(items)
         msg = "network down"
         raise httpx.ConnectError(msg)
 
-    monkeypatch.setattr(kick_chat, "fetch_emote_images", boom)
+    monkeypatch.setattr(kick_chat, "embed_images", boom)
 
     with caplog.at_level("ERROR", logger="stream_archive.kick_chat"):
         assert asyncio.run(embedded_data({"1": "AAA"})) is None
 
-    assert calls == [["1"]]  # the stub ran, so the guard path is the one under test
+    assert calls == [{"1": ("AAA", kick_chat.EMOTE_URL.format(id="1"))}]
     assert any("emote embedding failed" in r.getMessage() for r in caplog.records)
 
 
@@ -352,3 +352,18 @@ def test_embedded_data_bounds_the_encoded_payload(monkeypatch, caplog):
     assert [item["id"] for item in embedded["firstParty"]] == ["1"]
     assert "embeddedData limit reached" in caplog.text
     json.dumps(embedded)  # the truncated block is still valid JSON
+
+
+def test_build_comment_splits_seventv_words():
+    """xqc 7TV words become provider-prefixed emoticon fragments."""
+    tp = {"GAMBA": ("7tv:01G3WEGZN0000ET2J0MQP5YJ0G", "https://cdn.7tv.app/emote/01G3WEGZN0000ET2J0MQP5YJ0G/1x.webp")}
+    c = build_comment(make_msg(content="GAMBA all in"), 123, VIDEO_ID, START, tp)
+    fragments = c["message"]["fragments"]
+    assert fragments[0] == {"text": "GAMBA", "emoticon": {"emoticon_id": "7tv:01G3WEGZN0000ET2J0MQP5YJ0G"}}
+    assert fragments[1] == {"text": " all in"}
+    assert {"_id": "7tv:01G3WEGZN0000ET2J0MQP5YJ0G", "begin": 0, "end": 5} in c["message"]["emoticons"]
+
+
+def test_build_comment_without_third_party_unchanged():
+    c = build_comment(make_msg(content="GAMBA all in"), 123, VIDEO_ID, START)
+    assert c["message"]["fragments"] == [{"text": "GAMBA all in"}]
