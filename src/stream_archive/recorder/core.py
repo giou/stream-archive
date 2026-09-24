@@ -85,7 +85,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._recordings = {}
         self._locks = {}
         self._session = Streamlink()
-        self._session.set_option("http-timeout", 30)
+        # Short HTTP timeout: a dead playlist proxy must fail over fast
+        # instead of burning 30 s per proxy before the recording starts.
+        # Segment reads use stream-timeout, so this never slows a capture.
+        self._session.set_option("http-timeout", 10)
         # Ride through short HLS playlist stalls. With the default queue-deadline
         # factor (3) and Kick's ~2s target duration, streamlink aborts after ~6s
         # without new segments. Fresh Kick streams often hit that right after
