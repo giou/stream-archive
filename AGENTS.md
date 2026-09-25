@@ -47,6 +47,15 @@ A second job, `image`, builds the container image, but only on a Dependabot
 pull request: nothing else in CI builds it, and a base-image bump should fail
 before the merge instead of at release time.
 
+## Tests (mandatory)
+
+**Always use the `test-audit` skill when writing, changing, or reviewing
+tests.** Read `.agents/skills/test-audit/SKILL.md` first, then apply its
+authoring gate: name the behavior or contract, name the credible
+regression, show why existing coverage misses it, and avoid test-only
+production seams. One contract has one primary test owner. Extend a table
+case or a shared helper before you add a near-duplicate test.
+
 ## Conventions
 
 - Run `ruff format`, `ruff check`, and `mypy` on changed code before yielding.

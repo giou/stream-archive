@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import subprocess
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from stream_archive import disk
@@ -36,7 +37,7 @@ def test_thumbnail_path_rejects_audio_and_foreign(tmp_path):
 
 def test_capture_thumbnail_needs_real_frame(tmp_path):
     if shutil.which("ffmpeg") is None:
-        return
+        pytest.skip("ffmpeg not installed")
     from test_webui import make_webui
 
     from stream_archive.recorder.remux import capture_thumbnail
@@ -115,7 +116,7 @@ def test_thumb_endpoint_generates_on_demand(tmp_path):
     import asyncio as _asyncio
 
     if shutil.which("ffmpeg") is None:
-        return
+        pytest.skip("ffmpeg not installed")
     from test_webui import login, make_webui, rec_dir
 
     config, _, _, _, wh = make_webui(tmp_path)

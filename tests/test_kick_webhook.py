@@ -1105,7 +1105,9 @@ def test_rate_limiter_evicts_the_least_recently_used_key(monkeypatch):
     assert limiter.allow("a") is True  # touching "a" makes "b" the oldest
     assert limiter.allow("c") is True  # the full table drops "b"
 
-    assert list(limiter._buckets) == ["a", "c"]
+    assert limiter.allow("a") is True  # "a" survived: still far from its limit
+    assert limiter.allow("a") is False  # third use hits the per-key limit
+    assert limiter.allow("b") is True  # "b" went out with the eviction: fresh key
 
 
 class _StalledRequest:

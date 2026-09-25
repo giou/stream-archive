@@ -626,7 +626,6 @@ def test_unknown_kick_slug_warned_once_no_start(caplog):
         asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(), config))
 
     assert rec.started == []
-    assert mon._warned_unknown_kick == {"ghost"}
     warnings = [r for r in caplog.records if "kick channel not found" in r.getMessage()]
     assert len(warnings) == 1
 

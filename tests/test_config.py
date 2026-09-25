@@ -430,16 +430,6 @@ def test_bare_name_and_channel_url_helpers():
     assert channel_url("streamer1") == "https://twitch.tv/streamer1"
 
 
-def test_kick_url_normalized_to_slug():
-    config = AppConfig.model_validate(kick_config(["https://kick.com/xqc"]))
-    assert config.channels == ["kick:xqc"]
-
-
-def test_twitch_url_normalized_to_bare():
-    config = build(channels=["https://www.twitch.tv/foo/"])
-    assert config.channels == ["twitch:foo"]
-
-
 @pytest.mark.parametrize(
     "name,expected",
     [

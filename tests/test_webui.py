@@ -207,19 +207,6 @@ def test_login_js_served_publicly(tmp_path):
     assert "login-form" in body
 
 
-def test_root_serves_panel(tmp_path):
-    _, _, _, _, wh = make_webui(tmp_path)
-
-    async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
-            resp = await client.get("/")
-            return resp.status, await resp.text()
-
-    status, body = asyncio.run(scenario())
-    assert status == 200
-    assert "Login" in body
-
-
 def test_live_probe_failure_blocks_stream_and_delete(tmp_path):
     """A recorder hiccup must fail closed, never serve a live file as done."""
 

@@ -173,36 +173,20 @@ def test_app_check_no_installed_distribution(tmp_path, monkeypatch):
     assert report["app"]["latest"] == APP_LATEST
 
 
-def test_dev_install_never_reports_an_update(tmp_path, monkeypatch):
-    """A dev build tracks the working tree, so it stays silent on releases."""
-    monkeypatch.setattr("stream_archive.updater.installed_app_version", lambda: "1.1.1.dev0")
+@pytest.mark.parametrize(
+    "installed,latest",
+    [
+        ("1.1.1.dev0", "v1.1.1"),
+        ("1.2.0rc1", "v1.2.0"),
+        ("1.1.0+dev.1", "v1.1.0"),
+    ],
+)
+def test_dev_install_never_reports_an_update(tmp_path, monkeypatch, installed, latest):
+    """A dev, release-candidate, or local build tracks the working tree, so it stays silent."""
+    monkeypatch.setattr("stream_archive.updater.installed_app_version", lambda: installed)
     config = make_config(tmp_path)
     notifier = FakeNotifier()
-    u = UpdateChecker(config, notifier, http=app_http(app_tag="v1.1.1", app_body="Fix a bug"))
-    report = asyncio.run(u.check(notify=True))
-    assert report["app"]["status"] == "up_to_date"
-    assert report["app"]["current"] == "1.1.1.dev0"
-    assert report["app"]["latest"] == "1.1.1"
-    assert notifier.calls == []
-
-
-def test_prerelease_install_never_reports_an_update(tmp_path, monkeypatch):
-    """A release candidate tracks the working tree, so it stays silent too."""
-    monkeypatch.setattr("stream_archive.updater.installed_app_version", lambda: "1.2.0rc1")
-    config = make_config(tmp_path)
-    notifier = FakeNotifier()
-    u = UpdateChecker(config, notifier, http=app_http(app_tag="v1.2.0"))
-    report = asyncio.run(u.check(notify=True))
-    assert report["app"]["status"] == "up_to_date"
-    assert notifier.calls == []
-
-
-def test_local_install_never_reports_an_update(tmp_path, monkeypatch):
-    """A local build tracks the working tree, so it stays silent too."""
-    monkeypatch.setattr("stream_archive.updater.installed_app_version", lambda: "1.1.0+dev.1")
-    config = make_config(tmp_path)
-    notifier = FakeNotifier()
-    u = UpdateChecker(config, notifier, http=app_http(app_tag="v1.1.0"))
+    u = UpdateChecker(config, notifier, http=app_http(app_tag=latest))
     report = asyncio.run(u.check(notify=True))
     assert report["app"]["status"] == "up_to_date"
     assert notifier.calls == []

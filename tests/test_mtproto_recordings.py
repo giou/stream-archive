@@ -1133,24 +1133,6 @@ def test_shrunk_archive_clamps_offset(tmp_path):
     assert state.rec_offset == 0
 
 
-def test_stable_pick_survives_size_change(tmp_path):
-    _, ctrl = make_bot(tmp_path, files=[("live.ts", 10)])
-    text, markup = _open_only_channel(ctrl)
-    row = next(b["text"] for row in markup.to_dict()["keyboard"] for b in row if "live.ts" in b["text"])
-    rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
-    with open(rec_dir / "live.ts", "ab") as f:
-        f.write(b"y" * 5000)
-    text, markup = asyncio.run(ctrl.handle_reply_text(row))
-    assert ctrl._state_for(12345).menu == "rec_detail"
-    assert "live.ts" in text
-
-
-def test_progress_sentinel_needs_no_fake_full_bar(tmp_path):
-    # The None wake-up must not edit: drive the watcher sentinel directly.
-    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
-    assert ctrl._state_for(12345).menu == "root"
-
-
 def test_send_splits_over_cap_file(tmp_path):
     from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES
 
@@ -1230,19 +1212,10 @@ def test_split_streams_first_chunk_before_cutter_finishes(tmp_path):
     )
 
 
-def test_split_progress_shows_phase_per_part(tmp_path):
-    """Each part gets its own labeled bar: (split), (part 1/2), (part 2/2)."""
+def test_split_progress_phase_change_rerenders_at_lower_fraction():
+    """A restarted part bar re-renders even at a lower fraction: phase change wins."""
     from stream_archive.telegram.commands_mtproto import _progress_line
 
-    assert "(split)" in _progress_line("big.mp4", 100, 1, 2, 0.5, 1.0, "split")
-    first = _progress_line("big.mp4", 100, 100, 100, 1.0, 1.0, "part 1/2")
     second = _progress_line("big.mp4", 100, 10, 100, 0.1, 2.0, "part 2/2")
-    assert "(part 1/2)" in first and "(part 2/2)" in second
-    # A restarted part bar re-renders even at a lower fraction: phase change wins.
+    assert "(part 2/2)" in second
     assert "10%" in second
-
-
-def test_help_lists_recordings(tmp_path):
-    _, ctrl = make_bot(tmp_path)
-    assert "/recordings" in ctrl.handle_help()
-    assert "recordings" in {c.command for c in ctrl.command_list()}

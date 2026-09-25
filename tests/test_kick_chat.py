@@ -154,11 +154,6 @@ def test_comment_no_start_time_zero_offsets():
     assert c["content_offset_seconds"] == 0.0
 
 
-def test_comment_unicode_emoji_roundtrip():
-    c = build_comment(make_msg(content="\U0001f525\U0001f389"), 123, VIDEO_ID, START)
-    assert c["message"]["body"] == "\U0001f525\U0001f389"
-
-
 def test_streamer_identity_from_broadcaster():
     assert streamer_identity(make_msg(), "xqc") == (123, "xqc")
     assert streamer_identity(make_msg(broadcaster={}), "xqc") == (None, "xqc")

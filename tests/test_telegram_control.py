@@ -738,7 +738,8 @@ def test_status_contains_quality_and_disk_lines(tmp_path):
     assert "YouTube re-streams: unlimited" in text
     assert "Disk limits: disabled" in text
     assert "EventSub" not in text
-    assert "free of" in text
+    assert "GB free of" in text
+    assert "archive:" in text
 
 
 def test_quality_show_set_invalid(tmp_path):
@@ -2062,7 +2063,6 @@ def test_cloudflared_token_and_url_helpers():
     from stream_archive.tunnels import valid_token
 
     token = base64.b64encode(json.dumps({"a": "acct", "t": "tun", "s": "sec"}).encode()).decode()
-    assert token.endswith("=")
     assert valid_token(token)
     assert valid_token(token.rstrip("="))  # unpadded still decodes
     assert not valid_token("nope")
