@@ -65,6 +65,14 @@ main { margin: 0; padding: 0.5rem 0.75rem 4rem; }
   .list-toggle { display: none; }
   #chat-log { max-height: 40vh; }
 }
+@media (min-width: 1101px) {
+  .rec-chatpane { align-self: start; position: sticky; top: 8px; }
+  .rec-chatpane .card { height: auto; overflow: hidden; max-height: 70vh; }
+  #chat-log { max-height: none; min-height: 0; }
+  .rec-playerpane { align-self: start; position: sticky; top: 8px; padding-left: 60px; }
+  .player-bar .list-toggle { position: absolute; left: 0; top: -1px; margin-left: -61px; }
+  .rec-listpane .toolbar > #toggle-list { position: static; margin-left: 0; flex: none; }
+}
 @media (max-width: 640px) {
   header.top { padding: 0.5rem 0.75rem; }
   .brandrow { gap: 0.5rem; }
@@ -183,7 +191,10 @@ input, select {
 #player-prev svg, #player-next svg { fill: currentColor; }
 #player-wrap p { margin: 0.5rem 0 0; }
 #player { width: 100%; aspect-ratio: 16 / 9; border-radius: var(--radius); background: #000; }
-.player-bar .list-toggle { position: absolute; top: 0.5rem; left: 0.5rem; z-index: 6; opacity: 0.85; }
+@media (min-width: 1101px) {
+  #player { display: block; margin: 0 auto; }
+}
+.player-bar .list-toggle { opacity: 0.85; }
 .player-bar .list-toggle:hover { opacity: 1; }
 #seek-flash {
   position: absolute;

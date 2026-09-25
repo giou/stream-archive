@@ -108,6 +108,7 @@ function switchTab(name) {
     loadSettings();
   }
   currentTab = name;
+  if (name === "recordings") closePlayer();
   document.querySelectorAll("#nav button[data-tab]").forEach((b) => {
     b.classList.toggle("active", b.dataset.tab === name);
   });
@@ -632,7 +633,7 @@ function timeAgo(ts) {
 function layoutStage() {
   const playing = !$("player-wrap").hidden;
   document.querySelector(".rec-stage").classList.toggle("no-player", !playing);
-  const toggle = document.querySelector(".player-bar .list-toggle");
+  const toggle = $("toggle-list");
   if (toggle) toggle.hidden = !playing;
   if (!playing) setListHidden(false);
 }
@@ -641,7 +642,10 @@ function stickPlayer() {
   const header = document.querySelector("header.top");
   const wrap = $("player-wrap");
   if (header && !wrap.hidden) {
-    wrap.style.top = (header.offsetHeight + 8) + "px";
+    const top = header.offsetHeight + 8 + "px";
+    wrap.style.top = top;
+    const pane = document.querySelector(".rec-playerpane");
+    if (pane) pane.style.top = top;
   }
 }
 
@@ -692,6 +696,7 @@ function channelOf(id) {
 let selectedRecs = new Set();
 let playQueue = [];
 let currentPlayId = null;
+let lastSavedAt = -1;
 const recCards = new Map();
 const recGroups = new Map();
 
@@ -749,6 +754,7 @@ async function playRecording(entry, collapse = true) {
   wrapEl.hidden = false;
   if (collapse) setListHidden(true);
   layoutStage();
+  fitPlayer($("player-wrap"), $("player"));
   stickPlayer();
   wrapEl.scrollIntoView({ block: "nearest" });
   loadChat(entry.id, entry.name).catch(() => {});
@@ -783,6 +789,28 @@ function updatePlayerNav() {
   $("player-next").disabled = idx < 0 || idx >= playQueue.length - 1;
 }
 
+function closePlayer() {
+  if ($("player-wrap").hidden) return;
+  const player = $("player");
+  playToken++;
+  savePosition(currentPlayId, player.currentTime, player.duration);
+  lastSavedAt = -1;
+  player.pause();
+  player.playbackRate = 1;
+  $("player-speed").value = "1";
+  $("player-speed").querySelector("option[data-custom]")?.remove();
+  player.removeAttribute("src");
+  player.load();
+  $("player-wrap").hidden = true;
+  $("chat-panel").hidden = true;
+  document.querySelector(".rec-stage").classList.remove("no-chat");
+  chatMessages = [];
+  currentPlayId = null;
+  updatePlayerNav();
+  setListHidden(false);
+  layoutStage();
+}
+
 function stepVideo(delta) {
   const idx = playQueue.findIndex((e) => e.id === currentPlayId);
   const next = playQueue[idx + delta];
@@ -812,6 +840,69 @@ function setRate(rate) {
 function setListHidden(hidden) {
   if (hidden && $("player-wrap").hidden) return;
   document.querySelector(".rec-stage").classList.toggle("list-hidden", hidden);
+  dockToggle(hidden);
+  alignChat();
+}
+
+function dockToggle(collapsed) {
+  const btn = $("toggle-list");
+  if (!btn) return;
+  if (collapsed) {
+    const bar = document.querySelector(".player-bar");
+    if (bar && btn.parentElement !== bar) bar.prepend(btn);
+  } else {
+    const toolbar = document.querySelector(".rec-listpane .toolbar");
+    if (toolbar && btn.parentElement !== toolbar) toolbar.prepend(btn);
+  }
+}
+
+function alignChat() {
+  const panel = $("chat-panel");
+  const wrap = $("player-wrap");
+  const player = $("player");
+  const card = panel.querySelector(".card");
+  if (!card) return;
+  if (panel.hidden || wrap.hidden || window.matchMedia("(max-width: 1100px)").matches) {
+    card.style.maxHeight = "";
+    return;
+  }
+  fitPlayer(wrap, player);
+  const header = document.querySelector("header.top");
+  if (header) panel.style.top = header.offsetHeight + 8 + "px";
+  card.style.maxHeight = wrap.getBoundingClientRect().height + "px";
+}
+
+function fitPlayer(wrap, player) {
+  if (window.matchMedia("(max-width: 1100px)").matches) {
+    if (player.style.width) player.style.width = "";
+    return;
+  }
+  const pane = wrap.parentElement;
+  const colW = pane ? pane.clientWidth : player.clientWidth;
+  const ratio =
+    player.videoWidth > 0 && player.videoHeight > 0 ? player.videoWidth / player.videoHeight : 16 / 9;
+  const naturalH = colW / ratio;
+  const wrapRect = wrap.getBoundingClientRect();
+  const playerRect = player.getBoundingClientRect();
+  const chrome = Math.max(0, wrapRect.height - playerRect.height);
+  const targetH = window.innerHeight - wrapRect.top - chrome - 12;
+  if (targetH < naturalH - 1) {
+    const w = Math.max(0, targetH * ratio);
+    if (Math.abs(player.clientWidth - w) > 1) player.style.width = w + "px";
+  } else if (player.style.width) {
+    player.style.width = "";
+  }
+}
+
+let playerSizeObs = null;
+function watchPlayerSize() {
+  if (playerSizeObs || typeof ResizeObserver === "undefined") return;
+  const wrap = $("player-wrap");
+  const player = $("player");
+  if (!wrap || !player) return;
+  playerSizeObs = new ResizeObserver(() => alignChat());
+  playerSizeObs.observe(wrap);
+  playerSizeObs.observe(player);
 }
 
 let chatMessages = [];
@@ -869,6 +960,7 @@ async function loadChat(id, name) {
     panel.hidden = true;
     document.querySelector(".rec-stage").classList.add("no-chat");
   }
+  alignChat();
 }
 
 function appendChatText(div, text, emotes) {
@@ -920,7 +1012,15 @@ function syncChat() {
     rows[i].classList.toggle("now", i === at);
   }
   if (at >= 0 && $("chat-follow").checked && rows[at]) {
-    rows[at].scrollIntoView({ block: "nearest" });
+    if (window.matchMedia("(max-width: 1100px)").matches) {
+      rows[at].scrollIntoView({ block: "nearest" });
+      return;
+    }
+    const row = rows[at];
+    const rowRect = row.getBoundingClientRect();
+    const logRect = log.getBoundingClientRect();
+    if (rowRect.top < logRect.top) log.scrollTop -= logRect.top - rowRect.top;
+    else if (rowRect.bottom > logRect.bottom) log.scrollTop += rowRect.bottom - logRect.bottom;
   }
 }
 
@@ -1376,28 +1476,8 @@ document.addEventListener("DOMContentLoaded", () => {
     clearTimeout(recFilterTimer);
     recFilterTimer = setTimeout(loadRecordings, 300);
   });
-  $("player-close").addEventListener("click", () => {
-    const player = $("player");
-    playToken++;
-    savePosition(currentPlayId, player.currentTime, player.duration);
-    lastSavedAt = -1;
-    player.pause();
-    player.playbackRate = 1;
-    $("player-speed").value = "1";
-    $("player-speed").querySelector("option[data-custom]")?.remove();
-    player.removeAttribute("src");
-    player.load();
-    $("player-wrap").hidden = true;
-    $("chat-panel").hidden = true;
-    document.querySelector(".rec-stage").classList.remove("no-chat");
-    chatMessages = [];
-    currentPlayId = null;
-    updatePlayerNav();
-    setListHidden(false);
-    layoutStage();
-  });
+  $("player-close").addEventListener("click", closePlayer);
   $("player").addEventListener("timeupdate", syncChat);
-  let lastSavedAt = -1;
   $("player").addEventListener("timeupdate", () => {
     const t = Math.floor($("player").currentTime);
     if (currentPlayId && t >= lastSavedAt + 5) {
@@ -1430,7 +1510,11 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   initSeekTap();
   if (window.matchMedia("(max-width: 1100px)").matches) $("chat-follow").checked = false;
-  window.addEventListener("resize", stickPlayer);
+  window.addEventListener("resize", () => {
+    stickPlayer();
+    alignChat();
+  });
+  watchPlayerSize();
   $("op-reload").addEventListener("click", async () => {
     try {
       const r = await api("/api/reload", { method: "POST" });

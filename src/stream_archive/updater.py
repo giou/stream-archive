@@ -48,7 +48,7 @@ def installed_app_version() -> str | None:
 class UpdateChecker:
     """Periodic app update check and /update.
 
-    The check is read-only and never raises. The runtime downloads nothing and
+    A dev install never reports an update. The check is read-only and never raises. The runtime downloads nothing and
     applies nothing: a new app release ships in a new image. Streamlink and the
     vendored twitch.py plugin are not part of the check; the image build
     resolves them, and Dependabot updates the lockfile.
@@ -126,10 +126,19 @@ class UpdateChecker:
         if local is None:
             return {"status": "unknown", "current": None, "latest": tag}
         try:
-            status = "update" if Version(tag) > Version(local) else "up_to_date"
+            current = Version(local)
+            latest = Version(tag)
         except InvalidVersion as e:
             logger.warning("[updater] cannot compare release %r with installed %r: %s", tag, local, e)
             status = "unknown"
+        else:
+            if current.is_prerelease or current.local is not None:
+                # A dev build tracks the working tree, not the release
+                # channel. It never reports an update, even when a newer
+                # release tag exists.
+                status = "up_to_date"
+            else:
+                status = "update" if latest > current else "up_to_date"
         changelog = _changelog_lines(data.get("body")) if status == "update" else None
         return {"status": status, "current": local, "latest": tag, "changelog": changelog}
 
