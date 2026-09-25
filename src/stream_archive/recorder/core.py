@@ -30,7 +30,13 @@ from stream_archive.kick_chat import parse_time, video_id_for
 from stream_archive.recorder.chat_output import ChatOutputMixin
 from stream_archive.recorder.common import _open_stream, sanitize_filename
 from stream_archive.recorder.disk_output import DiskOutputMixin
-from stream_archive.recorder.remux import capture_thumbnail, ffmpeg_available, remux_ts_to_mp4_async
+from stream_archive.recorder.remux import (
+    capture_thumbnail,
+    ffmpeg_available,
+    find_pending_remuxes,
+    record_pending,
+    remux_ts_to_mp4_async,
+)
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YoutubeOutputMixin
@@ -438,11 +444,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         else:
             return True
 
-    async def stop(self, channel: str) -> dict[str, Any] | None:
+    async def stop(self, channel: str, *, finish_media: bool = True) -> dict[str, Any] | None:
         async with self._lock_for(channel):
-            return await self._stop_unlocked(channel)
+            return await self._stop_unlocked(channel, finish_media=finish_media)
 
-    async def _stop_unlocked(self, channel: str) -> dict[str, Any] | None:
+    async def _stop_unlocked(self, channel: str, *, finish_media: bool = True) -> dict[str, Any] | None:
         if channel not in self._recordings:
             return None
 
@@ -457,7 +463,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         chat_recorder = entry.pop("chat_recorder", None)
         youtube_info = entry.get("youtube_info")
-        await self._finalize_entry(channel, entry, chat_recorder)
+        await self._finalize_entry(channel, entry, chat_recorder, finish_media=finish_media)
 
         filepath = entry.get("filepath")
         file_info = None
@@ -496,7 +502,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 channel, title=title, game=game, user_id=user_id, notify=False, youtube_notify=True
             )
 
-    async def stop_all(self) -> None:
+    async def stop_all(self, *, finish_media: bool = True) -> None:
         cancelled: asyncio.CancelledError | None = None
         for channel in list(self._recordings):
             # One failing channel must not keep the others running: their
@@ -505,7 +511,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             # deadline cancels whatever it interrupts and the remaining
             # channels still need their children and chat writers closed.
             try:
-                await self.stop(channel)
+                await self.stop(channel, finish_media=finish_media)
             except asyncio.CancelledError as e:
                 cancelled = e
                 logger.warning("[recorder] stop of %s was interrupted; stopping the rest first", channel)
@@ -517,7 +523,23 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     async def close(self) -> None:
         cancelled: asyncio.CancelledError | None = None
         try:
-            await self.stop_all()
+            # Shutdown skips the remux: a multi-GB file outlasts the stop
+            # grace period, and the kill leaves a partial file behind. The
+            # kept `.ts` files go on the pending list first, so the boot
+            # repair pass remuxes them with no deadline.
+            try:
+                workdir: Path | None = self._config.workdir
+            except RuntimeError:
+                workdir = None
+            if workdir is not None:
+                pending: list[str] = []
+                for e in self._recordings.values():
+                    fp = e.get("filepath")
+                    if isinstance(fp, str) and fp.lower().endswith(".ts"):
+                        pending.append(fp)
+                if pending:
+                    record_pending(workdir, pending)
+            await self.stop_all(finish_media=False)
         except asyncio.CancelledError as e:
             # The shutdown deadline fired. Finish the teardown anyway: the
             # held broadcasts and the background finalizers must not be left
@@ -687,7 +709,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         chat_recorder = entry.pop("chat_recorder", None)
         await self._finalize_entry(channel, entry, chat_recorder)
 
-    async def _finalize_entry(self, channel: str, entry: Recording, chat_recorder: ChatRecorder | None) -> None:
+    async def _finalize_entry(
+        self, channel: str, entry: Recording, chat_recorder: ChatRecorder | None, *, finish_media: bool = True
+    ) -> None:
         """Finalize the chat capture, the broadcast, and the held state."""
         if chat_recorder:
             # _finalize_chat releases the writer's paths. Stopping the capture
@@ -698,6 +722,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         youtube_info = entry.get("youtube_info")
         if youtube_info:
             await self._release_broadcast(channel, youtube_info, entry)
+        if not finish_media:
+            return
         await self._remux_finished_file(entry)
         await self._thumbnail_finished_file(entry)
 
@@ -709,7 +735,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if not ffmpeg_available():
             logger.warning("[recorder] ffmpeg missing, keeping %s as .ts", filepath)
             return
-        target = await remux_ts_to_mp4_async(filepath)
+        try:
+            workdir = self._config.workdir
+        except RuntimeError:
+            workdir = None
+        target = await remux_ts_to_mp4_async(filepath, workdir)
         if target is not None:
             entry["filepath"] = str(target)
 
@@ -723,6 +753,30 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             return
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, capture_thumbnail, filepath, dest)
+
+    async def repair_pending_remuxes(self) -> tuple[int, int]:
+        """Remux captures whose stop-time remux died with the process.
+
+        Shutdown skips the remux, and a kill lands mid-file, so the boot
+        pass finishes that work with no deadline. Live captures stay out:
+        each source is checked against the active set right before its
+        remux. Returns (recovered, failed).
+        """
+        try:
+            workdir: Path | None = self._config.workdir
+        except RuntimeError:
+            workdir = None
+        loop = asyncio.get_running_loop()
+        base = disk.resolve_recording_dir(self._config)
+        pending = await loop.run_in_executor(None, find_pending_remuxes, base, workdir)
+        ok = 0
+        for src in pending:
+            if os.path.realpath(src) in self._active_paths():
+                continue
+            if await remux_ts_to_mp4_async(src, workdir) is not None:
+                ok += 1
+        disk.invalidate_snapshot()
+        return (ok, len(pending) - ok)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings

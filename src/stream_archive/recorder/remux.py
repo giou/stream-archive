@@ -9,17 +9,45 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from stream_archive.disk import LEGACY_REMUX_TMP_SUFFIX, TMP_DIRNAME
+
 logger = logging.getLogger(__name__)
 
 #: Suffixes the remux accepts as input. Only .ts recordings need it.
 REMUXABLE_SUFFIXES = (".ts",)
+
+#: File inside the data tmp folder that lists captures left for the boot
+#: repair. Shutdown skips the remux, so it records the kept `.ts` files
+#: here first: a remux that never started leaves no scratch behind.
+PENDING_FILENAME = "pending.json"
+
+
+def _scratch_path(source: Path, workdir: str | Path | None) -> Path:
+    """Scratch output of one remux: inside the data tmp folder, never the archive.
+
+    The path mirrors the source below the tmp folder, so two channels with
+    the same file name never share one scratch file. Without a workdir, or
+    with a source outside it, the scratch sits in a `.tmp` folder beside
+    the source. Both sit on the same filesystem, so the final move is atomic.
+    """
+    name = source.stem + ".mp4"
+    if workdir is not None:
+        try:
+            rel = source.parent.relative_to(Path(workdir))
+        except ValueError, OSError, RuntimeError:
+            pass
+        else:
+            return Path(workdir) / TMP_DIRNAME / rel / name
+    return source.parent / ".tmp" / name
 
 
 def remux_target(source: Path) -> Path:
@@ -85,9 +113,11 @@ def _probe_ok(path: Path) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
-def remux_ts_to_mp4(source: str | Path) -> Path | None:
+def remux_ts_to_mp4(source: str | Path, workdir: str | Path | None = None) -> Path | None:
     """Remux a finished .ts capture to .mp4, replacing the source.
 
+    The scratch file lives in the data tmp folder, never beside the
+    source: a killed run leaves no partial file in the archive listings.
     Returns the .mp4 path on success, None when nothing changed: wrong
     suffix, missing file, ffmpeg failure, or a bad probe. A failure keeps
     the .ts and logs, so the recording is never lost to a remux.
@@ -117,7 +147,12 @@ def remux_ts_to_mp4(source: str | Path) -> Path | None:
                     logger.warning("[remux] cleanup of %s failed: %s", src, e)
                 return target
             logger.warning("[remux] cached %s failed its probe, remuxing again", target)
-    tmp = src.with_name(src.stem + ".remux.tmp.mp4")
+    tmp = _scratch_path(src, workdir)
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("[remux] scratch dir failed for %s: %s", src, e)
+        return None
     try:
         if not _run_ffmpeg(src, tmp):
             return None
@@ -212,13 +247,116 @@ def _thumb_ok(path: Path) -> bool:
         return False
 
 
-async def remux_ts_to_mp4_async(source: str | Path) -> Path | None:
+async def remux_ts_to_mp4_async(source: str | Path, workdir: str | Path | None = None) -> Path | None:
     """Executor offload of :func:`remux_ts_to_mp4`. Never raises."""
     try:
-        return await asyncio.get_running_loop().run_in_executor(None, remux_ts_to_mp4, source)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, remux_ts_to_mp4, source, workdir)
     except Exception:
         logger.warning("[remux] background remux failed for %s", source, exc_info=True)
         return None
+
+
+def record_pending(workdir: str | Path, sources: list[str]) -> None:
+    """List `.ts` files for the boot repair. Never raises.
+
+    Shutdown calls this before it stops the captures without a remux.
+    The boot sweep remuxes the listed files. Entries that vanish or turn
+    out live are skipped there.
+    """
+    try:
+        tmp_root = Path(workdir) / TMP_DIRNAME
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        (tmp_root / PENDING_FILENAME).write_text(json.dumps([s for s in sources if s]))
+    except OSError:
+        logger.warning("[remux] pending list not stored, boot repair skips %d file(s)", len(sources))
+
+
+def find_pending_remuxes(base: str | Path, workdir: str | Path | None = None) -> list[Path]:
+    """`.ts` files whose last remux died with the process, oldest first.
+
+    Evidence is a leftover scratch file or a shutdown pending list: a
+    legacy `*.remux.tmp.mp4` beside the source, a file under the data tmp
+    folder that maps back to the `.ts`, or an entry in the pending file
+    that shutdown wrote. Scratch with no live `.ts` is garbage and goes
+    at once, as do empty tmp folders. A `.ts` whose finished `.mp4`
+    already probes clean needs no new remux: the source goes like a
+    normal run. Live captures never belong here: the caller skips active
+    paths before it remuxes.
+    """
+    root = Path(base)
+    found: dict[str, Path] = {}
+
+    def _note(ts: Path, tmp: Path | None) -> None:
+        try:
+            if not ts.is_file():
+                if tmp is not None:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink(missing_ok=True)
+                return
+        except OSError:
+            return
+        target = remux_target(ts)
+        try:
+            has_target = target.is_file()
+        except OSError:
+            return
+        if has_target:
+            if _probe_ok(target):
+                for p in (ts,) if tmp is None else (ts, tmp):
+                    with contextlib.suppress(OSError):
+                        p.unlink(missing_ok=True)
+                return
+            logger.warning("[remux] cached %s failed its probe, remuxing again", target)
+        try:
+            key = str(ts.resolve())
+        except OSError:
+            key = str(ts)
+        found.setdefault(key, ts)
+
+    try:
+        legacy = [p for p in root.rglob(f"*{LEGACY_REMUX_TMP_SUFFIX}") if p.is_file()]
+    except OSError:
+        legacy = []
+    for tmp in legacy:
+        _note(tmp.with_name(tmp.name[: -len(LEGACY_REMUX_TMP_SUFFIX)] + ".ts"), tmp)
+
+    if workdir is not None:
+        tmp_root = Path(workdir) / TMP_DIRNAME
+        pending_file = tmp_root / PENDING_FILENAME
+        try:
+            raw = pending_file.read_bytes()
+        except OSError:
+            raw = b""
+        if raw:
+            try:
+                entries = json.loads(raw)
+            except ValueError:
+                entries = []
+            if isinstance(entries, list):
+                for item in entries:
+                    if isinstance(item, str) and item:
+                        _note(Path(item), None)
+            with contextlib.suppress(OSError):
+                pending_file.unlink(missing_ok=True)
+        try:
+            leftovers = [p for p in tmp_root.rglob("*.mp4") if p.is_file()] if tmp_root.is_dir() else []
+        except OSError:
+            leftovers = []
+        for tmp in leftovers:
+            _note(Path(workdir) / tmp.parent.relative_to(tmp_root) / (tmp.stem + ".ts"), tmp)
+        with contextlib.suppress(OSError):
+            for dirpath, dirnames, filenames in os.walk(tmp_root, topdown=False):
+                if not dirnames and not filenames:
+                    Path(dirpath).rmdir()
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(found.values(), key=_mtime)
 
 
 def ffmpeg_available() -> bool:

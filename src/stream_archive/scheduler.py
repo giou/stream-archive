@@ -129,6 +129,7 @@ async def run_scheduler() -> None:
     updater_task: asyncio.Task[None] | None = None
     telegram: TelegramController | None = None
     mtproto: MtprotoUploader | None = None
+    repair_task: asyncio.Task[None] | None = None
     # Every resource inside the try below shuts down in order. A failed
     # Telegram start, for example, must not leave a recording or a held
     # YouTube broadcast behind.
@@ -204,6 +205,10 @@ async def run_scheduler() -> None:
 
         # Ready for orchestrators only now: the signal clients and the bot run.
         _READY = True
+        # A kill lands mid-remux, and shutdown skips it, so the boot pass
+        # finishes that work in the background with no deadline. Boot never
+        # waits for it: multi-GB files take minutes.
+        repair_task = asyncio.create_task(_repair_after_boot(recorder))
         await _run_loop(monitor, twitch_api, kick_api, config, recorder)
     except asyncio.CancelledError:
         logger.info("[scheduler] Scheduler task cancelled, shutting down")
@@ -222,7 +227,23 @@ async def run_scheduler() -> None:
             youtube_streamer=youtube_streamer,
             shared_http=shared_http,
             mtproto=mtproto,
+            repair_task=repair_task,
         )
+
+
+async def _repair_after_boot(recorder: Recorder) -> None:
+    """Remux captures that a past shutdown left behind. Never raises."""
+    try:
+        ok, failed = await recorder.repair_pending_remuxes()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("[scheduler] remux repair failed", exc_info=True)
+        return
+    if ok or failed:
+        logger.info("[scheduler] remux repair: %d recovered, %d failed", ok, failed)
+    else:
+        logger.info("[scheduler] remux repair: nothing pending")
 
 
 async def _pause(seconds: float) -> None:
@@ -304,6 +325,7 @@ async def _shutdown(
     youtube_streamer: YouTubeStreamer | None,
     shared_http: Any,
     mtproto: MtprotoUploader | None = None,
+    repair_task: asyncio.Task[None] | None = None,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest.
 
@@ -312,6 +334,15 @@ async def _shutdown(
     global _READY
     _READY = False
     logger.info("[scheduler] Shutting down, stopping all recordings...")
+    if repair_task is not None:
+        # A boot repair in flight holds no capture: stop it first so it
+        # cannot remux a file the teardown below still owns. Its scratch
+        # waits for the next boot.
+        try:
+            repair_task.cancel()
+            await asyncio.gather(repair_task, return_exceptions=True)
+        except Exception:
+            logger.error("[scheduler] remux repair cancel failed", exc_info=True)
     if notifier is not None:
         try:
             await notifier.notify_shutdown()

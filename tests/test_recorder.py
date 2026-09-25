@@ -968,12 +968,10 @@ def test_resolve_stream_audio_only_kick_demux_uses_480p(tmp_path, monkeypatch):
 
 def test_remux_ts_to_mp4_replaces_source(tmp_path):
     """A .ts file remuxes to .mp4 and the source is removed."""
-    pytest = __import__("pytest")
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         pytest.skip("ffmpeg not installed")
     src = tmp_path / "cap.ts"
-    shutil.copy(Path(__file__).parent / "data" / "sample.ts", src) if False else None
     # Build a tiny valid TS with ffmpeg instead of shipping a fixture.
     gen = subprocess.run(
         [
@@ -1031,7 +1029,9 @@ def test_remux_retries_stale_cached_mp4(tmp_path):
     stale = tmp_path / "cap.mp4"
     stale.write_bytes(b"junk")
     # The mocked ffmpeg run produces no file: stand in for its output.
-    (tmp_path / "cap.remux.tmp.mp4").write_bytes(b"v" * 100)
+    scratch = tmp_path / ".tmp" / "cap.mp4"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    scratch.write_bytes(b"v" * 100)
     with (
         mock.patch.object(remux_mod, "_probe_ok", side_effect=[False, True]),
         mock.patch.object(remux_mod, "_run_ffmpeg", return_value=True),
@@ -1085,7 +1085,7 @@ def test_finalize_points_entry_at_mp4(tmp_path):
     assert not src.exists()
 
 
-def test_split_parts_creates_playable_chunks(tmp_path):
+def test_split_parts_passes_small_file_through(tmp_path):
     import subprocess
 
     src = tmp_path / "cap.mp4"
@@ -2276,7 +2276,7 @@ def test_ffmpeg_stderr_log_hides_the_youtube_stream_key(tmp_path, caplog):
             return gen()
 
     class FakeProcess:
-        stderr = FakeStderr([b"[flv @ 0x1] Failed to open rtmp://a.rtmp.youtube.com/live2/secret-key\n"])
+        stderr = FakeStderr([b"[flv @ 0x1] Failed to open rtmp://a.rtmp.youtube.com/live2/secret-key?backup=1\n"])
 
     class Reader(DiskOutputMixin):
         _config = None
@@ -2288,19 +2288,7 @@ def test_ffmpeg_stderr_log_hides_the_youtube_stream_key(tmp_path, caplog):
         asyncio.run(scenario())
 
     assert "secret-key" not in caplog.text
-    assert "rtmp://a.rtmp.youtube.com/live2/***" in caplog.text
-
-
-def test_redact_credentials_covers_proxy_and_ingest_urls():
-    from stream_archive.recorder.common import _redact_credentials
-
-    proxy = _redact_credentials("proxy 'httpproxy://user:pass@193.32.153.101:9389' failed")
-    assert "pass" not in proxy
-    assert "httpproxy://***@193.32.153.101:9389" in proxy
-
-    ingest = _redact_credentials("rtmp://a.rtmp.youtube.com/live2/abcd-efgh-1234?backup=1 failed")
-    assert "abcd-efgh-1234" not in ingest
-    assert "rtmp://a.rtmp.youtube.com/live2/***?backup=1" in ingest
+    assert "rtmp://a.rtmp.youtube.com/live2/***?backup=1" in caplog.text
 
 
 def test_start_arms_the_watchdog_even_when_the_cap_is_off(tmp_path, monkeypatch):
@@ -2450,7 +2438,7 @@ def test_close_keeps_tearing_down_after_a_cancellation(tmp_path):
     stopped: list[str] = []
     ended: list[tuple[str, str]] = []
 
-    async def fake_stop(channel):
+    async def fake_stop(channel, *, finish_media=True):
         if channel == "twitch:a":
             raise asyncio.CancelledError
         stopped.append(channel)

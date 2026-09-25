@@ -224,7 +224,7 @@ class MtprotoUploader:
                     logger.warning("[mtproto] Cached %s failed its probe, keeping %s", target, path)
         except OSError:
             return path
-        made = await remux_ts_to_mp4_async(path)
+        made = await remux_ts_to_mp4_async(path, self._config.workdir)
         return made if made is not None else path
 
     @staticmethod

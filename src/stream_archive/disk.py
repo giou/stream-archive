@@ -44,6 +44,15 @@ THUMBNAIL_SUFFIXES = (".mp4", ".ts")
 #: Suffix of the cached thumbnail images.
 THUMBNAIL_IMAGE_SUFFIX = ".jpg"
 
+#: Scratch folder at the data root for in-progress remux output. The
+#: archive scans skip it: its files are incomplete by definition.
+TMP_DIRNAME = ".tmp"
+
+#: Suffix of the pre-tmp-folder remux scratch files beside the source.
+#: They hold partial output, never recordings: the scans skip them so
+#: they stay out of listings, disk totals, and retention passes.
+LEGACY_REMUX_TMP_SUFFIX = ".remux.tmp.mp4"
+
 
 def thumbnail_dir(config: AppConfig) -> Path:
     """Thumbnail cache dir: ``.cache/thumbnails`` inside the data dir."""
@@ -107,10 +116,16 @@ def _iter_suffixed(base: Path, suffixes: tuple[str, ...]) -> Iterator[Path]:
 
     One walk covers every suffix, so the archive is read once per scan.
     Split temp dirs (`<name>.split`) stay out: their chunks are not
-    recordings, and they vanish when the upload finishes.
+    recordings, and they vanish when the upload finishes. The data tmp
+    folder stays out too: its files are incomplete by definition.
     """
     for path in base.rglob("*"):
-        if any(part.endswith(".split") for part in path.parts[len(base.parts) : -1]):
+        rel_parts = path.parts[len(base.parts) : -1]
+        if any(part.endswith(".split") for part in rel_parts):
+            continue
+        if TMP_DIRNAME in rel_parts:
+            continue
+        if path.name.endswith(LEGACY_REMUX_TMP_SUFFIX):
             continue
         if path.name.endswith(suffixes) and path.is_file():
             yield path
@@ -123,6 +138,8 @@ def iter_recordings(base: Path) -> Iterator[Path]:
     The recorder itself writes only .ts and .m4a. The other two suffixes
     cover a file that an operator remuxed by hand. Chat files (.chat.json)
     are not recording artifacts and stay with the chat cleanup pass.
+    Legacy remux scratch files (`*.remux.tmp.mp4`) are partial output,
+    never recordings: the shared walker skips them.
     """
     yield from _iter_suffixed(base, _RECORDING_SUFFIXES)
 
