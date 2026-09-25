@@ -317,13 +317,6 @@ async function loadStatus(quiet) {
     const cards = $("status-cards");
     cards.textContent = "";
     cards.append(host, access, disk);
-    const banner = $("rec-banner");
-    if (s.recording.length) {
-      banner.textContent = "● REC - " + s.recording.join(", ");
-      banner.hidden = false;
-    } else {
-      banner.hidden = true;
-    }
     const now = $("rec-now");
     now.textContent = "";
     if (!s.recording.length) {
@@ -1333,7 +1326,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("#nav button[data-tab]").forEach((b) => {
     b.addEventListener("click", () => switchTab(b.dataset.tab));
   });
-  activatable($("rec-banner"), () => switchTab("recordings"));
   activatable($("update-chip"), () => switchTab("settings"));
   $("logout").addEventListener("click", async () => {
     try {
