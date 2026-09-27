@@ -68,10 +68,11 @@ docker compose run --rm stream-archive stream-archive-setup
 ```
 
 Run this command in the data directory before the first start. The
-wizard writes `config.json`: Twitch credentials and one control surface
-(web panel, Telegram bot, or both). Channels come later, from the panel
-or the bot. It also offers YouTube restream, Enable MTProto (upload to
-Telegram), panel access, and Enable Kick. Run it again later to add a
+wizard writes `config.json`: Twitch credentials, one control surface
+(web panel, Telegram bot, or both), and the first channels. It also
+offers YouTube restream, Enable MTProto (upload to
+Telegram), panel access, Enable Kick, and the control API. Run it again
+later to add a
 feature or change a block. The single-purpose commands
 `stream-archive-setup-youtube` and `stream-archive-setup-web` still work.
 

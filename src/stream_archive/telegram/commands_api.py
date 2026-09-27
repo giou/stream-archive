@@ -1,7 +1,7 @@
 """Control API commands: enable, disable, show the key, and rotate the key.
 
-The API is set up from the Remote access menu only. It runs on the Kick
-webhook listener, so every enable or disable reconciles that listener
+The API is set up from the Remote access menu only. It runs on the private
+listener, so every enable or disable reconciles that listener
 through ``KickWebhook.apply_state``. The key lives in ``api.key`` in
 config.json and is generated on the first enable.
 """
@@ -121,9 +121,7 @@ class ApiCommands:
                     )
             else:
                 lines.append(
-                    _html(
-                        "No public URL yet - set up a tunnel under Settings, then Remote access to reach the API from outside."
-                    )
+                    _html("No public URL yet - set the public URL in Remote access to reach the API from outside.")
                 )
         if created:
             lines.append(self._key_reveal("API key (keep it secret - Show key shows it again):", key, chat_id))

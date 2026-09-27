@@ -9,8 +9,6 @@ import pytest
 
 from stream_archive.tunnels import (
     parse_public_hostname,
-    token_from_input,
-    valid_token,
     write_ingress_config,
     write_nginx_config,
 )
@@ -18,18 +16,6 @@ from stream_archive.tunnels import (
 
 def _token(payload):
     return base64.b64encode(json.dumps(payload).encode()).decode()
-
-
-def test_token_from_input_strips_the_install_command():
-    token = _token({"a": "a", "t": "t", "s": "s"})
-    assert token_from_input(f"cloudflared service install {token}") == token
-    assert token_from_input(token) == token
-
-
-def test_valid_token_needs_account_tunnel_and_secret():
-    assert valid_token(_token({"a": "a", "t": "t", "s": "s"})) is True
-    assert valid_token(_token({"a": "a", "t": "t"})) is False
-    assert valid_token("not-a-token") is False
 
 
 def test_parse_public_hostname_accepts_url_and_bare_host():

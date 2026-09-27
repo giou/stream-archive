@@ -19,16 +19,6 @@ _HOSTNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?
 #: A cloudflared tunnel id for a file name. A UUID matches this pattern.
 _TUNNEL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-#: The dashboard command that holds a token: cloudflared service install <TOKEN>.
-_CLOUDFLARED_INSTALL_RE = re.compile(r"^cloudflared(?:\.exe)?\s+service\s+install\s+(\S+)\s*$")
-
-
-def token_from_input(text: str) -> str:
-    """Token from a pasted ``cloudflared service install <TOKEN>`` command or a bare token."""
-    text = text.strip()
-    match = _CLOUDFLARED_INSTALL_RE.match(text)
-    return match.group(1) if match else text
-
 
 def decode_token(token: str) -> dict[str, Any] | None:
     """Decode a cloudflared install token into its JSON payload, or return None."""
@@ -41,16 +31,6 @@ def decode_token(token: str) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             return payload
     return None
-
-
-def valid_token(token: str) -> bool:
-    """Return True when the token holds cloudflared install credentials.
-
-    The decoded JSON payload must contain non-empty strings under the keys
-    {a: account, t: tunnel, s: secret}.
-    """
-    data = decode_token(token)
-    return bool(isinstance(data, dict) and all(isinstance(data.get(k), str) and data[k] for k in ("a", "t", "s")))
 
 
 def safe_tunnel_id(raw: Any) -> str:

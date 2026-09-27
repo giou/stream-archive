@@ -102,7 +102,7 @@ class YouTubeStreamer:
                 return self._credentials
 
             if not self._token_path.exists():
-                msg = "YouTube token not found. Run 'python setup_youtube.py' first to authenticate."
+                msg = "YouTube token not found. Run 'stream-archive-setup-youtube' first to authenticate."
                 raise RuntimeError(msg)
 
             try:
@@ -126,7 +126,7 @@ class YouTubeStreamer:
             if token_err is not None:
                 msg = (
                     f"YouTube token file {self._token_path} {token_err}. "
-                    "Run 'python setup_youtube.py' again to authenticate."
+                    "Run 'stream-archive-setup-youtube' again to authenticate."
                 )
                 raise RuntimeError(msg) from load_err
             try:
@@ -134,7 +134,7 @@ class YouTubeStreamer:
             except (TypeError, KeyError, AttributeError, ValueError) as err:
                 msg = (
                     f"YouTube token file {self._token_path} has an unexpected shape ({err}). "
-                    "Run 'python setup_youtube.py' again to authenticate."
+                    "Run 'stream-archive-setup-youtube' again to authenticate."
                 )
                 raise RuntimeError(msg) from err
             self._credentials = creds
@@ -144,7 +144,7 @@ class YouTubeStreamer:
                     await asyncio.to_thread(creds.refresh, Request())
                     save_token(self._credentials, self._token_path)
                 else:
-                    msg = "YouTube token expired and cannot be refreshed. Run 'python setup_youtube.py' again."
+                    msg = "YouTube token expired and cannot be refreshed. Run 'stream-archive-setup-youtube' again."
                     raise RuntimeError(msg)
 
             return self._credentials

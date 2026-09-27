@@ -1,4 +1,4 @@
-"""Kick chat -> TwitchDownloader ChatRoot conversion, with embedded emote images.
+"""Kick chat -> TwitchDownloader ChatRoot conversion.
 
 TwitchDownloader renders chat emoticons from ``message.fragments[].emoticon``
 and resolves their artwork from ``embeddedData.firstParty`` (base64 image
@@ -8,35 +8,21 @@ bytes keyed by emote id) before it falls back to Twitch's CDN. This module:
   timestamps, reply offsets),
 - splits the body into fragments so each ``[emote:<id>:<name>]`` token
   becomes an emoticon reference,
-- downloads the kick emote images (files.kick.com/emotes/<id>/fullsize) and
-  builds the embeddedData block, so TwitchDownloader renders them offline
-  without contacting Twitch's CDN.
+- collects the emote names the recorder embeds (``EMOTE_URL`` maps an id
+  to its image, and the recorder calls ``emotes.embed_images`` itself).
 
-The recorder writes the comments while the recording runs. The limits in this
-module bound the emote work for one recording: 1024 distinct emote ids, 512
-KiB for one image, 16 MiB for all images, and 16 MiB for the base64 text the
-chat file embeds. An over-limit emote keeps its text token, so
-TwitchDownloader renders plain text there, never a broken image.
+The recorder writes the comments while the recording runs. The name table
+holds 1024 distinct emote ids per recording. An over-limit emote keeps its
+text token, so TwitchDownloader renders plain text there, never a broken
+image.
 """
 
-import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
-
 from stream_archive.chat_writer import file_info
-from stream_archive.emotes import (
-    MAX_EMOTE_BYTES,
-    MAX_EMOTE_TOTAL_BYTES,
-    MAX_EMOTES_PER_RECORDING,
-    download_images,
-    embed_images,
-    find_words,
-)
-
-logger = logging.getLogger(__name__)
+from stream_archive.emotes import MAX_EMOTES_PER_RECORDING, find_words
 
 EMOTE_URL = "https://files.kick.com/emotes/{id}/fullsize"
 _EMOTE_FIND_RE = re.compile(r"\[emote:(\d+):([^\]\[]+)\]")
@@ -240,50 +226,3 @@ def chat_root_trailer(
         video["created_at"] = started_wall
 
     return {"FileInfo": file_info(), "streamer": streamer, "video": video}
-
-
-async def fetch_emote_images(
-    ids: list[str],
-    client: httpx.AsyncClient | None = None,
-    *,
-    max_emotes: int = MAX_EMOTES_PER_RECORDING,
-    max_bytes_each: int = MAX_EMOTE_BYTES,
-    max_total_bytes: int = MAX_EMOTE_TOTAL_BYTES,
-) -> dict[str, bytes]:
-    """Download kick emote images, up to the given limits.
-
-    A failed download is skipped, so the returned dict can be partial. The
-    function stops at max_emotes ids, drops one image larger than
-    max_bytes_each, and returns at most max_total_bytes of image data. It
-    also drops an empty body and a body whose content type is not an image.
-    """
-    return await download_images(
-        client,
-        {i: EMOTE_URL.format(id=i) for i in ids},
-        max_emotes=max_emotes,
-        max_bytes_each=max_bytes_each,
-        max_total_bytes=max_total_bytes,
-    )
-
-
-async def embedded_data(emote_names: dict[str, str], client: httpx.AsyncClient | None = None) -> dict[str, Any] | None:
-    """Download the emote images and build the ChatRoot embeddedData block.
-
-    The method never raises. It returns None when no image is available, so
-    the caller still writes a complete file and TwitchDownloader renders the
-    text token instead.
-    """
-    if not emote_names:
-        return None
-    try:
-        embedded = await embed_images(
-            client,
-            {eid: (name, EMOTE_URL.format(id=eid)) for eid, name in emote_names.items()},
-            max_total_bytes=MAX_EMOTE_TOTAL_BYTES,
-        )
-    except Exception as e:
-        logger.error("[kick_chat] emote embedding failed: %s", e)
-        return None
-    if embedded is not None:
-        logger.info("[kick_chat] embedded %d emote image(s)", len(embedded["firstParty"]))
-    return embedded

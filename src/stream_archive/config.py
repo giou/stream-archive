@@ -247,7 +247,7 @@ class KickConfig(BaseModel):
 
 
 class ApiConfig(BaseModel):
-    """Control API served on the Kick webhook listener under /api/v1."""
+    """Control API served on the private listener under /api/v1."""
 
     model_config = ConfigDict(validate_assignment=True)
 
@@ -256,11 +256,11 @@ class ApiConfig(BaseModel):
 
 
 class WebConfig(BaseModel):
-    """Browser control panel served on the shared listener at the domain root.
+    """Browser control panel served on the private listener at the domain root.
 
     The panel replaces the Telegram bot: it needs no Telegram token. It
-    shares the listener with the Kick webhook and the control API, so it
-    runs while any of them is enabled. The password never reaches disk:
+    shares the private listener with the control API, so it runs while
+    any of them is enabled. The password never reaches disk:
     only its PBKDF2 hash is stored. Use ``stream-archive-setup-web`` to
     set it. The first boot with the panel on stores a generated secret in
     ``session_secret``, so logins survive restarts. Live sessions live in

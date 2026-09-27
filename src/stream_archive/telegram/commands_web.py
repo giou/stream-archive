@@ -1,7 +1,7 @@
 """Web panel commands: enable, disable, and the password.
 
 The panel is set up from the Remote access menu only. It runs on the
-shared listener, so every enable or disable reconciles that listener
+private listener, so every enable or disable reconciles that listener
 through ``KickWebhook.apply_state``. The password hash lives in
 ``web.password_hash`` in config.json, plus a generated session secret.
 A first enable generates a password and shows it once, like the API key flow.
@@ -107,9 +107,7 @@ class WebCommands:
                     )
             else:
                 lines.append(
-                    _html(
-                        "No public URL yet - set up a tunnel under Settings, then Remote access to reach the panel from outside."
-                    )
+                    _html("No public URL yet - set the public URL in Remote access to reach the panel from outside.")
                 )
         if created:
             lines.append(

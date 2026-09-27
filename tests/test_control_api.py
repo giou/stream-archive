@@ -1,4 +1,4 @@
-"""Tests for the /api/v1 control API served on the Kick webhook listener.
+"""Tests for the /api/v1 control API served on the private listener.
 
 The API is a thin adapter over the Telegram command layer, so these tests
 drive the real controller and check both the HTTP result and the config
@@ -714,7 +714,7 @@ def test_kick_delivery_test_route_calls_through(tmp_path):
 
 
 def test_kick_delivery_test_route_needs_the_listener(tmp_path):
-    """Without a listener owner the route answers 503, not 500."""
+    """Without a delivery owner the route answers 503, not 500."""
     config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
     ctrl._kick_webhook = None
 
@@ -725,7 +725,7 @@ def test_kick_delivery_test_route_needs_the_listener(tmp_path):
 
     status, body = asyncio.run(scenario())
     assert status == 503
-    assert body == {"error": "webhook listener unavailable"}
+    assert body == {"error": "Kick delivery test unavailable"}
 
 
 def test_disabled_api_never_spends_budget(tmp_path):

@@ -5,7 +5,7 @@ status, channels, settings, recordings with a video player, reload,
 restart, update check, and password change. The bot and the panel can run
 at once.
 
-The panel lives on the shared listener at the domain root. It runs while the
+The panel lives on the private listener at the domain root. It runs while the
 endpoint, the control API, or the panel itself is on.
 
 ## Enable the panel
@@ -45,8 +45,9 @@ The panel is powerful. Keep it off the open internet when you can.
 * For public access: your own reverse proxy plus identity-aware access
   (for example Cloudflare Tunnel plus Cloudflare Access). Access
   checks identity first, and the panel password stays as a second factor.
-* Keep `endpoint.listen_host` on loopback and let the proxy forward to
-  it. Never publish port 8787 directly.
+* Keep `endpoint.listen_host` on loopback on bare metal and let the proxy forward to
+  it. Under Docker set it to `0.0.0.0`, so the host proxy reaches the container.
+  Never publish port 8787 directly.
 
 ## Differences from the bot
 

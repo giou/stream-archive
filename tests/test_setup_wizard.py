@@ -60,7 +60,7 @@ def test_fresh_run_creates_valid_config(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["tid123", "1", "8"],
+        inputs=["tid123", "1", "3", "10"],
         secrets=["tsecret123", "long-enough-password", "long-enough-password"],
     )
     wizard.main()
@@ -81,7 +81,7 @@ def test_kick_step_asks_creds_then_tunnel(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["4", "kid123", "y", "3", "kick.example.com", "n", "8"],
+        inputs=["5", "kid123", "y", "3", "kick.example.com", "n", "10"],
         secrets=["ksecret123"],
     )
     wizard.main()
@@ -99,7 +99,7 @@ def test_rerun_enables_mtproto_and_keeps_stored_secrets(monkeypatch, tmp_path):
     old_hash = hash_password("old-password-123")
     _write_config(tmp_path, web={"enabled": True, "password_hash": old_hash})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["6", "y", "123456", "8"], secrets=["abcdef123456"])
+    _script(monkeypatch, inputs=["7", "y", "123456", "10"], secrets=["abcdef123456"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.mtproto.enabled is True
@@ -113,7 +113,7 @@ def test_control_choice_telegram_enables_bot_only(monkeypatch, tmp_path):
     """The Telegram choice enables the bot and leaves the panel off."""
     _write_config(tmp_path, telegram_user_id=0, bot_telegram_api="")
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["2", "2", "42", "8"], secrets=["bottoken123"])
+    _script(monkeypatch, inputs=["2", "2", "42", "10"], secrets=["bottoken123"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert telegram_enabled(config) is True
@@ -128,7 +128,7 @@ def test_youtube_step_saves_mode_and_runs_oauth(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     calls: list[str] = []
     monkeypatch.setattr(wizard, "youtube_main", lambda: calls.append("oauth"))
-    _script(monkeypatch, inputs=["5", "2", "8"], secrets=[])
+    _script(monkeypatch, inputs=["6", "2", "10"], secrets=[])
     wizard.main()
     assert calls == ["oauth"]
     assert get_config(tmp_path / "config.json").output_mode == "youtube"
@@ -192,7 +192,7 @@ def test_remote_step_tailnet_saves_url(monkeypatch, tmp_path):
     """The tailnet pick prints the serve command and saves the pasted address."""
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["3", "y", "1", "", "", "https://box.tailnet.ts.net", "8"], secrets=[])
+    _script(monkeypatch, inputs=["4", "y", "1", "", "", "https://box.tailnet.ts.net", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.endpoint.enabled is True
@@ -203,7 +203,7 @@ def test_remote_step_internet_saves_url(monkeypatch, tmp_path):
     """The internet pick saves a bare hostname as https."""
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["3", "y", "2", "", "", "test.com", "8"], secrets=[])
+    _script(monkeypatch, inputs=["4", "y", "2", "", "", "test.com", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.endpoint.enabled is True
@@ -217,7 +217,7 @@ def test_remote_step_blank_host_defaults_to_wildcard_in_containers(monkeypatch, 
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(os.path, "exists", lambda _path: True)
-    _script(monkeypatch, inputs=["3", "y", "2", "", "", "test.com", "8"], secrets=[])
+    _script(monkeypatch, inputs=["4", "y", "2", "", "", "test.com", "10"], secrets=[])
     wizard.main()
     assert get_config(tmp_path / "config.json").endpoint.listen_host == "0.0.0.0"
 
@@ -226,7 +226,7 @@ def test_kick_step_stores_separate_url(monkeypatch, tmp_path, capsys):
     """Kick channels get their own public entry, independent of the endpoint."""
     _write_config(tmp_path, channels=["kick:slug"])
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "y", "3", "kick.example.com", "n", "8"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -246,7 +246,7 @@ def test_kick_step_follow_endpoint_clears_override(monkeypatch, tmp_path):
         kick={"webhook": {"enabled": False, "setup_notified": True, "public_url": "https://kick.example.com"}},
     )
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "4", "8"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "4", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == ""
@@ -258,7 +258,7 @@ def test_remote_step_accepts_bare_hostname(monkeypatch, tmp_path):
     """The reported validation failure is gone: test.com saves as https."""
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["3", "y", "1", "", "", "test.com", "8"], secrets=[])
+    _script(monkeypatch, inputs=["4", "y", "1", "", "", "test.com", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.endpoint.enabled is True
@@ -269,7 +269,7 @@ def test_remote_step_skips_public_entry_without_kick(monkeypatch, tmp_path):
     """Twitch-only setups stay local: no URL or tunnel prompts follow a no."""
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["3", "n", "8"], secrets=[])
+    _script(monkeypatch, inputs=["4", "n", "10"], secrets=[])
     wizard.main()
     assert get_config(tmp_path / "config.json").endpoint.enabled is False
 
@@ -283,10 +283,10 @@ def test_kick_step_declined_leaves_config_alone(monkeypatch, tmp_path, capsys):
     def answer(prompt=""):
         calls["n"] += 1
         if calls["n"] == 1:
-            return "4"
+            return "5"
         if calls["n"] == 2:
             raise KeyboardInterrupt
-        return "8"
+        return "10"
 
     monkeypatch.setattr("builtins.input", answer)
     wizard.main()
@@ -325,7 +325,7 @@ def test_kick_step_without_entry_stays_on_polling(monkeypatch, tmp_path):
     """
     _write_config(tmp_path, kick={"client_id": "", "client_secret": ""})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "kid123", "n", "8"], secrets=["ksecret123"])
+    _script(monkeypatch, inputs=["5", "kid123", "n", "10"], secrets=["ksecret123"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.client_id == "kid123"
@@ -342,7 +342,7 @@ def test_kick_step_follow_without_panel_entry_warns(capsys, monkeypatch, tmp_pat
     """
     _write_config(tmp_path, kick={"client_id": "", "client_secret": ""})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "kid123", "y", "4", "8"], secrets=["ksecret123"])
+    _script(monkeypatch, inputs=["5", "kid123", "y", "4", "10"], secrets=["ksecret123"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == ""
@@ -363,7 +363,7 @@ def test_kick_step_rerun_enables_saved_entry(monkeypatch, tmp_path):
         kick={"webhook": {"enabled": False, "public_url": "https://kick.example.com"}},
     )
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "3", "", "n", "8"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "3", "", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -374,7 +374,7 @@ def test_kick_step_cloudflared_generates_ingress(monkeypatch, tmp_path):
     """The cloudflared pick writes an ingress file and saves the hostname."""
     _write_config(tmp_path, kick={"client_id": "cid", "client_secret": "csec"})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "y", "1", "kick.example.com", "n", "8"], secrets=[""])
+    _script(monkeypatch, inputs=["5", "n", "y", "1", "kick.example.com", "n", "10"], secrets=[""])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -390,7 +390,7 @@ def test_kick_step_nginx_generates_config(monkeypatch, tmp_path):
     """The nginx pick writes a server block with the webhook and API locations."""
     _write_config(tmp_path, kick={"client_id": "cid", "client_secret": "csec"})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "y", "2", "kick.example.com", "y", "n", "8"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "2", "kick.example.com", "y", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -406,7 +406,7 @@ def test_reset_wipes_config_and_starts_over(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["7", "y", "tid123", "1", "8"],
+        inputs=["9", "y", "tid123", "1", "3", "10"],
         secrets=["tsecret123", "long-enough-password", "long-enough-password"],
     )
     wizard.main()
@@ -432,7 +432,7 @@ def test_kick_entry_test_needs_the_app_running(monkeypatch, tmp_path, capsys):
     """The test prompt without a listener says to start the app, not hanging."""
     _write_config(tmp_path, endpoint={"listen_port": 47999})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "y", "3", "kick.example.com", "y", "8"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "y", "10"], secrets=[])
     wizard.main()
     assert "Start the app first" in capsys.readouterr().out
 
@@ -465,7 +465,7 @@ def test_kick_entry_test_reports_delivery(monkeypatch, tmp_path, capsys):
         port = server.server_address[1]
         _write_config(tmp_path, endpoint={"listen_port": port}, api={"enabled": True, "key": "k"})
         monkeypatch.chdir(tmp_path)
-        _script(monkeypatch, inputs=["4", "y", "3", "kick.example.com", "y", "8"], secrets=[])
+        _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "y", "10"], secrets=[])
         wizard.main()
     finally:
         server.shutdown()
@@ -488,10 +488,98 @@ def test_kick_entry_ingress_write_failure_changes_nothing(monkeypatch, tmp_path,
     _write_config(tmp_path)
     (tmp_path / "cloudflared").write_text("not a directory")
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["4", "y", "1", "kick.example.com", "n", "8"], secrets=[""])
+    _script(monkeypatch, inputs=["5", "n", "y", "1", "kick.example.com", "n", "10"], secrets=[""])
     wizard.main()
     out = capsys.readouterr().out
     assert "Nothing changed." in out
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == ""
     assert config.kick.webhook.enabled is False
+
+
+def test_channels_step_adds_valid_names_and_removes(monkeypatch, tmp_path):
+    """The channels step normalizes names, rejects bad ones, and removes.
+
+    The wizard had no channel path before: a typo reached the file raw
+    or the user never found where channels live.
+    """
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _script(
+        monkeypatch,
+        inputs=["3", "1", "NewName", "1", "kick:myslug", "1", "bad name!", "1", "twitch:newname", "2", "1", "3", "10"],
+        secrets=[],
+    )
+    wizard.main()
+    assert get_config(tmp_path / "config.json").channels == ["twitch:newname", "kick:myslug"]
+
+
+def test_api_step_generates_key_and_keeps_it_on_disable(monkeypatch, tmp_path, capsys):
+    """A first enable shows the key once, and disabling keeps the key.
+
+    Like the bot flow, a later enable reuses the key, so remote tools
+    keep working across a disable.
+    """
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["8", "y", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.api.enabled is True
+    assert len(config.api.key) >= 32
+    assert "API key:" in capsys.readouterr().out
+    key = config.api.key
+    _script(monkeypatch, inputs=["8", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.api.enabled is False
+    assert config.api.key == key
+
+
+def test_kick_step_replace_updates_stored_credentials(monkeypatch, tmp_path):
+    """A rerun can replace stored Kick credentials.
+
+    Without the replace question a rotated Kick secret stays stale
+    forever, and Kick auth fails.
+    """
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["5", "y", "newid", "n", "10"], secrets=["newsecret"])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.client_id == "newid"
+    assert config.kick.client_secret == "newsecret"
+
+
+def test_kick_step_in_containers_binds_the_webhook_wildcard(monkeypatch, tmp_path, capsys):
+    """In a container the kick step moves a loopback webhook bind to 0.0.0.0.
+
+    A loopback bind gets no proxy traffic, so Kick deliveries fail
+    silently without this repair.
+    """
+    import os
+
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(os.path, "exists", lambda _path: True)
+    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.webhook.listen_host == "0.0.0.0"
+    assert "binds 0.0.0.0" in capsys.readouterr().out
+
+
+def test_mtproto_step_accepts_an_env_reference_for_the_api_id(monkeypatch, tmp_path):
+    """The api id prompt resolves a ${VAR} reference from the environment.
+
+    Without it the reference fails the number parse and the user loops
+    on "must be a number" with no way forward.
+    """
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_API_ID", "777001")
+    _script(monkeypatch, inputs=["7", "y", "${TELEGRAM_API_ID}", "10"], secrets=["hash123"])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.mtproto.enabled is True
+    assert config.mtproto.api_id == 777001

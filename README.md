@@ -64,9 +64,10 @@ chat file and the broadcast. The notifier sends Telegram messages.
 
 Two services feed the monitor directly. The EventSub client holds one
 authenticated WebSocket for Twitch events. The Kick webhook receiver verifies
-and deduplicates incoming HTTP events and keeps the subscriptions in sync. Its
-listener also serves the control API under `/api/v1` and the web panel under
-`/web/`. The Telegram bot runs
+and deduplicates incoming HTTP events and keeps the subscriptions in sync. The
+private listener serves the web panel and the control API under `/api/v1`. A
+separate webhook listener serves `POST /kick/webhook` alone. The Telegram bot
+runs
 alongside as an admin-only polling bot. It validates each change on a copy,
 writes `config.json` atomically, and applies the change on the next cycle. The
 control API and the web panel call the same command layer, so all paths behave in the same way.
@@ -103,9 +104,10 @@ docker compose logs -f   # follow startup
 
 The setup wizard writes `config.json` in the data directory. It asks
 for the Twitch credentials and one control surface (web panel, Telegram
-bot, or both). Channels come later, from the panel or the bot. It also
-offers the optional features: YouTube restream, Enable MTProto (upload
-to Telegram), panel access, and Enable Kick. Run the wizard again later
+bot, or both). It then offers channels, the optional features (YouTube
+restream, Enable MTProto (upload
+to Telegram), panel access, Enable Kick, and the control API), one
+block at a time. Run the wizard again later
 to add a feature. See `docs/configuration.md` for every key.
 
 The data directory is the folder with `docker-compose.yml`

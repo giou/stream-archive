@@ -10,12 +10,14 @@ Blocks:
 
 * Twitch credentials (required).
 * Control surface: the web panel, the Telegram bot, or both (one is required).
+* Channels (optional now, but the app records nothing without them).
 * Panel access (optional): reach the panel from outside the machine.
 * Enable Kick (optional): app credentials, then chat and faster
   events through a public entry you publish yourself. Without a
   public entry Kick still works through polling (slower signals, no chat).
 * YouTube restream (optional, runs the OAuth flow of ``setup_youtube``).
 * Enable MTProto (upload to Telegram) (optional).
+* Control API (optional): remote HTTP control with a key shown once.
 * Reset config wipes config.json (kept as config.json.bak) and starts over.
 """
 
@@ -33,8 +35,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from stream_archive.config import (
     AppConfig,
+    api_base_url,
     apply_config_change,
     get_config,
+    is_kick_channel,
+    normalize_channel_name,
     normalize_endpoint_url,
     telegram_enabled,
     webhook_public_url,
@@ -208,7 +213,8 @@ def _step_twitch(config: AppConfig) -> None:
 
 def _prompt_kick_creds(config: AppConfig) -> tuple[str, str] | None:
     """Kick app credentials, or None when they are already stored."""
-    if config.kick.client_id.strip() and config.kick.client_secret.strip():
+    stored = bool(config.kick.client_id.strip() and config.kick.client_secret.strip())
+    if stored and not _yes("Replace the Kick credentials", default=False):
         return None
     print("Kick needs a Kick app: id and secret from the Kick Developer portal.")
     while True:
@@ -313,6 +319,54 @@ def _step_control(config: AppConfig, *, required: bool) -> None:
     _save(config, mutate, "Control surface")
 
 
+def _step_channels(config: AppConfig) -> None:
+    """Add or remove monitored channels.
+
+    A bare name means twitch. Kick channels need Kick credentials:
+    without them the save fails and the step says so.
+    """
+    print("\n-- Channels --")
+    print("Names are twitch:<name> or kick:<slug>. A bare name means twitch.")
+    print("The app records nothing until at least one channel is monitored.")
+    while True:
+        print(f"Monitored now: {', '.join(config.channels) if config.channels else 'none'}")
+        print("  1. Add a channel")
+        print("  2. Remove a channel")
+        print("  3. Done")
+        pick = _choose("Channels", 3)
+        if pick == 3:
+            return
+        if pick == 1:
+            raw = _read("Channel (twitch:name or kick:slug)")
+            name = normalize_channel_name(raw)
+            if name is None:
+                print("That name is not valid. Use twitch:name or kick:slug.")
+                continue
+            if name in config.channels:
+                print(f"{name} is already monitored.")
+                continue
+            if is_kick_channel(name) and not (config.kick.client_id.strip() and config.kick.client_secret.strip()):
+                print("Kick credentials are missing. Add them under Enable Kick, or this save fails.")
+
+            def mutate_add(candidate: AppConfig, name: str = name) -> None:
+                candidate.channels = [*candidate.channels, name]
+
+            _save(config, mutate_add, f"Channel {name}")
+            continue
+        if not config.channels:
+            print("Nothing to remove.")
+            continue
+        for number, channel in enumerate(config.channels, start=1):
+            print(f"  {number}. {channel}")
+        remove_pick = _choose("Remove", len(config.channels))
+        removed = config.channels[remove_pick - 1]
+
+        def mutate_remove(candidate: AppConfig, removed: str = removed) -> None:
+            candidate.channels = [c for c in candidate.channels if c != removed]
+
+        _save(config, mutate_remove, f"Channel {removed}")
+
+
 def _step_youtube(config: AppConfig) -> None:
     """Pick the output mode and run the YouTube OAuth flow when needed."""
     print("\n-- YouTube restream (optional) --")
@@ -358,7 +412,8 @@ def _step_mtproto(config: AppConfig) -> None:
     print(f"State: {'on' if config.mtproto.enabled else 'off'}")
     print(f"api id: {_mask(str(config.mtproto.api_id) if config.mtproto.api_id else '')}")
     print(f"api hash: {_mask(config.mtproto.api_hash)}")
-    print("Get both at https://my.telegram.org. ${VAR_NAME} reads the value from the environment.")
+    print("Get both at https://my.telegram.org.")
+    print("You can type ${TELEGRAM_API_ID} and ${TELEGRAM_API_HASH}: the app reads them from the environment.")
     if not _yes("Enable MTProto (upload to Telegram)", default=config.mtproto.enabled):
 
         def mutate_off(candidate: AppConfig) -> None:
@@ -371,6 +426,12 @@ def _step_mtproto(config: AppConfig) -> None:
         if not raw_id and config.mtproto.api_id:
             api_id = config.mtproto.api_id
             break
+        if raw_id.startswith("${") and raw_id.endswith("}"):
+            var = raw_id[2:-1].strip()
+            raw_id = os.environ.get(var, "")
+            if not raw_id:
+                print(f"Environment variable {var} is not set.")
+                continue
         try:
             api_id = int(raw_id)
         except ValueError:
@@ -392,6 +453,52 @@ def _step_mtproto(config: AppConfig) -> None:
         candidate.mtproto.enabled = True
 
     _save(config, mutate_on, "MTProto")
+
+
+def _step_api(config: AppConfig) -> None:
+    """Serve the HTTP control API for scripts and remote tools.
+
+    The panel needs no key: it uses its own login. A first enable
+    generates the key and shows it once. Disabling keeps the key,
+    so a later enable reuses it.
+    """
+    print("\n-- Control API (remote HTTP) (optional) --")
+    print(f"State: {'on' if config.api.enabled else 'off'}")
+    if config.api.enabled:
+        base = api_base_url(config)
+        if base:
+            print(f"Base URL: {base}")
+        else:
+            print("No public URL yet: enable Panel access to reach it from outside.")
+    if not _yes("Enable the control API", default=config.api.enabled):
+
+        def mutate_off(candidate: AppConfig) -> None:
+            candidate.api.enabled = False
+
+        _save(config, mutate_off, "Control API")
+        return
+    created = not config.api.key.strip()
+    key = secrets.token_urlsafe(32) if created else config.api.key
+
+    def mutate_on(candidate: AppConfig) -> None:
+        candidate.api.enabled = True
+        candidate.api.key = key
+
+    if not _save(config, mutate_on, "Control API"):
+        return
+    if created:
+        print(f"API key: {key}")
+        print("Keep it secret. Send it as Authorization: Bearer <key>.")
+        return
+    if _yes("Rotate the API key", default=False):
+        rotated = secrets.token_urlsafe(32)
+
+        def mutate_rotated(candidate: AppConfig) -> None:
+            candidate.api.key = rotated
+
+        if _save(config, mutate_rotated, "API key"):
+            print(f"New API key: {rotated}")
+            print("The old key stopped working. Keep the new one secret.")
 
 
 def _endpoint_address_label(config: AppConfig) -> tuple[str, str]:
@@ -567,10 +674,17 @@ def _setup_kick_entry(config: AppConfig) -> None:
         print("Then paste this URL in the Kick app (Settings, Developer, your app, Enable webhooks).")
 
     was_enabled = config.kick.webhook.enabled
+    # A container that still binds loopback gets no proxy traffic, like the
+    # endpoint step. Bare metal keeps the stored host.
+    docker_loopback = _listen_host_default(config.kick.webhook.listen_host) == "0.0.0.0" and (
+        config.kick.webhook.listen_host.strip() != "0.0.0.0"
+    )
 
     def mutate(candidate: AppConfig) -> None:
         if stored != config.kick.webhook.public_url:
             candidate.kick.webhook.public_url = stored
+        if docker_loopback:
+            candidate.kick.webhook.listen_host = "0.0.0.0"
         # A usable entry turns deliveries on; without one they stay off.
         # Otherwise the app holds an entry it never uses and chat stays
         # empty. This also repairs entries saved before the step did this.
@@ -582,6 +696,8 @@ def _setup_kick_entry(config: AppConfig) -> None:
 
     if not _save(config, mutate, "Kick endpoint"):
         return
+    if docker_loopback:
+        print("Note: under Docker the webhook listener binds 0.0.0.0, or the proxy cannot reach the app.")
     if not _kick_entry_usable(config):
         print("The panel has no public address, so Kick stays on polling until one is set.")
         return
@@ -748,15 +864,27 @@ def _missing_required(config: AppConfig) -> list[str]:
     return missing
 
 
+def _kick_status(config: AppConfig) -> str:
+    """One-line state of Kick: off, polling, or the delivery URL."""
+    if not config.kick.client_id.strip():
+        return "off"
+    url = webhook_public_url(config)
+    if config.kick.webhook.enabled and url:
+        return url
+    return "polling (no public entry)"
+
+
 def _menu_loop(config: AppConfig) -> None:
     """Run steps until the user quits with every required block complete."""
     steps = (
         ("Twitch credentials", _step_twitch),
         ("Control surface", lambda config: _step_control(config, required=False)),
+        ("Channels", _step_channels),
         ("Panel access", _step_remote),
         ("Enable Kick", _step_kick),
         ("YouTube restream", _step_youtube),
         ("Enable MTProto (upload to Telegram)", _step_mtproto),
+        ("Control API (remote HTTP)", _step_api),
         ("Reset config", _step_reset),
     )
     done = str(len(steps) + 1)
@@ -765,6 +893,8 @@ def _menu_loop(config: AppConfig) -> None:
         print(f"Control: {_control_label(config)}")
         print(f"Channels: {', '.join(config.channels) if config.channels else 'none'}")
         print(f"Output mode: {config.output_mode}")
+        print(f"Kick: {_kick_status(config)}")
+        print(f"Control API: {'on' if config.api.enabled else 'off'}")
         print(f"MTProto (Telegram upload): {'on' if config.mtproto.enabled else 'off'}")
         print(f"Panel access: {_panel_access_state(config)}")
         for number, (label, _) in enumerate(steps, start=1):
@@ -780,7 +910,8 @@ def _menu_loop(config: AppConfig) -> None:
             if missing:
                 print("Still missing: " + "; ".join(missing) + ".")
                 continue
-            print("Setup complete. Start the app with `docker compose up -d`.")
+            print("Setup complete. Add channels in step 3 (or the panel or the bot).")
+            print("Start the app with `docker compose up -d`.")
             return
         try:
             pick = int(raw)
@@ -843,6 +974,8 @@ def _fresh_run() -> AppConfig:
         raise SystemExit(1) from e
     print(f"Wrote {workdir / 'config.json'}. Now pick a control surface.")
     _step_control(config, required=True)
+    print("Add the first channels now, or leave them empty and add them later.")
+    _step_channels(config)
     return config
 
 

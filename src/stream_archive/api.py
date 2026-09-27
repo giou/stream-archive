@@ -510,7 +510,7 @@ class ControlAPI:
         """
         kick_webhook = self._ctrl._kick_webhook
         if kick_webhook is None:
-            msg = "webhook listener unavailable"
+            msg = "Kick delivery test unavailable"
             raise _ApiError(503, msg)
         ok, message = await kick_webhook.verify_delivery()
         return web.json_response({"ok": ok, "message": message})

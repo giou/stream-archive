@@ -7,6 +7,7 @@ import httpx
 
 from stream_archive.emotes import (
     build_first_party,
+    download_images,
     embed_images,
     fetch_channel_emotes,
     find_words,
@@ -127,3 +128,54 @@ def test_build_first_party_entries():
     raw = b"\x89PNG\r\n\x1a\n" + b"\0" * 10
     entries = build_first_party({"7tv:g": raw}, {"7tv:g": "GAMBA"})
     assert entries == [{"id": "7tv:g", "imageScale": 2, "data": base64.b64encode(raw).decode("ascii"), "name": "GAMBA"}]
+
+
+def _run_download(handler, items, **kwargs):
+    """Run ``download_images`` with a client on a mock transport."""
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await download_images(client, items, **kwargs)
+
+    return asyncio.run(scenario())
+
+
+def test_download_images_skips_failures():
+    def handler(request):
+        if request.url.path.endswith("/good"):
+            return httpx.Response(200, content=b"PNGDATA")
+        return httpx.Response(404)
+
+    images = _run_download(handler, {"a": "https://x/good", "b": "https://x/bad"})
+    assert images == {"a": b"PNGDATA"}  # 404 skipped silently
+
+
+def test_download_images_count_limit():
+    names = []
+
+    def handler(request):
+        names.append(request.url.path)
+        return httpx.Response(200, content=b"IMG")
+
+    items = {str(i): f"https://x/{i}" for i in range(4)}
+    images = _run_download(handler, items, max_emotes=2)
+    assert len(images) == 2
+    assert len(names) == 2  # the limit stops the requests, not only the result
+
+
+def test_download_images_per_image_limit():
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 64)
+
+    images = _run_download(handler, {"1": "https://x/1"}, max_bytes_each=16)
+    assert images == {}  # an oversized image is skipped, the capture continues
+
+
+def test_download_images_total_limit():
+    def handler(request):
+        return httpx.Response(200, content=b"x" * 4)
+
+    items = {str(i): f"https://x/{i}" for i in range(5)}
+    images = _run_download(handler, items, max_total_bytes=8)
+    assert sum(len(v) for v in images.values()) == 8  # 4-byte images fill the cap exactly
+    assert images
