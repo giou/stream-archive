@@ -11,6 +11,7 @@ import json
 
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import make_config as valid_config
+from conftest import read_file
 
 from stream_archive.api import ControlAPI
 from stream_archive.config import get_config
@@ -91,10 +92,6 @@ class FakeKickWebhook:
         # stub only proves the route calls through and passes the result on.
         self.verified.append(timeout)
         return True, "first delivery in 3s"
-
-
-def read_file(tmp_path):
-    return json.loads((tmp_path / "config.json").read_text())
 
 
 def make_api(tmp_path, *, enabled=True, recording=(), channels=("twitch:channel1",)):

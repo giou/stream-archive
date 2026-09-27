@@ -16,6 +16,7 @@ from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import make_config as valid_config
+from conftest import read_file
 
 from stream_archive.api import ControlAPI
 from stream_archive.config import get_config
@@ -890,7 +891,7 @@ def test_chat_prefers_embedded_images(tmp_path):
 def test_first_boot_stores_session_secret(tmp_path):
     """The first boot with the panel on writes a lasting session secret."""
     make_webui(tmp_path)
-    stored = json.loads((tmp_path / "config.json").read_text())["web"]["session_secret"]
+    stored = read_file(tmp_path)["web"]["session_secret"]
     assert isinstance(stored, str) and len(stored) >= 32
 
 

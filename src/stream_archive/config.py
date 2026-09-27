@@ -686,6 +686,43 @@ def _validated_placeholders(
     return out
 
 
+def atomic_write_private_json(path: Path, payload: Any, *, indent: int = 4) -> None:
+    """Replace ``path`` with ``payload`` as JSON, mode 0600, atomically.
+
+    The file holds secrets, so no other user reads it, not even during the
+    write. O_EXCL and O_NOFOLLOW keep a pre-existing entry at that path (a
+    symlink or a hard link planted by another writer) from redirecting this
+    write or its secret plaintext. A failed write removes the partial copy,
+    which would otherwise leave secrets on disk.
+    """
+    tmp = Path(str(path) + ".tmp")
+    mode = 0o600
+    try:
+        # Create the temporary file with its final mode. os.open applies its
+        # mode only when it creates the file, and the umask clears bits of
+        # that mode, so fchmod sets it again.
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        except FileExistsError:
+            # A file left by a crashed run. Remove the entry itself (never
+            # a symlink target) and create it exclusively.
+            tmp.unlink()
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        # Remove the partial copy: it holds plaintext secrets. A full disk
+        # raises OSError too, so callers can catch one type for any cause.
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
 def save_config(config: AppConfig) -> None:
     """Validate the config and atomically write it to its source file.
 
@@ -718,47 +755,24 @@ def save_config(config: AppConfig) -> None:
             # back, so the secret never reaches disk. A rotated
             # environment variable then takes effect on the next start.
             _set_at(data, found, raw)
-        tmp = Path(str(config_path) + ".tmp")
         try:
             existing_mode: int | None = config_path.stat().st_mode & 0o777
         except FileNotFoundError:
             existing_mode = None  # new file: use a private mode
         if existing_mode is not None and existing_mode & 0o077:
             logger.warning("config.json is readable by other users (mode %o), tightening it to 0600", existing_mode)
-        # Always write 0600. An existing file can carry a permissive mode from
-        # a bind mount or an older version, and this write adds secrets to it.
-        mode = 0o600
         try:
-            # Create the temporary file with its final mode. The file holds the
-            # same secrets as config.json, so no other user may read it, not
-            # even during the write. O_EXCL and O_NOFOLLOW keep a pre-existing
-            # entry at that path (a symlink or a hard link planted by another
-            # writer) from redirecting this write or its secret plaintext.
-            try:
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-            except FileExistsError:
-                # A file left by a crashed run. Remove the entry itself (never
-                # a symlink target) and create it exclusively.
-                tmp.unlink()
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-            # os.open applies its mode only when it creates the file, and the
-            # umask clears bits of that mode.
-            os.fchmod(fd, mode)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, config_path)
-            for key_path in drop:
-                config._env_placeholders.pop(key_path, None)
+            # Always write 0600. An existing file can carry a permissive mode
+            # from a bind mount or an older version, and this write adds
+            # secrets to it.
+            atomic_write_private_json(config_path, data, indent=4)
         except OSError as e:
-            # Remove the partial copy: it holds plaintext secrets. A full disk
-            # raises OSError too, and every caller expects ValueError.
-            with contextlib.suppress(OSError):
-                tmp.unlink()
+            # The write failed, so the file keeps its ${VAR} text. Every
+            # caller expects ValueError.
             msg = f"{config_path}: cannot write config: {e}"
             raise ValueError(msg) from e
+        for key_path in drop:
+            config._env_placeholders.pop(key_path, None)
 
 
 def endpoint_base_url(config: AppConfig) -> str:

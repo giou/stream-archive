@@ -1,11 +1,15 @@
 """Shared test helpers for the Stream Archive suite.
 
-``make_config`` builds a valid config from one set of test defaults, so the
-tests do not copy those defaults into every file.
+Helpers live here so the tests do not copy them into every file.
+
+``make_config`` builds a valid config from one set of test defaults.
+``read_file`` reads the config a test just changed. ``kb_labels`` reads
+the button labels of a Telegram keyboard.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from stream_archive.config import AppConfig
@@ -34,3 +38,15 @@ def make_config(**overrides: Any) -> AppConfig:
         else:
             data[key] = value
     return AppConfig.model_validate(data)
+
+
+def read_file(tmp_path: Any) -> dict[str, Any]:
+    """config.json in ``tmp_path`` as a dict, read back from disk."""
+    return json.loads((tmp_path / "config.json").read_text())
+
+
+def kb_labels(markup: Any) -> list[str]:
+    """Button labels of a Telegram reply keyboard or inline keyboard."""
+    data = markup.to_dict()
+    rows = data.get("inline_keyboard") or data.get("keyboard")
+    return [button["text"] for row in rows for button in row]

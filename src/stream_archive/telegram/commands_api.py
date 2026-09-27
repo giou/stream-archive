@@ -6,12 +6,12 @@ through ``KickWebhook.apply_state``. The key lives in ``api.key`` in
 config.json and is generated on the first enable.
 """
 
-import html
 import logging
 import secrets
 from typing import Any
 
 from stream_archive.config import AppConfig, api_base_url
+from stream_archive.telegram.html import code_span, escape, reveal
 from stream_archive.telegram.menu_state import is_error
 
 logger = logging.getLogger(__name__)
@@ -19,16 +19,6 @@ logger = logging.getLogger(__name__)
 #: Reply for a chat that is not the admin's private chat. The key is a secret:
 #: anyone in the chat can read it and then control the app.
 _KEY_ELSEWHERE = "\U0001f512 I show the API key only in our private chat - open the bot there and press Show key."
-
-
-def _html(text: str) -> str:
-    """Escape plain text for HTML, the parse mode of the key replies."""
-    return html.escape(text, quote=False)
-
-
-def _code_span(key: str) -> str:
-    """The key as an HTML code span. One tap on it copies the key."""
-    return f"<code>{html.escape(key, quote=False)}</code>"
 
 
 class ApiCommands:
@@ -59,15 +49,8 @@ class ApiCommands:
             logger.warning("[telegram] Failed to notify the admin about API changes", exc_info=True)
 
     def _key_reveal(self, label: str, key: str, chat_id: int | None) -> str:
-        """The key under ``label`` for the admin's private chat, or a pointer.
-
-        The reply is HTML and the key is a code span, so one tap on it
-        copies the key. A group chat keeps the secret out of the message: the
-        whole group would otherwise read it.
-        """
-        if chat_id is not None and chat_id != self._admin_id:
-            return _html(_KEY_ELSEWHERE)
-        return f"{_html(label)}\n{_code_span(key)}"
+        """The key under ``label`` for the admin's private chat, or a pointer."""
+        return reveal(label, key, chat_id, self._admin_id, _KEY_ELSEWHERE)
 
     def _api_key_text(self, chat_id: int | None = None) -> str:
         """The key as HTML text, or a hint when the API was never enabled.
@@ -76,14 +59,14 @@ class ApiCommands:
         chat gets a pointer instead of the key.
         """
         if chat_id is not None and chat_id != self._admin_id:
-            return _html(_KEY_ELSEWHERE)
+            return escape(_KEY_ELSEWHERE)
         key = self._config.api.key
         if not key:
-            return _html("No API key yet - enable the API to generate one.")
+            return escape("No API key yet - enable the API to generate one.")
         return (
-            f"{_html('API key:')}\n{_code_span(key)}\n\n"
-            f"{_html('Send it as an Authorization header (Bearer <key>) or an X-API-Key header.')}\n"
-            f"{_html('Keep it secret: anyone who has it can change your channels and settings.')}"
+            f"{escape('API key:')}\n{code_span(key)}\n\n"
+            f"{escape('Send it as an Authorization header (Bearer <key>) or an X-API-Key header.')}\n"
+            f"{escape('Keep it secret: anyone who has it can change your channels and settings.')}"
         )
 
     async def _set_api_enabled(self, enabled: bool, chat_id: int | None = None) -> str:
@@ -101,27 +84,27 @@ class ApiCommands:
 
         result: str = self._apply(mutate, lambda c: f"Control API {'enabled' if enabled else 'disabled'}", chat_id)
         if is_error(result):
-            return _html(result)
-        lines = [_html(result)]
+            return escape(result)
+        lines = [escape(result)]
         if self._kick_webhook is not None:
             try:
                 await self._kick_webhook.apply_state()
             except Exception:
                 logger.warning("[telegram] Failed to reconcile the webhook listener", exc_info=True)
-                lines.append(_html("\u26a0\ufe0f The listener could not be reconfigured - check the logs."))
+                lines.append(escape("\u26a0\ufe0f The listener could not be reconfigured - check the logs."))
         if enabled:
             # The base URL guides the setup of an enabled API. It is
             # noise on the disable path, where no reachability matters.
             base = api_base_url(self._config)
             if base:
-                lines.append(_html(f"Base URL: {base}"))
+                lines.append(escape(f"Base URL: {base}"))
                 if not self._config.endpoint.enabled:
                     lines.append(
-                        _html("\u26a0\ufe0f The endpoint is off, so this URL is not reachable from outside yet.")
+                        escape("\u26a0\ufe0f The endpoint is off, so this URL is not reachable from outside yet.")
                     )
             else:
                 lines.append(
-                    _html("No public URL yet - set the public URL in Remote access to reach the API from outside.")
+                    escape("No public URL yet - set the public URL in Remote access to reach the API from outside.")
                 )
         if created:
             lines.append(self._key_reveal("API key (keep it secret - Show key shows it again):", key, chat_id))
@@ -138,5 +121,5 @@ class ApiCommands:
         summary = "API key rotated - the old key stopped working" if existed else "API key generated"
         result: str = self._apply(mutate, lambda c: summary, chat_id)
         if is_error(result):
-            return _html(result)
-        return f"{_html(result)}\n\n" + self._key_reveal("New API key (keep it secret):", key, chat_id)
+            return escape(result)
+        return f"{escape(result)}\n\n" + self._key_reveal("New API key (keep it secret):", key, chat_id)

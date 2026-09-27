@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from conftest import make_config as valid_config
+from conftest import read_file
 
 from stream_archive import disk
 from stream_archive.config import get_config
@@ -820,7 +821,7 @@ def test_reload_notes_missing_mtproto_client(tmp_path):
 
     _, ctrl = make_bot(tmp_path)
     ctrl._mtproto = None
-    file_config = json.loads((tmp_path / "config.json").read_text())
+    file_config = read_file(tmp_path)
     file_config["mtproto"] = {"enabled": True, "api_id": 1, "api_hash": "hash", "session": "mtproto.session"}
     (tmp_path / "config.json").write_text(json.dumps(file_config))
     text = asyncio.run(ctrl.handle_reload())

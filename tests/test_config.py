@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from conftest import make_config as _make_config
+from conftest import read_file
 
 from stream_archive.config import (
     AppConfig,
@@ -536,7 +537,7 @@ def test_save_persists_bot_written_literal_over_placeholder(monkeypatch, tmp_pat
     assert '"literal"' in raw
     assert "${MY_TOK}" not in raw
     save_config(cfg)  # a second save keeps the literal (placeholder dropped)
-    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == "literal"
+    assert read_file(tmp_path)["bot_telegram_api"] == "literal"
 
 
 def test_untouched_placeholder_still_round_trips_masked(monkeypatch, tmp_path):
@@ -722,11 +723,11 @@ def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
 
     save_config(cfg)  # must not raise
 
-    rewritten = json.loads((tmp_path / "config.json").read_text())
+    rewritten = read_file(tmp_path)
     assert rewritten["bot_telegram_api"] == data["bot_telegram_api"]
     assert "bogus" not in rewritten
     save_config(cfg)  # later saves keep working
-    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == data["bot_telegram_api"]
+    assert read_file(tmp_path)["bot_telegram_api"] == data["bot_telegram_api"]
 
 
 def legacy_config():
@@ -814,4 +815,4 @@ def test_save_does_not_follow_a_symlink_at_the_temp_path(tmp_path):
 
     assert target.read_text() == "original"
     assert not (tmp_path / "config.json.tmp").exists()
-    assert json.loads((tmp_path / "config.json").read_text())["bot_telegram_api"] == "bot_token"
+    assert read_file(tmp_path)["bot_telegram_api"] == "bot_token"

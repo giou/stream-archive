@@ -30,7 +30,6 @@ import os
 import re
 import secrets
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -41,6 +40,7 @@ from stream_archive import disk
 from stream_archive.config import (
     AppConfig,
     apply_config_change,
+    atomic_write_private_json,
     telegram_enabled,
 )
 from stream_archive.emotes import (
@@ -52,6 +52,7 @@ from stream_archive.emotes import (
     sniff_mime,
 )
 from stream_archive.http import build_http_client
+from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.kick_chat import EMOTE_URL as _KICK_EMOTE_URL
 from stream_archive.updater import installed_app_version
 
@@ -380,7 +381,7 @@ class WebUI:
         self._ephemeral = secrets.token_hex(32)
         self._sessions: dict[str, _Session] = {}
         self._load_sessions()
-        self._login_fails: dict[str, deque[float]] = {}
+        self._login_budget = FailBudget(_LOGIN_MAX_FAILS, _LOGIN_WINDOW_S)
         self._assets = _load_assets()
 
     @property
@@ -465,7 +466,7 @@ class WebUI:
             return
         payload = {sid: {"csrf": s.csrf, "expires": s.expires, "pwd": s.pwd} for sid, s in self._sessions.items()}
         try:
-            _write_private_json(path, payload)
+            atomic_write_private_json(path, payload, indent=2)
         except OSError:
             logger.warning("[web] Cannot store sessions in %s", path)
 
@@ -632,23 +633,10 @@ class WebUI:
 
     def _login_allowed(self, request: web.Request) -> bool:
         """True when the address still holds login budget."""
-        now = time.monotonic()
-        key = request.remote or "unknown"
-        fails = self._login_fails.get(key)
-        if fails is None:
-            return True
-        while fails and now - fails[0] > _LOGIN_WINDOW_S:
-            fails.popleft()
-        if not fails:
-            del self._login_fails[key]
-            return True
-        return len(fails) < _LOGIN_MAX_FAILS
+        return self._login_budget.allowed(request.remote or "unknown")
 
     def _record_login_fail(self, request: web.Request) -> None:
-        fails = self._login_fails.setdefault(request.remote or "unknown", deque())
-        fails.append(time.monotonic())
-        while len(fails) > _LOGIN_MAX_FAILS:
-            fails.popleft()
+        self._login_budget.record(request.remote or "unknown")
 
     def _public_json(self, request: web.Request, payload: dict[str, Any], status: int = 200) -> web.Response:
         """Hardened JSON for the public auth endpoints (no session yet)."""
@@ -679,7 +667,7 @@ class WebUI:
             logger.warning("[web] login rate limited for %s", request.remote)
             return self._public_json(request, {"error": "too many attempts, try again later"}, status=429)
         try:
-            payload = await self._read_json(request, limit=_MAX_LOGIN_BYTES)
+            payload = await read_json_object(request, _MAX_LOGIN_BYTES, _WebError)
         except _WebError as e:
             return self._public_json(request, {"error": e.message}, status=e.status)
         password = payload.get("password")
@@ -694,7 +682,7 @@ class WebUI:
             logger.warning("[web] failed login from %s", request.remote)
             await asyncio.sleep(_LOGIN_FAIL_DELAY_S)
             return self._public_json(request, {"error": "invalid password"}, status=401)
-        self._login_fails.pop(request.remote or "unknown", None)
+        self._login_budget.clear(request.remote or "unknown")
         sid, session = self._new_session()
         logger.info("[web] login from %s", request.remote)
         resp = web.json_response({"ok": True, "csrf": session.csrf}, status=200)
@@ -763,28 +751,6 @@ class WebUI:
         wrapper.__name__ = handler.__name__
         return wrapper
 
-    async def _read_json(self, request: web.Request, limit: int = _MAX_BODY_BYTES) -> dict[str, Any]:
-        """Parse the JSON object body, or raise a 400/413."""
-        if request.content_length is not None and request.content_length > limit:
-            msg = "request body too large"
-            raise _WebError(413, msg)
-        raw = await request.content.read(limit + 1)
-        if len(raw) > limit:
-            msg = "request body too large"
-            raise _WebError(413, msg)
-        if not raw:
-            msg = "JSON body required"
-            raise _WebError(400, msg)
-        try:
-            payload = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            msg = f"invalid JSON body: {e}"
-            raise _WebError(400, msg) from e
-        if not isinstance(payload, dict):
-            msg = "JSON body must be an object"
-            raise _WebError(400, msg)
-        return payload
-
     # ---- responses --------------------------------------------------------
 
     def _secure_headers(self, response: Any, request: web.Request) -> None:
@@ -818,7 +784,7 @@ class WebUI:
         return resp
 
     async def _password(self, request: web.Request, session: _Session) -> web.Response:
-        payload = await self._read_json(request, limit=_MAX_LOGIN_BYTES)
+        payload = await read_json_object(request, _MAX_LOGIN_BYTES, _WebError)
         current = payload.get("current")
         new = payload.get("new")
         if not isinstance(current, str) or not isinstance(new, str):
@@ -1310,27 +1276,6 @@ async def _send_file_range(path: Path, start: int, end: int, resp: web.StreamRes
                     break
     except OSError:
         logger.warning("[web] stream read failed for %s", path.name)
-
-
-def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    """Write ``payload`` as JSON with mode 0600. It holds bearer secrets."""
-    tmp = Path(str(path) + ".tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except FileExistsError:
-        # A file left by a crashed run. Remove the entry itself (never
-        # a symlink target) and create it exclusively.
-        tmp.unlink()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    # os.open applies its mode only when it creates the file, and the
-    # umask clears bits of that mode.
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
 
 
 def _load_assets() -> dict[str, str]:

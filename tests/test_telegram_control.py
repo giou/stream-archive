@@ -7,6 +7,7 @@ import types
 import unittest.mock
 from datetime import UTC, datetime
 
+from conftest import kb_labels, read_file
 from conftest import make_config as valid_config
 from telegram import Chat, Message, Update
 from telegram import User as TelegramUser
@@ -180,10 +181,6 @@ def make_controller(tmp_path, channels=None, recording=(), active=(), on_restart
         kick_webhook=kick_webhook,
     )
     return config, ctrl, recorder, monitor, eventsub
-
-
-def read_file(tmp_path):
-    return json.loads((tmp_path / "config.json").read_text())
 
 
 def probe_ok(ctrl):
@@ -1035,12 +1032,6 @@ def test_status_disk_limits_in_plain_words(tmp_path):
     ctrl.handle_disk(["delete_oldest", "off"])
     text = asyncio.run(ctrl.handle_status())
     assert "max 100 GB (stop recording when over)" in text
-
-
-def kb_labels(markup):
-    data = markup.to_dict()
-    rows = data.get("inline_keyboard") or data.get("keyboard")
-    return [b["text"] for row in rows for b in row]
 
 
 def api_sent(bot):

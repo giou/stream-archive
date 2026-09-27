@@ -55,14 +55,16 @@ class TwitchAPI:
         self._token_lock = asyncio.Lock()
 
     async def _get_token(self) -> str:
-        now = time.time()
+        # Monotonic time, so a clock adjustment cannot make a dead token
+        # look valid. This matches the Kick token cache.
+        now = time.monotonic()
         if self._token and now < self._token_expires_at - 60:
             return self._token
         # Single-flight: concurrent callers must not each POST
         # client_credentials. Double-check the cache inside the lock
         # because the winner of the race already refreshed it.
         async with self._token_lock:
-            if self._token and time.time() < self._token_expires_at - 60:
+            if self._token and time.monotonic() < self._token_expires_at - 60:
                 return self._token
             try:
                 resp = await self.client.post(
@@ -76,7 +78,7 @@ class TwitchAPI:
                 resp.raise_for_status()
                 data = resp.json()
                 self._token = data["access_token"]
-                self._token_expires_at = time.time() + data.get("expires_in", 3600)
+                self._token_expires_at = time.monotonic() + float(data.get("expires_in", 3600))
             except (httpx.HTTPError, KeyError, ValueError) as e:
                 # Transport faults and a malformed body must reach the log.
                 logger.error("[twitch_api] Token request failed: %s", e)

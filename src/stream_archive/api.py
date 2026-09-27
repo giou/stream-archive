@@ -16,18 +16,16 @@ what an API client did.
 import functools
 import hmac
 import inspect
-import json
 import logging
 import math
 import secrets
-import time
-from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 from aiohttp import web
 
 from stream_archive.config import AppConfig, api_base_url, effective_quality, endpoint_base_url, normalize_channel_name
+from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.telegram.menu_state import is_error
 from stream_archive.updater import installed_app_version
 
@@ -241,7 +239,7 @@ class ControlAPI:
         self._ctrl = controller
         self._recorder = recorder
         self._session_of: Callable[[web.Request], Any] | None = None
-        self._key_fails: dict[str, deque[float]] = {}
+        self._key_budget = FailBudget(_KEY_MAX_FAILS, _KEY_WINDOW_S)
 
     def set_session_checker(self, checker: Callable[[web.Request], Any]) -> None:
         """Panel sessions that /api/v1 also accepts. Set once before serving.
@@ -309,23 +307,10 @@ class ControlAPI:
 
     def _key_allowed(self, request: web.Request) -> bool:
         """True when the address still holds key budget."""
-        now = time.monotonic()
-        key = request.remote or "unknown"
-        fails = self._key_fails.get(key)
-        if fails is None:
-            return True
-        while fails and now - fails[0] > _KEY_WINDOW_S:
-            fails.popleft()
-        if not fails:
-            del self._key_fails[key]
-            return True
-        return len(fails) < _KEY_MAX_FAILS
+        return self._key_budget.allowed(request.remote or "unknown")
 
     def _record_key_fail(self, request: web.Request) -> None:
-        fails = self._key_fails.setdefault(request.remote or "unknown", deque())
-        fails.append(time.monotonic())
-        while len(fails) > _KEY_MAX_FAILS:
-            fails.popleft()
+        self._key_budget.record(request.remote or "unknown")
 
     def _authenticate(self, request: web.Request) -> str:
         """Origin of the request for admin messages: key or panel session.
@@ -337,7 +322,7 @@ class ControlAPI:
         budget, so key guessing ends in 429.
         """
         if self._key_valid(request):
-            self._key_fails.pop(request.remote or "unknown", None)
+            self._key_budget.clear(request.remote or "unknown")
             return "Control API"
         if self._session_of is not None:
             session = self._session_of(request)
@@ -362,30 +347,6 @@ class ControlAPI:
         logger.warning("[api] rejected request from %s: bad or missing API key", request.remote)
         msg = "unauthorized"
         raise _ApiError(401, msg)
-
-    async def _read_json(self, request: web.Request) -> dict[str, Any]:
-        """Parse the JSON object body, or raise a 400/413."""
-        if request.content_length is not None and request.content_length > _MAX_BODY_BYTES:
-            msg = "request body too large"
-            raise _ApiError(413, msg)
-        raw = await request.content.read(_MAX_BODY_BYTES + 1)
-        if len(raw) > _MAX_BODY_BYTES:
-            msg = "request body too large"
-            raise _ApiError(413, msg)
-        if not raw:
-            msg = "JSON body required"
-            raise _ApiError(400, msg)
-        try:
-            payload = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            # json.loads decodes the bytes itself, so invalid UTF-8 raises
-            # UnicodeDecodeError, not JSONDecodeError. Both mean a bad body.
-            msg = f"invalid JSON body: {e}"
-            raise _ApiError(400, msg) from e
-        if not isinstance(payload, dict):
-            msg = "JSON body must be an object"
-            raise _ApiError(400, msg)
-        return payload
 
     def _known_channel(self, raw: str) -> str:
         """Normalized monitored channel name, or raise a 400/404."""
@@ -436,7 +397,7 @@ class ControlAPI:
 
     async def _patch_settings(self, request: web.Request) -> web.Response:
         """Apply the given global settings, one command per key."""
-        payload = await self._read_json(request)
+        payload = await read_json_object(request, _MAX_BODY_BYTES, _ApiError)
         unknown = sorted(set(payload) - set(_SETTING_KEYS))
         if unknown:
             msg = "unknown setting(s): " + ", ".join(unknown)
@@ -529,7 +490,7 @@ class ControlAPI:
 
     async def _add_channel(self, request: web.Request) -> web.Response:
         """Start monitoring a channel."""
-        payload = await self._read_json(request)
+        payload = await read_json_object(request, _MAX_BODY_BYTES, _ApiError)
         raw = payload.get("channel")
         if not isinstance(raw, str) or not raw.strip():
             msg = "channel is required"
@@ -552,7 +513,7 @@ class ControlAPI:
     async def _patch_channel(self, request: web.Request) -> web.Response:
         """Apply the given per-channel settings, one command per key."""
         channel = self._known_channel(request.match_info["channel"])
-        payload = await self._read_json(request)
+        payload = await read_json_object(request, _MAX_BODY_BYTES, _ApiError)
         unknown = sorted(set(payload) - set(_CHANNEL_SETTING_KEYS))
         if unknown:
             msg = "unknown setting(s): " + ", ".join(unknown)

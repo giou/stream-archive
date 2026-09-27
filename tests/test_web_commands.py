@@ -15,6 +15,7 @@ import types
 import unittest.mock
 
 from aiohttp.test_utils import TestClient, TestServer
+from conftest import kb_labels, read_file
 from conftest import make_config as valid_config
 
 from stream_archive.config import get_config
@@ -89,16 +90,6 @@ def make_controller(tmp_path):
     bot = unittest.mock.AsyncMock()
     ctrl._app = types.SimpleNamespace(bot=bot)
     return config, ctrl, bot
-
-
-def read_file(tmp_path):
-    return json.loads((tmp_path / "config.json").read_text())
-
-
-def kb_labels(markup):
-    data = markup.to_dict()
-    rows = data.get("inline_keyboard") or data.get("keyboard")
-    return [b["text"] for row in rows for b in row]
 
 
 def web_labels(enabled):
@@ -255,20 +246,13 @@ def test_group_enable_leaves_password_ungenerated(tmp_path):
 
 
 def test_disabled_stop_closes_owned_session(tmp_path):
-    import json as _json
-
-    from conftest import make_config as valid_config
-
-    from stream_archive.config import get_config
-    from stream_archive.telegram import TelegramController
-
     data = valid_config(
         channels=["twitch:channel1"],
         telegram_user_id=0,
         bot_telegram_api="",
         kick={"client_id": "client_id", "client_secret": "client_secret"},
     ).model_dump(mode="json", exclude_unset=True)
-    (tmp_path / "config.json").write_text(_json.dumps(data))
+    (tmp_path / "config.json").write_text(json.dumps(data))
     config = get_config(tmp_path / "config.json")
     ctrl = TelegramController(config, FakeRecorder(), FakeMonitor(), FakeEventSub(), kick_webhook=FakeKickWebhook())
     assert ctrl.enabled is False
