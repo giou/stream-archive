@@ -760,7 +760,8 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         Shutdown skips the remux, and a kill lands mid-file, so the boot
         pass finishes that work with no deadline. Live captures stay out:
         each source is checked against the active set right before its
-        remux. Returns (recovered, failed).
+        remux. Returns (recovered, failed). A skipped live capture counts
+        as neither: it is not recovered, and nothing failed.
         """
         try:
             workdir: Path | None = self._config.workdir
@@ -770,13 +771,16 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         base = disk.resolve_recording_dir(self._config)
         pending = await loop.run_in_executor(None, find_pending_remuxes, base, workdir)
         ok = 0
+        failed = 0
         for src in pending:
             if os.path.realpath(src) in self._active_paths():
                 continue
             if await remux_ts_to_mp4_async(src, workdir) is not None:
                 ok += 1
+            else:
+                failed += 1
         disk.invalidate_snapshot()
-        return (ok, len(pending) - ok)
+        return (ok, failed)
 
     def is_recording(self, channel: str) -> bool:
         return channel in self._recordings

@@ -85,7 +85,7 @@ def test_health_bind_failure_returns_none(caplog):
     assert any("health endpoint unavailable" in r.getMessage() for r in warnings)
 
 
-def test_missing_config_points_at_setup(monkeypatch):
+def test_missing_config_points_at_setup(monkeypatch, caplog):
     """A first boot with no config.json names the setup command, not a traceback."""
 
     def _missing() -> object:
@@ -93,8 +93,10 @@ def test_missing_config_points_at_setup(monkeypatch):
         raise FileNotFoundError(msg)
 
     monkeypatch.setattr(scheduler_module, "get_config", _missing)
-    with pytest.raises(SystemExit):
+    with caplog.at_level("ERROR", logger="stream_archive.scheduler"), pytest.raises(SystemExit) as exc:
         asyncio.run(scheduler_module.run_scheduler())
+    assert exc.value.code == 1
+    assert "stream-archive-setup" in caplog.text
 
 
 class _HangingRecorder:

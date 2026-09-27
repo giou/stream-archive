@@ -45,7 +45,7 @@ def make_api(handler=no_other_request, config=None, token=token_handler):
             return token(request)
         return handler(request)
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(route), headers={"User-Agent": _USER_AGENT})
+    client = httpx.AsyncClient(transport=httpx.MockTransport(route))
     api = KickAPI(AppConfig.model_validate(config or base_config()), http=client)
     _apis.append(api)
     return api
@@ -293,17 +293,17 @@ def test_http_errors_propagate(monkeypatch):
         asyncio.run(api.get_channel_statuses(["xqc"]))
 
 
-def test_channels_request_sends_user_agent():
-    seen = {}
+def test_owned_client_sends_user_agent():
+    """The client the API builds itself carries the product user agent.
 
-    def handler(request):
-        seen["ua"] = request.headers.get("User-Agent")
-        return httpx.Response(200, json={"data": []})
-
-    api = make_api(handler)
-    asyncio.run(api.get_channel_statuses(["xqc"]))
-
-    assert seen["ua"] == "stream-archive"
+    The injected-client path leaves headers to the caller, so this
+    contract is checked on construction, not on a request.
+    """
+    api = KickAPI(AppConfig.model_validate(base_config()))
+    try:
+        assert api.client.headers.get("User-Agent") == _USER_AGENT
+    finally:
+        asyncio.run(api.client.aclose())
 
 
 def test_transient_status_retried_then_succeeds(monkeypatch):
@@ -455,6 +455,10 @@ def test_top_livestreams_falls_back_to_v2_pages():
     api = make_api(handler)
 
     async def scenario():
-        return await api.get_top_livestreams()
+        full = await api.get_top_livestreams()
+        top_one = await api.get_top_livestreams(limit=1)
+        return full, top_one
 
-    assert asyncio.run(scenario()) == [("en-big", 3, 7000), ("old", 4, 50)]
+    full, top_one = asyncio.run(scenario())
+    assert full == [("en-big", 3, 7000), ("old", 4, 50)]
+    assert top_one == [("en-big", 3, 7000)]  # the client-side max truncates past the limit

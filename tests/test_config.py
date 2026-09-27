@@ -406,10 +406,10 @@ def test_legacy_webhook_config_migrates_to_the_endpoint():
     assert parsed.endpoint.listen_port == 9000
     assert parsed.endpoint.public_url == "https://kick.example.com/kick/webhook"
     # Tunnel management is gone: the old tunnel keys are dropped, not moved.
-    assert not hasattr(parsed.endpoint, "tunnel")
-    assert not hasattr(parsed.endpoint, "cloudflare_token")
-    assert not hasattr(parsed.endpoint, "cloudflare_managed")
-    assert not hasattr(parsed.kick.webhook, "cloudflare_managed")
+    # Pydantic drops unknown keys, so assert on the field sets: a hasattr
+    # check cannot fail here even when the migration misplaces the keys.
+    assert set(parsed.endpoint.model_dump()) == {"enabled", "listen_host", "listen_port", "public_url"}
+    assert "cloudflare_managed" not in parsed.kick.webhook.model_dump()
     # One URL served both: the new model reads an empty entry as "follow".
     assert parsed.kick.webhook.public_url == ""
     # The old file used one flag for both features: keep both on.

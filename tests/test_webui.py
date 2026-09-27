@@ -14,6 +14,7 @@ import os
 import time
 from pathlib import Path
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import make_config as valid_config
 from conftest import read_file
@@ -25,6 +26,22 @@ from stream_archive.telegram import TelegramController
 from stream_archive.webui import WebUI, hash_password, verify_password
 
 PW = "correct-horse-battery-12"
+
+
+@pytest.fixture(autouse=True)
+def _clean_events_feed():
+    """Empty the global events feed before and after each test.
+
+    The feed is module-level state, so an assertion failure between the
+    manual resets below would leak entries into the next test.
+    """
+    from stream_archive import events as events_mod
+
+    events_mod.reset()
+    try:
+        yield
+    finally:
+        events_mod.reset()
 
 
 class FakeRecorder:
@@ -475,7 +492,8 @@ def test_recordings_list_stream_range_delete(tmp_path):
     config, _, _, _, wh = make_webui(tmp_path)
     base = rec_dir(config)
     target = base / "show.mp4"
-    target.write_bytes(b"0123456789abcdef" * 64)
+    expected_body = b"0123456789abcdef" * 64
+    target.write_bytes(expected_body)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -499,7 +517,7 @@ def test_recordings_list_stream_range_delete(tmp_path):
     assert full.status == 200
     assert full.headers["Content-Type"] == "video/mp4"
     assert full.headers["Accept-Ranges"] == "bytes"
-    assert full_body == target.read_bytes() if target.exists() else full_body == b"0123456789abcdef" * 64
+    assert full_body == expected_body
     assert ranged.status == 206
     assert ranged.headers["Content-Range"] == f"bytes 0-15/{16 * 64}"
     assert ranged_body == b"0123456789abcdef"

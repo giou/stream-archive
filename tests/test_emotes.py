@@ -116,12 +116,19 @@ def test_fetch_kick_channel_emotes():
 
 
 def test_embed_images_shape():
-    stub = _Stub({})
+    """An unknown URL answers 404, so nothing is embedded."""
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(404)
 
     async def run():
-        return await embed_images(stub, {"7tv:g": ("GAMBA", "https://x/g")})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await embed_images(client, {"7tv:g": ("GAMBA", "https://x/g")})
 
     assert asyncio.run(run()) is None  # unknown URL 404s, nothing embedded
+    assert requested == ["https://x/g"]  # the download was attempted, not skipped
 
 
 def test_build_first_party_entries():

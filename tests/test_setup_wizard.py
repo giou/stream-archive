@@ -8,6 +8,7 @@ The OAuth flow itself is covered by test_setup_youtube.py.
 from __future__ import annotations
 
 import getpass
+import json
 
 import pytest
 from conftest import make_config
@@ -402,7 +403,7 @@ def test_kick_step_nginx_generates_config(monkeypatch, tmp_path):
 
 def test_reset_wipes_config_and_starts_over(monkeypatch, tmp_path):
     """Reset keeps a backup and runs the first-time flow again."""
-    old = _write_config(tmp_path, channels=["twitch:old"])
+    _write_config(tmp_path, channels=["twitch:old"])
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
@@ -411,16 +412,22 @@ def test_reset_wipes_config_and_starts_over(monkeypatch, tmp_path):
     )
     wizard.main()
     assert (tmp_path / "config.json.bak").exists()
+    bak = json.loads((tmp_path / "config.json.bak").read_text())
+    assert bak["channels"] == ["twitch:old"]  # the backup keeps the wiped channels
     config = get_config(tmp_path / "config.json")
     assert config.channels == []
-    assert old.channels == ["twitch:old"]
 
 
 def test_fresh_run_refuses_unwritable_dir(monkeypatch, tmp_path):
     """A root-owned data dir fails before the first prompt, with the fix."""
+    import os as _os
+
     work = tmp_path / "data"
     work.mkdir()
     work.chmod(0o555)
+    # Mode bits do not stop root, and os.access is what the wizard checks:
+    # deny the write directly so the test is deterministic for every user.
+    monkeypatch.setattr(_os, "access", lambda path, mode: False)
     monkeypatch.chdir(work)
     _script(monkeypatch, inputs=[], secrets=[])
     with pytest.raises(SystemExit):
@@ -431,6 +438,9 @@ def test_fresh_run_refuses_unwritable_dir(monkeypatch, tmp_path):
 def test_kick_entry_test_needs_the_app_running(monkeypatch, tmp_path, capsys):
     """The test prompt without a listener says to start the app, not hanging."""
     _write_config(tmp_path, endpoint={"listen_port": 47999})
+    monkeypatch.chdir(tmp_path)
+    # Fixed ports are not reliably closed, so force the unreachable branch.
+    monkeypatch.setattr(wizard, "_app_reachable", lambda config: False)
     monkeypatch.chdir(tmp_path)
     _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "y", "10"], secrets=[])
     wizard.main()

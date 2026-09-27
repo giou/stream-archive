@@ -18,6 +18,7 @@ from streamlink.exceptions import NoStreamsError, PluginError
 
 from stream_archive import disk
 from stream_archive.recorder import Recorder, sanitize_filename
+from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 from stream_archive.recorder.streamlink_source import _AudioOnlyStream
 
 
@@ -524,7 +525,7 @@ def test_clean_end_flag_cleared_on_restart(tmp_path, monkeypatch):
 
 def test_clean_end_latch_expires_after_grace(tmp_path):
     rec = Recorder(make_config(tmp_path))
-    rec._ended_clean["ch"] = time.monotonic() - 601
+    rec._ended_clean["ch"] = time.monotonic() - _ENDED_CLEAN_GRACE_S - 1
     assert not rec.ended_clean("ch")  # expired -> monitor restarts instead of suppressing
     assert "ch" not in rec._ended_clean  # expired entries are lazily popped
 
@@ -648,8 +649,9 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
 
     async def scenario():
         assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
         assert rec.is_recording("ch")
+        # The quota fallback to disk runs on its own task: poll for the path.
+        await wait_until(lambda: rec._recordings["ch"]["filepath"] is not None)
         assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
         await rec.stop("ch")
 
@@ -1044,6 +1046,8 @@ def test_remux_retries_stale_cached_mp4(tmp_path):
 
 def test_finalize_points_entry_at_mp4(tmp_path):
     """_finalize_entry remuxes the disk file and updates the entry path."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
     from stream_archive.recorder.remux import remux_target
 
     cfg = make_config(tmp_path)
@@ -1086,6 +1090,8 @@ def test_finalize_points_entry_at_mp4(tmp_path):
 
 
 def test_split_parts_passes_small_file_through(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
     import subprocess
 
     src = tmp_path / "cap.mp4"
@@ -1127,6 +1133,8 @@ def test_split_parts_passes_small_file_through(tmp_path):
 
 
 def test_split_parts_splits_over_cap_sparse(tmp_path):
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
     import subprocess
 
     from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES
@@ -1309,7 +1317,7 @@ def test_restart_youtube_sends_youtube_live_notification(tmp_path, monkeypatch):
         assert len(notifier.live[0][0]) == 4  # disk-mode start: twitch link only
         config.output_mode = "youtube"
         assert await rec.restart("ch") is True
-        await asyncio.sleep(0.05)  # let the tracked youtube task create the broadcast
+        await wait_until(lambda: len(notifier.live) == 2)  # the new broadcast link arrives on its own task
         assert len(notifier.live) == 2
         args, _ = notifier.live[1]
         assert args[0] == "ch"
@@ -1332,7 +1340,8 @@ def test_restart_disk_suppresses_live_notification(tmp_path, monkeypatch):
         assert await rec.start("ch") is True
         assert len(notifier.live) == 1  # from the initial start
         assert await rec.restart("ch") is True
-        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await asyncio.sleep(0)  # flush queued callbacks; a late duplicate would land here
         assert len(notifier.live) == 1  # apply-now restart: no extra live notification
         await rec.stop("ch")
 
@@ -1983,14 +1992,17 @@ def test_hold_bypasses_restart_gates(tmp_path, monkeypatch):
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
 
     async def scenario():
+        end_task = asyncio.create_task(asyncio.sleep(60))
         rec._held["ch"] = {
             "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"},
-            "end_task": asyncio.create_task(asyncio.sleep(60)),
+            "end_task": end_task,
             "keepalive": None,
         }
         rec._backoff_until["ch"] = time.monotonic() + 999
         rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
         assert rec.youtube_restart_blocked_reason("ch") is None
+        end_task.cancel()
+        await asyncio.gather(end_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -2096,7 +2108,8 @@ def test_reuse_stops_keepalive(tmp_path, monkeypatch):
         }
         monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
         assert await rec.start("ch") is True
-        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await asyncio.sleep(0)  # flush queued callbacks; a stray creation would land here
         assert yt.create_count == 0  # reuse: no new broadcast created
         assert proc.terminated
         assert rec._recordings["ch"]["youtube_info"]["broadcast_id"] == "b1"
@@ -2476,24 +2489,24 @@ def test_cancelled_chat_stop_still_closes_the_writer(tmp_path):
     chat_path.parent.mkdir(parents=True, exist_ok=True)
     rec = ChatRecorder("ch", str(chat_path), "title", "game")
     rec._writer.add_comment({"body": "hello"})
-    reader: list[asyncio.Task[None]] = []
 
     async def scenario():
         async def blocked_reader():
             await asyncio.sleep(3600)
 
         rec._task = asyncio.ensure_future(blocked_reader())
-        reader.append(rec._task)
         await asyncio.sleep(0)
         stop_task = asyncio.ensure_future(rec.stop())
         await asyncio.sleep(0)
         stop_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await stop_task
+        # Clean up on the same loop: a second asyncio.run cannot adopt
+        # a task bound to this loop.
+        rec._task.cancel()
+        await asyncio.gather(rec._task, return_exceptions=True)
 
     asyncio.run(scenario())
-    with contextlib.suppress(asyncio.CancelledError):
-        asyncio.run(asyncio.gather(*reader, return_exceptions=True))
 
     assert chat_path.exists(), "the cancelled stop must still rename the file"
     assert json.loads(chat_path.read_text())["comments"][0]["body"] == "hello"

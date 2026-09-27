@@ -270,6 +270,7 @@ def test_out_of_range_timestamp_falls_back_to_the_local_clock(tmp_path):
         assert comment["_id"] == "m1"
         created = datetime.strptime(comment["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
         assert abs((datetime.now(UTC) - created).total_seconds()) < 60
+        assert 0 <= comment["content_offset_seconds"] < 60  # the offset is wall-clock based, like the stamp
 
     asyncio.run(scenario())
 

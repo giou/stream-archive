@@ -241,12 +241,17 @@ def test_get_live_streams_splits_over_max_items_into_chunks():
 def test_empty_input_asks_the_api_for_nothing():
     """An empty input needs no token and no request."""
     requests = []
+    tokens = []
 
     def handler(request):
         requests.append(request.url.path)
         pytest.fail(f"unexpected request: {request.method} {request.url}")
 
-    api = make_api(handler)
+    def counting_token(request):
+        tokens.append(request.url.path)
+        return token_handler(request)
+
+    api = make_api(handler, token=counting_token)
 
     async def scenario():
         try:
@@ -257,6 +262,7 @@ def test_empty_input_asks_the_api_for_nothing():
 
     asyncio.run(scenario())
     assert requests == []
+    assert tokens == []  # the early return runs before the token fetch
 
 
 def test_create_eventsub_subscription_answers_a_non_json_body_with_an_empty_dict():

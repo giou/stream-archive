@@ -1418,6 +1418,7 @@ def test_empty_key_body_is_rejected_as_too_large(keypair):
         "Kick-Event-Signature": "AAAA",
     }
     big = _SegmentedRequest([b"x" * 4096] * 40, headers)  # 160 KiB, over the 64 KiB cap
+    big.content_length = None  # chunked: the drain loop enforces the cap, not the early length check
 
     async def scenario():
         response = await wh._handle(big)

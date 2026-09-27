@@ -146,8 +146,8 @@ def test_refresh_failure_reaches_every_caller_and_frees_the_lock(tmp_path, monke
     asyncio.run(asyncio.wait_for(scenario(), timeout=5))
 
 
-def test_broadcast_title_and_description_are_one_line_each():
-    """The published title and description carry platform text, so canonicalize it."""
+def test_broadcast_description_is_one_line_per_row():
+    """The published description carries platform text, so canonicalize it."""
     description = build_video_description("author\nUrl: https://evil.example", "twitch:ch", "game\u2028x")
     assert description.split("\n") == [
         "Twitch stream by author Url: https://evil.example",
@@ -170,9 +170,9 @@ class _RecordingClient:
         self.reached = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def request(self, method, url, **_kwargs):
+    async def request(self, method, url, **kwargs):
         path = url.rsplit("/v3/", 1)[-1]
-        self.calls.append((method, path))
+        self.calls.append((method, path, kwargs.get("params"), kwargs.get("json")))
         if self.block_path is not None and path == self.block_path:
             self.reached.set()
             await self.release.wait()
@@ -236,9 +236,17 @@ def test_cancelled_create_rolls_back_the_broadcast_and_stream(tmp_path, monkeypa
 
     asyncio.run(scenario())
 
-    assert ("POST", "liveBroadcasts/bind") in client.calls
-    assert ("DELETE", "liveStreams") in client.calls
-    assert ("DELETE", "liveBroadcasts") in client.calls
+    assert (
+        "POST",
+        "liveBroadcasts/bind",
+        {"id": "bcast-1", "streamId": "stream-1", "part": "id,snippet,status"},
+        None,
+    ) in client.calls
+    # The rollback deletes the ids the create just made, not swapped ones.
+    assert ("DELETE", "liveStreams", {"id": "stream-1"}, None) in client.calls
+    assert ("DELETE", "liveBroadcasts", {"id": "bcast-1"}, None) in client.calls
+    inserts = [call for call in client.calls if call[:2] == ("POST", "liveBroadcasts")]
+    assert inserts and inserts[0][3]["snippet"]["title"] == "author - title"
 
 
 def test_rollback_survives_the_cancellation_that_started_it(tmp_path, monkeypatch):
@@ -261,18 +269,18 @@ def test_rollback_survives_the_cancellation_that_started_it(tmp_path, monkeypatc
 
     async def scenario():
         task = asyncio.ensure_future(streamer.create_stream("author", "title", "twitch:ch", "game"))
-        await client.reached.wait()
+        await asyncio.wait_for(client.reached.wait(), timeout=5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         if streamer._rollback_tasks:
-            await asyncio.gather(*streamer._rollback_tasks, return_exceptions=True)
+            await asyncio.wait_for(asyncio.gather(*streamer._rollback_tasks, return_exceptions=True), timeout=5)
 
     asyncio.run(scenario())
 
     assert client.tracking_seen and set(client.tracking_seen) == {1}, (
         f"the streamer must hold the rollback task while it runs: observed {client.tracking_seen}"
     )
-    assert ("DELETE", "liveStreams") in client.calls
-    assert ("DELETE", "liveBroadcasts") in client.calls
+    assert ("DELETE", "liveStreams", {"id": "stream-1"}, None) in client.calls
+    assert ("DELETE", "liveBroadcasts", {"id": "bcast-1"}, None) in client.calls
     assert streamer._rollback_tasks == set()

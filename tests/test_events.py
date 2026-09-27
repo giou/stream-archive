@@ -8,8 +8,24 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from stream_archive import events
 from stream_archive.events import _FILE_MAX_LINES, _MAX_EVENTS
+
+
+@pytest.fixture(autouse=True)
+def _clean_events_feed():
+    """Empty the global feed before and after each test.
+
+    Every test below resets manually, but an assertion failure between
+    the two resets leaks entries into the next test.
+    """
+    events.reset()
+    try:
+        yield
+    finally:
+        events.reset()
 
 
 def _entry(n: int) -> dict[str, object]:

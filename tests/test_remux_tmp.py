@@ -159,4 +159,4 @@ def test_repair_skips_live_captures(tmp_path):
     with mock.patch("stream_archive.recorder.core.remux_ts_to_mp4_async", side_effect=fake_remux):
         ok, failed = asyncio.run(rec.repair_pending_remuxes())
     assert calls == [stale]
-    assert (ok, failed) == (1, 1)
+    assert (ok, failed) == (1, 0)  # the skipped live capture is neither recovered nor failed
