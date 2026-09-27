@@ -3,10 +3,34 @@ import contextlib
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from stream_archive.chat_recorder import ChatRecorder
 
 TS_MS = 1720000000000  # 2024-07-03T09:46:40Z
 TS2_MS = 1720000000500
+
+
+@pytest.fixture(autouse=True)
+def _no_network_emote_fetch(monkeypatch):
+    """Keep the capture offline: third-party emote fetches never leave the loop.
+
+    The first tagged message carries a room id, and the recorder then
+    fetches the 7TV, BTTV, and FFZ sets over real HTTP inside the read
+    loop. That I/O races the 5 s wait budgets below, so a slow provider
+    flakes the capture tests. The fetch path itself is covered in
+    test_emotes.
+    """
+
+    async def empty_channel(client, platform, channel_id):
+        return {}
+
+    async def empty_global(client):
+        return {}
+
+    monkeypatch.setattr("stream_archive.chat_recorder.fetch_channel_emotes", empty_channel)
+    monkeypatch.setattr("stream_archive.chat_recorder.fetch_global_emotes", empty_global)
+
 
 PRIVMSG_TEMPLATE = (
     "@badges=subscriber/12;color=#FF0000;display-name=ViewerName;emotes=25:6-10;"
