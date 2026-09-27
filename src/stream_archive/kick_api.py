@@ -167,7 +167,7 @@ class KickAPI:
             return await self._top_v1(limit)
         except Exception as e:
             logger.warning("[kick_api] v1 livestreams failed, falling back to v2: %s", e)
-        return await self._top_v2()
+        return await self._top_v2(limit)
 
     async def _top_v1(self, limit: int) -> list[tuple[str, int, int]]:
         headers = await self._headers()
@@ -184,7 +184,7 @@ class KickAPI:
             if item.get("slug") and item.get("broadcaster_user_id")
         ]
 
-    async def _top_v2(self) -> list[tuple[str, int, int]]:
+    async def _top_v2(self, limit: int) -> list[tuple[str, int, int]]:
         """Busiest channels of two v2 pages (global plus English)."""
         headers = await self._headers()
         rows: list[tuple[str, int, int]] = []
@@ -199,7 +199,7 @@ class KickAPI:
                 if slug and uid:
                     rows.append((slug, int(uid), int(item.get("viewer_count") or 0)))
         rows.sort(key=lambda row: row[2], reverse=True)
-        return rows[:5]
+        return rows[:limit]
 
     async def get_public_key(self, force: bool = False) -> str | None:
         """Return the PEM string used to verify webhook signatures.

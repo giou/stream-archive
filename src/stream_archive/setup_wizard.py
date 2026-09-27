@@ -529,8 +529,8 @@ def _setup_kick_entry(config: AppConfig) -> None:
             services.append((panel_host, config.endpoint.listen_port))
         try:
             path = write_ingress_config(config.workdir, token or "x", tuple(services))
-        except ValueError as e:
-            print(f"\u274c {e}")
+        except (ValueError, OSError) as e:
+            print(f"\u274c Cannot write the ingress file: {e}")
             print("Nothing changed.")
             return
         print(f"Wrote {path}.")
@@ -549,8 +549,8 @@ def _setup_kick_entry(config: AppConfig) -> None:
             api_port = config.endpoint.listen_port
         try:
             path = write_nginx_config(config.workdir, host, webhook_port, api_port)
-        except ValueError as e:
-            print(f"\u274c {e}")
+        except (ValueError, OSError) as e:
+            print(f"\u274c Cannot write the nginx file: {e}")
             print("Nothing changed.")
             return
         print(f"Wrote {path}.")
@@ -580,7 +580,8 @@ def _setup_kick_entry(config: AppConfig) -> None:
             # A new entry proves delivery again on the next event.
             candidate.kick.webhook.setup_notified = False
 
-    _save(config, mutate, "Kick endpoint")
+    if not _save(config, mutate, "Kick endpoint"):
+        return
     if not _kick_entry_usable(config):
         print("The panel has no public address, so Kick stays on polling until one is set.")
         return

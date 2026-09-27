@@ -40,6 +40,7 @@
 # that writes them next to a checkout.
 **/.tz
 **/cloudflared/
+**/nginx/
 # ":Zone.Identifier" is the Windows download marker.
 **/*:Zone.Identifier
 **/build/

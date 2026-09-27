@@ -11,6 +11,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg tzdata ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+
 # twitch.py plugin (2bc4/streamlink-ttvlol, BSD-2-Clause). The recorder imports
 # this file into its own process, so it runs with the app's authority: the bot
 # token, the Twitch and Kick client secrets, the YouTube token, and the data

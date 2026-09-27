@@ -481,3 +481,17 @@ def test_verify_needs_credentials_first(tmp_path, capsys):
     config = _write_config(tmp_path, kick={"client_id": "", "client_secret": ""})
     wizard._verify_kick_delivery(config)
     assert "Save Kick credentials first" in capsys.readouterr().out
+
+
+def test_kick_entry_ingress_write_failure_changes_nothing(monkeypatch, tmp_path, capsys):
+    """An unwritable data dir answers cleanly instead of a traceback."""
+    _write_config(tmp_path)
+    (tmp_path / "cloudflared").write_text("not a directory")
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["4", "y", "1", "kick.example.com", "n", "8"], secrets=[""])
+    wizard.main()
+    out = capsys.readouterr().out
+    assert "Nothing changed." in out
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.webhook.public_url == ""
+    assert config.kick.webhook.enabled is False

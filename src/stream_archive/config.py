@@ -221,6 +221,21 @@ class KickWebhookConfig(BaseModel):
     #: proxy and paste its URL here.
     public_url: StrictStr = ""
 
+    @model_validator(mode="after")
+    def _require_usable_public_url(self) -> KickWebhookConfig:
+        """A set Kick entry must be a public http(s) URL with a hostname.
+
+        Values like ``https://`` (no host) would otherwise save as success
+        and silently never receive events.
+        """
+        if not self.public_url.strip():
+            return self
+        parts = urlparse(self.public_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            msg = "kick.webhook.public_url must be an http(s) URL with a hostname, or empty to follow the endpoint"
+            raise ValueError(msg)
+        return self
+
 
 class KickConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
@@ -441,12 +456,27 @@ class AppConfig(BaseModel):
     def _require_distinct_listeners(self) -> AppConfig:
         """One address serves one listener. A shared port would serve the
         panel on the public webhook port, which the split exists to prevent."""
-        ep = (self.endpoint.listen_host, self.endpoint.listen_port)
-        wh = (self.kick.webhook.listen_host, self.kick.webhook.listen_port)
-        if ep == wh:
+        ep_host = _norm_listen_host(self.endpoint.listen_host)
+        wh_host = _norm_listen_host(self.kick.webhook.listen_host)
+        same_port = self.endpoint.listen_port == self.kick.webhook.listen_port
+        overlap = ep_host == wh_host or _is_wildcard_host(ep_host) or _is_wildcard_host(wh_host)
+        if same_port and overlap:
             msg = "kick.webhook listen address must differ from the endpoint listen address"
             raise ValueError(msg)
         return self
+
+
+def _norm_listen_host(host: str) -> str:
+    """Loopback names as one value for the listener comparison."""
+    host = host.strip().lower().rstrip(".")
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return "127.0.0.1"
+    return host
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """True for a bind that accepts every interface (overlaps all hosts)."""
+    return host.strip().lower() in ("0.0.0.0", "::", "")
 
 
 def _bound(config: AppConfig, attr: str, what: str) -> Path:
@@ -517,6 +547,11 @@ def _apply_legacy_layout(data: Any) -> Any:
     if not isinstance(kick, dict) or not isinstance(kick.get("webhook"), dict):
         return data
     webhook: dict[str, Any] = kick["webhook"]
+    if not any(key in webhook for key in ("listen_host", "listen_port")):
+        # No listener keys: not the pre-split layout (a current file that
+        # only omits the endpoint section). Leave it alone: moving the
+        # public URL out would break a standalone Kick entry.
+        return data
     moved = {key: webhook[key] for key in _LEGACY_ENDPOINT_KEYS if key in webhook}
     if not moved:
         return data
@@ -525,8 +560,11 @@ def _apply_legacy_layout(data: Any) -> Any:
     # The moved listen address described the one old listener. The split
     # gives the webhook listener its own bind, so the old address stays on
     # the endpoint only. A leftover here would bind both listeners to one
-    # port and fail validation.
-    webhook = {key: value for key, value in webhook.items() if key not in ("listen_host", "listen_port")}
+    # port and fail validation. The old public URL moves the same way: the
+    # new model reads an empty webhook entry as "follow the endpoint", so
+    # keeping the copy would pin Kick deliveries to a stale URL when the
+    # panel address changes later.
+    webhook = {key: value for key, value in webhook.items() if key not in ("listen_host", "listen_port", "public_url")}
     return {**data, "endpoint": moved, "kick": {**kick, "webhook": webhook}}
 
 

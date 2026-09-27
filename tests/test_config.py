@@ -352,6 +352,39 @@ def test_webhook_listener_address_must_differ_from_the_endpoint():
         AppConfig.model_validate(config)
 
 
+def test_webhook_listener_conflict_counts_aliases_and_wildcards():
+    """localhost, 127.0.0.1, and 0.0.0.0 overlap: all share one port."""
+    config = kick_config()
+    config["kick"]["webhook"]["listen_host"] = "localhost"
+    config["kick"]["webhook"]["listen_port"] = 8787
+    with pytest.raises(ValueError, match=r"kick\.webhook listen address must differ"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["endpoint"]["listen_host"] = "0.0.0.0"
+    config["endpoint"]["listen_port"] = 8788
+    with pytest.raises(ValueError, match=r"kick\.webhook listen address must differ"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["listen_host"] = "192.168.1.5"
+    config["kick"]["webhook"]["listen_port"] = 8787
+    AppConfig.model_validate(config)  # disjoint interfaces may share a port
+
+
+def test_kick_public_url_needs_host_or_empty():
+    """A hostname-less Kick entry would save as success and never deliver."""
+    config = kick_config()
+    config["kick"]["webhook"]["public_url"] = "https://"
+    with pytest.raises(ValueError, match=r"kick\.webhook\.public_url"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["public_url"] = "not a url"
+    with pytest.raises(ValueError, match=r"kick\.webhook\.public_url"):
+        AppConfig.model_validate(config)
+    config = kick_config()
+    config["kick"]["webhook"]["public_url"] = ""
+    AppConfig.model_validate(config)
+
+
 def test_legacy_webhook_config_migrates_to_the_endpoint():
     config = kick_config()
     del config["endpoint"]  # older files had no endpoint section
@@ -376,6 +409,8 @@ def test_legacy_webhook_config_migrates_to_the_endpoint():
     assert not hasattr(parsed.endpoint, "cloudflare_token")
     assert not hasattr(parsed.endpoint, "cloudflare_managed")
     assert not hasattr(parsed.kick.webhook, "cloudflare_managed")
+    # One URL served both: the new model reads an empty entry as "follow".
+    assert parsed.kick.webhook.public_url == ""
     # The old file used one flag for both features: keep both on.
     assert parsed.kick.webhook.enabled is True
     assert parsed.kick.webhook.setup_notified is True

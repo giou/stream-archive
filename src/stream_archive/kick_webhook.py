@@ -205,6 +205,7 @@ class KickWebhook:
         self._verify_slug: str = ""  # slug of the running delivery test
         self._verify_event: asyncio.Event | None = None  # set on its first verified delivery
         self._verify_ids: set[str] = set()  # test subscription ids the sweep must spare
+        self._verify_lock = asyncio.Lock()  # one delivery test at a time
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
         self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
         self._next_key_refetch = 0.0  # monotonic time. Gates the rotation refetch.
@@ -833,8 +834,18 @@ class KickWebhook:
         """
         if not self._sync_needed():
             return False, "Enable the endpoint and the Kick webhook first: nothing listens."
-        if self._verify_event is not None:
+        # Fast reject before the lock: a running test answers busy at once
+        # instead of queueing behind a minutes-long wait. The re-check
+        # inside holds the lock, so two racers cannot both arm.
+        if self._verify_event is not None or self._verify_lock.locked():
             return False, "A delivery test already runs."
+        async with self._verify_lock:
+            if self._verify_event is not None:
+                return False, "A delivery test already runs."
+            return await self._verify_delivery_locked(timeout)
+
+    async def _verify_delivery_locked(self, timeout: float) -> tuple[bool, str]:
+        """Body of verify_delivery with the lock held. See verify_delivery for the contract."""
         try:
             top = await self._api.get_top_livestreams()
         except Exception as e:

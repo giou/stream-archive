@@ -726,3 +726,18 @@ def test_kick_delivery_test_route_needs_the_listener(tmp_path):
     status, body = asyncio.run(scenario())
     assert status == 503
     assert body == {"error": "webhook listener unavailable"}
+
+
+def test_disabled_api_never_spends_budget(tmp_path):
+    """A disabled API answers 404 on every attempt, never 429."""
+    _, _, _, _, wh, _, _ = make_api(tmp_path, enabled=False)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            codes = []
+            for _ in range(11):
+                resp = await client.get("/api/v1/settings", headers=auth("nope"))
+                codes.append(resp.status)
+            return codes
+
+    assert asyncio.run(scenario()) == [404] * 11

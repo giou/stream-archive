@@ -349,14 +349,16 @@ class ControlAPI:
                         msg = "bad CSRF token"
                         raise _ApiError(403, msg)
                 return "Web panel"
+        cfg = self._config.api
+        if not cfg.enabled or not cfg.key:
+            # Absent means absent: no budget is spent, so a disabled API
+            # never answers 429 and leaks nothing through it.
+            msg = "not found"
+            raise _ApiError(404, msg)
         if not self._key_allowed(request):
             msg = "too many attempts, try again later"
             raise _ApiError(429, msg)
         self._record_key_fail(request)
-        cfg = self._config.api
-        if not cfg.enabled or not cfg.key:
-            msg = "not found"
-            raise _ApiError(404, msg)
         logger.warning("[api] rejected request from %s: bad or missing API key", request.remote)
         msg = "unauthorized"
         raise _ApiError(401, msg)

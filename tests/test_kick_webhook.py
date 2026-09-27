@@ -1635,3 +1635,26 @@ def test_sweep_deletes_the_test_subscription_after_the_test():
 
     asyncio.run(scenario())
     assert deletes == [["t-1"]]
+
+
+def test_verify_delivery_rejects_a_second_run(keypair):
+    """Two racers must not both arm: the loser reads busy at once."""
+    _, public_pem = keypair
+    api = FakeKickAPI(public_pem)
+    wh = make_webhook(config=enabled_config(), api=api)
+
+    async def scenario():
+        first = asyncio.create_task(wh.verify_delivery(timeout=5))
+        for _ in range(500):
+            if wh._verify_event is not None:
+                break
+            await asyncio.sleep(0.01)
+        second = await wh.verify_delivery(timeout=5)
+        assert wh._verify_event is not None  # the first still owns the test
+        wh._verify_event.set()  # release it without a delivery
+        return second, await first
+
+    (second_ok, second_msg), (first_ok, _) = asyncio.run(scenario())
+    assert (second_ok, second_msg) == (False, "A delivery test already runs.")
+    assert first_ok is True
+    assert api.deleted == [["sub-999-0", "sub-999-1"]]  # one test, one cleanup
