@@ -35,7 +35,6 @@ from stream_archive.telegram.commands_web import WebCommands
 from stream_archive.telegram.commands_webhook import WebhookCommands
 from stream_archive.telegram.menu_state import ChatId, ChatStateMixin, MenuResult
 from stream_archive.telegram.menus_commands import CommandsMixin
-from stream_archive.tunnels import CloudflaredTunnel
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +99,6 @@ class TelegramController(
     _admin_id: int
     _admin_filter: Any
     _enabled: bool
-    _cloudflared: CloudflaredTunnel
-    _cloudflared_lock: asyncio.Lock
-    _restore_task: asyncio.Task[None] | None
 
     def __init__(
         self,
@@ -148,11 +144,6 @@ class TelegramController(
         self._mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]] = {}
         self._pending_delete: dict[tuple[ChatId, str], str] = {}
         self._pending_bulk_delete: dict[tuple[ChatId, str], str | None] = {}
-        self._cloudflared = CloudflaredTunnel()
-        # One managed cloudflared process serves the whole app, so a tunnel
-        # press must not interleave with another one. See menu_kick_cloudflare.
-        self._cloudflared_lock = asyncio.Lock()
-        self._restore_task = None
         self._callback_handler: Any = None
 
     @property
@@ -248,32 +239,16 @@ class TelegramController(
             )
         except Exception:
             logger.warning("[telegram] Failed to re-send settings menu after restart", exc_info=True)
-        ep = self._config.endpoint
-        if ep.enabled and ep.tunnel == "cloudflare" and ep.cloudflare_managed:
-            # Keep the reference: stop() cancels and awaits this task, and a
-            # task without a reference can be collected mid-flight.
-            self._restore_task = asyncio.create_task(self._restore_cloudflared())
 
     async def stop(self) -> None:
-        """Stop the tunnel, the bot, and the owned HTTP session.
+        """Stop the bot and the owned HTTP session.
 
         Every step runs, even when an earlier one fails: the updater raises
         when it never started, and the owned session must still close. A
         failure is logged and does not stop the remaining steps. The bot
-        steps run only when polling started; the tunnel and the owned
-        session close in every mode, since __init__ owns them regardless.
+        steps run only when polling started; the owned session closes in
+        every mode, since __init__ owns it regardless.
         """
-        # A restore task that still runs can start a cloudflared process
-        # after this teardown, so cancel it and wait for it first. A failure
-        # in the task is not a reason to skip the remaining steps.
-        if self._restore_task is not None:
-            self._restore_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                try:
-                    await self._restore_task
-                except Exception:
-                    logger.warning("[telegram] cloudflared restore task failed at stop", exc_info=True)
-            self._restore_task = None
         if self._enabled and self._app is not None:
             updater = self._app.updater
             if updater is not None:
@@ -289,10 +264,6 @@ class TelegramController(
                 await self._app.shutdown()
             except Exception:
                 logger.warning("[telegram] Failed to shut down the bot", exc_info=True)
-        try:
-            self._cloudflared_stop()
-        except Exception:
-            logger.warning("[telegram] Failed to stop cloudflared", exc_info=True)
         if self._owns_http:
             try:
                 await self._http.aclose()

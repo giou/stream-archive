@@ -16,21 +16,6 @@ services:
       # rewritten compose file or .env runs on the next `docker compose up`.
       # The default stays "." so existing deployments keep their data.
       - ${STREAM_ARCHIVE_DATA:-.}:/data
-      # Host tailscale runtime directory. It lets the bot run `tailscale
-      # funnel` for the kick webhook tunnel. The mount is optional: the stack
-      # boots when tailscale is absent, because compose creates an empty
-      # directory. An empty directory is what tailscaled creates too. Set
-      # TAILSCALE_RUN_DIR when the host uses another path.
-      # Trust boundary: the socket carries control of the host tailnet
-      # (funnel/serve config, routes, up/down). The mount is read-write
-      # because a unix socket needs write access to connect. The service has
-      # no `user:` key, so anything that runs inside the container (a bug in
-      # the control API, the webhook receiver, or the bot) can reach that
-      # control. Mount the socket only where the bot must manage the tunnel.
-      # The socket is usually root:root mode 0600, so set USER_UID/USER_GID to
-      # a user that may write to it, or run
-      # `sudo chmod 0660 /var/run/tailscale/tailscaled.sock` on the host.
-      - ${TAILSCALE_RUN_DIR:-/var/run/tailscale}:/var/run/tailscale
       # /tmp is the only scratch space (HOME and the streamlink plugin cache
       # too), so cap it: without a limit a leaked file can consume half of the
       # host RAM. The size is in bytes. The mode stays unset: Docker mounts a
@@ -43,11 +28,14 @@ services:
         tmpfs:
           size: 1073741824
     ports:
-      # Kick webhook receiver and control API (/api/v1, same listener). The
-      # host's tailscale funnel forwards to the host loopback, so we publish
-      # the container listener there. This needs
-      # kick.webhook.listen_host = "0.0.0.0" in config.json under docker.
+      # Private listener: panel and control API. Publish it on host
+      # loopback only, and reach it over the tailnet (tailscale serve).
       - "127.0.0.1:8787:8787"
+      # Webhook listener: POST /kick/webhook alone. The public proxy
+      # targets this port. The panel never shares it. Under docker the
+      # listener must bind 0.0.0.0 in config.json (a container-local
+      # 127.0.0.1 refuses forwarded traffic); bare metal keeps 127.0.0.1.
+      - "127.0.0.1:8788:8788"
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1

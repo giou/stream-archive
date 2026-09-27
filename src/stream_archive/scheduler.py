@@ -100,7 +100,11 @@ async def run_scheduler() -> None:
 
     assert _shutdown_event is not None
 
-    config = get_config()
+    try:
+        config = get_config()
+    except (FileNotFoundError, ValueError) as e:
+        logger.error("[scheduler] Cannot start: %s. Run stream-archive-setup first.", e)
+        raise SystemExit(1) from e
     # The feed survives restarts: entries recorded before this boot return.
     events.load(events.feed_path(config.workdir))
     channels = config.channels
@@ -182,6 +186,9 @@ async def run_scheduler() -> None:
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)
         webui = WebUI(config, telegram, recorder, http=shared_http)
+        # The panel and scripts share /api/v1: a live panel session also
+        # authenticates there. Sessions end with the panel being off.
+        control_api.set_session_checker(lambda request: webui._session_of(request) if config.web.enabled else None)
         webui.register_routes(kick_webhook)
         telegram.bind_live_check(twitch_api, kick_api)
 

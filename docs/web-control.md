@@ -41,11 +41,11 @@ answered slowly. The log records logins, logouts, and password changes.
 The panel is powerful. Keep it off the open internet when you can.
 
 * Best for private use: Tailscale Serve. It keeps the panel inside your
-  tailnet with no public ingress. Use Funnel only when you need public
-  access.
-* For public access: Cloudflare Tunnel plus Cloudflare Access. Access
+  tailnet with no public ingress.
+* For public access: your own reverse proxy plus identity-aware access
+  (for example Cloudflare Tunnel plus Cloudflare Access). Access
   checks identity first, and the panel password stays as a second factor.
-* Keep `endpoint.listen_host` on loopback and let the tunnel forward to
+* Keep `endpoint.listen_host` on loopback and let the proxy forward to
   it. Never publish port 8787 directly.
 
 ## Differences from the bot
@@ -58,7 +58,7 @@ The panel is powerful. Keep it off the open internet when you can.
   sit side by side, and the chat follows the video position.
 * The panel cannot send a recording to your Telegram chat. Use the bot for
   MTProto upload.
-* The panel cannot manage tunnels, the Kick webhook, or the control API
+* The panel cannot manage the Kick webhook or the control API
   itself. Use the bot or edit `config.json` for those.
 * Every panel change writes `config.json` atomically like a bot change.
   A rejected change writes nothing.

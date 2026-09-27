@@ -16,8 +16,8 @@ src/stream_archive/
   monitor.py             # start/stop/restart decisions, failure alerts (Twitch + Kick)
   eventsub.py            # Twitch EventSub conduit client (stream.online/offline fast path)
   kick_webhook.py        # Kick webhook receiver (/kick/webhook), signature verification, subscription sync
-  api.py                 # HTTP control API (/api/v1): channels and settings on the webhook listener
-  tunnels.py             # managed public tunnels: cloudflared process, tailscale funnel, tunnel tokens
+  api.py                 # HTTP control API (/api/v1): channels, settings, delivery test, on the private listener
+  tunnels.py             # proxy config generators: cloudflared ingress and nginx server blocks (nothing is managed)
   kick_api.py            # Kick OAuth client (token, channel statuses, webhook subscriptions, public key)
   kick_chat.py           # Kick chat -> TwitchDownloader ChatRoot conversion + emote embedding
   recorder/              # streamlink capture, ffmpeg pipe, task tracking, chat finalization (core + mixins)
@@ -55,8 +55,8 @@ each update:
 
 - `uv`: the Python dependencies in `pyproject.toml` and `uv.lock`, including
   streamlink.
-- `docker`: the base images of the Dockerfile: python, cloudflared, and uv.
-  Cloudflared and uv sit in their own build stages, so their tags stay
+- `docker`: the base images of the Dockerfile: python and uv.
+  Uv sits in its own build stage, so its tag stays
   visible to Dependabot.
 - `github-actions`: the workflows in `.github/workflows`.
 

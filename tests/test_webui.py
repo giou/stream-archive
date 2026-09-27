@@ -17,6 +17,7 @@ from pathlib import Path
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import make_config as valid_config
 
+from stream_archive.api import ControlAPI
 from stream_archive.config import get_config
 from stream_archive.kick_webhook import KickWebhook
 from stream_archive.telegram import TelegramController
@@ -120,6 +121,11 @@ def make_webui(tmp_path, *, web_enabled=True, password=True, channels=("twitch:c
     wh = KickWebhook(config, None, None, None, None)
     webui = WebUI(config, ctrl, recorder)
     webui.register_routes(wh)
+    # Production serves the panel and /api/v1 on one listener with shared
+    # sessions, so the fixture wires the same pairing.
+    api = ControlAPI(config, ctrl, recorder)
+    api.set_session_checker(webui._session_of)
+    api.register_routes(wh)
     return config, ctrl, recorder, webui, wh
 
 
@@ -289,15 +295,15 @@ def test_status_reports_disk_cap(tmp_path):
 
 
 def test_patch_settings_bad_value_is_400_not_500(tmp_path):
-    """Shared validators must answer 400 through the panel, like the API."""
+    """Shared validators must answer 400 on /api/v1 with a panel session."""
     _, _, _, _, wh = make_webui(tmp_path)
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             csrf = await login(client)
             headers = {"X-CSRF-Token": csrf}
-            bad_number = await client.patch("/api/settings", json={"retention_days": "soon"}, headers=headers)
-            bad_switch = await client.patch("/api/settings", json={"record_chat": "yes"}, headers=headers)
+            bad_number = await client.patch("/api/v1/settings", json={"retention_days": "soon"}, headers=headers)
+            bad_switch = await client.patch("/api/v1/settings", json={"record_chat": "yes"}, headers=headers)
             return bad_number.status, await bad_number.json(), bad_switch.status
 
     number_status, body, switch_status = asyncio.run(scenario())
@@ -435,9 +441,9 @@ def test_write_needs_csrf(tmp_path):
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
             csrf = await login(client)
-            missing = await client.patch("/api/settings", json={"retention_days": 5})
-            wrong = await client.patch("/api/settings", json={"retention_days": 5}, headers={"X-CSRF-Token": "nope"})
-            ok = await client.patch("/api/settings", json={"retention_days": 5}, headers={"X-CSRF-Token": csrf})
+            missing = await client.patch("/api/v1/settings", json={"retention_days": 5})
+            wrong = await client.patch("/api/v1/settings", json={"retention_days": 5}, headers={"X-CSRF-Token": "nope"})
+            ok = await client.patch("/api/v1/settings", json={"retention_days": 5}, headers={"X-CSRF-Token": csrf})
             return missing.status, wrong.status, ok.status, await ok.json()
 
     missing, wrong, ok, body = asyncio.run(scenario())
@@ -535,7 +541,7 @@ def test_security_headers_and_no_secrets(tmp_path):
         async with TestClient(TestServer(wh._app)) as client:
             resp = await client.post("/api/login", json={"password": PW})
             body = await resp.text()
-            settings = await (await client.get("/api/settings")).text()
+            settings = await (await client.get("/api/v1/settings")).text()
             return resp.headers, body, settings
 
     headers, body, settings = asyncio.run(scenario())
@@ -555,9 +561,9 @@ def test_patch_channels_and_reload_restart(tmp_path):
         async with TestClient(TestServer(wh._app)) as client:
             csrf = await login(client)
             headers = {"X-CSRF-Token": csrf}
-            added = await client.post("/api/channels", json={"channel": "twitch:newch"}, headers=headers)
-            patched = await client.patch("/api/channels/twitch:newch", json={"quality": "720p"}, headers=headers)
-            removed = await client.delete("/api/channels/twitch:newch", headers=headers)
+            added = await client.post("/api/v1/channels", json={"channel": "twitch:newch"}, headers=headers)
+            patched = await client.patch("/api/v1/channels/twitch:newch", json={"quality": "720p"}, headers=headers)
+            removed = await client.delete("/api/v1/channels/twitch:newch", headers=headers)
             reloaded = await client.post("/api/reload", headers=headers)
             restarted = await client.post("/api/restart", headers=headers)
             return (
@@ -972,3 +978,54 @@ def test_corrupt_sessions_file_starts_empty(tmp_path):
     (tmp_path / "web_sessions.json").write_text("not json{{{")
     fresh = get_config(tmp_path / "config.json")
     assert WebUI(fresh, ctrl, recorder)._sessions == {}
+
+
+def test_chat_pages_past_cap(tmp_path, monkeypatch):
+    """Long chat pages to the end instead of stopping at the cap."""
+    import stream_archive.webui as webui_mod
+
+    monkeypatch.setattr(webui_mod, "_CHAT_MAX_MESSAGES", 3)
+    config, _, _, webui, wh = make_webui(tmp_path)
+    webui._http = StubHttp(fail=True)
+    comments = [
+        {
+            "content_offset_seconds": float(i),
+            "channel_id": "87629696",
+            "commenter": {"display_name": f"user{i}"},
+            "message": {"body": f"msg{i}"},
+        }
+        for i in range(5)
+    ]
+    _write_chat(config, "long", comments)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await login(client)
+            first = await (await client.get("/api/chat?id=twitch/channel1/long.mp4&offset=0&limit=3")).json()
+            second = await (await client.get("/api/chat?id=twitch/channel1/long.mp4&offset=3&limit=3")).json()
+            return first, second
+
+    first, second = asyncio.run(scenario())
+    assert [m["text"] for m in first["messages"]] == ["msg0", "msg1", "msg2"]
+    assert first["total"] == 5
+    assert first["truncated"] is True
+    assert [m["text"] for m in second["messages"]] == ["msg3", "msg4"]
+    assert second["total"] == 5
+    assert second["truncated"] is False
+
+
+def test_panel_settings_routes_are_gone_from_v1_unification(tmp_path):
+    """Settings and channels live on /api/v1 only. A leftover panel route
+    would fork the API again, so the old paths must answer 404."""
+    _, _, _, _, wh = make_webui(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            get_settings = await client.get("/api/settings")
+            patch_settings = await client.patch("/api/settings", json={"retention_days": 5}, headers=headers)
+            get_channels = await client.get("/api/channels")
+            return get_settings.status, patch_settings.status, get_channels.status
+
+    assert asyncio.run(scenario()) == (404, 404, 404)

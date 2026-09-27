@@ -1,8 +1,9 @@
-"""Browser control panel served on the shared listener at the domain root.
+"""Browser control panel served on the private listener next to the control API.
 
 The panel replaces the Telegram bot: it needs no Telegram token. The bot
-and the panel can run at once. The panel shares the listener with the
-Kick webhook and the control API, so it runs while any of them is on.
+and the panel can run at once. The panel shares the private listener with
+the control API, so it runs while any of them is on. The Kick webhook has
+its own listener on its own port.
 
 Security model (the panel is exposed through a tunnel):
 
@@ -37,24 +38,9 @@ from typing import TYPE_CHECKING, Any, cast
 from aiohttp import web
 
 from stream_archive import disk
-from stream_archive.api import (
-    _CHANNEL_SETTING_KEYS,
-    _SETTING_KEYS,
-    _ApiError,
-    _channel_json,
-    _global_mode,
-    _global_quality,
-    _hold_seconds,
-    _mode,
-    _quality,
-    _scalar,
-    _settings_json,
-    _switch,
-)
 from stream_archive.config import (
     AppConfig,
     apply_config_change,
-    normalize_channel_name,
     telegram_enabled,
 )
 from stream_archive.emotes import (
@@ -205,8 +191,14 @@ def _pwd_tag(password_hash: str) -> str:
 
 
 #: Largest served chat payload: comment count cap, not bytes. Chat files
-#: grow with the stream; the panel renders at most this many messages.
+#: grow with the stream; one response carries at most this many messages.
+#: The panel pages past it with ``offset``, so long streams still play
+#: to the end.
 _CHAT_MAX_MESSAGES = 5000
+
+#: Chat files cached in memory, keyed by path. Chat files never change
+#: after the recording stops, so a (mtime, size) check guards the cache.
+_CHAT_CACHE_MAX = 8
 
 
 def _embedded_map(payload: dict[str, Any]) -> dict[str, str]:
@@ -321,8 +313,47 @@ def _chat_channel_id(payload: dict[str, Any], comments: list[Any]) -> str:
     return ""
 
 
+def _parse_chat_raw(raw: bytes, kick: bool) -> tuple[str, list[dict[str, Any]], bool]:
+    """Sorted base messages of a chat file. Runs off the event loop.
+
+    Each base entry holds ``t``, ``user``, ``text``, and ``spans`` (the
+    Twitch or Kick emote spans). Third-party word spans stay out: they
+    follow the live emote cache, so each request adds them fresh. The
+    flag is False when the file holds no comment list.
+    """
+    payload = json.loads(raw)
+    comments = payload.get("comments") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or not isinstance(comments, list):
+        return "", [], False
+    embedded = _embedded_map(payload)
+    channel_id = "" if kick else _chat_channel_id(payload, comments)
+    base: list[dict[str, Any]] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        try:
+            offset = float(comment.get("content_offset_seconds", -1))
+        except TypeError, ValueError:
+            continue
+        if offset < 0:
+            continue
+        commenter = comment.get("commenter") or {}
+        message = comment.get("message") or {}
+        body = message.get("body")
+        if not isinstance(body, str) or not body:
+            continue
+        name = commenter.get("display_name") or commenter.get("name") or "?"
+        if not isinstance(name, str):
+            name = "?"
+        text = body[:500]
+        spans = _capture_spans(message.get("fragments"), text, kick, embedded)
+        base.append({"t": offset, "user": name[:64], "text": text, "spans": spans})
+    base.sort(key=lambda m: m["t"])
+    return channel_id, base, True
+
+
 class WebUI:
-    """Serve the browser panel on the shared listener."""
+    """Serve the browser panel on the private listener."""
 
     def __init__(
         self,
@@ -338,6 +369,10 @@ class WebUI:
         self._owns_http = http is None
         self._emote_sets: dict[str, tuple[float, dict[str, str]]] = {}
         self._emote_globals: tuple[float, dict[str, str]] | None = None
+        # Parsed chat files by path: (mtime, size, channel id, base
+        # messages). Chat files never change after the recording stops,
+        # so repeat opens skip the parse and the emote span work.
+        self._chat_cache: dict[str, tuple[float, int, str, list[dict[str, Any]]]] = {}
         # A fresh config carries no secret. The panel stores a generated
         # secret in config.json on first boot (see register_routes), so
         # logins survive restarts. Until then an ephemeral secret signs
@@ -435,10 +470,10 @@ class WebUI:
             logger.warning("[web] Cannot store sessions in %s", path)
 
     def register_routes(self, kick_webhook: Any) -> None:
-        """Add the panel routes to the shared listener.
+        """Add the panel routes to the private listener.
 
-        Call before the listener starts. One application serves the
-        webhook, the control API, and the panel.
+        Call before the listener starts. One application serves the panel
+        and the control API; the webhook listener carries /kick/webhook alone.
         """
         self._ensure_secret()
         kick_webhook.add_routes(self._register)
@@ -456,13 +491,8 @@ class WebUI:
         app.router.add_post("/api/login", self._login)
         app.router.add_post("/api/logout", self._guarded_csrf(self._logout))
         app.router.add_get("/api/status", self._guarded(self._status))
-        app.router.add_get("/api/settings", self._guarded(self._settings))
-        app.router.add_patch("/api/settings", self._guarded_csrf(self._patch_settings))
-        app.router.add_get("/api/channels", self._guarded(self._channels))
-        app.router.add_post("/api/channels", self._guarded_csrf(self._add_channel))
-        app.router.add_get("/api/channels/{channel}", self._guarded(self._channel))
-        app.router.add_patch("/api/channels/{channel}", self._guarded_csrf(self._patch_channel))
-        app.router.add_delete("/api/channels/{channel}", self._guarded_csrf(self._remove_channel))
+        # Settings and channels live on /api/v1 (the control API accepts
+        # panel sessions too, so the panel and scripts share one API).
         app.router.add_get("/api/recordings", self._guarded(self._recordings))
         app.router.add_get("/api/recordings/stream", self._guarded(self._stream))
         app.router.add_get("/api/recordings/thumb", self._guarded(self._thumb))
@@ -841,7 +871,6 @@ class WebUI:
             "telegram_enabled": telegram_enabled(self._config),
             "endpoint": {
                 "enabled": self._config.endpoint.enabled,
-                "tunnel": self._config.endpoint.tunnel,
                 "public_url": self._config.endpoint.public_url,
             },
             "kick_webhook": {"enabled": self._config.kick.webhook.enabled},
@@ -854,79 +883,6 @@ class WebUI:
             "disk": {**snap, "cap_gb": self._config.disk.max_total_gb},
         }
         return self._json(request, payload)
-
-    async def _settings(self, request: web.Request, session: _Session) -> web.Response:
-        return self._json(request, _settings_json(self._config))
-
-    async def _patch_settings(self, request: web.Request, session: _Session) -> web.Response:
-        payload = await self._read_json(request)
-        unknown = sorted(set(payload) - set(_SETTING_KEYS))
-        if unknown:
-            msg = "unknown setting(s): " + ", ".join(unknown)
-            raise _WebError(400, msg)
-        helper = _ApiHelper(self._ctrl)
-        applied, errors, status = await helper.apply_each(payload, helper.apply_setting)
-        await self._notify([f"{v}" for v in applied.values()], origin="Web panel")
-        body: dict[str, Any] = {"applied": applied, "errors": errors, "settings": _settings_json(self._config)}
-        return self._json(request, body, status=status)
-
-    # ---- channels ------------------------------------------------------------
-
-    def _channel_state(self, channel: str) -> dict[str, Any]:
-        return _channel_json(self._config, channel, self._recorder.is_recording(channel))
-
-    def _known_channel(self, raw: str) -> str:
-        channel = normalize_channel_name(raw)
-        if channel is None:
-            msg = f"invalid channel name: {raw!r} (use twitch:<name> or kick:<name>)"
-            raise _WebError(400, msg)
-        if channel not in self._config.channels:
-            msg = f"{channel} is not monitored"
-            raise _WebError(404, msg)
-        return channel
-
-    async def _channels(self, request: web.Request, session: _Session) -> web.Response:
-        return self._json(request, {"channels": [self._channel_state(ch) for ch in self._config.channels]})
-
-    async def _channel(self, request: web.Request, session: _Session) -> web.Response:
-        channel = self._known_channel(request.match_info["channel"])
-        return self._json(request, self._channel_state(channel))
-
-    async def _add_channel(self, request: web.Request, session: _Session) -> web.Response:
-        payload = await self._read_json(request)
-        raw = payload.get("channel")
-        if not isinstance(raw, str) or not raw.strip():
-            msg = "channel is required"
-            raise _WebError(400, msg)
-        channel = normalize_channel_name(raw.strip())
-        if channel is None:
-            msg = f"invalid channel name: {raw!r} (use twitch:<name>, kick:<name>, or a profile URL)"
-            raise _WebError(400, msg)
-        helper = _ApiHelper(self._ctrl)
-        message = await helper.run(self._ctrl.handle_add, [channel])
-        await self._notify([message], origin="Web panel")
-        return self._json(request, {"message": message, "channel": channel, "channels": list(self._config.channels)})
-
-    async def _remove_channel(self, request: web.Request, session: _Session) -> web.Response:
-        channel = self._known_channel(request.match_info["channel"])
-        helper = _ApiHelper(self._ctrl)
-        message = await helper.run(self._ctrl.handle_remove, [channel])
-        await self._notify([message], origin="Web panel")
-        return self._json(request, {"message": message, "channel": channel, "channels": list(self._config.channels)})
-
-    async def _patch_channel(self, request: web.Request, session: _Session) -> web.Response:
-        channel = self._known_channel(request.match_info["channel"])
-        payload = await self._read_json(request)
-        unknown = sorted(set(payload) - set(_CHANNEL_SETTING_KEYS))
-        if unknown:
-            msg = "unknown setting(s): " + ", ".join(unknown)
-            raise _WebError(400, msg)
-        helper = _ApiHelper(self._ctrl)
-        applied, errors, status = await helper.apply_each(
-            payload, lambda key, value, _ch=channel: helper.apply_channel_setting(_ch, key, value)
-        )
-        await self._notify([f"{v}" for v in applied.values()], origin="Web panel")
-        return self._json(request, {"channel": channel, "applied": applied, "errors": errors}, status=status)
 
     # ---- chat emotes --------------------------------------------------------
 
@@ -1141,60 +1097,73 @@ class WebUI:
         the mirrored chat dir. Comments already carry video-relative
         ``content_offset_seconds``, so the panel highlights by player time
         with no clock math. Live captures answer 409 like the stream.
+        ``offset`` and ``limit`` page through the messages, so long
+        streams play to the end instead of stopping at the cap.
         """
         rel = request.query.get("id", "")
         path = self._recording_path(rel)
         if self._is_live(path):
             msg = f"{path.name} is recording now"
             raise _WebError(409, msg)
+        try:
+            offset = int(request.query.get("offset", "0"))
+        except ValueError:
+            msg = "offset must be a number"
+            raise _WebError(400, msg) from None
+        try:
+            limit = int(request.query.get("limit", str(_CHAT_MAX_MESSAGES)))
+        except ValueError:
+            msg = "limit must be a number"
+            raise _WebError(400, msg) from None
+        offset = max(offset, 0)
+        limit = min(max(limit, 1), _CHAT_MAX_MESSAGES)
         chat_file = self._chat_file(path)
+        loop = asyncio.get_running_loop()
         try:
-            raw = await asyncio.get_running_loop().run_in_executor(None, chat_file.read_bytes)
+            st = await loop.run_in_executor(None, chat_file.stat)
         except OSError:
-            return self._json(request, {"messages": [], "truncated": False, "missing": True})
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError, UnicodeDecodeError:
-            msg = "chat file is not valid JSON"
-            raise _WebError(502, msg) from None
-        comments = payload.get("comments") if isinstance(payload, dict) else None
-        if not isinstance(comments, list):
-            return self._json(request, {"messages": [], "truncated": False, "missing": True})
-        messages: list[dict[str, Any]] = []
-        kick = rel.startswith("kick/")
-        embedded = _embedded_map(payload)
-        channel_id = "" if kick else _chat_channel_id(payload, comments)
-        names = await self._third_party_map(channel_id) if channel_id else {}
-        for comment in comments:
-            if not isinstance(comment, dict):
-                continue
+            return self._json(request, {"messages": [], "total": 0, "truncated": False, "missing": True})
+        key = str(chat_file)
+        cached = self._chat_cache.get(key)
+        channel_id = ""
+        base: list[dict[str, Any]] = []
+        valid = True
+        if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            channel_id = cached[2]
+            base = cached[3]
+        else:
             try:
-                offset = float(comment.get("content_offset_seconds", -1))
-            except TypeError, ValueError:
-                continue
-            if offset < 0:
-                continue
-            commenter = comment.get("commenter") or {}
-            message = comment.get("message") or {}
-            body = message.get("body")
-            if not isinstance(body, str) or not body:
-                continue
-            name = commenter.get("display_name") or commenter.get("name") or "?"
-            if not isinstance(name, str):
-                name = "?"
-            text = body[:500]
-            spans = _capture_spans(message.get("fragments"), text, kick, embedded)
-            spans.extend(_word_spans(text, names, spans))
-            entry: dict[str, Any] = {"t": offset, "user": name[:64], "text": text}
+                raw = await loop.run_in_executor(None, chat_file.read_bytes)
+            except OSError:
+                return self._json(request, {"messages": [], "total": 0, "truncated": False, "missing": True})
+            kick = rel.startswith("kick/")
+            try:
+                channel_id, base, valid = await loop.run_in_executor(None, _parse_chat_raw, raw, kick)
+            except json.JSONDecodeError, UnicodeDecodeError:
+                msg = "chat file is not valid JSON"
+                raise _WebError(502, msg) from None
+            if not valid:
+                return self._json(request, {"messages": [], "total": 0, "truncated": False, "missing": True})
+            self._chat_cache[key] = (st.st_mtime, st.st_size, channel_id, base)
+            while len(self._chat_cache) > _CHAT_CACHE_MAX:
+                self._chat_cache.pop(next(iter(self._chat_cache)))
+        total = len(base)
+        names = await self._third_party_map(channel_id) if channel_id else {}
+        messages: list[dict[str, Any]] = []
+        for item in base[offset : offset + limit]:
+            text = item["text"]
+            spans = [span for span in item["spans"]]
+            if names:
+                spans.extend(_word_spans(text, names, spans))
+            entry: dict[str, Any] = {"t": item["t"], "user": item["user"], "text": text}
             if spans:
                 spans.sort(key=lambda s: (s[0], s[1]))
                 entry["emotes"] = [{"start": s, "end": e, "src": u} for s, e, u in spans]
             messages.append(entry)
-        messages.sort(key=lambda m: m["t"])
-        truncated = len(messages) > _CHAT_MAX_MESSAGES
+        truncated = offset + len(messages) < total
         return self._json(
             request,
-            {"messages": messages[:_CHAT_MAX_MESSAGES], "truncated": truncated, "missing": False},
+            {"messages": messages, "total": total, "truncated": truncated, "missing": False},
         )
 
     def _chat_file(self, recording: Path) -> Path:
@@ -1286,102 +1255,6 @@ class WebUI:
         _events_mod.clear()
         logger.info("[web] events cleared from %s", request.remote)
         return self._json(request, {"message": "Events cleared."})
-
-
-class _ApiHelper:
-    """Run Telegram command methods like the control API does.
-
-    The web panel shares the command layer with the bot and the API, so
-    one validation path serves every control surface. Rejected changes
-    become 400, and the audio-only prompt becomes 409.
-    """
-
-    _ERROR_MARK = "❌"
-    _CONFLICT_MARK = "⚠️"
-
-    def __init__(self, ctrl: Any) -> None:
-        self._ctrl = ctrl
-
-    async def run(self, method: Any, args: list[Any]) -> str:
-        import inspect as _inspect
-
-        out: Any = method(args)
-        if _inspect.isawaitable(out):
-            out = await out
-        text = str(out)
-        if text.startswith(self._ERROR_MARK):
-            msg = text[len(self._ERROR_MARK) :].lstrip()
-            raise _WebError(400, msg)
-        if text.startswith(self._CONFLICT_MARK):
-            msg = text[len(self._CONFLICT_MARK) :].lstrip()
-            raise _WebError(409, msg)
-        return text
-
-    async def apply_setting(self, key: str, value: Any) -> str:
-        ctrl = self._ctrl
-        if key == "output_mode":
-            return await self.run(ctrl.handle_mode, [_global_mode(value)])
-        if key == "preferred_quality":
-            return await self.run(ctrl.handle_quality, [_global_quality(value)])
-        if key == "retention_days":
-            return await self.run(ctrl.handle_retention, [_scalar(value, key)])
-        if key == "max_concurrent_recordings":
-            return await self.run(ctrl.handle_maxrecordings, [_scalar(value, key)])
-        if key == "max_concurrent_youtube_streams":
-            return await self.run(ctrl.handle_maxyoutube, [_scalar(value, key)])
-        if key == "record_chat":
-            return await self.run(ctrl.handle_chat, [_switch(value, key), "twitch"])
-        if key == "kick_record_chat":
-            return await self.run(ctrl.handle_chat, [_switch(value, key), "kick"])
-        if key == "disk_max_total_gb":
-            return await self.run(ctrl.handle_disk, ["maxsize", _scalar(value, key)])
-        if key == "disk_delete_oldest":
-            return await self.run(ctrl.handle_disk, ["delete_oldest", _switch(value, key)])
-        msg = f"unknown setting: {key}"
-        raise _WebError(400, msg)
-
-    async def apply_channel_setting(self, channel: str, key: str, value: Any) -> str:
-        ctrl = self._ctrl
-        if key == "output_mode":
-            return await self.run(ctrl.handle_mode, [channel, _mode(value)])
-        if key == "quality":
-            return await self.run(ctrl.handle_quality, [channel, _quality(value)])
-        if key == "youtube_hold_seconds":
-            return await self.run(ctrl.handle_channel_hold, [channel, _hold_seconds(value)])
-        msg = f"unknown setting: {key}"
-        raise _WebError(400, msg)
-
-    async def apply_each(self, payload: dict[str, Any], apply: Any) -> tuple[dict[str, str], dict[str, str], int]:
-        """Run one command per key. One failure never blocks the other keys."""
-        import inspect as _inspect
-
-        applied: dict[str, str] = {}
-        errors: dict[str, str] = {}
-        conflicts_only = True
-        internal = False
-        for key, value in payload.items():
-            try:
-                out = apply(key, value)
-                if _inspect.isawaitable(out):
-                    out = await out
-                applied[key] = out
-            except _WebError as e:
-                errors[key] = e.message
-                conflicts_only = conflicts_only and e.status == 409
-            except _ApiError as e:
-                # The shared validators raise the API error type. Translate
-                # it so a bad value answers 400, not 500.
-                errors[key] = e.message
-                conflicts_only = conflicts_only and e.status == 409
-            except Exception:
-                logger.exception("[web] applying %r failed", key)
-                errors[key] = "internal error"
-                internal = True
-        if internal:
-            return applied, errors, 500
-        if not errors:
-            return applied, errors, 200
-        return applied, errors, 409 if conflicts_only else 400
 
 
 def _parse_range(header: str | None, size: int) -> tuple[int | None, int | None]:

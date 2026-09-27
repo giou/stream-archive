@@ -154,6 +154,53 @@ class KickAPI:
                 }
         return out
 
+    async def get_top_livestreams(self, limit: int = 5) -> list[tuple[str, int, int]]:
+        """Busiest live channels as (slug, broadcaster id, viewers).
+
+        The v1 viewer sort gives the true top. v1 is deprecated, so any
+        failure falls back to v2: one page of global plus one page of
+        English streams with a client-side max. v2 sorts oldest first,
+        so a single page never holds the global top. An empty list means
+        Kick returned nothing usable: the caller reports and stops.
+        """
+        try:
+            return await self._top_v1(limit)
+        except Exception as e:
+            logger.warning("[kick_api] v1 livestreams failed, falling back to v2: %s", e)
+        return await self._top_v2()
+
+    async def _top_v1(self, limit: int) -> list[tuple[str, int, int]]:
+        headers = await self._headers()
+        resp = await self._request(
+            "GET",
+            "https://api.kick.com/public/v1/livestreams",
+            headers=headers,
+            params={"sort": "viewer_count", "limit": limit},
+        )
+        resp.raise_for_status()
+        return [
+            (item["slug"], int(item["broadcaster_user_id"]), int(item.get("viewer_count") or 0))
+            for item in (resp.json().get("data") or [])
+            if item.get("slug") and item.get("broadcaster_user_id")
+        ]
+
+    async def _top_v2(self) -> list[tuple[str, int, int]]:
+        """Busiest channels of two v2 pages (global plus English)."""
+        headers = await self._headers()
+        rows: list[tuple[str, int, int]] = []
+        for params in ({"limit": 1000}, {"limit": 1000, "language_code": "en"}):
+            resp = await self._request(
+                "GET", "https://api.kick.com/public/v2/livestreams", headers=headers, params=params
+            )
+            resp.raise_for_status()
+            for item in resp.json().get("data") or []:
+                slug = (item.get("channel") or {}).get("slug")
+                uid = (item.get("broadcaster_user") or {}).get("id")
+                if slug and uid:
+                    rows.append((slug, int(uid), int(item.get("viewer_count") or 0)))
+        rows.sort(key=lambda row: row[2], reverse=True)
+        return rows[:5]
+
     async def get_public_key(self, force: bool = False) -> str | None:
         """Return the PEM string used to verify webhook signatures.
 

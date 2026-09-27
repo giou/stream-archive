@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+import pytest
 from aiohttp import ClientSession, ClientTimeout
 
 from stream_archive import scheduler as scheduler_module
@@ -82,6 +83,18 @@ def test_health_bind_failure_returns_none(caplog):
 
     warnings = [r for r in caplog.records if r.name == "stream_archive.scheduler" and r.levelno == logging.WARNING]
     assert any("health endpoint unavailable" in r.getMessage() for r in warnings)
+
+
+def test_missing_config_points_at_setup(monkeypatch):
+    """A first boot with no config.json names the setup command, not a traceback."""
+
+    def _missing() -> object:
+        msg = "config.json not found"
+        raise FileNotFoundError(msg)
+
+    monkeypatch.setattr(scheduler_module, "get_config", _missing)
+    with pytest.raises(SystemExit):
+        asyncio.run(scheduler_module.run_scheduler())
 
 
 class _HangingRecorder:

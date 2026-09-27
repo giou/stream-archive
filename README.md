@@ -84,21 +84,29 @@ See [Development](docs/development.md) for the module map.
   the bot and use the [web panel](docs/web-control.md) instead.
 - A Google Cloud OAuth client (`client_secret.json`) for `output_mode: youtube`
   or `both`. See [YouTube setup](docs/youtube-setup.md).
-- `cloudflared` or Tailscale for the Kick webhook tunnel. Both ship in the
-  image. The Tailscale funnel option also needs tailscale on the host. The app
-  mounts the host tailscale directory into the container.
+- A public address for the Kick webhook and, optionally, the panel.
+  You publish it yourself: `tailscale serve` for tailnet-only panel
+  access, or your own reverse proxy (cloudflared you run, nginx, or
+  anything with TLS) for the public entries. The setup wizard generates
+  the proxy config.
 
 ## Quick start
 
 ```sh
 mkdir ~/stream-archive-data && cd ~/stream-archive-data
 curl -LO https://github.com/giou/stream-archive/releases/latest/download/docker-compose.yml
-curl -LO https://github.com/giou/stream-archive/releases/latest/download/config.json.example
-cp config.json.example config.json
-# fill in each key, see docs/configuration.md
+docker compose pull
+docker compose run --rm stream-archive stream-archive-setup
 docker compose up -d
 docker compose logs -f   # follow startup
 ```
+
+The setup wizard writes `config.json` in the data directory. It asks
+for the Twitch credentials and one control surface (web panel, Telegram
+bot, or both). Channels come later, from the panel or the bot. It also
+offers the optional features: YouTube restream, Enable MTProto (upload
+to Telegram), panel access, and Enable Kick. Run the wizard again later
+to add a feature. See `docs/configuration.md` for every key.
 
 The data directory is the folder with `docker-compose.yml`
 (`~/stream-archive-data/` in this example). It holds the settings, the
@@ -116,7 +124,7 @@ To update the app, pull the new image:
 docker compose pull && docker compose up -d
 ```
 
-Then configure the optional features:
+The wizard covers the optional features. For the full procedure behind each one:
 
 - [YouTube setup](docs/youtube-setup.md) for `output_mode: youtube` or `both`.
 - [Kick webhook](docs/kick-webhook.md) for instant signals and Kick chat.
@@ -128,7 +136,7 @@ Then configure the optional features:
 | [Configuration](docs/configuration.md) | All keys of `config.json`, and secrets from the environment |
 | [Running](docs/running.md) | Start, data directory, container identity, logs, shutdown |
 | [YouTube setup](docs/youtube-setup.md) | OAuth client and the one-time authorization flow |
-| [Kick webhook](docs/kick-webhook.md) | Public URL, tunnel options, receiver internals |
+| [Kick webhook](docs/kick-webhook.md) | Public URLs, proxy setup, delivery test, receiver internals |
 | [Telegram control](docs/telegram-control.md) | Bot menu and command list |
 | [Control API](docs/control-api.md) | HTTP endpoints, accepted values, error answers |
 | [Chat recording](docs/chat-recording.md) | Chat files and TwitchDownloader commands |

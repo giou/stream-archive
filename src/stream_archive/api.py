@@ -1,8 +1,7 @@
-"""HTTP control API for channels and settings, served on the webhook listener.
+"""HTTP control API for channels and settings, served on the private listener.
 
 Routes live under ``/api/v1``. The listener belongs to ``KickWebhook``, so
-the API is reachable through the same tunnel as the webhook and runs while
-either feature is enabled. Every request needs the key from ``api.key``,
+the API runs while either feature is enabled. Every request needs the key from ``api.key``,
 sent as ``Authorization: Bearer <key>`` or ``X-API-Key: <key>``. When the
 API is disabled, the routes answer 404 as if they did not exist.
 
@@ -15,11 +14,14 @@ what an API client did.
 """
 
 import functools
+import hmac
 import inspect
 import json
 import logging
 import math
 import secrets
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,6 +39,15 @@ logger = logging.getLogger(__name__)
 
 #: Largest accepted request body. Settings payloads are tiny.
 _MAX_BODY_BYTES = 64 * 1024
+
+#: Failed key attempts per address before the API answers 429.
+_KEY_MAX_FAILS = 10
+
+#: Window of the key budget, in seconds.
+_KEY_WINDOW_S = 600
+
+#: Request slot for the authenticated origin ("Control API" or "Web panel").
+_ORIGIN_KEY: web.RequestKey[str] = web.RequestKey("api_origin", str)
 
 #: Markers of the Telegram command layer: rejected change, pending confirm.
 _ERROR_MARK = "\u274c"
@@ -113,7 +124,6 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
         },
         "endpoint": {
             "enabled": config.endpoint.enabled,
-            "tunnel": config.endpoint.tunnel,
             "public_url": endpoint_base_url(config),
         },
         "kick_webhook": {"enabled": config.kick.webhook.enabled},
@@ -224,18 +234,28 @@ def _hold_seconds(value: Any) -> str:
 
 
 class ControlAPI:
-    """Serve /api/v1 on the shared listener and apply changes like the bot."""
+    """Serve /api/v1 on the private listener and apply changes like the bot."""
 
     def __init__(self, config: AppConfig, controller: TelegramController, recorder: Recorder) -> None:
         self._config = config
         self._ctrl = controller
         self._recorder = recorder
+        self._session_of: Callable[[web.Request], Any] | None = None
+        self._key_fails: dict[str, deque[float]] = {}
+
+    def set_session_checker(self, checker: Callable[[web.Request], Any]) -> None:
+        """Panel sessions that /api/v1 also accepts. Set once before serving.
+
+        The checker returns the live session or None. The panel passes its
+        own session lookup, so the panel and scripts share one API.
+        """
+        self._session_of = checker
 
     def register_routes(self, kick_webhook: Any) -> None:
-        """Add the API routes to the Kick webhook listener.
+        """Add the API routes to the private listener.
 
-        Call before the listener starts. One application serves the webhook
-        and the API.
+        Call before the listener starts. One application serves the panel
+        and the API; the webhook listener carries POST /kick/webhook alone.
         """
         kick_webhook.add_routes(self._register)
 
@@ -248,13 +268,14 @@ class ControlAPI:
         app.router.add_get("/api/v1/channels/{channel}", self._guarded(self._channel))
         app.router.add_patch("/api/v1/channels/{channel}", self._guarded(self._patch_channel))
         app.router.add_delete("/api/v1/channels/{channel}", self._guarded(self._remove_channel))
+        app.router.add_post("/api/v1/kick/webhook/test", self._guarded(self._test_kick_delivery))
 
     def _guarded(self, handler: Any) -> Any:
-        """Wrap one handler with key checks and JSON error responses."""
+        """Wrap one handler with key-or-session checks and JSON error responses."""
 
         async def wrapper(request: web.Request) -> web.StreamResponse:
             try:
-                self._check_key(request)
+                request[_ORIGIN_KEY] = self._authenticate(request)
                 return cast(web.StreamResponse, await handler(request))
             except _ApiError as e:
                 headers = {"WWW-Authenticate": "Bearer"} if e.status == 401 else None
@@ -271,22 +292,74 @@ class ControlAPI:
         wrapper.__name__ = handler.__name__
         return wrapper
 
-    def _check_key(self, request: web.Request) -> None:
-        """Reject a request without the current API key. A disabled API is absent."""
+    def _key_valid(self, request: web.Request) -> bool:
+        """True when the request carries the current API key."""
+        cfg = self._config.api
+        if not cfg.enabled or not cfg.key:
+            return False
+        token = _request_token(request)
+        if token is None:
+            return False
+        # Compare bytes. A header can carry bytes that are not UTF-8, and
+        # secrets.compare_digest rejects a str that is not ASCII. The
+        # encoding maps such bytes back, so they fail the comparison.
+        return secrets.compare_digest(
+            token.encode("utf-8", "surrogateescape"), cfg.key.encode("utf-8", "surrogateescape")
+        )
+
+    def _key_allowed(self, request: web.Request) -> bool:
+        """True when the address still holds key budget."""
+        now = time.monotonic()
+        key = request.remote or "unknown"
+        fails = self._key_fails.get(key)
+        if fails is None:
+            return True
+        while fails and now - fails[0] > _KEY_WINDOW_S:
+            fails.popleft()
+        if not fails:
+            del self._key_fails[key]
+            return True
+        return len(fails) < _KEY_MAX_FAILS
+
+    def _record_key_fail(self, request: web.Request) -> None:
+        fails = self._key_fails.setdefault(request.remote or "unknown", deque())
+        fails.append(time.monotonic())
+        while len(fails) > _KEY_MAX_FAILS:
+            fails.popleft()
+
+    def _authenticate(self, request: web.Request) -> str:
+        """Origin of the request for admin messages: key or panel session.
+
+        A valid API key returns "Control API". A live panel session returns
+        "Web panel" (state-changing calls still need its CSRF token, like on
+        the panel routes). Anything else fails like before: a disabled API
+        reads 404, a bad key reads 401. Failures spend the per-address
+        budget, so key guessing ends in 429.
+        """
+        if self._key_valid(request):
+            self._key_fails.pop(request.remote or "unknown", None)
+            return "Control API"
+        if self._session_of is not None:
+            session = self._session_of(request)
+            if session is not None:
+                csrf = getattr(session, "csrf", "")
+                if request.method != "GET":
+                    token = request.headers.get("X-CSRF-Token", "")
+                    if not token or not csrf or not hmac.compare_digest(token, csrf):
+                        msg = "bad CSRF token"
+                        raise _ApiError(403, msg)
+                return "Web panel"
+        if not self._key_allowed(request):
+            msg = "too many attempts, try again later"
+            raise _ApiError(429, msg)
+        self._record_key_fail(request)
         cfg = self._config.api
         if not cfg.enabled or not cfg.key:
             msg = "not found"
             raise _ApiError(404, msg)
-        token = _request_token(request)
-        # Compare bytes. A header can carry bytes that are not UTF-8, and
-        # secrets.compare_digest rejects a str that is not ASCII. The
-        # encoding maps such bytes back, so they fail the comparison.
-        if token is None or not secrets.compare_digest(
-            token.encode("utf-8", "surrogateescape"), cfg.key.encode("utf-8", "surrogateescape")
-        ):
-            logger.warning("[api] rejected request from %s: bad or missing API key", request.remote)
-            msg = "unauthorized"
-            raise _ApiError(401, msg)
+        logger.warning("[api] rejected request from %s: bad or missing API key", request.remote)
+        msg = "unauthorized"
+        raise _ApiError(401, msg)
 
     async def _read_json(self, request: web.Request) -> dict[str, Any]:
         """Parse the JSON object body, or raise a 400/413."""
@@ -323,9 +396,9 @@ class ControlAPI:
             raise _ApiError(404, msg)
         return channel
 
-    async def _notify(self, messages: Iterable[str]) -> None:
+    async def _notify(self, messages: Iterable[str], origin: str = "Control API") -> None:
         """Tell the admin about applied API changes. A failure never fails the request."""
-        await self._ctrl.notify_api_changes(list(messages))
+        await self._ctrl.notify_api_changes(list(messages), origin=origin)
 
     async def _run(self, method: Any, args: list[Any]) -> str:
         """Run one Telegram command method and return its message.
@@ -367,7 +440,7 @@ class ControlAPI:
             msg = "unknown setting(s): " + ", ".join(unknown)
             raise _ApiError(400, msg)
         applied, errors, status = await self._apply_each(payload, self._apply_setting)
-        await self._notify(applied.values())
+        await self._notify(applied.values(), request[_ORIGIN_KEY])
         body = {"applied": applied, "errors": errors, "settings": _settings_json(self._config)}
         return web.json_response(body, status=status)
 
@@ -427,6 +500,19 @@ class ControlAPI:
             return applied, errors, 200
         return applied, errors, 409 if conflicts_only else 400
 
+    async def _test_kick_delivery(self, request: web.Request) -> web.Response:
+        """Run the Kick delivery test and report its timed result.
+
+        The wait follows the test timeout (minutes on a cold setup): the
+        request stays open until the first delivery or the timeout.
+        """
+        kick_webhook = self._ctrl._kick_webhook
+        if kick_webhook is None:
+            msg = "webhook listener unavailable"
+            raise _ApiError(503, msg)
+        ok, message = await kick_webhook.verify_delivery()
+        return web.json_response({"ok": ok, "message": message})
+
     async def _channels(self, request: web.Request) -> web.Response:
         """Every monitored channel with its effective settings."""
         return web.json_response({"channels": [self._channel_state(ch) for ch in self._config.channels]})
@@ -451,14 +537,14 @@ class ControlAPI:
             msg = f"invalid channel name: {raw!r} (use twitch:<name>, kick:<name>, or a profile URL)"
             raise _ApiError(400, msg)
         message = await self._run(self._ctrl.handle_add, [channel])
-        await self._notify([message])
+        await self._notify([message], request[_ORIGIN_KEY])
         return web.json_response({"message": message, "channel": channel, "channels": list(self._config.channels)})
 
     async def _remove_channel(self, request: web.Request) -> web.Response:
         """Stop monitoring a channel. A live recording stops."""
         channel = self._known_channel(request.match_info["channel"])
         message = await self._run(self._ctrl.handle_remove, [channel])
-        await self._notify([message])
+        await self._notify([message], request[_ORIGIN_KEY])
         return web.json_response({"message": message, "channel": channel, "channels": list(self._config.channels)})
 
     async def _patch_channel(self, request: web.Request) -> web.Response:
@@ -472,7 +558,7 @@ class ControlAPI:
         applied, errors, status = await self._apply_each(
             payload, functools.partial(self._apply_channel_setting, channel)
         )
-        await self._notify(applied.values())
+        await self._notify(applied.values(), request[_ORIGIN_KEY])
         body = {"channel": channel, "applied": applied, "errors": errors}
         return web.json_response(body, status=status)
 

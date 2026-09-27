@@ -413,3 +413,48 @@ def test_get_public_key_keeps_cache_on_malformed_response():
     assert calls["n"] == 2
     assert first == pem
     assert second == pem  # known-good PEM survives a malformed response
+
+
+def test_top_livestreams_uses_v1_viewer_sort():
+    """The v1 viewer sort is the default: one call returns the true top."""
+
+    def handler(request):
+        assert request.url.path == "/public/v1/livestreams"
+        assert request.url.params["sort"] == "viewer_count"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"slug": "big", "broadcaster_user_id": 1, "viewer_count": 9000},
+                    {"slug": "small", "broadcaster_user_id": 2, "viewer_count": 10},
+                ]
+            },
+        )
+
+    api = make_api(handler)
+
+    async def scenario():
+        return await api.get_top_livestreams()
+
+    assert asyncio.run(scenario()) == [("big", 1, 9000), ("small", 2, 10)]
+
+
+def test_top_livestreams_falls_back_to_v2_pages():
+    """A dead v1 falls back to two v2 pages with a client-side max."""
+
+    def handler(request):
+        if request.url.path == "/public/v1/livestreams":
+            return httpx.Response(500, json={"data": [], "message": "boom"})
+        assert request.url.path == "/public/v2/livestreams"
+        if request.url.params.get("language_code") == "en":
+            data = [{"channel": {"slug": "en-big"}, "broadcaster_user": {"id": 3}, "viewer_count": 7000}]
+        else:
+            data = [{"channel": {"slug": "old"}, "broadcaster_user": {"id": 4}, "viewer_count": 50}]
+        return httpx.Response(200, json={"data": data})
+
+    api = make_api(handler)
+
+    async def scenario():
+        return await api.get_top_livestreams()
+
+    assert asyncio.run(scenario()) == [("en-big", 3, 7000), ("old", 4, 50)]

@@ -51,9 +51,6 @@ _LEGACY_ENDPOINT_KEYS = (
     "listen_host",
     "listen_port",
     "public_url",
-    "tunnel",
-    "cloudflare_token",
-    "cloudflare_managed",
 )
 
 #: Path of the Kick webhook receiver on the endpoint.
@@ -180,10 +177,12 @@ class EventSubConfig(BaseModel):
 
 
 class EndpointConfig(BaseModel):
-    """Public endpoint: the HTTP listener and the tunnel that exposes it.
+    """Public endpoint: the HTTP listener and its public URL.
 
     The Kick webhook receiver and the control API are both served here, so
-    the endpoint is not tied to either feature.
+    the endpoint is not tied to either feature. Tunnels are user-managed:
+    point a reverse proxy or tailnet serve at the listener and paste the
+    public URL below.
     """
 
     model_config = ConfigDict(validate_assignment=True)
@@ -192,9 +191,6 @@ class EndpointConfig(BaseModel):
     listen_host: str = Field("127.0.0.1", min_length=1)
     listen_port: StrictInt = Field(8787, ge=1, le=65535)
     public_url: StrictStr = ""
-    tunnel: Literal["", "cloudflare", "tailscale"] = ""
-    cloudflare_token: StrictStr = ""
-    cloudflare_managed: StrictBool = False
 
     @model_validator(mode="after")
     def _require_public_url_when_enabled(self) -> EndpointConfig:
@@ -213,6 +209,17 @@ class KickWebhookConfig(BaseModel):
 
     enabled: StrictBool = False
     setup_notified: StrictBool = False
+    #: Bind of the webhook-only listener. The public proxy targets this
+    #: port. It serves POST /kick/webhook and nothing else, so the panel
+    #: never shares a port with the public internet.
+    listen_host: str = Field("127.0.0.1", min_length=1)
+    listen_port: StrictInt = Field(8788, ge=1, le=65535)
+    #: Separate public entry for Kick deliveries. Empty follows the endpoint
+    #: URL. Set it when the endpoint serves a tailnet (or localhost) that
+    #: Kick cannot reach: the panel keeps its address while Kick delivers
+    #: to this one. The app manages no tunnel for it: run your own reverse
+    #: proxy and paste its URL here.
+    public_url: StrictStr = ""
 
 
 class KickConfig(BaseModel):
@@ -292,7 +299,9 @@ class AppConfig(BaseModel):
     bot_telegram_api: str
     twitch_client_id: str = Field(min_length=1)
     twitch_client_secret: str = Field(min_length=1)
-    channels: list[str] = Field(min_length=1)
+    # Empty is valid: a setup can skip channels and add them later, and
+    # removing the last monitored channel is allowed everywhere.
+    channels: list[str]
     proxy_list: list[str] = Field(min_length=1)
     monitoring_interval: PositiveFloat
     timezone: str = Field(min_length=1)
@@ -428,6 +437,17 @@ class AppConfig(BaseModel):
                 raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def _require_distinct_listeners(self) -> AppConfig:
+        """One address serves one listener. A shared port would serve the
+        panel on the public webhook port, which the split exists to prevent."""
+        ep = (self.endpoint.listen_host, self.endpoint.listen_port)
+        wh = (self.kick.webhook.listen_host, self.kick.webhook.listen_port)
+        if ep == wh:
+            msg = "kick.webhook listen address must differ from the endpoint listen address"
+            raise ValueError(msg)
+        return self
+
 
 def _bound(config: AppConfig, attr: str, what: str) -> Path:
     """Return a bound path attribute. Callers hold _CONFIG_LOCK."""
@@ -502,6 +522,11 @@ def _apply_legacy_layout(data: Any) -> Any:
         return data
     if "enabled" in moved:
         webhook = {**webhook, "enabled": moved["enabled"]}
+    # The moved listen address described the one old listener. The split
+    # gives the webhook listener its own bind, so the old address stays on
+    # the endpoint only. A leftover here would bind both listeners to one
+    # port and fail validation.
+    webhook = {key: value for key, value in webhook.items() if key not in ("listen_host", "listen_port")}
     return {**data, "endpoint": moved, "kick": {**kick, "webhook": webhook}}
 
 
@@ -701,9 +726,8 @@ def save_config(config: AppConfig) -> None:
 def endpoint_base_url(config: AppConfig) -> str:
     """Public base URL of the endpoint, without a trailing slash.
 
-    The endpoint serves the Kick webhook and the control API, so the base
-    URL is the tunnel host. Configs that stored the old webhook URL lose
-    that path here.
+    The endpoint serves the panel and the control API. Configs that stored
+    the old webhook URL lose that path here.
     """
     return normalize_endpoint_url(config.endpoint.public_url)
 
@@ -717,7 +741,18 @@ def normalize_endpoint_url(url: str) -> str:
 
 
 def webhook_public_url(config: AppConfig) -> str:
-    """Public URL that Kick POSTs to, or "" when no public URL is set."""
+    """Public URL that Kick POSTs to, or "" when no public URL is set.
+
+    A separate Kick entry wins when set, so the panel can stay on a
+    tailnet while Kick delivers to its own public address. Otherwise the
+    endpoint base carries the webhook path, like before. A tailnet-only
+    endpoint address reads as usable here but never receives events: the
+    setup flows warn about it, and the sync failure alert fires if
+    deliveries never arrive.
+    """
+    override = normalize_endpoint_url(config.kick.webhook.public_url)
+    if override:
+        return f"{override}{WEBHOOK_PATH}"
     base = endpoint_base_url(config)
     return f"{base}{WEBHOOK_PATH}" if base else ""
 

@@ -324,18 +324,6 @@ def test_endpoint_invalid_values_raise():
     config["endpoint"]["enabled"] = "yes"
     with pytest.raises(ValueError, match=r"endpoint\.enabled"):
         AppConfig.model_validate(config)
-    config = kick_config()
-    config["endpoint"]["tunnel"] = "wireguard"
-    with pytest.raises(ValueError, match="endpoint.tunnel"):
-        AppConfig.model_validate(config)
-    config = kick_config()
-    config["endpoint"]["cloudflare_token"] = 42
-    with pytest.raises(ValueError, match="endpoint.cloudflare_token"):
-        AppConfig.model_validate(config)
-    config = kick_config()
-    config["endpoint"]["cloudflare_managed"] = "yes"
-    with pytest.raises(ValueError, match="endpoint.cloudflare_managed"):
-        AppConfig.model_validate(config)
 
 
 def test_webhook_feature_invalid_values_raise():
@@ -346,6 +334,21 @@ def test_webhook_feature_invalid_values_raise():
     config = kick_config()
     config["kick"]["webhook"]["setup_notified"] = "yes"
     with pytest.raises(ValueError, match=r"kick\.webhook\.setup_notified"):
+        AppConfig.model_validate(config)
+
+
+def test_webhook_listener_defaults_to_its_own_port():
+    config = AppConfig.model_validate(kick_config())
+    assert (config.kick.webhook.listen_host, config.kick.webhook.listen_port) == ("127.0.0.1", 8788)
+
+
+def test_webhook_listener_address_must_differ_from_the_endpoint():
+    """One port serves one listener. A shared address would serve the panel
+    on the public webhook port, which the split exists to prevent."""
+    config = kick_config()
+    config["kick"]["webhook"]["listen_host"] = "127.0.0.1"
+    config["kick"]["webhook"]["listen_port"] = 8787
+    with pytest.raises(ValueError, match=r"kick\.webhook listen address must differ"):
         AppConfig.model_validate(config)
 
 
@@ -368,9 +371,11 @@ def test_legacy_webhook_config_migrates_to_the_endpoint():
     assert parsed.endpoint.listen_host == "0.0.0.0"
     assert parsed.endpoint.listen_port == 9000
     assert parsed.endpoint.public_url == "https://kick.example.com/kick/webhook"
-    assert parsed.endpoint.tunnel == "cloudflare"
-    assert parsed.endpoint.cloudflare_token == "tok"
-    assert parsed.endpoint.cloudflare_managed is True
+    # Tunnel management is gone: the old tunnel keys are dropped, not moved.
+    assert not hasattr(parsed.endpoint, "tunnel")
+    assert not hasattr(parsed.endpoint, "cloudflare_token")
+    assert not hasattr(parsed.endpoint, "cloudflare_managed")
+    assert not hasattr(parsed.kick.webhook, "cloudflare_managed")
     # The old file used one flag for both features: keep both on.
     assert parsed.kick.webhook.enabled is True
     assert parsed.kick.webhook.setup_notified is True
@@ -401,7 +406,7 @@ def test_endpoint_section_wins_over_a_legacy_webhook():
     assert parsed.endpoint.listen_host == "127.0.0.1"
     assert parsed.endpoint.listen_port == 8787
     assert parsed.endpoint.public_url == ""
-    assert parsed.endpoint.tunnel == ""
+    assert not hasattr(parsed.endpoint, "tunnel")
     assert parsed.kick.webhook.enabled is True
 
 
@@ -414,9 +419,12 @@ def test_bare_channels_valid_without_kick_section():
     assert config.endpoint.listen_host == "127.0.0.1"
     assert config.endpoint.listen_port == 8787
     assert config.endpoint.public_url == ""
-    assert config.endpoint.tunnel == ""
-    assert config.endpoint.cloudflare_token == ""
-    assert config.endpoint.cloudflare_managed is False
+    assert not hasattr(config.endpoint, "tunnel")
+
+
+def test_empty_channels_valid_for_first_setup():
+    """A first-time setup can skip channels and add them later."""
+    assert build(channels=[]).channels == []
 
 
 def test_bare_name_and_channel_url_helpers():
@@ -567,6 +575,10 @@ def test_public_url_helpers():
     assert endpoint_base_url(config) == "https://kick.example.com"
     assert api_base_url(config) == "https://kick.example.com/api/v1/"
     assert webhook_public_url(config) == "https://kick.example.com/kick/webhook"
+    # A separate Kick entry wins, so the panel can stay on a tailnet.
+    config.kick.webhook.public_url = "https://kick-public.example.com"
+    assert webhook_public_url(config) == "https://kick-public.example.com/kick/webhook"
+    assert endpoint_base_url(config) == "https://kick.example.com"
 
 
 def test_apply_config_change_writes_and_adopts_the_change(tmp_path):
@@ -706,18 +718,18 @@ def test_legacy_migration_keeps_the_env_mask_on_a_moved_key(monkeypatch, tmp_pat
     When the layout moves afterwards, the recorded path is gone, and the
     resolved secret used to be written out as a literal.
     """
-    monkeypatch.setenv("CF_TOKEN", "cf-secret-123")
+    monkeypatch.setenv("PANEL_URL", "https://panel.example.com")
     data = legacy_config()
-    data["kick"]["webhook"]["cloudflare_token"] = "${CF_TOKEN}"
+    data["kick"]["webhook"]["public_url"] = "${PANEL_URL}"
     (tmp_path / "config.json").write_text(json.dumps(data))
 
     cfg = get_config(tmp_path / "config.json")
-    assert cfg.endpoint.cloudflare_token == "cf-secret-123"
+    assert cfg.endpoint.public_url == "https://panel.example.com"
     save_config(cfg)
 
     raw = (tmp_path / "config.json").read_text()
-    assert json.loads(raw)["endpoint"]["cloudflare_token"] == "${CF_TOKEN}"
-    assert "cf-secret-123" not in raw
+    assert json.loads(raw)["endpoint"]["public_url"] == "${PANEL_URL}"
+    assert "https://panel.example.com" not in raw
 
 
 def test_legacy_migration_still_moves_the_listener_keys(tmp_path):

@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 stream-archive = "stream_archive.scheduler:main"
+stream-archive-setup = "stream_archive.setup_wizard:main"
 stream-archive-setup-youtube = "stream_archive.setup_youtube:main"
 stream-archive-setup-web = "stream_archive.setup_web:main"
 

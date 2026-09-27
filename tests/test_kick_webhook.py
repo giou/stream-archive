@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from conftest import make_config as _make_config
 from cryptography.hazmat.primitives import hashes, serialization
@@ -36,6 +37,7 @@ def base_config():
         kick={"client_secret": "csec", "webhook": {"enabled": True}},
     ).model_dump()
     data["endpoint"]["listen_port"] = 0  # ephemeral for tests
+    data["kick"]["webhook"]["listen_port"] = 0  # ephemeral for tests
     return data
 
 
@@ -73,6 +75,9 @@ class FakeKickAPI:
     def __init__(self, public_key_pem=None):
         self.public_key_pem = public_key_pem
         self.fetch_count = 0
+        self.created: list[tuple[int, list[str]]] = []
+        self.deleted: list[list[str]] = []
+        self.top: list[tuple[str, int, int]] = [("busy", 999, 12000)]
 
     async def get_public_key(self, force=False):
         self.fetch_count += 1
@@ -89,6 +94,19 @@ class FakeKickAPI:
 
     async def list_event_subscriptions(self):
         return []
+
+    async def get_top_livestreams(self, limit=5):
+        return self.top[:limit]
+
+    async def create_event_subscriptions(self, broadcaster_user_id, events):
+        self.created.append((broadcaster_user_id, list(events)))
+        return [
+            {"name": name, "version": 1, "subscription_id": f"sub-{broadcaster_user_id}-{index}"}
+            for index, name in enumerate(events)
+        ]
+
+    async def delete_event_subscriptions(self, ids):
+        self.deleted.append(list(ids))
 
 
 def enabled_config(**overrides):
@@ -107,19 +125,25 @@ def make_webhook(config=None, monitor=None, recorder=None, api=None, notifier=No
     raw = copy.deepcopy(config) if isinstance(config, dict) else config
     if raw is None:
         raw = base_config()
-    # base_config uses listen_port 0 for an ephemeral port so bind tests never
+    # base_config uses listen_port 0 for ephemeral ports so bind tests never
     # collide. The config model allows only ports 1-65535, so make_webhook
-    # validates with a placeholder port and re-applies 0 afterwards.
+    # validates with placeholder ports and re-applies 0 afterwards.
     if isinstance(raw, AppConfig):
         ephemeral = raw.endpoint.listen_port == 0
+        ephemeral_wh = raw.kick.webhook.listen_port == 0
         config = raw
     else:
         ephemeral = raw.get("endpoint", {}).get("listen_port") == 0
+        ephemeral_wh = raw.get("kick", {}).get("webhook", {}).get("listen_port") == 0
         if ephemeral:
             raw["endpoint"]["listen_port"] = 8787
+        if ephemeral_wh:
+            raw["kick"]["webhook"]["listen_port"] = 8788
         config = AppConfig.model_validate(raw)
     if ephemeral:
         object.__setattr__(config.endpoint, "listen_port", 0)
+    if ephemeral_wh:
+        object.__setattr__(config.kick.webhook, "listen_port", 0)
     return KickWebhook(
         config,
         monitor or FakeMonitor(),
@@ -286,7 +310,7 @@ def post_event(wh, private_key, body, event_type, msg_id="m1", ts=None):
     headers = _signed_headers(private_key, msg_id, timestamp, body, event_type)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post("/kick/webhook", data=body, headers=headers)
             return resp.status
 
@@ -341,7 +365,7 @@ def test_failed_dispatch_not_marked_seen(keypair):
     monitor.handle_online = flaky_online
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             body = live_event(is_live=True)
             headers = _signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE)
             first = await client.post("/kick/webhook", data=body, headers=headers)
@@ -392,7 +416,7 @@ def test_bad_signature_returns_401_and_no_dispatch(keypair):
     body = live_event(is_live=True)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post(
                 "/kick/webhook",
                 data=body,
@@ -409,7 +433,7 @@ def test_missing_signature_headers_401(keypair):
     wh = make_webhook(api=FakeKickAPI(public_pem))
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post("/kick/webhook", data=live_event())
             assert resp.status == 401
 
@@ -446,8 +470,9 @@ def make_mock_api(handler):
     # Pass the mock client through the constructor, so KickAPI does not build
     # and leak an httpx client of its own. The caller closes this one.
     config = base_config()
-    # The config model needs a real port, although KickAPI itself never binds.
+    # The config model needs real ports, although KickAPI itself never binds.
     config["endpoint"]["listen_port"] = 8787
+    config["kick"]["webhook"]["listen_port"] = 8788
     client = httpx.AsyncClient(transport=httpx.MockTransport(route))
     return KickAPI(AppConfig.model_validate(config), http=client)
 
@@ -460,7 +485,8 @@ def token_response(request):
 def writable_config(tmp_path):
     """enabled_config bound to a real file, so a flow that persists a flag can save it."""
     raw = enabled_config()
-    raw["endpoint"]["listen_port"] = 8799  # a real port, which the model requires
+    raw["endpoint"]["listen_port"] = 8799  # real ports, which the model requires
+    raw["kick"]["webhook"]["listen_port"] = 8800
     raw["_workdir"] = tmp_path
     cfg_file = tmp_path / "config.json"
     cfg_file.write_text(json.dumps({k: v for k, v in raw.items() if not k.startswith("_")}, indent=4))
@@ -479,7 +505,7 @@ def test_first_verified_event_confirms_delivery_once(tmp_path, keypair):
     # A signature-verified POST proves that Kick saved the URL and can reach
     # it. The webhook confirms setup exactly once and then persists the flag.
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             body = live_event()
             await client.post(
                 "/kick/webhook",
@@ -519,7 +545,7 @@ def test_two_first_events_confirm_the_delivery_once(tmp_path, keypair):
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=BlockingNotifier())
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             body = live_event()
             first = asyncio.create_task(
                 client.post(
@@ -552,7 +578,7 @@ def test_unverified_event_does_not_confirm(tmp_path, keypair):
     wh = make_webhook(config=config, api=FakeKickAPI(public_pem), notifier=notifier)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post("/kick/webhook", data=live_event())  # no signature
             assert resp.status == 401
 
@@ -699,7 +725,7 @@ def test_disabled_webhook_ignores_deliveries(keypair):
     wh = make_webhook(config=config, monitor=monitor, recorder=recorder, api=FakeKickAPI(public_pem))
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             body = live_event(is_live=True)
             live = await client.post(
                 "/kick/webhook",
@@ -1002,7 +1028,7 @@ def test_duplicate_message_id_dropped(keypair):
     body = live_event(is_live=True)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             headers = _signed_headers(private_key, "dup-1", _fresh_ts(), body, wh.EVENT_LIVE)
             first = await client.post("/kick/webhook", data=body, headers=headers)
             replay = await client.post("/kick/webhook", data=body, headers=headers)
@@ -1037,7 +1063,7 @@ def test_bad_signature_key_refetch_rate_limited(keypair):
     body = live_event(is_live=True)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             headers = _signed_headers(private_key, "m1", _fresh_ts(), b"tampered", wh.EVENT_LIVE)
             # The first request fetches the key, refetches, verifies against the
             # fresh key and rejects the signature: a fetched key that does not
@@ -1068,7 +1094,7 @@ def test_rate_limit_returns_429(keypair):
     wh._rate_limiter = _RateLimiter(2, 60)
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             statuses = []
             for _ in range(4):
                 resp = await client.post("/kick/webhook", data=b"{}")
@@ -1216,7 +1242,7 @@ def test_failed_key_fetch_is_not_repeated_for_every_request(keypair):
     body = chat_event()
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             for index in range(5):
                 resp = await client.post(
                     "/kick/webhook",
@@ -1241,7 +1267,7 @@ def test_unverified_requests_do_not_consume_the_dispatch_budget(keypair):
     async def scenario():
         stalls = [asyncio.create_task(wh._handle(_StalledRequest())) for _ in range(16)]
         await asyncio.sleep(0.05)  # let every stall reach the body read
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post(
                 "/kick/webhook",
                 data=body,
@@ -1311,7 +1337,7 @@ def test_missing_public_key_asks_for_a_redelivery(keypair):
     body = chat_event()
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post(
                 "/kick/webhook",
                 data=body,
@@ -1364,7 +1390,7 @@ def test_a_concurrent_cold_cache_burst_makes_one_key_fetch(keypair):
     body = chat_event()
 
     async def scenario():
-        async with TestClient(TestServer(wh._app)) as client:
+        async with TestClient(TestServer(wh._webhook_app)) as client:
             responses = await asyncio.gather(
                 *[
                     client.post(
@@ -1398,3 +1424,214 @@ def test_empty_key_body_is_rejected_as_too_large(keypair):
         assert response.status == 413
 
     asyncio.run(scenario())
+
+
+def test_private_and_webhook_listeners_serve_disjoint_routes(keypair):
+    """Nothing registered for the panel may answer on the webhook port, and
+    the webhook route must not exist on the private port. A future edit that
+    registers panel routes on the wrong app would expose the panel publicly.
+    """
+    private_key, public_pem = keypair
+    wh = make_webhook(api=FakeKickAPI(public_pem))
+
+    async def probe(request):
+        return web.Response(text="private")
+
+    wh.add_routes(lambda app: app.router.add_get("/probe", probe))
+    body = live_event(is_live=True)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as private:
+            assert (await private.get("/probe")).status == 200
+            headers = _signed_headers(private_key, "m1", _fresh_ts(), body, wh.EVENT_LIVE)
+            assert (await private.post("/kick/webhook", data=body, headers=headers)).status == 404
+        async with TestClient(TestServer(wh._webhook_app)) as public:
+            assert (await public.get("/probe")).status == 404
+            headers = _signed_headers(private_key, "m2", _fresh_ts(), body, wh.EVENT_LIVE)
+            assert (await public.post("/kick/webhook", data=body, headers=headers)).status == 200
+
+    asyncio.run(scenario())
+
+
+def test_webhook_listener_follows_the_webhook_flag():
+    """Disabling the webhook closes its port while the panel stays up. A
+    listener left behind would keep a public port open for nothing."""
+    wh = make_webhook(config=enabled_config())
+
+    async def scenario():
+        await wh.apply_state()
+        assert wh._runner is not None
+        assert wh._webhook_runner is not None
+        assert wh._sync_task is not None
+        wh._config.kick.webhook.enabled = False
+        await wh.apply_state()
+        assert wh._runner is not None  # the panel stays up
+        assert wh._webhook_runner is None  # the public port closes
+        assert wh._sync_task is None
+        await wh.close()
+        assert wh._runner is None
+        assert wh._webhook_runner is None
+
+    asyncio.run(scenario())
+
+
+def test_verify_delivery_proves_first_event_and_cleans_up(keypair):
+    """The test subscribes, matches only its broadcaster, deletes, and leaves no trace.
+
+    The test channel is never monitored, so dispatch must ignore it: no
+    recording, no chat archive, no channel-list entry. The temp ids must
+    never reach the subscription bookkeeping either.
+    """
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    recorder = FakeRecorder()
+    api = FakeKickAPI(public_pem)
+    wh = make_webhook(config=enabled_config(), monitor=monitor, recorder=recorder, api=api)
+
+    async def scenario():
+        task = asyncio.create_task(wh.verify_delivery(timeout=5))
+        for _ in range(500):
+            if wh._verify_event is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert wh._verify_event is not None  # the test is armed before the delivery
+        async with TestClient(TestServer(wh._webhook_app)) as client:
+            body = chat_event(slug="busy")
+            headers = _signed_headers(private_key, "v1", _fresh_ts(), body, wh.EVENT_CHAT)
+            assert (await client.post("/kick/webhook", data=body, headers=headers)).status == 200
+        return await task
+
+    ok, message = asyncio.run(scenario())
+    assert ok is True
+    assert "kick:busy" in message and message.endswith("s.")
+    assert api.created == [(999, ["livestream.status.updated", "chat.message.sent"])]
+    assert api.deleted == [["sub-999-0", "sub-999-1"]]
+    assert wh._subs == {}
+    assert wh._verify_event is None and wh._verify_ids == set()
+    assert monitor.online == [] and monitor.offline == []
+    assert recorder.chat == []
+    assert "kick:busy" not in wh._config.channels
+
+
+def test_verify_delivery_ignores_other_broadcasters(keypair):
+    """An event for another channel must not complete the test."""
+    private_key, public_pem = keypair
+    monitor = FakeMonitor()
+    api = FakeKickAPI(public_pem)
+    wh = make_webhook(config=enabled_config(), monitor=monitor, api=api)
+
+    async def scenario():
+        task = asyncio.create_task(wh.verify_delivery(timeout=0.05))
+        for _ in range(500):
+            if wh._verify_event is not None:
+                break
+            await asyncio.sleep(0.01)
+        async with TestClient(TestServer(wh._webhook_app)) as client:
+            body = live_event(slug="xqc", is_live=True)  # monitored, but not the test channel
+            headers = _signed_headers(private_key, "v2", _fresh_ts(), body, wh.EVENT_LIVE)
+            assert (await client.post("/kick/webhook", data=body, headers=headers)).status == 200
+        return await task
+
+    ok, _ = asyncio.run(scenario())
+    assert ok is False
+    assert len(monitor.online) == 1  # the other event still dispatches normally
+    assert api.deleted == [["sub-999-0", "sub-999-1"]]  # the timeout still deletes
+
+
+def test_verify_delivery_timeout_reports_and_deletes(keypair):
+    """Silence answers False with the failing layer named, and still deletes."""
+    _, public_pem = keypair
+    api = FakeKickAPI(public_pem)
+    wh = make_webhook(config=enabled_config(), api=api)
+
+    ok, message = asyncio.run(wh.verify_delivery(timeout=0.05))
+    assert ok is False
+    assert "No delivery in" in message
+    assert api.deleted == [["sub-999-0", "sub-999-1"]]
+
+
+def test_verify_delivery_needs_nothing_to_listen_for(keypair):
+    """Without endpoint and webhook on, the test refuses instead of hanging."""
+    _, public_pem = keypair
+    api = FakeKickAPI(public_pem)
+    wh = make_webhook(config=base_config(), api=api)
+
+    ok, message = asyncio.run(wh.verify_delivery(timeout=0.05))
+    assert ok is False
+    assert "Enable the endpoint and the Kick webhook first" in message
+    assert api.created == []
+
+
+def _sync_api_with_test_sub(deletes):
+    """Mock API: xqc resolves and stays subscribed, plus a foreign test sub."""
+    channel_data = {
+        "slug": "xqc",
+        "stream_title": None,
+        "category": None,
+        "stream": {"is_live": False},
+        "broadcaster_user_id": 123,
+    }
+
+    def handler(request):
+        if request.url.path == "/public/v1/channels":
+            return httpx.Response(200, json={"data": [channel_data]})
+        if request.url.path == "/public/v1/events/subscriptions":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "keep-1",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 123,
+                                "events": [{"name": "livestream.status.updated"}, {"name": "chat.message.sent"}],
+                            },
+                            {
+                                "id": "t-1",
+                                "app_id": "cid",
+                                "broadcaster_user_id": 999,
+                                "events": [{"name": "chat.message.sent"}],
+                            },
+                        ]
+                    },
+                )
+            if request.method == "DELETE":
+                deletes.append([v for k, v in request.url.params.multi_items() if k == "id"])
+                return httpx.Response(200, json={"data": []})
+        pytest.fail(f"unexpected request: {request.method} {request.url}")
+
+    return make_mock_api(handler)
+
+
+def test_sweep_spares_the_active_test_subscription():
+    """The reconcile must not delete the ids of a running delivery test."""
+    deletes = []
+    api = _sync_api_with_test_sub(deletes)
+    wh = make_webhook(api=api)
+    wh._verify_ids = {"t-1"}
+
+    async def scenario():
+        try:
+            await wh._sync_subscriptions(["kick:xqc"])
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())
+    assert deletes == []
+
+
+def test_sweep_deletes_the_test_subscription_after_the_test():
+    """Once the test clears its ids, the same sub reads as an orphan and goes."""
+    deletes = []
+    api = _sync_api_with_test_sub(deletes)
+    wh = make_webhook(api=api)
+
+    async def scenario():
+        try:
+            await wh._sync_subscriptions(["kick:xqc"])
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())
+    assert deletes == [["t-1"]]

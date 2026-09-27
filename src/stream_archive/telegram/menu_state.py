@@ -62,7 +62,6 @@ class MenuState:
     menu: str = "root"
     channel: str | None = None
     custom: str | None = None
-    cloudflare_hostname: str | None = None
     rec_offset: int = 0
     rec_path: str | None = None
     rec_channel: str | None = None
@@ -79,8 +78,6 @@ _OWNED_FIELDS: dict[str, frozenset[str]] = {
     # The custom menu waits for a value, so it owns the pending key. It keeps
     # the channel: the channel_hold key names the channel to change.
     "custom": frozenset({"channel", "custom"}),
-    # The DNS step reads the hostname that the hostname step stored.
-    "kick_cloudflare_dns": frozenset({"cloudflare_hostname"}),
     # The recordings browser keeps its page and its picked file. The
     # channel page keeps its channel too; the list owns neither file.
     "recordings": frozenset({"rec_offset"}),
@@ -197,8 +194,8 @@ class ChatStateMixin:
         """Move one chat into ``menu`` and clear the fields that menu does not own.
 
         Every navigation goes through here, so a value of an earlier flow (a
-        pending custom key or a tunnel hostname) can never reach the next
-        menu. See ``_OWNED_FIELDS`` for the fields of each menu.
+        pending custom key) can never reach the next menu. See ``_OWNED_FIELDS``
+        for the fields of each menu.
         """
         state = self._state_for(chat_id)
         if channel is not None:
@@ -208,8 +205,6 @@ class ChatStateMixin:
             state.channel = None
         if "custom" not in owned:
             state.custom = None
-        if "cloudflare_hostname" not in owned:
-            state.cloudflare_hostname = None
         if "rec_offset" not in owned:
             state.rec_offset = 0
         if "rec_path" not in owned:

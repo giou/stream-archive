@@ -31,7 +31,7 @@
 **/*.chat.json
 **/*.chat.json.tmp
 **/*.bak
-# Key material: tunnel state, service-account keys, PEM files.
+# Key material: generated proxy configs, service-account keys, PEM files.
 **/*.pem
 **/*.key
 **/*.p12

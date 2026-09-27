@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from telegram import ReplyKeyboardMarkup
 
-from stream_archive.config import api_base_url
+from stream_archive.config import api_base_url, webhook_public_url
 from stream_archive.telegram import menus_api as api_menus
 from stream_archive.telegram import menus_kick as kick_menus
 from stream_archive.telegram import menus_mtproto as mtproto_menus
@@ -89,7 +89,6 @@ _STATIC_KEYBOARDS: dict[str, list[list[str]]] = {
         ["Remote access", "MTProto upload"],
         ["Back"],
     ],
-    "kick_cloudflare_dns": [["Skip DNS"], ["Back"]],
 }
 
 
@@ -158,7 +157,6 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         return _frame(
             [
                 [f"{_toggle_action(c.endpoint.enabled)} endpoint"],
-                ["Cloudflare tunnel", "Tailscale funnel"],
                 ["Kick webhook", "API", "Web panel"],
                 ["Back"],
             ]
@@ -187,17 +185,10 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         rows.insert(0, ["Back"])
         return _frame(rows)
     if menu == "kick_webhook":
-        return _frame([[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"], ["Back"]])
-    if menu == "kick_cloudflare":
-        return _frame(
-            [
-                [f"{_toggle_action(ctrl._tunnel_active('cloudflare'))} Cloudflare tunnel"],
-                ["Quick tunnel", "Named tunnel"],
-                ["Back"],
-            ]
-        )
-    if menu == "kick_tailscale":
-        return _frame([[f"{_toggle_action(ctrl._tunnel_active('tailscale'))} Tailscale funnel"], ["Back"]])
+        rows = [[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"]]
+        rows.append(["Set Kick URL", "Test delivery"])
+        rows.append(["Back"])
+        return _frame(rows)
     return _frame([list(row) for row in _STATIC_KEYBOARDS.get(menu, [["Back"]])])
 
 
@@ -224,8 +215,9 @@ async def _text_remote_access(ctrl: TelegramController, state: MenuState) -> str
         f"Kick webhook: {ctrl._webhook_state_text()}\n"
         f"Control API: {ctrl._api_state_text()}\n"
         f"Web panel: {ctrl._web_state_text()}\n\n"
-        "Cloudflare tunnel and Tailscale funnel set the public URL. The toggle starts and stops "
-        "the endpoint. The Kick webhook, the control API, and the web panel are served there."
+        "The endpoint is a public URL you publish yourself (your own reverse "
+        "proxy or tailnet serve). The toggle starts and stops the listeners. "
+        "Paste a URL here to enable it with that address."
     )
 
 
@@ -289,14 +281,12 @@ async def _text_api(ctrl: TelegramController, state: MenuState) -> str:
     if not ctrl._config.api.enabled:
         return (
             "Control API: off\n\n"
-            "The API manages channels and settings over HTTP under /api/v1/, on the same "
-            "listener and public URL as the Kick webhook.\n"
+            "The API manages channels and settings over HTTP under /api/v1/, on the private "
+            "listener next to the web panel.\n"
             "Enable it and I generate the API key."
         )
     base = api_base_url(ctrl._config)
-    url_line = (
-        f"Base URL: {base}" if base else "Base URL: none yet - set up a tunnel under Settings, then Remote access."
-    )
+    url_line = f"Base URL: {base}" if base else "Base URL: none yet - set the public URL in Remote access."
     text = f"Control API: on\n{url_line}\nTap Show key to display the key. Changes apply on the next cycle."
     if not ctrl._config.endpoint.enabled:
         text += "\nThe public URL needs remote access. Turn it on to reach the API from outside."
@@ -307,14 +297,12 @@ async def _text_web(ctrl: TelegramController, state: MenuState) -> str:
     if not ctrl._config.web.enabled:
         return (
             "Web panel: off\n\n"
-            "The panel controls the app in the browser at the domain root, on the same "
-            "listener and public URL as the Kick webhook.\n"
+            "The panel controls the app in the browser at the domain root, on the private "
+            "listener next to the control API.\n"
             "Enable it and I generate the panel password."
         )
     url = ctrl._web_panel_url()
-    url_line = (
-        f"Panel URL: {url}" if url else "Panel URL: none yet - set up a tunnel under Settings, then Remote access."
-    )
+    url_line = f"Panel URL: {url}" if url else "Panel URL: none yet - set the public URL in Remote access."
     text = (
         f"Web panel: on\n{url_line}\nPassword: {'set' if ctrl._config.web.password_hash else 'missing - run stream-archive-setup-web'}.\n"
         "Tap New password to replace it (ends all browser sessions)."
@@ -326,65 +314,20 @@ async def _text_web(ctrl: TelegramController, state: MenuState) -> str:
 
 async def _text_kick_webhook(ctrl: TelegramController, state: MenuState) -> str:
     text = f"Kick webhook: {ctrl._webhook_state_text()}\n"
+    if ctrl._config.kick.webhook.public_url.strip():
+        text += f"Kick URL: {webhook_public_url(ctrl._config)} (own entry)\n"
+    else:
+        text += "Kick URL: follows the panel address - it must reach the public internet.\n"
     if not ctrl._config.endpoint.enabled:
         text += "The endpoint is off, so Kick cannot deliver events.\n"
-    return text + "\nThe endpoint and its tunnels are set in Remote access."
+    return text + "\nSet Kick URL saves your own public entry for Kick deliveries."
 
 
-async def _text_kick_cloudflare(ctrl: TelegramController, state: MenuState) -> str:
-    ep = ctrl._config.endpoint
-    active = ctrl._tunnel_active("cloudflare")
-    text = f"Cloudflare tunnel: {'on' if active else 'off'}\n"
-    if not active and ep.tunnel == "cloudflare" and ep.public_url:
-        text += f"Saved setup: {ep.public_url}. Tap Enable to restore it.\n"
+async def _text_kick_webhook_url(ctrl: TelegramController, state: MenuState) -> str:
     return (
-        f"{text}\n"
-        "\u2022 Quick tunnel - no Cloudflare account needed, temporary URL.\n"
-        "\u2022 Named tunnel - your Cloudflare account, stable hostname.\n"
-        "\u2022 Already running your own tunnel? Send me its URL directly."
-    )
-
-
-async def _text_kick_tailscale(ctrl: TelegramController, state: MenuState) -> str:
-    ep = ctrl._config.endpoint
-    active = ctrl._tunnel_active("tailscale")
-    text = f"Tailscale funnel: {'on' if active else 'off'}"
-    if active:
-        text += f" \u00b7 {ep.public_url}"
-    elif ep.tunnel == "tailscale" and ep.public_url:
-        text += f"\nSaved setup: {ep.public_url}. Tap Enable to restore it."
-    return (
-        f"{text}\n\n"
-        f"Enable runs tailscale funnel {ep.listen_port} on this host for the endpoint. "
-        "Disable stops the funnel and the endpoint."
-    )
-
-
-async def _text_kick_cloudflare_token(ctrl: TelegramController, state: MenuState) -> str:
-    return (
-        "Send your tunnel token:\n\n"
-        "cloudflared service install <TOKEN>\n\n"
-        "Paste the whole command or just the token - I'll run cloudflared for you."
-    )
-
-
-async def _text_kick_cloudflare_hostname(ctrl: TelegramController, state: MenuState) -> str:
-    return (
-        "Send the public hostname to use for the webhook, e.g. kick.example.com.\n\n"
-        "I'll point your tunnel at this app automatically - no dashboard configuration needed."
-    )
-
-
-async def _text_kick_cloudflare_dns(ctrl: TelegramController, state: MenuState) -> str:
-    return (
-        "Send your Cloudflare API token so I can create the DNS record automatically:\n\n"
-        "dash.cloudflare.com \u2192 My Profile \u2192 API Tokens \u2192 Create Token:\n"
-        "\u2022 Permissions: Zone \u2192 Read, DNS \u2192 Edit\n"
-        "\u2022 Zone Resources: Include \u2192 your domain (e.g. the part after the "
-        "dot of your hostname)\n"
-        "(the 'Edit zone DNS' template has exactly those two)\n\n"
-        "Or tap the Skip button to create the DNS record yourself - "
-        "I'll give you the exact record."
+        "Send the public URL for Kick deliveries, e.g. https://kick.example.com.\n\n"
+        "Point your own reverse proxy at the webhook listener port first, "
+        "then paste its address here."
     )
 
 
@@ -547,11 +490,7 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "api": _text_api,
     "web": _text_web,
     "kick_webhook": _text_kick_webhook,
-    "kick_cloudflare": _text_kick_cloudflare,
-    "kick_tailscale": _text_kick_tailscale,
-    "kick_cloudflare_token": _text_kick_cloudflare_token,
-    "kick_cloudflare_hostname": _text_kick_cloudflare_hostname,
-    "kick_cloudflare_dns": _text_kick_cloudflare_dns,
+    "kick_webhook_url": _text_kick_webhook_url,
     "mtproto": _text_mtproto,
     "recordings": _text_recordings,
     "rec_channel": _text_rec_channel,
@@ -585,11 +524,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "rec_channel": rec_menus.menu_rec_channel,
     "rec_detail": rec_menus.menu_rec_detail,
     "kick_webhook": kick_menus.menu_kick_webhook,
-    "kick_cloudflare": kick_menus.menu_kick_cloudflare,
-    "kick_tailscale": kick_menus.menu_kick_tailscale,
-    "kick_cloudflare_token": kick_menus.menu_kick_token,
-    "kick_cloudflare_hostname": kick_menus.menu_kick_hostname,
-    "kick_cloudflare_dns": kick_menus.menu_kick_dns,
+    "kick_webhook_url": kick_menus.menu_kick_webhook_url,
 }
 
 #: Back-button target per menu. Menus without an entry (root) have no Back button.
@@ -618,11 +553,7 @@ PARENT: dict[str, str] = {
     "rec_channel": "recordings",
     "rec_detail": "rec_channel",
     "kick_webhook": "remote_access",
-    "kick_cloudflare": "remote_access",
-    "kick_tailscale": "remote_access",
-    "kick_cloudflare_token": "kick_cloudflare",
-    "kick_cloudflare_hostname": "kick_cloudflare_token",
-    "kick_cloudflare_dns": "kick_cloudflare_hostname",
+    "kick_webhook_url": "kick_webhook",
 }
 
 

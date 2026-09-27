@@ -40,6 +40,10 @@ _VERIFY_WINDOW_S = 300
 # This store holds one dedup entry per unique signed event, for the
 # freshness window. Its bound stops a flood from growing memory.
 _MAX_SEEN_IDS = 50_000
+# Seconds the delivery test waits for the first event. A fresh Kick
+# subscription can take minutes to warm up, so the test reports progress
+# while it waits and exits early on the first delivery.
+_VERIFY_TEST_TIMEOUT_S = 180.0
 # A failed signature triggers a public-key refetch (key-rotation retry).
 # This negative cache bounds that refetch. Without it, an unauthenticated
 # flood forces one outbound Kick API call per request and exhausts the Kick
@@ -187,54 +191,66 @@ class KickWebhook:
         self._notifier = notifier
         self._runner: Any = None
         self._site: Any = None
-        self._bound: tuple[str, int] | None = None  # (host, port) of the live listener
+        self._bound: tuple[str, int] | None = None  # (host, port) of the private listener
+        self._webhook_runner: Any = None
+        self._webhook_site: Any = None
+        self._webhook_bound: tuple[str, int] | None = None  # (host, port) of the webhook listener
         self._sync_task: asyncio.Task[Any] | None = None
         self._sync_failed_notified = False
         self._sync_failing_since: float | None = None  # monotonic start of current failure episode
         self._sync_error_logged = False
         self._subs: dict[str, set[str]] = {}  # bare slug -> set(subscription ids)
         self._seen_ids: dict[str, float] = {}  # message_id -> expires (monotonic)
+        self._verify_uid: int | None = None  # broadcaster of the running delivery test
+        self._verify_slug: str = ""  # slug of the running delivery test
+        self._verify_event: asyncio.Event | None = None  # set on its first verified delivery
+        self._verify_ids: set[str] = set()  # test subscription ids the sweep must spare
         self._rate_limiter = _RateLimiter(_RATE_LIMIT_PER_IP, _RATE_LIMIT_WINDOW_S)
         self._sem = asyncio.Semaphore(_MAX_CONCURRENT)
         self._next_key_refetch = 0.0  # monotonic time. Gates the rotation refetch.
         self._next_key_fetch = 0.0  # monotonic time. Gates a repeat of a failed key fetch.
         self._app = web.Application()
-        self._app.router.add_post("/kick/webhook", self._handle)
+        self._webhook_app = web.Application()
+        self._webhook_app.router.add_post("/kick/webhook", self._handle)
 
     def add_routes(self, register: Callable[[web.Application], None]) -> None:
-        """Register extra routes on the shared listener (the control API uses this).
+        """Register extra routes on the private listener (the control API and the panel use this).
 
-        Call before the first ``apply_state``. One listener serves the
-        webhook and every extra route.
+        Call before the first ``apply_state``. The webhook listener serves
+        POST /kick/webhook alone, so nothing registered here ever reaches
+        the public internet through the webhook port.
         """
         register(self._app)
 
     def listening_needed(self) -> bool:
-        """True when the listener must run: the endpoint, the API, or the web panel is on."""
+        """True when the private listener must run: the endpoint, the API, or the web panel is on."""
         return self._config.endpoint.enabled or self._config.api.enabled or self._config.web.enabled
 
     async def apply_state(self) -> None:
-        """Match the live listener and sync loop to the config. Idempotent.
+        """Match both listeners and the sync loop to the config. Idempotent.
 
-        The listener serves the public endpoint, which carries the Kick
-        webhook and the control API, so it runs while the endpoint or the
-        API is enabled. The subscription sync loop needs the webhook and a
-        reachable endpoint, and it deletes subscriptions for unmonitored
-        channels. When the webhook goes off, the loop stops and the app
-        deletes the subscriptions it created, so Kick stops the deliveries.
+        The private listener serves the panel and the control API, so it
+        runs while the endpoint, the API, or the panel is enabled. The
+        webhook listener serves POST /kick/webhook alone and runs while
+        Kick delivers events. The subscription sync loop needs the webhook
+        and a reachable endpoint, and it deletes subscriptions for
+        unmonitored channels. When the webhook goes off, the loop stops and
+        the app deletes the subscriptions it created, so Kick stops the
+        deliveries.
         """
         if not self.listening_needed():
-            # The listener is off, so Kick cannot deliver anything. Stop the
-            # sync loop, then delete the subscriptions it created. Kick then
-            # stops the deliveries to a dead URL.
+            # Neither listener is needed, so Kick cannot deliver anything.
+            # Stop the sync loop, then delete the subscriptions it created.
+            # Kick then stops the deliveries to a dead URL.
             await self._stop_sync()
             await self._drop_subscriptions()
             await self._unbind()
+            await self._unbind_webhook()
             return
         ep = self._config.endpoint
         if self._runner is not None and self._bound != (ep.listen_host, ep.listen_port):
             # A reload can change the listen address. Rebind, so the listener
-            # and the webhook URL point at the same address. Stop the sync
+            # and the panel URL point at the same address. Stop the sync
             # loop first: it exits once the runner is gone, and a stopped loop
             # is recreated below.
             await self._stop_sync()
@@ -250,17 +266,50 @@ class KickWebhook:
                 raise
             self._bound = (ep.listen_host, ep.listen_port)
             logger.info(
-                "[kick_webhook] listening on http://%s:%s (public: %s)",
+                "[kick_webhook] panel listening on http://%s:%s",
                 ep.listen_host,
                 ep.listen_port,
-                ep.public_url or "(none)",
             )
+        await self._apply_webhook_state()
         if not self._sync_needed():
             await self._stop_sync()
             await self._drop_subscriptions()
             return
         if self._sync_task is None:
             self._sync_task = asyncio.create_task(self._sync_loop())
+
+    async def _apply_webhook_state(self) -> None:
+        """Bind the webhook-only listener while Kick delivers, else release it.
+
+        The port stays closed unless the endpoint and the webhook are both
+        on: least exposure by default.
+        """
+        if not self._sync_needed():
+            await self._unbind_webhook()
+            return
+        wh = self._config.kick.webhook
+        if self._webhook_runner is not None and self._webhook_bound != (wh.listen_host, wh.listen_port):
+            # A reload can change the listen address. Rebind, so the listener
+            # and the webhook URL point at the same address. Stop the sync
+            # loop first: it exits once the runner is gone, and a stopped loop
+            # is recreated in apply_state.
+            await self._stop_sync()
+            await self._unbind_webhook()
+        if self._webhook_runner is None:
+            self._webhook_runner = web.AppRunner(self._webhook_app)
+            await self._webhook_runner.setup()
+            try:
+                self._webhook_site = web.TCPSite(self._webhook_runner, wh.listen_host, wh.listen_port)
+                await self._webhook_site.start()
+            except OSError:
+                await self._unbind_webhook()  # a failed bind leaves no half-built runner
+                raise
+            self._webhook_bound = (wh.listen_host, wh.listen_port)
+            logger.info(
+                "[kick_webhook] webhook listening on http://%s:%s",
+                wh.listen_host,
+                wh.listen_port,
+            )
 
     async def _drop_subscriptions(self) -> None:
         """Delete the subscriptions of every tracked channel.
@@ -275,9 +324,10 @@ class KickWebhook:
         return self._config.endpoint.enabled and self._config.kick.webhook.enabled
 
     async def close(self) -> None:
-        """Stop the sync loop and the HTTP listener. Idempotent."""
+        """Stop the sync loop and both HTTP listeners. Idempotent."""
         await self._stop_sync()
         await self._unbind()
+        await self._unbind_webhook()
 
     async def _stop_sync(self) -> None:
         task = self._sync_task
@@ -300,8 +350,22 @@ class KickWebhook:
             with contextlib.suppress(Exception):
                 await runner.cleanup()
 
+    async def _unbind_webhook(self) -> None:
+        """Release the webhook-only listener. Idempotent."""
+        site = self._webhook_site
+        self._webhook_site = None
+        self._webhook_bound = None
+        if site is not None:
+            with contextlib.suppress(Exception):
+                await site.stop()
+        runner = self._webhook_runner
+        self._webhook_runner = None
+        if runner is not None:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+
     async def _sync_loop(self) -> None:
-        while self._runner is not None:
+        while self._webhook_runner is not None:
             try:
                 await self._sync_subscriptions(self._config.channels)
             except Exception as e:
@@ -401,6 +465,7 @@ class KickWebhook:
             known = event_type if event_type in (self.EVENT_LIVE, self.EVENT_CHAT) else "unknown"
             logger.warning("[kick_webhook] signature verification failed (event=%s)", known)
             return web.Response(status=401, text="unauthorized")
+        self._match_verify_event(body)
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=_DISPATCH_WAIT_S)
         except TimeoutError:
@@ -436,6 +501,28 @@ class KickWebhook:
             return web.Response(status=200, text="ok")
         finally:
             self._sem.release()
+
+    def _match_verify_event(self, body: bytes) -> None:
+        """Set the pending delivery-test event when the body is its broadcaster.
+
+        Only runs while a test waits, so the JSON parse never costs the hot
+        path anything. Never raises: a bad body still gets its normal
+        dispatch verdict below.
+        """
+        if self._verify_event is None:
+            return
+        try:
+            event = json.loads(body)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        broadcaster = event.get("broadcaster") or {}
+        if not isinstance(broadcaster, dict):
+            return
+        uid = broadcaster.get("user_id") or broadcaster.get("channel_id")
+        if uid == self._verify_uid or broadcaster.get("channel_slug") == self._verify_slug:
+            self._verify_event.set()
 
     def _remember_id(self, message_id: str | None) -> bool:
         """True when the message id is new within the freshness window.
@@ -691,7 +778,10 @@ class KickWebhook:
         for uid, subs in by_user.items():
             if uid in desired_ids:
                 continue
-            ids = [s.get("id") for s in subs if s.get("id")]
+            # Test subscriptions of a running delivery test stay: the test
+            # deletes them itself. Anything left without a test is an
+            # orphan and goes.
+            ids = [s.get("id") for s in subs if s.get("id") and s.get("id") not in self._verify_ids]
             if ids:
                 await self._api.delete_event_subscriptions(ids)
                 for sub in subs:
@@ -730,6 +820,67 @@ class KickWebhook:
             # flag: the next event retries the confirmation.
             wh.setup_notified = False
             logger.error("[kick_webhook] setup confirmation failed: %s", e)
+
+    async def verify_delivery(self, timeout: float = _VERIFY_TEST_TIMEOUT_S) -> tuple[bool, str]:
+        """Prove Kick deliveries reach this listener, then clean up.
+
+        Temp-subscribes to the busiest live channel that is not monitored
+        and waits for its first verified event. The test channel never
+        enters the channel list, so nothing records and no chat is
+        archived: dispatch ignores unmonitored channels. Returns
+        (ok, message) with the elapsed time. Always deletes the test
+        subscription, even on timeout. Only one test runs at a time.
+        """
+        if not self._sync_needed():
+            return False, "Enable the endpoint and the Kick webhook first: nothing listens."
+        if self._verify_event is not None:
+            return False, "A delivery test already runs."
+        try:
+            top = await self._api.get_top_livestreams()
+        except Exception as e:
+            return False, f"Kick livestreams lookup failed: {e}"
+        if not top:
+            return False, "Kick returned no live channel to test with - try again later."
+        monitored = {bare_name(c) for c in self._config.channels if is_kick_channel(c)}
+        pick = next(((s, u, v) for s, u, v in top if s not in monitored), top[0])
+        slug, uid, viewers = pick
+        try:
+            created = await self._api.create_event_subscriptions(uid, [self.EVENT_LIVE, self.EVENT_CHAT])
+        except Exception as e:
+            return False, f"Kick subscription failed: {e}"
+        ids = [item["subscription_id"] for item in created if item.get("subscription_id")]
+        if not ids:
+            return False, f"Kick created no subscription: {created}"
+        self._verify_uid = uid
+        self._verify_slug = slug
+        self._verify_ids = set(ids)
+        self._verify_event = asyncio.Event()
+        start = time.monotonic()
+        ok = False
+        try:
+            await asyncio.wait_for(self._verify_event.wait(), timeout=timeout)
+            ok = True
+        except TimeoutError:
+            pass
+        finally:
+            elapsed = time.monotonic() - start
+            self._verify_event = None
+            self._verify_uid = None
+            self._verify_slug = ""
+            # Clearing first is deliberate: a failed delete leaves orphans,
+            # and the next sweep must remove them instead of sparing them.
+            self._verify_ids = set()
+            try:
+                await self._api.delete_event_subscriptions(ids)
+            except Exception as e:
+                logger.warning("[kick_webhook] test subscription delete failed: %s", e)
+        if ok:
+            return True, f"First delivery from kick:{slug} ({viewers} watching) in {elapsed:.0f}s."
+        return (
+            False,
+            f"No delivery in {timeout:.0f}s from kick:{slug} ({viewers} watching). "
+            "Check the public proxy and the Kick dashboard URL.",
+        )
 
     async def add_channel(self, channel: str) -> None:
         """Subscribe a newly added kick channel to both events. This logs errors."""

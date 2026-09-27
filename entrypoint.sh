@@ -70,8 +70,7 @@ if [ -z "$uid" ]; then
     uid="$owner_uid"
 fi
 if [ -n "$uid" ] && [ -z "$gid" ]; then
-    # An explicit USER_GID wins over the data-dir group: docker-compose tells
-    # the user to grant access to the tailscale socket that way. Take the
+    # An explicit USER_GID wins over the data-dir group. Take the
     # data-dir group only when the data dir belongs to that uid.
     if [ "$owner_uid" = "$uid" ]; then
         gid="$owner_gid"

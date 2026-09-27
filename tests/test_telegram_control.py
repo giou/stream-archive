@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import html
 import json
 import re
@@ -17,7 +16,6 @@ from stream_archive.config import get_config
 from stream_archive.telegram import TelegramController
 from stream_archive.telegram.dispatcher import _deferred_affected_channels
 from stream_archive.telegram.menus_callbacks import AdminCallbackQueryHandler
-from stream_archive.tunnels import tailscale_funnel_off
 
 
 class FakeRecorder:
@@ -113,6 +111,7 @@ class FakeKickWebhook:
         self.added = []
         self.removed = []
         self.synced = []
+        self.verified = []
 
     async def apply_state(self):
         self.applied.append(1)
@@ -125,6 +124,12 @@ class FakeKickWebhook:
 
     async def sync_channels(self, channels):
         self.synced.append(list(channels))
+
+    async def verify_delivery(self, timeout=180.0):
+        # The delivery proof itself belongs to the webhook tests: here the
+        # stub only proves the button calls through and reports the result.
+        self.verified.append(timeout)
+        return True, "first delivery in 3s"
 
 
 class FakeUpdater:
@@ -196,7 +201,7 @@ def open_settings(ctrl):
 
 
 def open_remote_access(ctrl):
-    """Open the Remote access menu, which owns the public URL and its tunnels."""
+    """Open the Remote access menu, which owns the public URL."""
     open_settings(ctrl)
     return asyncio.run(ctrl.handle_reply_text("Remote access"))
 
@@ -1091,8 +1096,6 @@ def api_labels(enabled):
 def remote_labels(enabled):
     return [
         f"{toggle_action(enabled)} endpoint",
-        "Cloudflare tunnel",
-        "Tailscale funnel",
         "Kick webhook",
         "API",
         "Web panel",
@@ -1109,15 +1112,7 @@ def mtproto_labels(enabled):
 
 
 def webhook_labels(enabled):
-    return [f"{toggle_action(enabled)} Kick webhook", "Back"]
-
-
-def cloudflare_labels(enabled):
-    return [f"{toggle_action(enabled)} Cloudflare tunnel", "Quick tunnel", "Named tunnel", "Back"]
-
-
-def tailscale_labels(enabled):
-    return [f"{toggle_action(enabled)} Tailscale funnel", "Back"]
+    return [f"{toggle_action(enabled)} Kick webhook", "Set Kick URL", "Test delivery", "Back"]
 
 
 def test_command_list_covers_all_handlers(tmp_path):
@@ -1764,159 +1759,6 @@ def scripted_exec(monkeypatch, **procs):
     return seen
 
 
-def test_tailscale_webhook_url_missing_binary(tmp_path, monkeypatch):
-    def missing(*args, **kwargs):
-        raise FileNotFoundError()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing)
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "not installed" in hint
-    assert "tailscale.com/install.sh" in hint
-
-
-def test_tailscale_webhook_url_status_failure(tmp_path, monkeypatch):
-    scripted_exec(monkeypatch, status=_FakeProc(returncode=1, stderr=b"failed to connect to local tailscaled"))
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "failed to connect to local tailscaled" in hint
-
-
-def test_tailscale_webhook_url_enables_funnel(tmp_path, monkeypatch):
-    calls = scripted_exec(
-        monkeypatch,
-        status=_FakeProc(stdout=_status_json()),
-        funnel=_FakeProc(stdout=b"Funnel already enabled\n"),
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url == "https://box.tail1234.ts.net"
-    assert hint is None
-    assert [argv for argv, _ in calls] == [
-        ("tailscale", "status", "--json"),
-        ("tailscale", "funnel", "--bg", "--yes", "8787"),
-    ]
-
-
-def test_tailscale_webhook_url_funnel_failure(tmp_path, monkeypatch):
-    scripted_exec(
-        monkeypatch,
-        status=_FakeProc(stdout=_status_json()),
-        funnel=_FakeProc(returncode=1, stderr=b"Funnel requires HTTPS certificates enabled"),
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "tailscale funnel 8787 failed" in hint
-    assert "HTTPS certificates" in hint
-
-
-def test_tailscale_webhook_url_funnel_already_enabled(tmp_path, monkeypatch):
-    serve_json = json.dumps(
-        {
-            "Foreground": {
-                "cap1": {
-                    "Web": {
-                        "box.tail1234.ts.net:443": {
-                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}},
-                        }
-                    },
-                }
-            }
-        }
-    ).encode()
-    calls = scripted_exec(
-        monkeypatch,
-        status=_FakeProc(stdout=_status_json()),
-        funnel=_FakeProc(
-            returncode=1,
-            stderr=b"sending serve config: updating config: listener already exists for port 443",
-        ),
-        serve=_FakeProc(stdout=serve_json),  # serve status --json
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url == "https://box.tail1234.ts.net"
-    assert hint is None
-    assert [argv for argv, _ in calls] == [
-        ("tailscale", "status", "--json"),
-        ("tailscale", "funnel", "--bg", "--yes", "8787"),
-        ("tailscale", "serve", "status", "--json"),
-    ]
-
-
-def test_tailscale_webhook_url_listener_conflict_other_port(tmp_path, monkeypatch):
-    serve_json = json.dumps(
-        {
-            "Foreground": {
-                "cap1": {
-                    "Web": {
-                        "other.ts.net:443": {
-                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}},
-                        }
-                    },
-                }
-            }
-        }
-    ).encode()
-
-    scripted_exec(
-        monkeypatch,
-        status=_FakeProc(stdout=_status_json()),
-        funnel=_FakeProc(returncode=1, stderr=b"listener already exists for port 443"),
-        serve=_FakeProc(stdout=serve_json),
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "tailscale funnel 8787 failed" in hint
-
-
-def test_tailscale_webhook_url_funnel_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.tunnels._TAILSCALE_FUNNEL_TIMEOUT", 0.01)
-    proc = _FakeProc(hang=True)
-    scripted_exec(monkeypatch, status=_FakeProc(stdout=_status_json()), funnel=proc)
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "timed out" in hint
-    assert proc.killed
-
-
-def test_tailscale_webhook_url_no_dns_name(tmp_path, monkeypatch):
-    scripted_exec(monkeypatch, status=_FakeProc(stdout=json.dumps({"Self": {}}).encode()))
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._tailscale_webhook_url())
-
-    assert url is None
-    assert "no machine DNS name" in hint
-
-
-def test_tailscale_funnel_off_uses_documented_syntax(tmp_path, monkeypatch):
-    calls = scripted_exec(monkeypatch, funnel=_FakeProc())
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    assert asyncio.run(tailscale_funnel_off()) is True
-    assert [argv for argv, _ in calls] == [("tailscale", "funnel", "--https=443", "off")]
-
-
 class _LineStream:
     def __init__(self, lines, hang=False):
         self._lines = list(lines)
@@ -1946,132 +1788,6 @@ class _CloudflaredFakeProc:
 
     async def wait(self):
         return self.returncode
-
-
-def test_cloudflared_quick_start_parses_url(tmp_path, monkeypatch):
-    calls = scripted_exec(
-        monkeypatch,
-        cloudflared=_CloudflaredFakeProc(
-            lines=[
-                b"2026-08-14T00:00:00Z INF +-----------------------------+\n",
-                b"INF |  https://abc123.trycloudflare.com  |\n",
-                b"INF +-----------------------------+\n",
-            ]
-        ),
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._cloudflared_quick_start())
-
-    assert calls[0][0][:3] == ("cloudflared", "--no-autoupdate", "tunnel")
-    assert "--url" in calls[0][0]
-    assert url == "https://abc123.trycloudflare.com"  # the endpoint stores the base URL
-    assert hint is None
-    assert ctrl._cloudflared.running is True
-
-
-def test_cloudflared_quick_start_exit_reports_output(tmp_path, monkeypatch):
-    scripted_exec(monkeypatch, cloudflared=_CloudflaredFakeProc(lines=[b"error: failed to connect\n"], returncode=1))
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._cloudflared_quick_start())
-
-    assert url is None
-    assert "exited before publishing a URL" in hint
-    assert "failed to connect" in hint
-
-
-def test_cloudflared_quick_start_timeout_kills_proc(tmp_path, monkeypatch):
-    monkeypatch.setattr("stream_archive.tunnels._CLOUDFLARED_QUICK_TIMEOUT", 0.01)
-    proc = _CloudflaredFakeProc(lines=[], hang=True)
-    scripted_exec(monkeypatch, cloudflared=proc)
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._cloudflared_quick_start())
-
-    assert url is None
-    assert "did not publish" in hint
-    assert proc.killed
-
-
-def test_cloudflared_quick_start_missing_binary(tmp_path, monkeypatch):
-    def missing(*args, **kwargs):
-        raise FileNotFoundError()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing)
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    url, hint = asyncio.run(ctrl._cloudflared_quick_start())
-
-    assert url is None
-    assert "cloudflared is not installed" in hint
-
-
-def test_cloudflared_named_start_registered(tmp_path, monkeypatch):
-    calls = scripted_exec(
-        monkeypatch, cloudflared=_CloudflaredFakeProc(lines=[b"INF Registered tunnel connection connIndex=0\n"])
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    ok, hint = asyncio.run(ctrl._cloudflared_named_start("tok"))
-
-    argv, kwargs = calls[0]
-    assert argv[:4] == ("cloudflared", "tunnel", "--no-autoupdate", "run")
-    # The install token is a credential: it goes in the child's
-    # environment, never on the world-readable command line.
-    assert "--token" not in argv
-    assert kwargs["env"]["TUNNEL_TOKEN"] == "tok"
-    assert ok is True
-    assert hint is None
-    assert ctrl._cloudflared.running is True
-
-
-def test_cloudflared_named_start_failure_reports_output(tmp_path, monkeypatch):
-    scripted_exec(
-        monkeypatch,
-        cloudflared=_CloudflaredFakeProc(
-            lines=[b"ERR failed to register tunnel connection: invalid token\n"],
-            returncode=1,
-        ),
-    )
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    ok, hint = asyncio.run(ctrl._cloudflared_named_start("bad"))
-
-    assert ok is False
-    assert "invalid token" in hint
-    assert ctrl._cloudflared.running is False
-
-
-def test_cloudflared_named_start_timeout_kills_proc(tmp_path, monkeypatch):
-    """A silent process has not registered: report a failed start, not a running tunnel."""
-    monkeypatch.setattr("stream_archive.tunnels._CLOUDFLARED_RUN_TIMEOUT", 0.01)
-    proc = _CloudflaredFakeProc(lines=[], hang=True, returncode=None)
-    scripted_exec(monkeypatch, cloudflared=proc)
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    ok, hint = asyncio.run(ctrl._cloudflared_named_start("tok"))
-
-    assert ok is False
-    assert "did not register" in hint
-    assert proc.killed
-    assert ctrl._cloudflared.running is False
-
-
-def test_cloudflared_token_and_url_helpers():
-    from stream_archive.config import normalize_endpoint_url
-    from stream_archive.tunnels import valid_token
-
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun", "s": "sec"}).encode()).decode()
-    assert valid_token(token)
-    assert valid_token(token.rstrip("="))  # unpadded still decodes
-    assert not valid_token("nope")
-    assert not valid_token(base64.b64encode(b"not json").decode())
-    assert not valid_token(base64.b64encode(json.dumps({"a": "acct"}).encode()).decode())  # missing t/s
-    assert normalize_endpoint_url("https://x.example.com") == "https://x.example.com"
-    assert normalize_endpoint_url("https://x.example.com/") == "https://x.example.com"
-    assert normalize_endpoint_url("https://x.example.com/kick/webhook") == "https://x.example.com"
-    assert normalize_endpoint_url("https://x.example.com/custom") == "https://x.example.com/custom"
 
 
 def test_callback_unknown_data_silent(tmp_path):
@@ -2308,7 +2024,7 @@ def test_reply_text_kick_webhook_menu_flow(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     text, markup = open_webhook_menu(ctrl)
     assert "Kick webhook: off" in text
-    assert "tunnels are set in Remote access" in text
+    assert "Set Kick URL saves your own public entry" in text
     assert kb_labels(markup) == webhook_labels(False)  # only the toggle and Back
     assert menu_of(ctrl).menu == "kick_webhook"
 
@@ -2319,7 +2035,7 @@ def test_reply_text_remote_access_menu(tmp_path):
     assert "Endpoint: off" in text
     assert "Kick webhook: off" in text
     assert "Control API: off" in text
-    assert "set the public URL" in text
+    assert "Paste a URL here to enable it with that address" in text
     assert kb_labels(markup) == remote_labels(False)
     assert menu_of(ctrl).menu == "remote_access"
 
@@ -2330,8 +2046,13 @@ def test_reply_text_remote_access_back_navigation(tmp_path):
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "remote_access"
     assert kb_labels(markup) == remote_labels(False)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    assert menu_of(ctrl).menu == "kick_cloudflare"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Kick webhook"))
+    assert menu_of(ctrl).menu == "kick_webhook"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Set Kick URL"))
+    assert menu_of(ctrl).menu == "kick_webhook_url"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert menu_of(ctrl).menu == "kick_webhook"
+    assert kb_labels(markup) == webhook_labels(False)
     text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
     assert menu_of(ctrl).menu == "remote_access"
     assert kb_labels(markup) == remote_labels(False)
@@ -2347,7 +2068,6 @@ def test_reply_text_remote_access_toggle_restores_the_saved_url(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     config.endpoint.public_url = "https://my-tunnel.example.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
     text, markup = open_remote_access(ctrl)
     assert kb_labels(markup) == remote_labels(False)
     text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
@@ -2361,15 +2081,11 @@ def test_reply_text_remote_access_toggle_restores_the_saved_url(tmp_path):
 def test_reply_text_remote_access_toggle_off_keeps_the_setup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://my-tunnel.example.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
     config.endpoint.enabled = True
-    stopped = []
-    ctrl._cloudflared_stop = lambda: stopped.append(1)
     open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Disable endpoint"))
     assert "Endpoint disabled" in text
     assert "Your setup is saved" in text
-    assert stopped == [1]
     assert menu_of(ctrl).menu == "remote_access"
     assert kb_labels(markup) == remote_labels(False)
     assert read_file(tmp_path)["endpoint"]["public_url"] == "https://my-tunnel.example.com/kick/webhook"
@@ -2492,21 +2208,10 @@ def test_reply_text_api_rotate_key_replaces_it(tmp_path):
     assert kb_labels(markup) == api_labels(True)
 
 
-def test_reply_text_kick_webhook_cloudflare_prompt(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    assert "Quick tunnel" in text
-    assert "Named tunnel" in text
-    assert kb_labels(markup) == cloudflare_labels(False)
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-
-
 def test_reply_text_kick_webhook_url_applies(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     text, markup = asyncio.run(ctrl.handle_reply_text("https://tunnel.trycloudflare.com/kick/webhook"))
     assert "Endpoint enabled" in text
     assert "https://tunnel.trycloudflare.com/kick/webhook" in text
@@ -2516,12 +2221,9 @@ def test_reply_text_kick_webhook_url_applies(tmp_path):
     w = read_file(tmp_path)["endpoint"]
     assert w["enabled"] is True
     assert w["public_url"] == "https://tunnel.trycloudflare.com"
-    assert w["tunnel"] == "cloudflare"
-    assert w["cloudflare_managed"] is False
-    assert kb_labels(markup) == cloudflare_labels(True)
     assert ctrl._kick_webhook.applied == [1]
     assert ctrl._kick_webhook.synced == [["twitch:channel1"]]
-    assert menu_of(ctrl).menu == "kick_cloudflare"
+    assert menu_of(ctrl).menu == "remote_access"
 
 
 def test_reply_text_kick_webhook_enable_rearms_setup_notification(tmp_path):
@@ -2529,7 +2231,6 @@ def test_reply_text_kick_webhook_enable_rearms_setup_notification(tmp_path):
     probe_ok(ctrl)
     config.kick.webhook.setup_notified = True  # already confirmed once before
     open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     asyncio.run(ctrl.handle_reply_text("https://tunnel.trycloudflare.com/kick/webhook"))
     assert read_file(tmp_path)["kick"]["webhook"]["setup_notified"] is False  # re-armed
 
@@ -2538,423 +2239,27 @@ def test_reply_text_kick_webhook_url_normalizes_root_path(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
     open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
     text, markup = asyncio.run(ctrl.handle_reply_text("https://tunnel.trycloudflare.com"))
     assert "Endpoint: https://tunnel.trycloudflare.com/" in text
     assert "https://tunnel.trycloudflare.com/kick/webhook" in text
     assert read_file(tmp_path)["endpoint"]["public_url"] == "https://tunnel.trycloudflare.com"
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-
-
-def test_reply_text_kick_webhook_quick_tunnel_enables(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-
-    async def fake_quick():
-        # The adapter already normalizes the tunnel output to a base URL.
-        return "https://abc123.trycloudflare.com", None
-
-    ctrl._cloudflared_quick_start = fake_quick
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
-    assert "Endpoint enabled" in text
-    assert "https://abc123.trycloudflare.com/kick/webhook" in text
-    assert "cloudflared quick tunnel is running" in text
-    assert "URL is reachable" in text
-    w = read_file(tmp_path)["endpoint"]
-    assert w["enabled"] is True
-    assert w["public_url"] == "https://abc123.trycloudflare.com"
-    assert w["tunnel"] == "cloudflare"
-    assert w["cloudflare_managed"] is True
-    assert w["cloudflare_token"] == ""
-    assert ctrl._kick_webhook.applied == [1]
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-
-
-def test_reply_text_kick_webhook_quick_tunnel_failure_stays(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    async def failing_quick():
-        return None, "cloudflared is not installed in this container."
-
-    ctrl._cloudflared_quick_start = failing_quick
-    before = read_file(tmp_path)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
-    assert "cloudflared is not installed" in text
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-    assert kb_labels(markup) == cloudflare_labels(False)
-    assert read_file(tmp_path) == before
-    assert ctrl._kick_webhook.applied == []
-
-
-def test_reply_text_kick_webhook_named_token_prompt(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    assert "cloudflared service install" in text
-    assert kb_labels(markup) == KICK_TOKEN_LABELS
-    assert menu_of(ctrl).menu == "kick_cloudflare_token"
-
-
-def test_reply_text_kick_webhook_named_token_accepted(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    started = []
-
-    async def fake_named(tok, config_path=None):
-        started.append((tok, config_path))
-
-    ctrl._cloudflared_named_start = fake_named
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text(f"cloudflared.exe service install {token}"))
-    assert "Tunnel token accepted" in text
-    assert "kick.example.com" in text
-    assert started == []  # cloudflared starts only after the hostname is known
-    assert read_file(tmp_path)["endpoint"]["cloudflare_token"] == token
-    assert read_file(tmp_path)["endpoint"]["enabled"] is False
-    assert kb_labels(markup) == KICK_TOKEN_LABELS
-    assert menu_of(ctrl).menu == "kick_cloudflare_hostname"
-
-
-def test_reply_text_kick_webhook_named_token_invalid_stays(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    before = read_file(tmp_path)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("cloudflared service install nope"))
-    assert "That doesn't look like a cloudflared tunnel token" in text
-    assert menu_of(ctrl).menu == "kick_cloudflare_token"
-    assert read_file(tmp_path) == before
-    assert ctrl._kick_webhook.applied == []
-
-
-def test_reply_text_kick_webhook_named_hostname_invalid_stays(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    asyncio.run(ctrl.handle_reply_text(token))
-    before = read_file(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_reply_text("nope"))
-    assert "doesn't look like a public hostname" in text
-    assert menu_of(ctrl).menu == "kick_cloudflare_hostname"
-    assert read_file(tmp_path) == before
-
-
-def test_reply_text_kick_webhook_named_flow_skip_dns(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    started = []
-
-    async def fake_named(tok, config_path=None):
-        started.append((tok, str(config_path)))
-        return True, None
-
-    ctrl._cloudflared_named_start = fake_named
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    asyncio.run(ctrl.handle_reply_text(token))
-    text, markup = asyncio.run(ctrl.handle_reply_text("kick.example.com"))
-    assert "kick.example.com" in text
-    assert kb_labels(markup) == ["Skip DNS", "Back"]
-    assert menu_of(ctrl).menu == "kick_cloudflare_dns"
-    text, markup = asyncio.run(ctrl.handle_reply_text("Skip DNS"))
-    assert "Endpoint enabled" in text
-    assert "https://kick.example.com/kick/webhook" in text
-    assert "CNAME kick.example.com \u2192 tun-id.cfargotunnel.com" in text
-    w = read_file(tmp_path)["endpoint"]
-    assert w["enabled"] is True
-    assert w["public_url"] == "https://kick.example.com"
-    assert w["tunnel"] == "cloudflare"
-    assert w["cloudflare_token"] == token
-    assert w["cloudflare_managed"] is True
-    assert len(started) == 1
-    assert started[0][0] == token
-    cfg_path = tmp_path / "cloudflared" / "tun-id.yml"
-    assert started[0][1] == str(cfg_path)
-    cfg = cfg_path.read_text()
-    assert "hostname: kick.example.com" in cfg
-    assert "service: http://127.0.0.1:8787" in cfg
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-
-
-def test_reply_text_kick_webhook_named_flow_with_api_token(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-
-    async def fake_named(tok, config_path=None):
-        return True, None
-
-    async def fake_dns(api_token, chat_id=None):
-        return True, "\u2705 DNS record created - the hostname now points at your tunnel."
-
-    ctrl._cloudflared_named_start = fake_named
-    ctrl._create_cloudflare_dns = fake_dns
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    asyncio.run(ctrl.handle_reply_text(token))
-    asyncio.run(ctrl.handle_reply_text("kick.example.com"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("api-token-123"))
-    assert "Endpoint enabled" in text
-    assert "DNS record created" in text
-    assert "CNAME kick.example.com" not in text  # no manual step needed
-    assert read_file(tmp_path)["endpoint"]["public_url"] == "https://kick.example.com"
-    assert menu_of(ctrl).menu == "kick_cloudflare"
-
-
-class _FakeCfResp:
-    def __init__(self, status_code, payload=None, text=""):
-        self.status_code = status_code
-        self._payload = payload
-        self.text = text
-
-    def json(self):
-        return self._payload
-
-
-class _FakeCfClient:
-    def __init__(self, zones, records=None, verify_status="active"):
-        self.zones = zones
-        self.records = records or []
-        self.verify_status = verify_status
-        self.calls = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def get(self, url, headers=None):
-        self.calls.append(("get", url))
-        if url.endswith("/user/tokens/verify"):
-            if self.verify_status == "account-owned":
-                return _FakeCfResp(401, {"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]})
-            return _FakeCfResp(200, {"result": {"status": self.verify_status}})
-        if url.endswith("/tokens/verify"):
-            return _FakeCfResp(200, {"result": {"status": "active"}})
-        if "/zones?per_page=50" in url:
-            return _FakeCfResp(200, {"result": self.zones})
-        if "/dns_records?" in url:
-            return _FakeCfResp(200, {"result": self.records})
-        return _FakeCfResp(404, {})
-
-    async def post(self, url, headers=None, json=None):
-        self.calls.append(("post", url, json))
-        return _FakeCfResp(200, {"result": json})
-
-
-def make_cf_ctrl(tmp_path, client):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    ctrl._http = client
-    ctrl._owns_http = False
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    config.endpoint.cloudflare_token = token
-    menu_of(ctrl).cloudflare_hostname = "kick.example.com"
-    return config, ctrl, token
-
-
-def test_create_cloudflare_dns_creates_record(tmp_path):
-    client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}])
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert ok is True
-    assert (
-        "post",
-        "https://api.cloudflare.com/client/v4/zones/z1/dns_records",
-        {
-            "type": "CNAME",
-            "name": "kick.example.com",
-            "content": "tun-id.cfargotunnel.com",
-            "proxied": True,
-        },
-    ) in client.calls
-
-
-def test_create_cloudflare_dns_picks_longest_zone_match(tmp_path):
-    client = _FakeCfClient(
-        zones=[
-            {"id": "z1", "name": "example.com"},
-            {"id": "z2", "name": "sub.example.com"},
-        ]
-    )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-    menu_of(ctrl).cloudflare_hostname = "kick.sub.example.com"
-
-    ok, _ = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert (
-        "post",
-        "https://api.cloudflare.com/client/v4/zones/z2/dns_records",
-        {
-            "type": "CNAME",
-            "name": "kick.sub.example.com",
-            "content": "tun-id.cfargotunnel.com",
-            "proxied": True,
-        },
-    ) in client.calls
-
-
-def test_create_cloudflare_dns_existing_same_target_ok(tmp_path):
-    client = _FakeCfClient(
-        zones=[{"id": "z1", "name": "example.com"}],
-        records=[{"content": "tun-id.cfargotunnel.com"}],
-    )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert ok is True
-    assert "already points" in message
-    assert not any(c[0] == "post" for c in client.calls)
-
-
-def test_create_cloudflare_dns_existing_other_target_fails(tmp_path):
-    client = _FakeCfClient(
-        zones=[{"id": "z1", "name": "example.com"}],
-        records=[{"content": "elsewhere.example.net"}],
-    )
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert ok is False
-    assert "already used" in message
-
-
-def test_create_cloudflare_dns_no_zone_fails(tmp_path):
-    client = _FakeCfClient(zones=[{"id": "z1", "name": "other.org"}])
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert ok is False
-    assert "No Cloudflare zone matches kick.example.com" in message
-
-
-def test_create_cloudflare_dns_account_owned_token_fallback(tmp_path):
-    # cfat_ account tokens cannot pass /user/tokens/verify. The account-scoped
-    # verify endpoint must be used instead.
-    client = _FakeCfClient(zones=[{"id": "z1", "name": "example.com"}], verify_status="account-owned")
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("cfat_..."))
-
-    assert ("get", "https://api.cloudflare.com/client/v4/accounts/acct/tokens/verify") in client.calls
-    assert (
-        "post",
-        "https://api.cloudflare.com/client/v4/zones/z1/dns_records",
-        {
-            "type": "CNAME",
-            "name": "kick.example.com",
-            "content": "tun-id.cfargotunnel.com",
-            "proxied": True,
-        },
-    ) in client.calls
-
-
-def test_create_cloudflare_dns_invalid_token_fails(tmp_path):
-    client = _FakeCfClient(zones=[], verify_status="expired")
-    config, ctrl, _ = make_cf_ctrl(tmp_path, client)
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("bad"))
-
-    assert ok is False
-    assert "not valid" in message
-
-
-def test_restore_named_tunnel_uses_local_config(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-    config.endpoint.public_url = "https://kick.example.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
-    config.endpoint.cloudflare_token = token
-    config.endpoint.cloudflare_managed = True
-    config.endpoint.enabled = True
-    started = []
-
-    async def fake_named(tok, config_path=None):
-        started.append((tok, str(config_path) if config_path else None))
-        return True, None
-
-    async def fake_send(text):
-        msg = f"unexpected admin message: {text}"
-        raise AssertionError(msg)
-
-    ctrl._cloudflared_named_start = fake_named
-    ctrl._send_admin = fake_send
-    asyncio.run(ctrl._restore_cloudflared())
-
-    cfg_path = tmp_path / "cloudflared" / "tun-id.yml"
-    assert started == [(token, str(cfg_path))]
-    assert "hostname: kick.example.com" in cfg_path.read_text()
-
-
-def test_reply_text_kick_webhook_named_dns_failure_stays(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "tun-id", "s": "sec"}).encode()).decode()
-
-    async def fake_named(tok, config_path=None):
-        return True, None
-
-    async def fake_dns(api_token, chat_id=None):
-        return False, "\u274c That Cloudflare API token is not valid."
-
-    ctrl._cloudflared_named_start = fake_named
-    ctrl._create_cloudflare_dns = fake_dns
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Named tunnel"))
-    asyncio.run(ctrl.handle_reply_text(token))
-    asyncio.run(ctrl.handle_reply_text("kick.example.com"))
-    before = read_file(tmp_path)
-    text, markup = asyncio.run(ctrl.handle_reply_text("bad-token"))
-    assert "not valid" in text
-    assert menu_of(ctrl).menu == "kick_cloudflare_dns"
-    assert read_file(tmp_path) == before
-    assert ctrl._kick_webhook.applied == []
+    assert menu_of(ctrl).menu == "remote_access"
 
 
 def test_reply_text_kick_webhook_off_keeps_the_setup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     probe_ok(ctrl)
-    stopped = []
-
-    async def fake_quick():
-        # cloudflared prints a base URL, which the adapter normalizes.
-        return "https://abc123.trycloudflare.com", None
-
-    ctrl._cloudflared_quick_start = fake_quick
-    ctrl._cloudflared_stop = lambda: stopped.append(1)
     open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Cloudflare tunnel"))
+    asyncio.run(ctrl.handle_reply_text("https://abc123.trycloudflare.com"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Disable endpoint"))
     assert "Endpoint disabled" in text
     assert "Your setup is saved" in text
-    assert stopped == [1]  # the managed tunnel stops
     w = read_file(tmp_path)["endpoint"]
     assert w["enabled"] is False
     assert w["public_url"] == "https://abc123.trycloudflare.com"  # kept for the next On
-    assert w["tunnel"] == "cloudflare"
-    assert w["cloudflare_managed"] is True
     assert ctrl._kick_webhook.applied == [1, 1]  # enable, then off reconciles the listener
-    assert menu_of(ctrl).menu == "kick_cloudflare"  # the Off press came from the Cloudflare menu
-    assert kb_labels(markup) == cloudflare_labels(False)
+    assert menu_of(ctrl).menu == "remote_access"  # the Off press came from the Remote access menu
+    assert kb_labels(markup) == remote_labels(False)
 
 
 def test_reply_text_kick_webhook_off_when_already_off(tmp_path):
@@ -2968,36 +2273,12 @@ def test_reply_text_kick_webhook_off_when_already_off(tmp_path):
     assert menu_of(ctrl).menu == "kick_webhook"
 
 
-def test_reply_text_remote_access_on_restarts_a_managed_quick_tunnel(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-    config.endpoint.public_url = "https://old.trycloudflare.com"
-    config.endpoint.tunnel = "cloudflare"
-    config.endpoint.cloudflare_managed = True
-    started = []
-
-    async def fake_quick():
-        started.append(1)
-        return "https://new.trycloudflare.com", None
-
-    ctrl._cloudflared_quick_start = fake_quick
-    open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
-    assert started == [1]
-    assert "Endpoint: https://new.trycloudflare.com/" in text
-    assert "https://new.trycloudflare.com/kick/webhook" in text
-    w = read_file(tmp_path)["endpoint"]
-    assert w["enabled"] is True
-    assert w["public_url"] == "https://new.trycloudflare.com"  # the quick URL rotates
-    assert kb_labels(markup) == remote_labels(True)
-
-
 def test_reply_text_remote_access_on_without_a_saved_setup(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     open_remote_access(ctrl)
     text, markup = asyncio.run(ctrl.handle_reply_text("Enable endpoint"))
-    assert "No saved tunnel yet" in text
+    assert "No saved public URL yet" in text
     assert read_file(tmp_path) == before
     assert ctrl._kick_webhook.applied == []
     assert kb_labels(markup) == remote_labels(False)
@@ -3017,230 +2298,73 @@ def test_reply_text_webhook_toggle_on_and_off(tmp_path):
     assert kb_labels(markup) == webhook_labels(False)
 
 
-def test_reply_text_kick_webhook_tailscale_detected(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-
-    async def fake_tailscale():
-        return "https://box.tail1234.ts.net", None
-
-    ctrl._tailscale_webhook_url = fake_tailscale
-    open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    assert "Tailscale funnel: off" in text
-    assert kb_labels(markup) == tailscale_labels(False)
-    assert menu_of(ctrl).menu == "kick_tailscale"
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
-    assert "https://box.tail1234.ts.net" in text
-    assert "tailscale funnel 8787 is enabled" in text
-    # No reachability probe for tailscale. The funnel is verified against the
-    # daemon, and the container cannot reach the host's tailnet IP (hairpin).
-    assert "URL is reachable" not in text
-    assert "doesn't respond yet" not in text
-    assert read_file(tmp_path)["endpoint"]["enabled"] is True
-    assert read_file(tmp_path)["endpoint"]["public_url"] == "https://box.tail1234.ts.net"
-    assert read_file(tmp_path)["endpoint"]["tunnel"] == "tailscale"
-    assert ctrl._kick_webhook.applied == [1]
-    assert menu_of(ctrl).menu == "kick_tailscale"
-    assert kb_labels(markup) == tailscale_labels(True)
-
-
-def test_reply_text_kick_webhook_tailscale_fallback_to_input(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-
-    async def no_tailscale():
-        return None, "Tailscale is not installed in this container."
-
-    ctrl._tailscale_webhook_url = no_tailscale
-    before = read_file(tmp_path)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
-    assert "Tailscale is not installed" in text
-    assert "Cloudflare tunnel instead" in text
-    assert menu_of(ctrl).menu == "kick_tailscale"
-    assert kb_labels(markup) == tailscale_labels(False)
-    assert read_file(tmp_path) == before
-    assert ctrl._kick_webhook.applied == []
+def test_webhook_enable_on_tailnet_endpoint_warns(tmp_path):
+    """A tailnet panel address cannot take Kick events, but the enable is no
+    longer refused: the reply warns and the probe note says unreachable."""
+    config = base_config()
+    config["endpoint"] = {
+        "enabled": True,
+        "listen_host": "0.0.0.0",
+        "listen_port": 8787,
+        "public_url": "https://box.tailnet.ts.net",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config, indent=4))
+    loaded = get_config(tmp_path / "config.json")
+    ctrl = TelegramController(
+        loaded,
+        FakeRecorder(),
+        FakeMonitor(),
+        FakeEventSub(),
+        on_restart=None,
+        kick_webhook=FakeKickWebhook(),
+    )
+    open_webhook_menu(ctrl)
+    text, _ = asyncio.run(ctrl.handle_reply_text("Enable Kick webhook"))
+    assert "tailnet" in text
+    assert loaded.kick.webhook.enabled is True
+    assert read_file(tmp_path)["kick"]["webhook"]["enabled"] is True
 
 
-def test_reply_text_kick_tailscale_off_turns_off_the_funnel(tmp_path, monkeypatch):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://box.tail1234.ts.net"
-    config.endpoint.tunnel = "tailscale"
-    config.endpoint.enabled = True
-    funnel_off_calls = []
-
-    async def fake_funnel_off():
-        funnel_off_calls.append(1)
-        return True
-
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook.tailscale_funnel_off", fake_funnel_off)
-    open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    assert kb_labels(markup) == tailscale_labels(True)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Tailscale funnel"))
-    assert funnel_off_calls == [1]
-    assert "Your setup is saved" in text
-    w = read_file(tmp_path)["endpoint"]
-    assert w["enabled"] is False
-    assert w["tunnel"] == "tailscale"  # saved for the next On press
-    assert w["public_url"] == "https://box.tail1234.ts.net"
-    assert kb_labels(markup) == tailscale_labels(False)
-
-
-def test_switch_tailscale_to_cloudflare_tears_down_funnel(tmp_path, monkeypatch):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-    config.endpoint.public_url = "https://box.tail1234.ts.net"
-    config.endpoint.tunnel = "tailscale"
-    config.endpoint.enabled = True
-    funnel_off_calls = []
-
-    async def fake_quick():
-        return "https://abc123.trycloudflare.com", None
-
-    async def fake_funnel_off():
-        funnel_off_calls.append(1)
-        return True
-
-    ctrl._cloudflared_quick_start = fake_quick
-    monkeypatch.setattr("stream_archive.telegram.commands_webhook.tailscale_funnel_off", fake_funnel_off)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    asyncio.run(ctrl.handle_reply_text("Quick tunnel"))
-    assert funnel_off_calls == [1]
-    w = read_file(tmp_path)["endpoint"]
-    assert w["tunnel"] == "cloudflare"
-    assert w["enabled"] is True
-
-
-def test_switch_cloudflare_to_tailscale_stops_cloudflared(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://abc123.trycloudflare.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
-    config.endpoint.cloudflare_token = ""
-    config.endpoint.cloudflare_managed = True
-    config.endpoint.enabled = True
-    stopped = []
-
-    async def fake_tailscale():
-        return "https://box.tail1234.ts.net", None
-
-    ctrl._tailscale_webhook_url = fake_tailscale
-    ctrl._cloudflared_stop = lambda: stopped.append(1)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Tailscale funnel"))
-    asyncio.run(ctrl.handle_reply_text("Enable Tailscale funnel"))
-    assert stopped == [1]
-    w = read_file(tmp_path)["endpoint"]
-    assert w["tunnel"] == "tailscale"
-    assert w["cloudflare_token"] == ""
-    assert w["cloudflare_managed"] is False
-
-
-def test_cloudflare_off_leaves_another_tunnel_alone(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://box.tail1234.ts.net"
-    config.endpoint.tunnel = "tailscale"
-    config.endpoint.enabled = True
-    before = read_file(tmp_path)
-    open_remote_access(ctrl)
-    text, markup = asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    assert kb_labels(markup) == cloudflare_labels(False)  # cloudflare itself is off
-    text, markup = asyncio.run(ctrl.handle_reply_text("Disable Cloudflare tunnel"))
-    assert "Cloudflare tunnel is not on" in text
-    assert read_file(tmp_path) == before  # the tailscale webhook keeps running
-
-
-def test_cloudflare_on_without_a_saved_cloudflare_tunnel(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://box.tail1234.ts.net"
-    config.endpoint.tunnel = "tailscale"
-    before = read_file(tmp_path)
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Cloudflare tunnel"))
-    assert "No saved Cloudflare tunnel" in text
-    assert read_file(tmp_path) == before
-    assert kb_labels(markup) == cloudflare_labels(False)
-
-
-def test_cloudflare_on_restores_a_saved_cloudflare_tunnel(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    probe_ok(ctrl)
-    config.endpoint.public_url = "https://my-tunnel.example.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
-    open_remote_access(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Cloudflare tunnel"))
-    text, markup = asyncio.run(ctrl.handle_reply_text("Enable Cloudflare tunnel"))
-    assert "Endpoint enabled" in text
-    assert read_file(tmp_path)["endpoint"]["enabled"] is True
-    assert kb_labels(markup) == cloudflare_labels(True)
-
-
-def test_restore_quick_tunnel_new_url_rearms_confirmation(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://old.trycloudflare.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
-    config.endpoint.cloudflare_managed = True
-    config.kick.webhook.setup_notified = True  # confirmed before the restart
-    config.endpoint.enabled = True
-    sent = []
-
-    async def fake_quick():
-        return "https://new.trycloudflare.com", None  # the adapter returns a base URL
-
-    async def fake_send(text):
-        sent.append(text)
-
-    ctrl._cloudflared_quick_start = fake_quick
-    ctrl._send_admin = fake_send
-    probe_ok(ctrl)
-    asyncio.run(ctrl._restore_cloudflared())
-    w = read_file(tmp_path)["endpoint"]
-    assert w["public_url"] == "https://new.trycloudflare.com"
-    assert read_file(tmp_path)["kick"]["webhook"]["setup_notified"] is False  # re-armed
-    assert len(sent) == 1
-    assert "new temporary URL" in sent[0]
-    assert "URL is reachable" in sent[0]
-
-
-def test_restore_quick_tunnel_same_url_stays_silent(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    config.endpoint.public_url = "https://same.trycloudflare.com/kick/webhook"
-    config.endpoint.tunnel = "cloudflare"
-    config.endpoint.cloudflare_managed = True
-    config.kick.webhook.setup_notified = True
-    config.endpoint.enabled = True
-    sent = []
-
-    async def fake_quick():
-        return "https://same.trycloudflare.com", None  # the adapter returns a base URL
-
-    async def fake_send(text):
-        sent.append(text)
-
-    ctrl._cloudflared_quick_start = fake_quick
-    ctrl._send_admin = fake_send
-    before = read_file(tmp_path)
-    asyncio.run(ctrl._restore_cloudflared())
-    assert config.kick.webhook.setup_notified is True  # live config untouched
-    assert read_file(tmp_path) == before
-    assert sent == []
+def test_webhook_enable_allowed_with_separate_kick_url(tmp_path):
+    """A separate public Kick entry allows the enable on a serve endpoint."""
+    config = base_config()
+    config["endpoint"] = {
+        "enabled": True,
+        "listen_host": "0.0.0.0",
+        "listen_port": 8787,
+        "public_url": "https://box.tailnet.ts.net",
+    }
+    config["kick"] = {
+        "record_chat": True,
+        "webhook": {"enabled": False, "public_url": "https://kick.example.com"},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config, indent=4))
+    loaded = get_config(tmp_path / "config.json")
+    ctrl = TelegramController(
+        loaded,
+        FakeRecorder(),
+        FakeMonitor(),
+        FakeEventSub(),
+        on_restart=None,
+        kick_webhook=FakeKickWebhook(),
+    )
+    menu_text, _ = open_webhook_menu(ctrl)
+    assert "https://kick.example.com/kick/webhook (own entry)" in menu_text
+    text, _ = asyncio.run(ctrl.handle_reply_text("Enable Kick webhook"))
+    assert "Kick webhook enabled" in text
+    assert loaded.kick.webhook.enabled is True
+    assert read_file(tmp_path)["kick"]["webhook"]["enabled"] is True
 
 
 def test_menu_texts_split_endpoint_and_webhook(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     config.endpoint.public_url = "https://abc123.trycloudflare.com"
-    config.endpoint.tunnel = "cloudflare"
     config.endpoint.enabled = True
     config.kick.webhook.enabled = True
     webhook_text = asyncio.run(ctrl.menu_text("kick_webhook"))
     assert "Kick webhook: on" in webhook_text
-    assert "cloudflare" not in webhook_text  # the URL lives with the endpoint
     remote_text = asyncio.run(ctrl.menu_text("remote_access"))
-    assert "Endpoint: on (cloudflare \u00b7 https://abc123.trycloudflare.com/)" in remote_text
+    assert "Endpoint: on (https://abc123.trycloudflare.com/)" in remote_text
 
 
 def test_reply_text_channel_hold_menu(tmp_path):
@@ -3378,37 +2502,6 @@ def test_remove_clears_hold_override(tmp_path):
     assert "twitch:channel1" not in read_file(tmp_path)["channels"]
 
 
-def test_create_cloudflare_dns_html_verify_body_reports_invalid(tmp_path):
-    """A proxy 502 HTML page on token verify returns (False, message), with a
-    'not valid' message, and never escapes as a JSONDecodeError during the
-    setup flow."""
-
-    class _HtmlVerifyResp:
-        status_code = 200
-        text = "<html><body>502 Bad Gateway</body></html>"
-
-        def json(self):
-            msg = "Expecting value"
-            raise json.JSONDecodeError(msg, self.text, 0)
-
-    class _HtmlCfClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def get(self, url, headers=None):
-            return _HtmlVerifyResp()
-
-    config, ctrl, _ = make_cf_ctrl(tmp_path, _HtmlCfClient())
-
-    ok, message = asyncio.run(ctrl._create_cloudflare_dns("apitok"))
-
-    assert ok is False
-    assert "not valid" in message
-
-
 def test_every_advertised_command_has_a_handler(tmp_path):
     """The help text and the Telegram /-menu must not name a command without a handler."""
     from telegram.ext import CommandHandler
@@ -3466,28 +2559,6 @@ def test_reload_reconciles_the_listener(tmp_path):
     assert text == "\u2705 Config reloaded from config.json"
     assert ctrl._kick_webhook.applied == [1]
     assert ctrl._kick_webhook.synced == [ctrl._config.channels]
-
-
-def test_write_cloudflared_config_keeps_the_file_inside_its_directory(tmp_path):
-    """A token can carry a hostile tunnel id, so the file name must not hold a path."""
-    _, ctrl, _, _, _ = make_controller(tmp_path)
-    token = base64.b64encode(json.dumps({"a": "acct", "t": "../../etc/evil", "s": "sec"}).encode()).decode()
-    ctrl._config.endpoint.cloudflare_token = token
-
-    path = asyncio.run(ctrl._write_cloudflared_config("kick.example.com"))
-
-    assert path.parent == tmp_path / "cloudflared"
-    assert path.name == "tunnel.yml"
-    assert path.exists()
-
-
-def test_parse_public_hostname_rejects_malformed_input():
-    from stream_archive.tunnels import parse_public_hostname
-
-    assert parse_public_hostname("https://[::1") is None  # unclosed IPv6 bracket
-    assert parse_public_hostname("not a hostname") is None
-    assert parse_public_hostname("https://kick.example.com/path") == "kick.example.com"
-    assert parse_public_hostname("kick.example.com.") == "kick.example.com"
 
 
 def _admin_update(user_id, text="hi"):
@@ -3597,3 +2668,15 @@ def test_reload_reports_a_released_channel_even_when_applying_fails(tmp_path):
     assert "listener rebind failed" in text
     assert "twitch:channel2" in text
     assert recorder.stop_calls == ["twitch:channel2"]
+
+
+def test_reply_text_kick_webhook_test_delivery_reports_result(tmp_path):
+    """The Test delivery button runs the listener's proof and reports it."""
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    open_webhook_menu(ctrl)
+    text, markup = asyncio.run(ctrl.handle_reply_text("Test delivery"))
+    assert text.startswith("\u2705 ")
+    assert "first delivery in 3s" in text
+    assert ctrl._kick_webhook.verified == [180.0]
+    assert menu_of(ctrl).menu == "kick_webhook"
+    assert kb_labels(markup) == webhook_labels(False)

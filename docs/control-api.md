@@ -28,9 +28,10 @@ The bot sends the key as code text. Tap the key to put it on the clipboard.
 | Item | Value |
 | --- | --- |
 | Base URL | `<endpoint.public_url>/api/v1/` |
-| Kick webhook URL | `<endpoint.public_url>/kick/webhook` |
+| Kick webhook URL | `<kick.webhook.public_url or endpoint.public_url>/kick/webhook` |
 
-The endpoint is the listener plus its tunnel. Open **Settings → Remote access** in
+The endpoint is the private listener (panel plus API). A tailnet serve or
+your own reverse proxy publishes it. Open **Settings → Remote access** in
 Telegram to see its state and to turn it on. While the endpoint is off, the
 API answers on the local address only.
 
@@ -43,10 +44,16 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 curl -H "X-API-Key: $API_KEY" https://streamarchive.example.com/api/v1/status
 ```
 
+A live panel session works instead of the key (the browser sends its
+cookie; state-changing calls still need the `X-CSRF-Token` header). The
+panel and scripts share the one API at `/api/v1/`.
+
 | Answer | Meaning |
 | --- | --- |
 | `401` | The key is missing or wrong. |
+| `403` | A session call without (or with a wrong) CSRF token. |
 | `404` | The API is off, or no key was generated yet. The routes behave as if they do not exist. |
+| `429` | Too many failed key attempts from your address. Wait and try again. |
 
 Keep the key secret. Anyone who has it can change your channels and
 settings.
@@ -63,6 +70,7 @@ settings.
 | `GET` | `/api/v1/channels/<channel>` | One channel |
 | `PATCH` | `/api/v1/channels/<channel>` | Change per-channel settings |
 | `DELETE` | `/api/v1/channels/<channel>` | Remove a channel |
+| `POST` | `/api/v1/kick/webhook/test` | Run the Kick delivery test, report its timed result |
 
 A channel name carries its platform prefix, for example `twitch:example` or
 `kick:example`. If your client requires it, percent-encode the colon as
@@ -110,7 +118,6 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
   "disk": {"max_total_gb": 0.0, "delete_oldest": false},
   "endpoint": {
     "enabled": true,
-    "tunnel": "cloudflare",
     "public_url": "https://streamarchive.example.com"
   },
   "kick_webhook": {"enabled": true},
@@ -119,8 +126,8 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 }
 ```
 
-The answer never contains a secret. The API key, the bot token, and the
-tunnel token stay in `config.json`.
+The answer never contains a secret. The API key and the bot token
+stay in `config.json`.
 
 ### Write
 
@@ -262,7 +269,8 @@ after you confirm. The API changes nothing.
 ## Behavior
 
 - Every applied change sends the admin a Telegram message with the origin
-  `Control API`, so you see what an API client did.
+  (`Control API`, or `Web panel` for a panel-session call), so you see what
+  changed it.
 - Every change goes through the same validation and the same atomic
   `config.json` write as a Telegram change. A rejected change changes
   nothing.

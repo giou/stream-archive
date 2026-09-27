@@ -54,7 +54,7 @@ main { margin: 0; padding: 0.5rem 0.75rem 4rem; }
 .rec-chatpane { grid-area: chat; min-width: 0; align-self: stretch; }
 .rec-chatpane .card { margin-bottom: 0; height: 100%; display: flex; flex-direction: column; }
 #chat-log { max-height: 70vh; overflow-y: auto; display: grid; gap: 0.35rem; margin-top: 0.5rem; flex: 1 1 auto; }
-.chat-msg { overflow-wrap: anywhere; font-size: 0.92rem; cursor: pointer; }
+.chat-msg { overflow-wrap: anywhere; font-size: 0.92rem; cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 2.2rem; }
 .chat-msg .user { font-weight: 600; }
 .chat-emote { height: 1.75rem; vertical-align: middle; }
 .chat-msg.future { opacity: 0.45; }
@@ -180,6 +180,10 @@ input, select {
 #player-wrap {
   position: sticky;
   top: 8px;
+  /* The header sticks to the top of the viewport. This margin keeps
+     scrollIntoView from sliding the player under the header. The script
+     sets the exact value when the player opens. */
+  scroll-margin-top: 80px;
   z-index: 5;
   background: var(--bg);
   border: 1px solid var(--border);

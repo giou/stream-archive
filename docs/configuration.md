@@ -39,17 +39,17 @@ file with placeholders is safe to commit or to share.
 | `kick.record_chat` | no | `true` | Record Kick chat (the webhook delivers it). Requires `kick.webhook.enabled` |
 | `kick.webhook.enabled` | no | `false` | Receive Kick webhooks (live, offline, and chat) and keep the subscriptions in sync. `false` = Kick polling only (no chat). While it is `false`, the receiver ignores deliveries and the app deletes the subscriptions of the monitored channels |
 | `kick.webhook.setup_notified` | no | `false` | Internal: tracks the "webhook is working" confirmation for the current enable |
-| `endpoint.enabled` | no | `false` | Serve the public endpoint: the HTTP listener plus its tunnel. The Kick webhook and the control API use it |
-| `endpoint.listen_host` | no | `127.0.0.1` | Bind address of the listener. Set `0.0.0.0` under Docker, so the host tunnel reaches it |
-| `endpoint.listen_port` | no | `8787` | Port of the listener. The tunnels forward to it |
-| `endpoint.public_url` | yes² | `""` | Public base URL of the endpoint, for example `https://streamarchive.example.com`. Kick POSTs to `<base>/kick/webhook`. The control API answers on `<base>/api/v1/`. Required when `endpoint.enabled` is true |
-| `endpoint.tunnel` | no | `""` | `cloudflare` or `tailscale` when the bot manages the tunnel. The bot sets this key |
-| `endpoint.cloudflare_token` | no | `""` | cloudflared tunnel token for a managed Cloudflare tunnel |
-| `endpoint.cloudflare_managed` | no | `false` | True when the bot started the Cloudflare tunnel itself. The app restores it on boot |
-| `api.enabled` | no | `false` | Serve the HTTP control API under `/api/v1` on the Kick webhook listener. The bot sets this key |
+| `kick.webhook.public_url` | no | `""` | Separate public entry for Kick deliveries. Empty follows `endpoint.public_url`. Set it when the endpoint serves a tailnet that Kick cannot reach. The app manages no tunnel for it |
+| `kick.webhook.listen_host` | no | `127.0.0.1` | Bind address of the webhook-only listener. Set `0.0.0.0` under Docker |
+| `kick.webhook.listen_port` | no | `8788` | Port of the webhook-only listener. The public proxy targets this port. It serves `POST /kick/webhook` and nothing else |
+| `endpoint.enabled` | no | `false` | Serve the private listener: the web panel and the control API. The Kick webhook has its own listener below |
+| `endpoint.listen_host` | no | `127.0.0.1` | Bind address of the private listener. Set `0.0.0.0` under Docker, so the host proxy reaches it |
+| `endpoint.listen_port` | no | `8787` | Port of the private listener. Tailnet serve and the private side of the proxy target it |
+| `endpoint.public_url` | yes² | `""` | Public base URL of the endpoint, for example `https://streamarchive.example.com`. The panel lives at the root. Required when `endpoint.enabled` is true |
+| `api.enabled` | no | `false` | Serve the HTTP control API under `/api/v1` on the private listener. The bot sets this key |
 | `api.key` | no | `""` | API key (bearer token). The bot generates it on the first enable. Keep it secret |
-| `web.enabled` | no | `false` | Serve the browser control panel at the domain root on the shared listener. See [Web control panel](web-control.md) |
-| `web.password_hash` | no | `""` | PBKDF2 hash of the panel password. Set it with `stream-archive-setup-web`. Empty locks the panel |
+| `web.enabled` | no | `false` | Serve the browser control panel at the domain root on the private listener. See [Web control panel](web-control.md) |
+| `web.password_hash` | no | `""` | PBKDF2 hash of the panel password. Set it with `stream-archive-setup` or `stream-archive-setup-web`. Empty locks the panel |
 | `web.session_secret` | no | `""` | HMAC secret of the panel sessions. The first boot with the panel on generates and stores one, so logins survive restarts |
 | `mtproto.enabled` | no | `false` | Send recordings over MTProto (up to 2 GB). The Bot API allows 50 MB only. The bot sets this key |
 | `mtproto.api_id` | yes³ | `0` | Telegram app api id from my.telegram.org. Use `${TELEGRAM_API_ID}`. Required when `mtproto.enabled` is true |
@@ -77,9 +77,11 @@ Streamlink and the `twitch.py` plugin are not part of the update check. The
 image build fetches the newest plugin release, and Dependabot opens the
 streamlink updates as pull requests. Both ship in a new image.
 
-Older files keep the listener, the public URL, and the tunnel keys under
+Older files keep the listener and the public URL under
 `kick.webhook`, for example `kick.webhook.listen_host`. The app moves these
-keys to `endpoint` when it loads the file and keeps both features on. A file
+keys to `endpoint` when it loads the file and keeps both features on. The
+old tunnel keys (`tunnel`, `cloudflare_token`, `cloudflare_managed`) are
+dropped: tunnels are user-managed now. A file
 that already has an `endpoint` section is not changed. A working setup keeps
 working, and the first save writes the new layout.
 
@@ -88,7 +90,7 @@ working, and the first save writes the new layout.
 
 ## Related guides
 
-- [Kick webhook](kick-webhook.md) sets `endpoint.public_url` and the tunnel.
+- [Kick webhook](kick-webhook.md) sets the public URLs for deliveries.
 - [Control API](control-api.md) changes channels and settings over HTTP.
 - [Web control panel](web-control.md) replaces the bot in the browser.
 - [Plugin override](development.md#plugin-override) replaces the plugin in the

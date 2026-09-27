@@ -12,7 +12,9 @@ Do this procedure only when `output_mode` is `youtube` or `both`.
 
    While the app is in *Testing*, refresh tokens expire after 7 days and only
    test users can authorize. Publishing keeps the token valid.
-4. Run the one-time authorization flow:
+4. Run the one-time authorization flow. The setup wizard
+   (`stream-archive-setup`) runs this flow as one of its steps. To run it
+   alone:
 
    ```sh
    docker compose run --rm stream-archive stream-archive-setup-youtube

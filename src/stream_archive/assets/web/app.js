@@ -284,7 +284,7 @@ async function loadStatus(quiet) {
       ["Telegram bot", s.telegram_enabled ? "on" : "off"],
     ]);
     const access = kvCard("Access", [
-      ["Endpoint", s.endpoint.enabled ? "on (" + s.endpoint.tunnel + ")" : "off"],
+      ["Endpoint", s.endpoint.enabled ? "on" : "off"],
       ["Public URL", s.endpoint.public_url || "none"],
       ["Kick webhook", s.kick_webhook.enabled ? "on" : "off"],
       ["MTProto upload", s.mtproto.enabled ? "on" : "off"],
@@ -353,7 +353,7 @@ function actionBtn(label, cls, fn) {
 async function loadChannels() {
   try {
     const [data, feed] = await Promise.all([
-      api("/api/channels"),
+      api("/api/v1/channels"),
       api("/api/events?limit=200").catch(() => ({})),
     ]);
     const lastByChannel = new Map();
@@ -399,7 +399,7 @@ async function loadChannels() {
       modeSel.setAttribute("aria-label", "Output mode for " + ch.channel);
       modeSel.addEventListener("change", async () => {
         try {
-          await api("/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ output_mode: modeSel.value }),
           });
@@ -424,7 +424,7 @@ async function loadChannels() {
       qInput.addEventListener("change", async () => {
         try {
           const v = qInput.value.trim() || "default";
-          await api("/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ quality: v }),
           });
@@ -458,7 +458,7 @@ async function loadChannels() {
             return;
           }
           const v = raw === "" ? "default" : Number(raw);
-          await api("/api/channels/" + encodeURIComponent(ch.channel), {
+          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ youtube_hold_seconds: v }),
           });
@@ -474,7 +474,7 @@ async function loadChannels() {
       wrap.className = "row-actions";
       wrap.appendChild(actionBtn("Remove", "danger", async () => {
         if (!window.confirm("Remove " + ch.channel + "?")) return;
-        await api("/api/channels/" + encodeURIComponent(ch.channel), { method: "DELETE" });
+        await api("/api/v1/channels/" + encodeURIComponent(ch.channel), { method: "DELETE" });
         toast("Channel removed");
         loadChannels();
         loadStatus();
@@ -583,7 +583,7 @@ const settingGetters = {};
 
 async function loadSettings() {
   try {
-    const s = await api("/api/settings");
+    const s = await api("/api/v1/settings");
     s.disk = obj(s.disk);
     const form = $("settings-form");
     form.textContent = "";
@@ -637,6 +637,9 @@ function stickPlayer() {
   if (header && !wrap.hidden) {
     const top = header.offsetHeight + 8 + "px";
     wrap.style.top = top;
+    // Keep scrollIntoView clear of the sticky header. The header height
+    // changes with the viewport width, so the script sets the margin here.
+    wrap.style.scrollMarginTop = top;
     const pane = document.querySelector(".rec-playerpane");
     if (pane) pane.style.top = top;
   }
@@ -747,9 +750,14 @@ async function playRecording(entry, collapse = true) {
   wrapEl.hidden = false;
   if (collapse) setListHidden(true);
   layoutStage();
-  fitPlayer($("player-wrap"), $("player"));
   stickPlayer();
-  wrapEl.scrollIntoView({ block: "nearest" });
+  // block:start aligns the player top on every open. block:nearest stops
+  // half way when the player is taller than the viewport. The scroll margin
+  // from stickPlayer keeps the player clear of the sticky header.
+  wrapEl.scrollIntoView({ block: "start" });
+  // Measure after the scroll: the rect is viewport-relative, so the fit
+  // uses the settled position and shrinks the player on short windows.
+  fitPlayer($("player-wrap"), $("player"));
   loadChat(entry.id, entry.name).catch(() => {});
   player.src = "/api/recordings/stream?id=" + encodeURIComponent(entry.id);
   const stored = loadPositions()[entry.id];
@@ -786,6 +794,7 @@ function closePlayer() {
   if ($("player-wrap").hidden) return;
   const player = $("player");
   playToken++;
+  chatLoadToken++;
   savePosition(currentPlayId, player.currentTime, player.duration);
   lastSavedAt = -1;
   player.pause();
@@ -798,6 +807,8 @@ function closePlayer() {
   $("chat-panel").hidden = true;
   document.querySelector(".rec-stage").classList.remove("no-chat");
   chatMessages = [];
+  lastChatIdx = -1;
+  lastChatSecond = -1;
   currentPlayId = null;
   updatePlayerNav();
   setListHidden(false);
@@ -900,8 +911,58 @@ function watchPlayerSize() {
 
 let chatMessages = [];
 let lastChatSecond = -1;
+let lastChatIdx = -1;
+let chatLoadToken = 0;
+const CHAT_PAGE_SIZE = 5000;
+
+function appendChatNodes(page) {
+  const log = $("chat-log");
+  const frag = document.createDocumentFragment();
+  for (const m of page) {
+    const div = document.createElement("div");
+    div.className = "chat-msg future";
+    div.setAttribute("role", "button");
+    div.setAttribute("tabindex", "0");
+    div.setAttribute("title", "Jump to " + Math.floor(m.t) + "s");
+    div.dataset.t = String(m.t);
+    const user = document.createElement("span");
+    user.className = "user";
+    user.textContent = m.user + " ";
+    div.appendChild(user);
+    appendChatText(div, m.text, m.emotes);
+    frag.appendChild(div);
+  }
+  log.appendChild(frag);
+}
+
+function bindChatLogOnce() {
+  const log = $("chat-log");
+  if (log.dataset.bound) return;
+  log.dataset.bound = "1";
+  const activateRow = (row) => {
+    if (!row) return;
+    const t = Number(row.dataset.t);
+    if (!Number.isFinite(t)) return;
+    const player = $("player");
+    player.currentTime = Math.max(0, t - 1);
+    player.play().catch(() => {});
+  };
+  log.addEventListener("click", (e) => {
+    const row = e.target.closest ? e.target.closest(".chat-msg") : null;
+    if (row && log.contains(row)) activateRow(row);
+  });
+  log.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const row = e.target.closest ? e.target.closest(".chat-msg") : null;
+    if (row && log.contains(row)) {
+      e.preventDefault();
+      activateRow(row);
+    }
+  });
+}
 
 async function loadChat(id, name) {
+  const my = ++chatLoadToken;
   const panel = $("chat-panel");
   const log = $("chat-log");
   const note = $("chat-note");
@@ -911,45 +972,45 @@ async function loadChat(id, name) {
   panel.hidden = false;
   chatMessages = [];
   lastChatSecond = -1;
+  lastChatIdx = -1;
+  bindChatLogOnce();
   try {
-    const data = await api("/api/chat?id=" + encodeURIComponent(id));
-    chatMessages = data.messages || [];
-    if (!chatMessages.length) {
-      panel.hidden = true;
-      document.querySelector(".rec-stage").classList.add("no-chat");
-      return;
+    let offset = 0;
+    let total = Infinity;
+    let first = true;
+    for (;;) {
+      if (my !== chatLoadToken) return;
+      const data = await api(
+        "/api/chat?id=" + encodeURIComponent(id) + "&offset=" + offset + "&limit=" + CHAT_PAGE_SIZE
+      );
+      if (my !== chatLoadToken) return;
+      const page = data.messages || [];
+      if (typeof data.total === "number" && Number.isFinite(data.total)) {
+        total = data.total;
+      } else {
+        total = data.truncated ? offset + page.length + 1 : offset + page.length;
+      }
+      if (first && !page.length && !total) {
+        panel.hidden = true;
+        document.querySelector(".rec-stage").classList.add("no-chat");
+        return;
+      }
+      first = false;
+      document.querySelector(".rec-stage").classList.remove("no-chat");
+      for (const m of page) chatMessages.push(m);
+      appendChatNodes(page);
+      offset += page.length;
+      if (offset < total) {
+        note.textContent = "Loading chat… " + chatMessages.length + " of " + total + ".";
+        note.hidden = false;
+      }
+      syncChat(true);
+      if (my !== chatLoadToken) return;
+      if (!page.length || offset >= total) break;
     }
-    document.querySelector(".rec-stage").classList.remove("no-chat");
-    for (const m of chatMessages) {
-      const div = document.createElement("div");
-      div.className = "chat-msg future";
-      div.setAttribute("role", "button");
-      div.setAttribute("tabindex", "0");
-      div.setAttribute("title", "Jump to " + Math.floor(m.t) + "s");
-      const activate = () => {
-        const player = $("player");
-        player.currentTime = Math.max(0, m.t - 1);
-        player.play().catch(() => {});
-      };
-      div.addEventListener("click", activate);
-      div.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          activate();
-        }
-      });
-      const user = document.createElement("span");
-      user.className = "user";
-      user.textContent = m.user + " ";
-      div.appendChild(user);
-      appendChatText(div, m.text, m.emotes);
-      log.appendChild(div);
-    }
-    if (data.truncated) {
-      note.textContent = "Showing first " + chatMessages.length + " messages.";
-      note.hidden = false;
-    }
+    note.hidden = true;
   } catch (e) {
+    if (my !== chatLoadToken) return;
     panel.hidden = true;
     document.querySelector(".rec-stage").classList.add("no-chat");
   }
@@ -979,11 +1040,11 @@ function appendChatText(div, text, emotes) {
   if (pos < text.length) div.appendChild(document.createTextNode(text.slice(pos)));
 }
 
-function syncChat() {
+function syncChat(force) {
   if (!chatMessages.length) return;
   const player = $("player");
   const t = player.currentTime;
-  if (Math.floor(t) === lastChatSecond) return;
+  if (!force && Math.floor(t) === lastChatSecond) return;
   lastChatSecond = Math.floor(t);
   let lo = 0;
   let hi = chatMessages.length - 1;
@@ -997,12 +1058,24 @@ function syncChat() {
       hi = mid - 1;
     }
   }
+  if (!force && at === lastChatIdx) return;
   const log = $("chat-log");
   const rows = log.children;
-  for (let i = 0; i < rows.length && i < chatMessages.length; i++) {
-    const past = i <= at;
-    rows[i].classList.toggle("future", !past);
-    rows[i].classList.toggle("now", i === at);
+  const prev = lastChatIdx;
+  lastChatIdx = at;
+  if (prev >= 0 && rows[prev]) rows[prev].classList.remove("now");
+  if (at >= 0 && rows[at]) {
+    rows[at].classList.remove("future");
+    rows[at].classList.add("now");
+  }
+  if (prev < at) {
+    for (let i = Math.max(0, prev + 1); i < at && i < rows.length; i++) {
+      rows[i].classList.remove("future");
+    }
+  } else if (prev > at) {
+    for (let i = at + 1; i <= prev && i < rows.length; i++) {
+      if (i >= 0) rows[i].classList.add("future");
+    }
   }
   if (at >= 0 && $("chat-follow").checked && rows[at]) {
     if (window.matchMedia("(max-width: 1100px)").matches) {
@@ -1355,7 +1428,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("add-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     try {
-      await api("/api/channels", {
+      await api("/api/v1/channels", {
         method: "POST",
         body: JSON.stringify({ channel: $("add-input").value }),
       });
@@ -1380,7 +1453,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         payload[def.key] = value;
       }
-      res = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
+      res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });
     } catch (err) {
       // A 400/409 still carries per-key results in the payload: show
       // them and keep the edits for retry instead of reloading.

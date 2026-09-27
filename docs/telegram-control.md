@@ -7,8 +7,8 @@ keyboard.
 The root menu holds **Channels**, **Recordings**, and **Settings**.
 **Settings** holds **Output mode**, **Quality**, **Chat recording**,
 **Storage & limits** (retention, disk, and the two concurrency limits),
-**Remote access** (the public URL tunnels, the Kick webhook toggle, the
-HTTP control API, and the web panel), and **MTProto upload** (send recordings up to 2 GB to this
+**Remote access** (the public URLs, the Kick webhook toggle and delivery
+test, the HTTP control API, and the web panel), and **MTProto upload** (send recordings up to 2 GB to this
 chat). A submenu holds four buttons at most, plus **Back**. A toggle button
 names the action that applies now, for example **Disable Kick webhook**. The
 current value of a preset list carries a check mark, for example **✓ 1080p**.
@@ -93,7 +93,7 @@ untouched.
   files stay on disk. A delete asks for confirm and then frees disk
   space at once.
 - Secrets (bot token, Twitch credentials, proxy credentials, Kick credentials,
-  tunnel tokens, MTProto api id and hash) are never printed by `/status`. You
+  MTProto api id and hash) are never printed by `/status`. You
   cannot change them over Telegram.
 
 ## Related guides
