@@ -695,6 +695,10 @@ let currentPlayId = null;
 let lastSavedAt = -1;
 const recCards = new Map();
 const recGroups = new Map();
+// Ids of the listed, selectable (finished) recordings. Select-all controls
+// follow the filter: they cover exactly these ids, per channel and overall.
+let visibleRecIds = [];
+const visibleByChannel = new Map();
 
 const POS_KEY = "sa:positions";
 const POS_MAX = 200;
@@ -1105,7 +1109,7 @@ function buildRecCard(r, player) {
     box.addEventListener("change", () => {
       if (box.checked) selectedRecs.add(r.id);
       else selectedRecs.delete(r.id);
-      updateBulkButton();
+      paintRecSelection();
     });
     top.appendChild(box);
   }
@@ -1169,6 +1173,8 @@ function refreshRecCard(li, r, player) {
     return;
   }
   li.querySelector(":scope > .rec-meta").textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  const box = li.querySelector(":scope > .rec-top > .rec-select");
+  if (box) box.checked = selectedRecs.has(r.id);
 }
 
 function buildChannelGroup() {
@@ -1176,6 +1182,20 @@ function buildChannelGroup() {
   group.className = "channel-group";
   const head = document.createElement("div");
   head.className = "channel-head";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.className = "rec-select";
+  box.addEventListener("change", () => {
+    const ids = visibleByChannel.get(group.dataset.channel) || [];
+    if (box.checked) ids.forEach((id) => selectedRecs.add(id));
+    else ids.forEach((id) => selectedRecs.delete(id));
+    for (const id of ids) {
+      const card = recCards.get(id)?.querySelector(":scope > .rec-top > .rec-select");
+      if (card) card.checked = box.checked;
+    }
+    paintRecSelection();
+  });
+  head.appendChild(box);
   const name = document.createElement("span");
   name.className = "channel-name";
   head.appendChild(name);
@@ -1186,11 +1206,29 @@ function buildChannelGroup() {
   return group;
 }
 
+function paintBox(box, ids) {
+  const checked = ids.filter((id) => selectedRecs.has(id)).length;
+  box.checked = ids.length > 0 && checked === ids.length;
+  box.indeterminate = checked > 0 && checked < ids.length;
+  box.disabled = ids.length === 0;
+}
+
+function paintRecSelection() {
+  for (const [, group] of recGroups) {
+    const box = group.querySelector(":scope > .channel-head > .rec-select");
+    if (box) paintBox(box, visibleByChannel.get(group.dataset.channel) || []);
+  }
+  paintBox($("rec-select-all"), visibleRecIds);
+  updateBulkButton();
+}
+
 function refreshChannelGroup(group, ch, files, player, wanted) {
   const total = files.reduce((n, f) => n + f.size, 0);
+  group.dataset.channel = ch;
   group.querySelector(":scope > .channel-head > .channel-name").textContent =
     ch + " (" + files.length + " file" + (files.length === 1 ? "" : "s") + ", " + fmtSize(total) + ")";
   const head = group.querySelector(":scope > .channel-head");
+  head.querySelector(":scope > .rec-select").setAttribute("aria-label", "Select all of " + ch);
   const hasPill = !!head.querySelector(":scope > .pill");
   if (files.some((f) => f.live) && !hasPill) {
     const pill = document.createElement("span");
@@ -1263,9 +1301,12 @@ async function loadRecordings() {
     let shown = 0;
     const wantedGroups = new Set();
     const wanted = new Set();
+    visibleRecIds = files.filter((r) => !r.live).map((r) => r.id);
+    visibleByChannel.clear();
     for (const [ch, chFiles] of groups) {
       shown += chFiles.length;
       wantedGroups.add(ch);
+      visibleByChannel.set(ch, chFiles.filter((r) => !r.live).map((r) => r.id));
       let group = recGroups.get(ch);
       if (!group) {
         group = buildChannelGroup();
@@ -1286,6 +1327,7 @@ async function loadRecordings() {
         recCards.delete(id);
       }
     }
+    paintRecSelection();
     list.querySelectorAll(":scope > li.rec-card.muted").forEach((li) => li.remove());
     const counter = $("rec-count");
     if (data.total > data.recordings.length) {
@@ -1424,6 +1466,16 @@ document.addEventListener("DOMContentLoaded", () => {
   $("rec-channel").addEventListener("change", loadRecordings);
   $("rec-delete-selected").addEventListener("click", () => {
     deleteSelected().catch((e) => toast(String(e.message || e), true));
+  });
+  $("rec-select-all").addEventListener("change", () => {
+    const on = $("rec-select-all").checked;
+    if (on) visibleRecIds.forEach((id) => selectedRecs.add(id));
+    else visibleRecIds.forEach((id) => selectedRecs.delete(id));
+    for (const id of visibleRecIds) {
+      const card = recCards.get(id)?.querySelector(":scope > .rec-top > .rec-select");
+      if (card) card.checked = on;
+    }
+    paintRecSelection();
   });
   $("add-form").addEventListener("submit", async (e) => {
     e.preventDefault();

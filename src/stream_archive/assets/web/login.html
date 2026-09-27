@@ -20,9 +20,9 @@
     <h2>Login</h2>
     <p id="setup-hint" class="muted" hidden>The panel has no password yet. Run
       <code>stream-archive-setup-web</code> on the host, then reload.</p>
-    <form id="login-form">
+    <form id="login-form" method="post" action="/api/login">
       <label>Password
-        <input type="password" id="password" autocomplete="current-password" required>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
       </label>
       <label class="checkline"><input type="checkbox" id="show-password"> Show password</label>
       <p id="caps-hint" class="muted" hidden>Caps Lock is on.</p>
