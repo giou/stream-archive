@@ -61,7 +61,7 @@ def test_fresh_run_creates_valid_config(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["tid123", "1", "3", "10"],
+        inputs=["tid123", "1", "n", "10"],
         secrets=["tsecret123", "long-enough-password", "long-enough-password"],
     )
     wizard.main()
@@ -82,7 +82,7 @@ def test_kick_step_asks_creds_then_tunnel(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["5", "kid123", "y", "3", "kick.example.com", "n", "10"],
+        inputs=["5", "kid123", "y", "4", "kick.example.com", "n", "10"],
         secrets=["ksecret123"],
     )
     wizard.main()
@@ -142,6 +142,9 @@ def test_youtube_step_saves_mode_and_runs_oauth(monkeypatch, tmp_path):
         ("https://example.com/", "https://example.com"),
         ("http://example.com/kick/webhook", "http://example.com"),
         ("https://example.com/kick/webhook", "https://example.com"),
+        ("https://example.com:443", "https://example.com:443"),
+        ("https://example.com:99999", None),
+        ("http://example.com:0", None),
         ("", None),
         ("not a url at all", None),
         ("ftp://example.com", None),
@@ -150,6 +153,13 @@ def test_youtube_step_saves_mode_and_runs_oauth(monkeypatch, tmp_path):
 def test_normalize_public_url_accepts_bare_hostnames(raw, expected):
     """A bare hostname gets https://, and unusable text reads as None."""
     assert wizard._normalize_public_url(raw) == expected
+
+
+def test_normalize_public_url_with_dot_blocks_single_labels():
+    """The Kick entry needs a public host: a single label never saves."""
+    assert wizard._normalize_public_url("a", require_dot=True) is None
+    assert wizard._normalize_public_url("http://localhost:8787", require_dot=True) is None
+    assert wizard._normalize_public_url("kick.example.com", require_dot=True) == "https://kick.example.com"
 
 
 def test_local_timezone_prefers_tz_then_localtime(monkeypatch):
@@ -178,6 +188,10 @@ def _raise_missing_link(_path):  # type: ignore[no-untyped-def]
     [
         ("127.0.0.1", True, "0.0.0.0"),
         ("127.0.0.1", False, "127.0.0.1"),
+        ("localhost", True, "0.0.0.0"),
+        ("localhost", False, "localhost"),
+        ("::1", True, "0.0.0.0"),
+        ("::1", False, "::1"),
         ("0.0.0.0", True, "0.0.0.0"),
     ],
 )
@@ -227,7 +241,7 @@ def test_kick_step_stores_separate_url(monkeypatch, tmp_path, capsys):
     """Kick channels get their own public entry, independent of the endpoint."""
     _write_config(tmp_path, channels=["kick:slug"])
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "n", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -247,7 +261,7 @@ def test_kick_step_follow_endpoint_clears_override(monkeypatch, tmp_path):
         kick={"webhook": {"enabled": False, "setup_notified": True, "public_url": "https://kick.example.com"}},
     )
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "n", "4", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "5", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == ""
@@ -343,7 +357,7 @@ def test_kick_step_follow_without_panel_entry_warns(capsys, monkeypatch, tmp_pat
     """
     _write_config(tmp_path, kick={"client_id": "", "client_secret": ""})
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "kid123", "y", "4", "10"], secrets=["ksecret123"])
+    _script(monkeypatch, inputs=["5", "kid123", "y", "5", "10"], secrets=["ksecret123"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == ""
@@ -364,7 +378,7 @@ def test_kick_step_rerun_enables_saved_entry(monkeypatch, tmp_path):
         kick={"webhook": {"enabled": False, "public_url": "https://kick.example.com"}},
     )
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "n", "3", "", "n", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "4", "", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
@@ -407,7 +421,7 @@ def test_reset_wipes_config_and_starts_over(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _script(
         monkeypatch,
-        inputs=["9", "y", "tid123", "1", "3", "10"],
+        inputs=["9", "y", "tid123", "1", "n", "10"],
         secrets=["tsecret123", "long-enough-password", "long-enough-password"],
     )
     wizard.main()
@@ -448,7 +462,7 @@ def test_kick_entry_test_needs_the_app_running(monkeypatch, tmp_path, capsys):
     # Fixed ports are not reliably closed, so force the unreachable branch.
     monkeypatch.setattr(wizard, "_app_reachable", lambda config: False)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "y", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "y", "10"], secrets=[])
     wizard.main()
     assert "Start the app first" in capsys.readouterr().out
 
@@ -480,7 +494,7 @@ def test_kick_entry_test_reports_delivery(monkeypatch, tmp_path, capsys):
         port = server.server_address[1]
         _write_config(tmp_path, endpoint={"listen_port": port}, api={"enabled": True, "key": "k"})
         monkeypatch.chdir(tmp_path)
-        _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "y", "10"], secrets=[])
+        _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "y", "10"], secrets=[])
         wizard.main()
     finally:
         server.shutdown()
@@ -577,7 +591,7 @@ def test_kick_step_in_containers_binds_the_webhook_wildcard(monkeypatch, tmp_pat
     _write_config(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(os.path, "exists", lambda _path: True)
-    _script(monkeypatch, inputs=["5", "n", "y", "3", "kick.example.com", "n", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "n", "10"], secrets=[])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.listen_host == "0.0.0.0"
@@ -598,3 +612,59 @@ def test_mtproto_step_accepts_an_env_reference_for_the_api_id(monkeypatch, tmp_p
     config = get_config(tmp_path / "config.json")
     assert config.mtproto.enabled is True
     assert config.mtproto.api_id == 777001
+
+
+def test_kick_step_follow_tailnet_warns_about_serve_and_funnel(monkeypatch, tmp_path, capsys):
+    """Following a tailnet panel address names serve as dead and funnel as live.
+
+    The follow pick saved the tailnet URL as a working delivery with no
+    warning, while serve never leaves the tailnet and funnel on the same
+    name reaches the public internet.
+    """
+    _write_config(
+        tmp_path,
+        kick={"client_id": "cid", "client_secret": "cs"},
+        endpoint={"enabled": True, "public_url": "https://box.tailnet.ts.net"},
+    )
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["5", "n", "5", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.webhook.enabled is True
+    out = capsys.readouterr().out
+    assert "Tailnet serve never gets events" in out
+    assert "Funnel on the same name does" in out
+    assert "Kick webhook URL: https://box.tailnet.ts.net/kick/webhook" in out
+
+
+def test_kick_step_funnel_saves_tailnet_url(monkeypatch, tmp_path, capsys):
+    """The funnel pick saves the tailnet name as a working Kick entry.
+
+    Serve never leaves the tailnet, so the wizard had no path for the
+    funnel on the same name that reaches the public internet.
+    """
+    _write_config(tmp_path, kick={"client_id": "cid", "client_secret": "cs"})
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["5", "n", "y", "3", "box.tailnet.ts.net", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.webhook.public_url == "https://box.tailnet.ts.net"
+    assert config.kick.webhook.enabled is True
+    out = capsys.readouterr().out
+    assert "tailscale funnel 8788" in out
+    assert "Enable webhooks" in out
+
+
+def test_kick_step_own_url_rejects_a_single_label(monkeypatch, tmp_path):
+    """The own-URL pick rejects a single label like the hostname picks do.
+
+    The hostname picks need a dot, but the URL pick saved https://a as a
+    working Kick entry.
+    """
+    _write_config(tmp_path, kick={"client_id": "cid", "client_secret": "cs"})
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["5", "n", "y", "4", "a", "kick.example.com", "n", "10"], secrets=[])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.kick.webhook.public_url == "https://kick.example.com"
+    assert config.kick.webhook.enabled is True

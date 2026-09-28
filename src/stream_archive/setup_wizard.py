@@ -157,11 +157,13 @@ def _local_timezone() -> str:
     return name
 
 
-def _normalize_public_url(raw: str) -> str | None:
+def _normalize_public_url(raw: str, *, require_dot: bool = False) -> str | None:
     """Endpoint URL with a scheme, or None when the text is unusable.
 
     A bare hostname gets https://, so ``example.com`` works. The result
-    drops a trailing slash and any webhook path.
+    drops a trailing slash and any webhook path. With ``require_dot``
+    the host must hold a dot, so a single label never saves as a
+    public Kick entry.
     """
     text = raw.strip()
     if not text:
@@ -171,10 +173,23 @@ def _normalize_public_url(raw: str) -> str | None:
     parts = urlparse(text)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
     host = parts.hostname
     if not all(char.isalnum() or char in ".-" for char in host) or not host.strip(".-"):
         return None
+    if require_dot and "." not in host:
+        return None
     return normalize_endpoint_url(text)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for a bind that keeps proxy traffic out of a container."""
+    return host.strip().lower().rstrip(".") in ("localhost", "127.0.0.1", "::1")
 
 
 def _listen_host_default(host: str) -> str:
@@ -184,7 +199,7 @@ def _listen_host_default(host: str) -> str:
     container that still binds its own loopback gets no traffic. Bare
     metal keeps the stored host.
     """
-    if host.strip() == "127.0.0.1" and os.path.exists("/.dockerenv"):
+    if _is_loopback_host(host) and os.path.exists("/.dockerenv"):
         return "0.0.0.0"
     return host
 
@@ -530,8 +545,8 @@ def _kick_entry_usable(config: AppConfig) -> bool:
     """True when Kick has a public internet entry for deliveries.
 
     A separate Kick entry counts on its own. Otherwise the endpoint must
-    be on with a public URL. A tailnet-only address never delivers to
-    Kick: the enable step warns about it.
+    be on with a public URL. A tailnet serve address never delivers to
+    Kick: the step warns about it. Funnel on the same name does deliver.
     """
     if config.kick.webhook.public_url.strip():
         return True
@@ -545,7 +560,9 @@ def _step_remote(config: AppConfig) -> None:
     The panel works on this machine with nothing set. The wizard saves a
     public URL you publish yourself: a tailnet address (tailscale serve,
     private to your devices) or an internet address (your own reverse
-    proxy). An internet address also lets Kick deliver events.
+    proxy). An internet address also lets Kick deliver events. For Kick
+    on the same tailnet name, turn on funnel for the webhook port in
+    the Kick step.
     """
     print("\n-- Panel access (optional) --")
     print(f"Endpoint: {'on' if config.endpoint.enabled else 'off'}")
@@ -583,7 +600,7 @@ def _step_remote(config: AppConfig) -> None:
             if url:
                 break
             print("Type a URL like https://example.com or a bare hostname like example.com.")
-    if host.strip() == "127.0.0.1":
+    if _is_loopback_host(host):
         print("Note: under Docker set the listen host to 0.0.0.0, or the proxy cannot reach the app.")
 
     def mutate_on(candidate: AppConfig) -> None:
@@ -599,28 +616,31 @@ def _step_remote(config: AppConfig) -> None:
         if config.kick.webhook.public_url.strip():
             print(f"Kick deliveries keep using {webhook_public_url(config)}.")
         else:
-            print("Note: the Kick webhook stays unavailable here: Kick cannot deliver events to a tailnet address.")
+            print("Note: Kick stays on polling here. Tailnet serve never gets events. Funnel on the same name does.")
 
 
 def _setup_kick_entry(config: AppConfig) -> None:
     """Pick the public entry for Kick deliveries and save it.
 
     The proxy choice leads: the wizard generates the proxy config for the
-    pick and prints the command that runs it. A pasted URL or the panel
-    address stays available for existing setups. Following a panel with
-    no public address leaves Kick on polling: the step says so instead
-    of implying that deliveries work.
+    pick and prints the command that runs it. A funnel URL, a pasted URL,
+    or the panel address stays available for existing setups. Following a
+    tailnet serve address leaves Kick on polling: the step says so instead
+    of implying that deliveries work. Funnel on the same name does deliver.
     """
     wh = config.kick.webhook
     webhook_port = wh.listen_port
     print(f"Panel uses: {config.endpoint.public_url or 'none'}")
     print(f"Kick deliveries use: {webhook_public_url(config) or 'none'}")
     print(f"The Kick entry must reach the webhook listener on port {webhook_port}.")
+    if config.endpoint.public_url.strip():
+        print("Tailnet serve never delivers to Kick. Funnel on the same name does.")
     print("  1. Cloudflare tunnel (you run cloudflared)")
     print("  2. nginx (you run nginx)")
-    print("  3. Own reverse proxy URL (already running)")
-    print("  4. Follow the panel address")
-    pick = _choose("Kick entry", 4)
+    print("  3. Tailscale funnel (you run tailscale funnel)")
+    print("  4. Own reverse proxy URL (already running)")
+    print("  5. Follow the panel address")
+    pick = _choose("Kick entry", 5)
     stored = ""
     if pick == 1:
         while True:
@@ -664,9 +684,20 @@ def _setup_kick_entry(config: AppConfig) -> None:
         print("Symlink it from sites-enabled, get a certificate (certbot), then: nginx -s reload")
         stored = f"https://{host}"
     elif pick == 3:
+        print("Funnel publishes the webhook listener on your tailnet name.")
+        while True:
+            raw_url = _read("Funnel URL", default=config.kick.webhook.public_url or None)
+            stored = _normalize_public_url(raw_url, require_dot=True) or ""
+            if stored:
+                break
+            print("Type the funnel URL, like https://host.tailnet.ts.net.")
+        print(f"Run on the host: tailscale funnel {webhook_port}")
+        print("Keep it running while the app runs.")
+        print("Then paste this URL in the Kick app (Settings, Developer, your app, Enable webhooks).")
+    elif pick == 4:
         while True:
             raw_url = _read("Public kick URL", default=config.kick.webhook.public_url or None)
-            stored = _normalize_public_url(raw_url) or ""
+            stored = _normalize_public_url(raw_url, require_dot=True) or ""
             if stored:
                 break
             print("Type a URL like https://example.com or a bare hostname like example.com.")
@@ -703,6 +734,10 @@ def _setup_kick_entry(config: AppConfig) -> None:
         return
     print(f"Kick webhook URL: {webhook_public_url(config)}")
     print("Paste it in the Kick app (Settings, Developer, your app, Enable webhooks).")
+    if not stored.strip():
+        print(
+            "Note: that address must reach the public internet. Tailnet serve never gets events. Funnel on the same name does."
+        )
     if _yes("Test Kick delivery now", default=True):
         _verify_kick_delivery(config)
 
@@ -974,8 +1009,8 @@ def _fresh_run() -> AppConfig:
         raise SystemExit(1) from e
     print(f"Wrote {workdir / 'config.json'}. Now pick a control surface.")
     _step_control(config, required=True)
-    print("Add the first channels now, or leave them empty and add them later.")
-    _step_channels(config)
+    if _yes("Add channels now", default=False):
+        _step_channels(config)
     return config
 
 

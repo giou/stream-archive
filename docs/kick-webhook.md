@@ -9,7 +9,7 @@ The app binds two loopback listeners and publishes nothing itself:
 - `endpoint.listen_host:endpoint.listen_port` (default `127.0.0.1:8787`): web panel and control API.
 - `kick.webhook.listen_host:listen_port` (default `127.0.0.1:8788`): `POST /kick/webhook` alone.
 
-You publish them yourself. A common split: `tailscale serve` for the web panel port (tailnet only), and your own reverse proxy (cloudflared you run, nginx, or anything with TLS) for the webhook port. The setup wizard generates the proxy setup for the pick: a cloudflared ingress file or an nginx server block that forwards only `/kick/webhook` and drops the rest, so the web panel never leaks through the public hostname.
+You publish them yourself. A common split: `tailscale serve` for the web panel port (tailnet only), and your own reverse proxy (cloudflared you run, nginx, or anything with TLS) for the webhook port. `tailscale funnel` on the same tailnet name also reaches Kick: serve never leaves the tailnet. The setup wizard generates the proxy setup for the pick: a cloudflared ingress file or an nginx server block that forwards only `/kick/webhook` and drops the rest, so the web panel never leaks through the public hostname.
 
 Under Docker set both listen hosts to `0.0.0.0`, or the host proxies cannot reach the container.
 
