@@ -1,27 +1,18 @@
 # Control API
 
-The control API manages channels and settings over HTTP. The bot serves it
-on the endpoint under `/api/v1`. Use it to make the same changes without
-the Telegram app.
+The control API manages channels and settings over HTTP. It runs on the private listener under `/api/v1`. Use it to make the same changes without the Telegram app.
 
-The API is off by default.
+The control API is off by default.
 
-## Enable the API
+## Enable the control API
 
-1. Open `/settings` in Telegram.
+1. Open `/settings` in the Telegram bot.
 2. Choose **Settings → Remote access → API**.
 3. Tap **Enable API**.
 
-The bot generates the API key and shows it with the base URL. Tap
-**Show key** to show the key again, and **Rotate key** to replace it. A
-rotated key stops the old key at once. Disabling the API keeps the key, so
-a later enable uses the same key.
+The Telegram bot generates the key and shows it with the base URL. Tap **Show key** to show the key again, and **Rotate key** to replace it. A rotated key stops the old key at once. Disabling the control API keeps the key, so a later enable uses the same key.
 
-The bot shows the key in the private chat with the admin only. In a group
-chat the bot answers with a pointer to that chat, because every member of
-the group can read the reply.
-
-The bot sends the key as code text. Tap the key to put it on the clipboard.
+The Telegram bot shows the key in the private chat with the admin only. In a group chat the Telegram bot answers with a pointer to that chat, because every member of the group can read the reply.
 
 ## Base URL
 
@@ -30,10 +21,7 @@ The bot sends the key as code text. Tap the key to put it on the clipboard.
 | Base URL | `<endpoint.public_url>/api/v1/` |
 | Kick webhook URL | `<kick.webhook.public_url or endpoint.public_url>/kick/webhook` |
 
-The endpoint is the private listener (panel plus API). A tailnet serve or
-your own reverse proxy publishes it. Open **Settings → Remote access** in
-Telegram to see its state and to turn it on. While the endpoint is off, the
-API answers on the local address only.
+The endpoint is the private listener (web panel plus control API). A tailnet serve or your own reverse proxy publishes it. Open **Settings → Remote access** in the Telegram bot to see its state and to turn it on. While the endpoint is off, the control API answers on the local address only.
 
 ## Authentication
 
@@ -44,19 +32,16 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 curl -H "X-API-Key: $API_KEY" https://streamarchive.example.com/api/v1/status
 ```
 
-A live panel session works instead of the key (the browser sends its
-cookie; state-changing calls still need the `X-CSRF-Token` header). The
-panel and scripts share the one API at `/api/v1/`.
+A live web panel session works instead of the key. The browser sends its cookie. State-changing calls still need the `X-CSRF-Token` header. The web panel and scripts share the one control API at `/api/v1/`.
 
 | Answer | Meaning |
 | --- | --- |
 | `401` | The key is missing or wrong. |
 | `403` | A session call without (or with a wrong) CSRF token. |
-| `404` | The API is off, or no key was generated yet. The routes behave as if they do not exist. |
+| `404` | The control API is off, or no key exists yet. The routes behave as if they do not exist. |
 | `429` | Too many failed key attempts from your address. Wait and try again. |
 
-Keep the key secret. Anyone who has it can change your channels and
-settings.
+Keep the key secret. Anyone who has it can change your channels and settings.
 
 ## Endpoints
 
@@ -72,12 +57,9 @@ settings.
 | `DELETE` | `/api/v1/channels/<channel>` | Remove a channel |
 | `POST` | `/api/v1/kick/webhook/test` | Run the Kick delivery test, report its timed result |
 
-A channel name carries its platform prefix, for example `twitch:example` or
-`kick:example`. If your client requires it, percent-encode the colon as
-`%3A` in a URL (`/api/v1/channels/kick%3Aexample`). Both forms work.
+A channel name carries its platform prefix, for example `twitch:example` or `kick:example`. If your client encodes it, use `%3A` for the colon (`/api/v1/channels/kick%3Aexample`). Both forms work.
 
-`POST` and `PATCH` take a JSON object body. The API rejects a body larger
-than 64 KiB with `413`, and a body that is not a JSON object with `400`.
+`POST` and `PATCH` take a JSON object body. The control API rejects a body larger than 64 KiB with `413`, and a body that is not a JSON object with `400`.
 
 ## Status
 
@@ -94,8 +76,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 }
 ```
 
-`recording` lists the channels that capture a stream at this moment.
-`monitoring_interval_s` is the poll interval.
+`recording` lists the channels that capture a stream at this moment. `monitoring_interval_s` is the poll interval.
 
 ## Global settings
 
@@ -126,8 +107,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 }
 ```
 
-The answer never contains a secret. The API key and the bot token
-stay in `config.json`.
+The answer never holds a secret. The key and the Telegram bot token stay in `config.json`.
 
 ### Write
 
@@ -138,8 +118,8 @@ stay in `config.json`.
 | `output_mode` | `disk`, `youtube`, `both` | Output of every channel without an override |
 | `preferred_quality` | `best`, `1080p`, `720p`, `480p`, `360p`, `audio_only` | Quality for every channel without an override |
 | `retention_days` | whole number ≥ 0 | Delete recordings older than this many days. `0` disables cleanup |
-| `max_concurrent_recordings` | whole number ≥ 0 | Recording limit. `0` = unlimited |
-| `max_concurrent_youtube_streams` | whole number ≥ 0 | YouTube re-stream limit. `0` = unlimited |
+| `max_concurrent_recordings` | whole number ≥ 0 | Recording limit. `0` means unlimited |
+| `max_concurrent_youtube_streams` | whole number ≥ 0 | YouTube restream limit. `0` means unlimited |
 | `record_chat` | `true`, `false` | Record Twitch chat |
 | `kick_record_chat` | `true`, `false` | Record Kick chat |
 | `disk_max_total_gb` | number ≥ 0 | Archive size cap. `0` disables the cap |
@@ -163,9 +143,7 @@ curl -X PATCH https://streamarchive.example.com/api/v1/settings \
 }
 ```
 
-One request can hold one key or more. The API applies each key on its own,
-so one bad key does not block the others. `applied` names each key that
-worked, and `errors` names each key that failed.
+One request can hold one key or more. The control API applies each key on its own, so one bad key does not block the others. `applied` names each key that worked, and `errors` names each key that failed.
 
 ## Channels
 
@@ -192,9 +170,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 }
 ```
 
-The fields without `_override` are the values that the monitor uses. A
-value with `_override` is set for that channel alone. `null` means "use the
-global setting".
+The fields without `_override` are the values that the monitor uses. A value with `_override` applies to that channel alone. `null` means "use the global setting".
 
 ### Add
 
@@ -205,11 +181,7 @@ curl -X POST https://streamarchive.example.com/api/v1/channels \
   -d '{"channel": "twitch:example"}'
 ```
 
-The API takes a channel name with a platform prefix or a profile URL
-(`https://twitch.tv/example`, `https://kick.com/example`). The answer holds
-the message, the normalized channel name, and the new channel list.
-Subscriptions follow at once: the bot creates the EventSub subscription for
-Twitch and the webhook subscription for Kick.
+The control API takes a channel name with a platform prefix or a profile URL (`https://twitch.tv/example`, `https://kick.com/example`). The answer holds the message, the normalized channel name, and the new channel list. Subscriptions follow at once: the app creates the EventSub subscription for Twitch and the webhook subscription for Kick.
 
 ### Change one channel
 
@@ -246,9 +218,7 @@ curl -X DELETE https://streamarchive.example.com/api/v1/channels/twitch:example 
   -H "Authorization: Bearer $API_KEY"
 ```
 
-The API stops a live recording of that channel, clears its overrides, and
-deletes its webhook subscription. The last channel cannot be removed: the
-config needs at least one channel.
+The control API stops a live recording of that channel, clears its overrides, and deletes its webhook subscription. The last channel cannot be removed: the settings need at least one channel.
 
 ## Error answers
 
@@ -257,27 +227,19 @@ A request that fails as a whole answers with `error`:
 | Status | Body | Cause |
 | --- | --- | --- |
 | `400` | `{"error": "…"}` | Bad JSON, unknown key, or an invalid value |
-| `401` | `{"error": "unauthorized"}` | Missing or wrong API key |
-| `404` | `{"error": "…"}` | The API is off, or the channel is not monitored |
-| `409` | `{"applied": {}, "errors": {"quality": "…"}}` | A quality change to `audio_only` for a channel that re-streams to YouTube |
+| `401` | `{"error": "unauthorized"}` | Missing or wrong key |
+| `404` | `{"error": "…"}` | The control API is off, or the channel is not monitored |
+| `409` | `{"applied": {}, "errors": {"quality": "…"}}` | A quality change to `audio_only` for a channel that restreams to YouTube |
 | `413` | `{"error": "request body too large"}` | Body above 64 KiB |
 
-The `409` case needs a confirm press in Telegram, because audio-only cannot
-go to YouTube. The bot switches the output of that channel to `disk` only
-after you confirm. The API changes nothing.
+The `409` case needs a confirm press in the Telegram bot, because audio-only cannot go to YouTube. The Telegram bot switches the output of that channel to `disk` only after you confirm. The control API changes nothing.
 
 ## Behavior
 
-- Every applied change sends the admin a Telegram message with the origin
-  (`Control API`, or `Web panel` for a panel-session call), so you see what
-  changed it.
-- Every change goes through the same validation and the same atomic
-  `config.json` write as a Telegram change. A rejected change changes
-  nothing.
-- A change applies on the next poll cycle. A recording that is in
-  progress keeps the settings of its start.
-- The API serves the same settings as the bot. It cannot change secrets,
-  the endpoint, or the API itself.
+- Every applied change sends the admin a Telegram message with the origin. The origin is `Control API`, or `Web panel` for a web panel session call.
+- Every change goes through the same validation and the same atomic `config.json` write as a Telegram bot change. A rejected change changes nothing.
+- A change applies on the next poll cycle. A recording in progress keeps the settings of its start.
+- The control API serves the same settings as the Telegram bot. It cannot change secrets, the endpoint, or itself.
 
 ## Full example
 
