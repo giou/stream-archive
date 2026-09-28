@@ -455,7 +455,6 @@ def test_kick_entry_test_needs_the_app_running(monkeypatch, tmp_path, capsys):
 
 def test_kick_entry_test_reports_delivery(monkeypatch, tmp_path, capsys):
     """A running app answers the test call: the wizard prints its verdict."""
-    import json as _json
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -463,7 +462,7 @@ def test_kick_entry_test_reports_delivery(monkeypatch, tmp_path, capsys):
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             self.server.requests.append((self.path, self.headers.get("Authorization"), length))
-            body = _json.dumps({"ok": True, "message": "first delivery in 3s"}).encode()
+            body = json.dumps({"ok": True, "message": "first delivery in 3s"}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

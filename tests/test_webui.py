@@ -9,6 +9,7 @@ token prove the panel works without Telegram tokens.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -610,15 +611,13 @@ def test_telegram_disabled_but_both_can_run(tmp_path):
 
 
 def test_chat_endpoint_serves_recording_chat(tmp_path):
-    import json as _json
-
     config, _, _, _, wh = make_webui(tmp_path)
     base = rec_dir(config)
     (base / "show.mp4").write_bytes(b"v" * 10)
     chat_base = config.workdir / "chat" / "twitch" / "channel1"
     chat_base.mkdir(parents=True, exist_ok=True)
     (chat_base / "show.chat.json").write_text(
-        _json.dumps(
+        json.dumps(
             {
                 "comments": [
                     {
@@ -688,13 +687,11 @@ class StubHttp:
 
 
 def _write_chat(config, name, comments, streamer_id=87629696):
-    import json as _json
-
     base = rec_dir(config)
     (base / f"{name}.mp4").write_bytes(b"v" * 10)
     chat_base = config.workdir / "chat" / "twitch" / "channel1"
     chat_base.mkdir(parents=True, exist_ok=True)
-    (chat_base / f"{name}.chat.json").write_text(_json.dumps({"streamer": {"id": streamer_id}, "comments": comments}))
+    (chat_base / f"{name}.chat.json").write_text(json.dumps({"streamer": {"id": streamer_id}, "comments": comments}))
 
 
 def _chat_comment(body, user="alice", fragments=None):
@@ -784,8 +781,6 @@ def test_chat_emote_lookup_failure_keeps_plain_text(tmp_path):
 
 
 def test_chat_renders_kick_emotes_without_lookup(tmp_path):
-    import json as _json
-
     config, _, _, webui, wh = make_webui(tmp_path)
     webui._http = StubHttp(fail=True)
     base = config.workdir / "recordings" / "kick" / "slug"
@@ -794,7 +789,7 @@ def test_chat_renders_kick_emotes_without_lookup(tmp_path):
     chat_base = config.workdir / "chat" / "kick" / "slug"
     chat_base.mkdir(parents=True, exist_ok=True)
     (chat_base / "show.chat.json").write_text(
-        _json.dumps(
+        json.dumps(
             {
                 "comments": [
                     {
@@ -851,9 +846,6 @@ def test_chat_emote_with_punctuation_resolves(tmp_path):
 
 
 def test_chat_prefers_embedded_images(tmp_path):
-    import base64 as _b64
-    import json as _json
-
     config, _, _, webui, wh = make_webui(tmp_path)
     webui._http = StubHttp(fail=True)  # embedded needs no network
     raw = b"\x89PNG\r\n\x1a\n" + b"\0" * 10
@@ -862,7 +854,7 @@ def test_chat_prefers_embedded_images(tmp_path):
     chat_base = config.workdir / "chat" / "twitch" / "channel1"
     chat_base.mkdir(parents=True, exist_ok=True)
     (chat_base / "emo.chat.json").write_text(
-        _json.dumps(
+        json.dumps(
             {
                 "comments": [
                     {
@@ -885,7 +877,7 @@ def test_chat_prefers_embedded_images(tmp_path):
                         {
                             "id": "emotesv2_272cdedc96e34baf925ddcba142cbf7a",
                             "imageScale": 2,
-                            "data": _b64.b64encode(raw).decode(),
+                            "data": base64.b64encode(raw).decode(),
                             "name": "smooth305OMG",
                         }
                     ]

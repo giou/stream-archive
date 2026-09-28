@@ -8,6 +8,7 @@ controller through its reply-text and callback entries.
 import asyncio
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,8 +150,6 @@ def test_uploader_connect_and_send(tmp_path):
 
 
 def test_send_marks_mp4_streamable(tmp_path):
-    import subprocess
-
     gen = subprocess.run(
         [
             "ffmpeg",
@@ -177,9 +176,7 @@ def test_send_marks_mp4_streamable(tmp_path):
         capture_output=True,
     )
     if gen.returncode != 0:
-        import pytest as _pytest
-
-        _pytest.skip("cannot generate a TS fixture here")
+        pytest.skip("cannot generate a TS fixture here")
     config = uploader_config(tmp_path)
     config.mtproto.api_id = 1
     config.mtproto.api_hash = "hash"

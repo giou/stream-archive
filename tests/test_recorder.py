@@ -1079,9 +1079,7 @@ def test_finalize_points_entry_at_mp4(tmp_path):
         capture_output=True,
     )
     if gen.returncode != 0:
-        import pytest as _pytest
-
-        _pytest.skip("cannot generate a TS fixture here")
+        pytest.skip("cannot generate a TS fixture here")
     entry = {"filepath": str(src), "tasks": [], "youtube_info": None}
     asyncio.run(rec._finalize_entry("twitch:x", entry, None))
     assert entry["filepath"] == str(remux_target(src))
@@ -1092,8 +1090,6 @@ def test_finalize_points_entry_at_mp4(tmp_path):
 def test_split_parts_passes_small_file_through(tmp_path):
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg not installed")
-    import subprocess
-
     src = tmp_path / "cap.mp4"
     gen = subprocess.run(
         [
@@ -1121,9 +1117,7 @@ def test_split_parts_passes_small_file_through(tmp_path):
         capture_output=True,
     )
     if gen.returncode != 0:
-        import pytest as _pytest
-
-        _pytest.skip("cannot generate an MP4 fixture here")
+        pytest.skip("cannot generate an MP4 fixture here")
     from stream_archive.recorder.remux import split_parts
 
     half = src.stat().st_size // 2 + 1
@@ -1135,8 +1129,6 @@ def test_split_parts_passes_small_file_through(tmp_path):
 def test_split_parts_splits_over_cap_sparse(tmp_path):
     if shutil.which("ffmpeg") is None:
         pytest.skip("ffmpeg not installed")
-    import subprocess
-
     from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES
     from stream_archive.recorder.remux import cleanup_split, split_parts
 
@@ -1162,9 +1154,7 @@ def test_split_parts_splits_over_cap_sparse(tmp_path):
         check=False,
     )
     if not src.exists():
-        import pytest as _pytest
-
-        _pytest.skip("cannot generate an MP4 fixture here")
+        pytest.skip("cannot generate an MP4 fixture here")
 
     with open(src, "ab") as f:
         f.truncate(MAX_UPLOAD_BYTES + 1024)
