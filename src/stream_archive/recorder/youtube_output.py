@@ -16,7 +16,7 @@ from stream_archive.config import (
     AppConfig,
     channel_url,
 )
-from stream_archive.recorder.common import sanitize_filename
+from stream_archive.recorder.common import sanitize_filename, sanitize_metadata_text
 from stream_archive.recorder.types import HoldState, Recording
 
 if TYPE_CHECKING:
@@ -335,7 +335,7 @@ class YoutubeOutputMixin:
                     msg = (
                         f"\u26a0\ufe0f YouTube rate limit reached!\n"
                         f"Channel: {channel}\n"
-                        f"Stream: {title or 'Unknown'}\n"
+                        f"Stream: {sanitize_metadata_text(title or 'Unknown')}\n"
                         f"Stream link: {channel_url(channel)}"
                     )
                     if self._notifier:

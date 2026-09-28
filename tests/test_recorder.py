@@ -658,6 +658,33 @@ def test_youtube_quota_error_falls_back_to_disk(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_youtube_rate_limit_alert_keeps_the_title_on_one_line(tmp_path, monkeypatch):
+    """A hostile stream title must not forge extra lines in the rate-limit alert."""
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    notifier = FakeNotifier()
+    rec = Recorder(
+        config,
+        youtube_streamer=FakeYouTubeStreamer(create_error=RuntimeError("The user has exceeded their quota")),
+        notifier=notifier,
+    )
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(
+        rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Win\nOffline: twitch:other", "Game")
+    )
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await wait_until(lambda: len(notifier.messages) > 0)
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+    assert len(notifier.messages) == 1
+    assert "Win Offline: twitch:other" in notifier.messages[0]
+    assert "Win\nOffline" not in notifier.messages[0]
+
+
 def test_start_records_chat_when_enabled(tmp_path, monkeypatch):
     rec = make_recorder(tmp_path, monkeypatch, record_chat=True)
     monkeypatch.setattr("stream_archive.recorder.core.ChatRecorder", FakeChatRecorder)
