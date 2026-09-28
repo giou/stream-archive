@@ -158,7 +158,10 @@ def test_get_channel_statuses_maps_live_offline_unknown():
 
 
 def test_get_channel_statuses_empty_list_returns_empty():
-    api = make_api()
+    def token(request):
+        pytest.fail(f"unexpected token fetch: {request.method} {request.url}")
+
+    api = make_api(token=token)
     assert asyncio.run(api.get_channel_statuses([])) == {}
 
 
@@ -298,7 +301,10 @@ def test_delete_event_subscriptions_sends_ids():
 
 
 def test_delete_event_subscriptions_empty_is_noop():
-    api = make_api()
+    def token(request):
+        pytest.fail(f"unexpected token fetch: {request.method} {request.url}")
+
+    api = make_api(token=token)
     asyncio.run(api.delete_event_subscriptions([]))
 
 
