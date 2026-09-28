@@ -17,6 +17,25 @@ def base_config():
 _apis: list[KickAPI] = []
 
 
+class YieldingTransport(httpx.AsyncBaseTransport):
+    """A transport that turns the event loop before it answers.
+
+    MockTransport calls its handler straight from the await, so a burst of
+    callers can never overlap and the single-flight test would pass without
+    a lock. The yields give the other callers a turn while the request is in
+    flight. Mirrors the twitch_api suite helper.
+    """
+
+    def __init__(self, handler, yields=20):
+        self._handler = handler
+        self._yields = yields
+
+    async def handle_async_request(self, request):
+        for _ in range(self._yields):
+            await asyncio.sleep(0)
+        return self._handler(request)
+
+
 def token_handler(request):
     assert request.url.path == "/oauth/token"
     assert request.method == "POST"
@@ -31,13 +50,15 @@ def no_other_request(request):
     pytest.fail(f"unexpected request: {request.method} {request.url}")
 
 
-def make_api(handler=no_other_request, config=None, token=token_handler):
+def make_api(handler=no_other_request, config=None, token=token_handler, transport=None):
     """Build a KickAPI on an injected mock-transport client.
 
     Every authenticated call needs a token first, so that POST is served
     here and ``handler`` describes only the endpoint under test. The
     constructor path also sets ``_owns_client`` False, so the fixture closes
-    the injected client itself.
+    the injected client itself. Pass ``transport`` (a factory over the
+    route, like the yielding transport below) to interleave concurrent
+    callers.
     """
 
     def route(request):
@@ -45,7 +66,8 @@ def make_api(handler=no_other_request, config=None, token=token_handler):
             return token(request)
         return handler(request)
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(route))
+    transport = httpx.MockTransport(route) if transport is None else transport(route)
+    client = httpx.AsyncClient(transport=transport)
     api = KickAPI(AppConfig.model_validate(config or base_config()), http=client)
     _apis.append(api)
     return api
@@ -221,10 +243,8 @@ def test_list_event_subscriptions_filters_foreign_app():
 
 
 def test_list_event_subscriptions_without_client_id_returns_empty():
-    subs = [{"id": "ours-1", "app_id": "cid", "broadcaster_user_id": 1}]
-
     def handler(request):
-        return httpx.Response(200, json={"data": subs})
+        pytest.fail(f"unexpected request: {request.method} {request.url}")
 
     config = base_config()
     del config["kick"]["client_id"]  # no client_id
@@ -382,7 +402,7 @@ def test_concurrent_token_refresh_is_single_flight():
         calls["tokens"] += 1
         return token_handler(request)
 
-    api = make_api(token=token)
+    api = make_api(token=token, transport=YieldingTransport)
 
     async def scenario():
         return await asyncio.gather(*[api._get_token() for _ in range(5)])
@@ -439,8 +459,11 @@ def test_top_livestreams_uses_v1_viewer_sort():
     assert asyncio.run(scenario()) == [("big", 1, 9000), ("small", 2, 10)]
 
 
-def test_top_livestreams_falls_back_to_v2_pages():
+def test_top_livestreams_falls_back_to_v2_pages(monkeypatch):
     """A dead v1 falls back to two v2 pages with a client-side max."""
+    # A v1 500 on a GET is retryable, so each call sleeps the retry delays
+    # before it falls back. Zero them: the fallback is what this test owns.
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
 
     def handler(request):
         if request.url.path == "/public/v1/livestreams":

@@ -1149,9 +1149,11 @@ class _StalledRequest:
         self.content_length = 4096
         self.remote = remote
         self.released = asyncio.Event()
+        self.entered = asyncio.Event()
         self.content = SimpleNamespace(read=self._read)
 
     async def _read(self, _size):
+        self.entered.set()
         await self.released.wait()
         return b""
 
@@ -1265,8 +1267,11 @@ def test_unverified_requests_do_not_consume_the_dispatch_budget(keypair):
     body = chat_event()
 
     async def scenario():
-        stalls = [asyncio.create_task(wh._handle(_StalledRequest())) for _ in range(16)]
-        await asyncio.sleep(0.05)  # let every stall reach the body read
+        reqs = [_StalledRequest() for _ in range(16)]
+        stalls = [asyncio.create_task(wh._handle(req)) for req in reqs]
+        # Poll until every stall blocks in the body read: a fixed sleep
+        # passes on a fast runner even when the stalls never got there.
+        await asyncio.wait_for(asyncio.gather(*[req.entered.wait() for req in reqs]), timeout=5)
         async with TestClient(TestServer(wh._webhook_app)) as client:
             resp = await client.post(
                 "/kick/webhook",

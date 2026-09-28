@@ -426,8 +426,14 @@ def test_fresh_run_refuses_unwritable_dir(monkeypatch, tmp_path):
     work.mkdir()
     work.chmod(0o555)
     # Mode bits do not stop root, and os.access is what the wizard checks:
-    # deny the write directly so the test is deterministic for every user.
-    monkeypatch.setattr(_os, "access", lambda path, mode: False)
+    # deny the write for the data dir only, so an unrelated access check
+    # still runs the original and the test cannot pass for its sake.
+    _real_access = _os.access
+    monkeypatch.setattr(
+        _os,
+        "access",
+        lambda path, mode: False if _os.path.realpath(path) == _os.path.realpath(work) else _real_access(path, mode),
+    )
     monkeypatch.chdir(work)
     _script(monkeypatch, inputs=[], secrets=[])
     with pytest.raises(SystemExit):

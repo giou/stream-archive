@@ -442,7 +442,11 @@ def test_endpoint_section_wins_over_a_legacy_webhook():
     assert parsed.endpoint.listen_host == "127.0.0.1"
     assert parsed.endpoint.listen_port == 8787
     assert parsed.endpoint.public_url == ""
-    assert not hasattr(parsed.endpoint, "tunnel")
+    # Tunnel management is gone: the old tunnel keys are dropped, not moved.
+    # Pydantic drops unknown keys, so assert on the field sets: a hasattr
+    # check cannot fail here even when the migration misplaces the keys.
+    assert set(parsed.endpoint.model_dump()) == {"enabled", "listen_host", "listen_port", "public_url"}
+    assert "cloudflare_managed" not in parsed.kick.webhook.model_dump()
     assert parsed.kick.webhook.enabled is True
 
 
@@ -455,7 +459,6 @@ def test_bare_channels_valid_without_kick_section():
     assert config.endpoint.listen_host == "127.0.0.1"
     assert config.endpoint.listen_port == 8787
     assert config.endpoint.public_url == ""
-    assert not hasattr(config.endpoint, "tunnel")
 
 
 def test_empty_channels_valid_for_first_setup():
