@@ -26,6 +26,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import re
 import secrets
 import sys
 from pathlib import Path
@@ -111,12 +112,27 @@ def _yes(prompt: str, *, default: bool = True) -> bool:
         print("Answer y or n.")
 
 
+def _short_error(e: ValueError) -> str:
+    """One plain line of a save failure, without validator noise.
+
+    Pydantic prints the model name, the raw input, and a docs link.
+    The user needs only the cause, like the missing key it names.
+    """
+    text = " ".join(str(e).split())
+    if "Value error, " in text:
+        text = text.split("Value error, ", 1)[1]
+    text = re.sub(r"\[type=[^\]]*\]", "", text)
+    text = text.split("For further information visit", 1)[0]
+    text = " ".join(text.split()).strip().rstrip(".")
+    return text or "invalid value"
+
+
 def _save(config: AppConfig, mutate: Any, what: str) -> bool:
     """Write one step. A rejected change prints the cause and saves nothing."""
     try:
         apply_config_change(config, mutate)
     except ValueError as e:
-        print(f"Cannot save {what}: {e}")
+        print(f"Cannot save {what}: {_short_error(e)}.")
         return False
     print(f"{what} saved.")
     return True
@@ -311,27 +327,42 @@ def _step_control(config: AppConfig, *, required: bool) -> None:
                 token = entered
                 break
             print("The bot token is required.")
-    if want_web and not replace_hash and not password:
-        print("The panel needs a password. Nothing saved.")
-        return
-    if want_bot and (user_id <= 0 or not token.strip()):
-        print("The bot needs a user id and a token. Nothing saved.")
-        return
     hashed = hash_password(password) if password else config.web.password_hash
+    if want_web:
+        if not replace_hash and not password:
+            print("The panel needs a password. Web panel unchanged.")
+        else:
 
-    def mutate(candidate: AppConfig) -> None:
-        candidate.web.enabled = want_web
-        candidate.web.password_hash = hashed if want_web else candidate.web.password_hash
-        if want_web and not candidate.web.session_secret.strip():
-            candidate.web.session_secret = secrets.token_urlsafe(32)
-        if want_bot:
-            candidate.telegram_user_id = user_id
-            candidate.bot_telegram_api = token
-        elif not required:
+            def mutate_web(candidate: AppConfig) -> None:
+                candidate.web.enabled = True
+                candidate.web.password_hash = hashed
+                if not candidate.web.session_secret.strip():
+                    candidate.web.session_secret = secrets.token_urlsafe(32)
+
+            _save(config, mutate_web, "Web panel")
+    elif not required:
+
+        def mutate_web_off(candidate: AppConfig) -> None:
+            candidate.web.enabled = False
+
+        _save(config, mutate_web_off, "Web panel")
+    if want_bot:
+        if user_id <= 0 or not token.strip():
+            print("The bot needs a user id and a token. Telegram bot unchanged.")
+        else:
+
+            def mutate_bot(candidate: AppConfig) -> None:
+                candidate.telegram_user_id = user_id
+                candidate.bot_telegram_api = token
+
+            _save(config, mutate_bot, "Telegram bot")
+    elif not required:
+
+        def mutate_bot_off(candidate: AppConfig) -> None:
             candidate.telegram_user_id = 0
             candidate.bot_telegram_api = ""
 
-    _save(config, mutate, "Control surface")
+        _save(config, mutate_bot_off, "Telegram bot")
 
 
 def _step_channels(config: AppConfig) -> None:
@@ -348,11 +379,15 @@ def _step_channels(config: AppConfig) -> None:
         print("  1. Add a channel")
         print("  2. Remove a channel")
         print("  3. Done")
-        pick = _choose("Channels", 3)
+        raw_pick = _read("Channels (1-3, or type a name to add it)")
+        try:
+            pick = int(raw_pick)
+        except ValueError:
+            pick = 0
         if pick == 3:
             return
-        if pick == 1:
-            raw = _read("Channel (twitch:name or kick:slug)")
+        if pick == 1 or (pick == 0 and raw_pick):
+            raw = raw_pick if pick == 0 else _read("Channel (twitch:name or kick:slug)")
             name = normalize_channel_name(raw)
             if name is None:
                 print("That name is not valid. Use twitch:name or kick:slug.")
@@ -367,6 +402,9 @@ def _step_channels(config: AppConfig) -> None:
                 candidate.channels = [*candidate.channels, name]
 
             _save(config, mutate_add, f"Channel {name}")
+            continue
+        if pick != 2:
+            print("Type 1, 2, 3, or a channel name.")
             continue
         if not config.channels:
             print("Nothing to remove.")
@@ -504,6 +542,7 @@ def _step_api(config: AppConfig) -> None:
     if created:
         print(f"API key: {key}")
         print("Keep it secret. Send it as Authorization: Bearer <key>.")
+        print("It stays in config.json under api.key.")
         return
     if _yes("Rotate the API key", default=False):
         rotated = secrets.token_urlsafe(32)
@@ -586,6 +625,7 @@ def _step_remote(config: AppConfig) -> None:
     url: str | None = ""
     if tailnet:
         print(f"Run on the host: tailscale serve --bg --yes {port}")
+        print("Funnel stays out here on purpose: it would put the panel on the public internet.")
         print("Then paste the tailnet address it serves.")
         while True:
             raw_url = _read("Tailnet URL", default=config.endpoint.public_url or None)
@@ -776,9 +816,10 @@ def _verify_kick_delivery(config: AppConfig) -> None:
     if not config.kick.client_id.strip() or not config.kick.client_secret.strip():
         print("Save Kick credentials first: the test subscribes with them.")
         return
-    if not _app_reachable(config):
-        print("Start the app first: nothing listens on the endpoint port.")
-        return
+    while not _app_reachable(config):
+        print("Nothing listens on the endpoint port. Start the app, then test again.")
+        if not _yes("Test again", default=True):
+            return
     base = f"http://127.0.0.1:{config.endpoint.listen_port}"
     headers: dict[str, str] = {}
     opener: Any = None
@@ -909,6 +950,17 @@ def _kick_status(config: AppConfig) -> str:
     return "polling (no public entry)"
 
 
+def _start_hint() -> str:
+    """How to start the app after setup, for this machine.
+
+    A container starts through compose on the host. Bare metal runs
+    the installed entry point.
+    """
+    if os.path.exists("/.dockerenv"):
+        return "Start the app with `docker compose up -d`."
+    return "Start the app with `stream-archive`."
+
+
 def _menu_loop(config: AppConfig) -> None:
     """Run steps until the user quits with every required block complete."""
     steps = (
@@ -925,15 +977,24 @@ def _menu_loop(config: AppConfig) -> None:
     done = str(len(steps) + 1)
     while True:
         print("\n== StreamArchive setup ==")
+        print("Tip: Ctrl+C returns to the menu from any step.")
         print(f"Control: {_control_label(config)}")
         print(f"Channels: {', '.join(config.channels) if config.channels else 'none'}")
         print(f"Output mode: {config.output_mode}")
+        token_path = config.workdir / "youtube_token.json"
+        print(f"YouTube token: {'yes' if token_path.exists() else 'no'}")
         print(f"Kick: {_kick_status(config)}")
         print(f"Control API: {'on' if config.api.enabled else 'off'}")
         print(f"MTProto (Telegram upload): {'on' if config.mtproto.enabled else 'off'}")
         print(f"Panel access: {_panel_access_state(config)}")
+        missing = _missing_required(config)
         for number, (label, _) in enumerate(steps, start=1):
-            print(f"  {number}. {label}")
+            mark = ""
+            if label == "Twitch credentials" and "Twitch credentials" in missing:
+                mark = " (missing)"
+            if label == "Control surface" and "control surface (web panel, Telegram bot, or both)" in missing:
+                mark = " (missing)"
+            print(f"  {number}. {label}{mark}")
         print(f"  {done}. Done")
         try:
             raw = _read("Choose a step").strip().lower()
@@ -946,7 +1007,7 @@ def _menu_loop(config: AppConfig) -> None:
                 print("Still missing: " + "; ".join(missing) + ".")
                 continue
             print("Setup complete. Add channels in step 3 (or the panel or the bot).")
-            print("Start the app with `docker compose up -d`.")
+            print(_start_hint())
             return
         try:
             pick = int(raw)

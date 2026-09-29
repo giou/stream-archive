@@ -456,15 +456,17 @@ def test_fresh_run_refuses_unwritable_dir(monkeypatch, tmp_path):
 
 
 def test_kick_entry_test_needs_the_app_running(monkeypatch, tmp_path, capsys):
-    """The test prompt without a listener says to start the app, not hanging."""
+    """The test prompt without a listener offers a retry instead of hanging."""
     _write_config(tmp_path, endpoint={"listen_port": 47999})
     monkeypatch.chdir(tmp_path)
     # Fixed ports are not reliably closed, so force the unreachable branch.
     monkeypatch.setattr(wizard, "_app_reachable", lambda config: False)
     monkeypatch.chdir(tmp_path)
-    _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "y", "10"], secrets=[])
+    _script(monkeypatch, inputs=["5", "n", "y", "4", "kick.example.com", "y", "n", "10"], secrets=[])
     wizard.main()
-    assert "Start the app first" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Nothing listens on the endpoint port" in out
+    assert "Setup complete." in out
 
 
 def test_kick_entry_test_reports_delivery(monkeypatch, tmp_path, capsys):
@@ -668,3 +670,83 @@ def test_kick_step_own_url_rejects_a_single_label(monkeypatch, tmp_path):
     config = get_config(tmp_path / "config.json")
     assert config.kick.webhook.public_url == "https://kick.example.com"
     assert config.kick.webhook.enabled is True
+
+
+def test_save_failure_prints_one_plain_line(monkeypatch, tmp_path, capsys):
+    """A rejected save prints the cause alone, without validator noise.
+
+    The raw error named the model, dumped the input, and linked the
+    validator docs: nothing a tired reader needs.
+    """
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    config = get_config(tmp_path / "config.json")
+
+    def mutate(candidate):
+        candidate.channels = ["kick:x", "kick:x"]
+
+    assert wizard._save(config, mutate, "Test") is False
+    out = capsys.readouterr().out
+    assert "Duplicate channel" in out
+    assert "errors.pydantic.dev" not in out
+    assert "\n" not in out.strip().split("Cannot save Test: ", 1)[1]
+
+
+def test_control_both_saves_the_valid_half(monkeypatch, tmp_path, capsys):
+    """Both with a good password and an empty token keeps the web half.
+
+    One missing half used to drop the whole step with Nothing saved,
+    so a user without the token lost the panel too.
+    """
+    from stream_archive.webui import verify_password
+
+    _write_config(tmp_path, telegram_user_id=0, bot_telegram_api="", web={"enabled": False, "password_hash": ""})
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["2", "3", "42", "10"], secrets=["long-enough-pass4", "long-enough-pass4", ""])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.web.enabled is True
+    assert verify_password("long-enough-pass4", config.web.password_hash) is True
+    assert config.telegram_user_id == 0
+    assert config.bot_telegram_api == ""
+    out = capsys.readouterr().out
+    assert "Web panel saved." in out
+    assert "Telegram bot unchanged." in out
+
+
+def test_channels_step_takes_a_pasted_name(monkeypatch, tmp_path):
+    """A name typed at the channels menu adds the channel at once.
+
+    New users typed the name where the step asked, and the number
+    parser rejected it with no hint that a name works there.
+    """
+    _write_config(tmp_path, channels=[])
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["3", "FreshName", "3", "10"], secrets=[])
+    wizard.main()
+    assert get_config(tmp_path / "config.json").channels == ["twitch:freshname"]
+
+
+def test_menu_marks_missing_steps_and_token(monkeypatch, tmp_path, capsys):
+    """The menu names the missing required steps and the token state.
+
+    The gap only showed after a failed Done, so users guessed which
+    step still needed work.
+    """
+    _write_config(tmp_path, telegram_user_id=0, bot_telegram_api="", web={"enabled": False, "password_hash": ""})
+    monkeypatch.chdir(tmp_path)
+    _script(monkeypatch, inputs=["10", "2", "2", "42", "10"], secrets=["bottoken123"])
+    wizard.main()
+    out = capsys.readouterr().out
+    assert "2. Control surface (missing)" in out
+    assert "YouTube token: no" in out
+
+
+def test_start_hint_matches_the_machine(monkeypatch):
+    """The closing line names compose in a container, the binary outside."""
+    import os
+
+    monkeypatch.setattr(os.path, "exists", lambda _path: True)
+    assert wizard._start_hint() == "Start the app with `docker compose up -d`."
+    monkeypatch.setattr(os.path, "exists", lambda _path: False)
+    assert wizard._start_hint() == "Start the app with `stream-archive`."
