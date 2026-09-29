@@ -43,9 +43,9 @@ Dockerfile uv stage agree; a check that the Dockerfile healthcheck port equals
 changes require a matching `uv.lock` update. The image build uses `--frozen`,
 because it installs the shipped lock as it is.
 
-A second job, `image`, builds the container image, but only on a Dependabot
-pull request: nothing else in CI builds it, and a base-image bump should fail
-before the merge instead of at release time.
+A second job, `image`, builds the container image on every pull request,
+so Dockerfile, entrypoint, and plugin changes fail before the merge
+instead of at release time.
 
 ## Tests (mandatory)
 

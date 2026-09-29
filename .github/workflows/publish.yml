@@ -31,6 +31,35 @@ jobs:
       - name: Install ffmpeg (runtime dep; hold/reuse tests spawn it)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: uv sync --frozen
+      # --frozen installs the shipped lock as it is. The check below fails
+      # when uv.lock is out of step with pyproject.toml, so a skewed lock
+      # cannot ship.
+      - run: uv lock --check
+      # The vendored plugin runs with the app's secrets authority, so its bytes
+      # and the Dockerfile pin must move together. This needs no network: it
+      # hashes the file in the checkout.
+      - name: Verify the vendored streamlink-ttvlol plugin
+        run: |
+          TAG=$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)
+          SHA=$(sed -n 's/^ARG TTVLOL_PLUGIN_SHA256=//p' Dockerfile)
+          if [ -z "$TAG" ] || [ -z "$SHA" ]; then
+            echo "the Dockerfile is missing the streamlink-ttvlol pin" >&2; exit 1
+          fi
+          printf '%s  %s\n' "$SHA" "vendor/streamlink-ttvlol/${TAG}/twitch.py" | sha256sum -c -
+      # The healthcheck and scheduler.py hold the same port number. Compare them
+      # here, so a change to one of them fails instead of leaving the container
+      # permanently unhealthy.
+      - name: Check the healthcheck port against scheduler.py
+        run: |
+          DOC_PORT=$(sed -n 's|^HEALTHCHECK.*127\.0\.0\.1:\([0-9]*\)/healthz.*|\1|p' Dockerfile)
+          CODE_PORT=$(uv run python -c 'from stream_archive.scheduler import _HEALTH_PORT; print(_HEALTH_PORT)')
+          if [ -z "$DOC_PORT" ] || [ -z "$CODE_PORT" ]; then
+            echo "cannot read the healthcheck port: Dockerfile '$DOC_PORT', scheduler.py '$CODE_PORT'" >&2
+            exit 1
+          fi
+          if [ "$DOC_PORT" != "$CODE_PORT" ]; then
+            echo "the Dockerfile healthcheck port $DOC_PORT is not _HEALTH_PORT $CODE_PORT" >&2; exit 1
+          fi
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy

@@ -26,6 +26,7 @@ The app validates each change and writes it atomically to `config.json`. The cha
 | `/maxrecordings [n]` | Show or set the concurrent recording limit (`0` means unlimited) |
 | `/maxyoutube [n]` | Show or set the concurrent YouTube restream limit (`0` means unlimited) |
 | `/chat [on\|off] [twitch\|kick]` | Show whether chat recording is on, or set it (globally, or for one platform with `twitch`/`kick`). `off` stops chat capture in flight and finalizes it. Video recordings continue |
+| `/hold <seconds>` | Set the global YouTube hold delay (`0` ends the restream at once) |
 | `/recordings` | Browse stored recordings. Tap a file to send it over MTProto (up to 2 GB) or delete it |
 
 ## Notes

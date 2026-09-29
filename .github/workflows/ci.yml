@@ -94,11 +94,11 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest -q
   # Nothing else in CI builds the image: the test job installs the dependencies
-  # and publish.yml builds on a v* tag. A Dependabot pull request bumps a base
-  # image (python, uv), so build the image there and fail before
-  # the merge instead of at release time.
+  # and publish.yml builds on a v* tag. A pull request can change the
+  # Dockerfile, the entrypoint, the compose file, or the vendored plugin, so
+  # build the image on every pull request and fail before the merge instead
+  # of at release time.
   image:
-    if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

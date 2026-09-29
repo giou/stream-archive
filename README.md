@@ -19,7 +19,7 @@ docker compose logs -f
 
 The setup wizard writes `config.json` in the data directory. It asks for Twitch credentials and one control surface (web panel, Telegram bot, or both). Then it offers channels and each optional block: web panel access, Kick, YouTube restream, Telegram upload, and the control API. Run the setup wizard again later to add a block.
 
-The data directory holds the settings, the recordings, the chat files, and the tokens. To move it to another disk, set `STREAM_ARCHIVE_DATA` in `.env` in that folder:
+The data directory holds the settings, the recordings, the chat files, and the tokens. To move it to another disk, set `STREAM_ARCHIVE_DATA` in `.env` in that folder. See [Backup and restore](docs/backup-restore.md) before you copy or move it:
 
 ```sh
 # ~/stream-archive-data/.env
@@ -56,6 +56,7 @@ Two blocks need extra steps:
 | --- | --- |
 | [Settings](docs/configuration.md) | All keys of `config.json`, and secrets from the environment |
 | [Running](docs/running.md) | Data directory, container identity, logs, shutdown |
+| [Backup and restore](docs/backup-restore.md) | Data directory contents, backup, restore rules |
 | [YouTube restream](docs/youtube-setup.md) | OAuth client and the one-time authorization flow |
 | [Kick webhook](docs/kick-webhook.md) | Public URLs, proxy setup, delivery test |
 | [Telegram control](docs/telegram-control.md) | Telegram bot menu and command list |

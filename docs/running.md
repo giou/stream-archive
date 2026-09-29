@@ -28,7 +28,7 @@ The setup wizard writes `config.json`: Twitch credentials, one control surface (
 
 The default data directory is the folder that holds `docker-compose.yml`, for example `~/stream-archive-data/`. It holds `config.json`, `recordings/`, `chat/`, `youtube_token.json`, `client_secret.json`, and `update_state.json`.
 
-Back it up by copying the folder. To move it to another disk, set `STREAM_ARCHIVE_DATA` in `.env` in that folder. See the setup in the README.
+Back it up by copying the folder. See [Backup and restore](backup-restore.md) for the full contents and the restore rules. To move it to another disk, set `STREAM_ARCHIVE_DATA` in `.env` in that folder. See the setup in the README.
 
 ## Container identity and time
 
@@ -47,3 +47,7 @@ docker compose logs -f
 ```
 
 `SIGTERM` and `SIGINT` trigger a graceful shutdown. All recordings stop. The active YouTube broadcasts go to `complete`. The scheduler exits with `[scheduler] Shutdown complete`.
+
+## Health and readiness
+
+`/healthz` on port 9100 answers `200` while the process runs. It says nothing about the work: a full disk or dead credentials still read healthy. `/readyz` on the same port answers `200` with `{"ready": true, "degraded": [...]}` once the clients exist, `503` while starting. The `degraded` list names present problems (`disk_full`, `twitch_auth`, `kick_auth`, `youtube_auth`). Point an orchestrator at `/readyz` when it must tell starting apart from broken.

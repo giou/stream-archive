@@ -8,7 +8,7 @@ The web panel lives on the private listener at the domain root. It runs while th
 
 The setup wizard sets the web panel up as one of its steps. It is the recommended path. To enable it by hand, do the steps that follow.
 
-1. Enable the endpoint and set its public URL (see [Kick webhook](kick-webhook.md)).
+1. Turn on the private listener: enable the endpoint, the control API, or the web panel itself (see [Kick webhook](kick-webhook.md)). The endpoint alone is sufficient. Then set its public URL.
 2. Set a password: open **Settings → Remote access → Web panel** in the Telegram bot and tap **Enable Web panel** (the first enable generates the password and shows it once), or run `stream-archive-setup-web` on the host. The command stores a hash, plus a session secret on first use. The password never reaches disk or logs. Docker: `docker compose exec stream-archive stream-archive-setup-web`.
 3. Set `web.enabled` to `true` in `config.json` (the setup command does this) and restart.
 4. Open `<endpoint.public_url>/` and log in.
@@ -33,8 +33,14 @@ The web panel is powerful. Keep it off the open internet when you can.
 
 - Recordings stream and download in the browser. Finished captures are MP4 (M4A for audio-only: the recorder remuxes when the stream ends) and play inline. A file that still records shows a REC badge with no actions: it unlocks when the stream ends. Live captures cannot be deleted either. On wide screens the recordings list, the player, and the recorded chat sit side by side, and the chat follows the video position.
 - The web panel cannot send a recording to your Telegram chat. Use the Telegram bot for MTProto upload.
-- The web panel cannot manage the Kick webhook or the control API itself. Use the Telegram bot or edit `config.json` for those.
+- The web panel edits remote access too: the endpoint toggle and URL, the Kick toggle and URL, the API toggle, and the global YouTube hold. A first API enable shows the new key once. Listener binds, ports, and all secrets stay out: use the setup wizard or edit `config.json` for those.
 - Every web panel change writes `config.json` atomically like a Telegram bot change. A rejected change writes nothing.
+
+## Settings the panel edits
+
+The panel edits the same 15 global keys as `PATCH /api/v1/settings`: `output_mode`, `preferred_quality`, `retention_days`, `max_concurrent_recordings`, `max_concurrent_youtube_streams`, `record_chat`, `kick_record_chat`, `disk_max_total_gb`, `disk_delete_oldest`, `youtube_hold_seconds`, `endpoint_enabled`, `endpoint_public_url`, `kick_webhook_enabled`, `kick_webhook_public_url`, `api_enabled`. It also adds and removes channels and edits per-channel `output_mode`, `quality`, and `youtube_hold_seconds`.
+
+It cannot touch the read-only keys of the control API: listener binds and ports, `kick.client_id` and `kick.client_secret`, `web.*`, `api.key`, `youtube.privacy_status`, `timezone`, `monitoring_interval`, `proxy_list`, the plugin, recording, chat, and session dirs, `eventsub.enabled`, `update_check.*`, and all secrets. See [Control API](control-api.md) for the full read-only list.
 
 ## Related guides
 

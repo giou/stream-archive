@@ -11,6 +11,15 @@ The app binds two loopback listeners and publishes nothing itself:
 
 You publish them yourself. A common split: `tailscale serve` for the web panel port (tailnet only), and your own reverse proxy (cloudflared you run, nginx, or anything with TLS) for the webhook port. `tailscale funnel` on the same tailnet name also reaches Kick: serve never leaves the tailnet. The setup wizard generates the proxy setup for the pick: a cloudflared ingress file or an nginx server block that forwards only `/kick/webhook` and drops the rest, so the web panel never leaks through the public hostname.
 
+The wizard writes the generated files into the data directory:
+
+- `cloudflared/<tunnel-id>.yml`: ingress file for `cloudflared tunnel --config <path> run`. Back it up with the rest of the data directory.
+- `nginx/<host>.conf`: server block for the public hostname. Symlink it from `sites-enabled`, get a certificate, then run `nginx -s reload`. Back it up with the rest of the data directory.
+
+A blank cloudflared token writes `cloudflared/tunnel.yml` with no tunnel credentials. The tunnel fails at run time with that file. Paste the token from the Cloudflare dashboard to get a working file.
+
+The nginx generator has a plain-HTTP mode (`tls=False` in `tunnels.py`) for use behind a tunnel that ends TLS itself, such as cloudflared. It listens on `127.0.0.1:8090` with no certificates. The setup wizard always writes the TLS mode (`tls=True`). To use the plain mode, call the generator by hand or write the block yourself.
+
 Under Docker set both listen hosts to `0.0.0.0`, or the host proxies cannot reach the container.
 
 ## Set the public URL
