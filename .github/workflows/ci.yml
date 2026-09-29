@@ -64,16 +64,19 @@ jobs:
       # leaves the version input alone. publish.yml pins its own setup-uv
       # version for the release build, so check that too: a release built
       # with a different uv than CI tested is a drift the merge must catch.
+      # ttvlol-bump.yml pins one more copy for the plugin gate: check it as
+      # well, or the bump runs on a different uv than everything else.
       - name: Check the uv version against the Dockerfile
         run: |
           IMAGE_UV=$(sed -n 's|^FROM ghcr.io/astral-sh/uv:\([^ ]*\) AS uv$|\1|p' Dockerfile)
           CI_UV="${UV_VERSION}"
           PUB_UV=$(sed -n '/astral-sh\/setup-uv/,+3p' .github/workflows/publish.yml | sed -n 's|^ *version: "\(.*\)"$|\1|p')
-          if [ -z "$IMAGE_UV" ] || [ -z "$CI_UV" ] || [ -z "$PUB_UV" ]; then
-            echo "cannot read a uv version: Dockerfile '$IMAGE_UV', ci.yml '$CI_UV', publish.yml '$PUB_UV'" >&2; exit 1
+          BUMP_UV=$(sed -n '/astral-sh\/setup-uv/,+3p' .github/workflows/ttvlol-bump.yml | sed -n 's|^ *version: "\(.*\)"$|\1|p')
+          if [ -z "$IMAGE_UV" ] || [ -z "$CI_UV" ] || [ -z "$PUB_UV" ] || [ -z "$BUMP_UV" ]; then
+            echo "cannot read a uv version: Dockerfile '$IMAGE_UV', ci.yml '$CI_UV', publish.yml '$PUB_UV', ttvlol-bump.yml '$BUMP_UV'" >&2; exit 1
           fi
-          if [ "$IMAGE_UV" != "$CI_UV" ] || [ "$IMAGE_UV" != "$PUB_UV" ]; then
-            echo "uv versions differ: Dockerfile $IMAGE_UV, ci.yml $CI_UV, publish.yml $PUB_UV" >&2; exit 1
+          if [ "$IMAGE_UV" != "$CI_UV" ] || [ "$IMAGE_UV" != "$PUB_UV" ] || [ "$IMAGE_UV" != "$BUMP_UV" ]; then
+            echo "uv versions differ: Dockerfile $IMAGE_UV, ci.yml $CI_UV, publish.yml $PUB_UV, ttvlol-bump.yml $BUMP_UV" >&2; exit 1
           fi
       # The healthcheck and scheduler.py hold the same port number. Compare them
       # here, so a change to one of them fails instead of leaving the container
