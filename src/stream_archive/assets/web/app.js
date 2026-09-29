@@ -424,24 +424,54 @@ async function loadChannels() {
       qInput.setAttribute("aria-label", "Quality for " + ch.channel);
       qInput.addEventListener("change", async () => {
         try {
-          const v = qInput.value.trim() || "default";
-          if (v === "audio_only" && (ch.output_mode === "youtube" || ch.output_mode === "both")) {
-            const ok = window.confirm(
-              "Setting audio-only quality will set output mode to disk for: " + ch.channel
-            );
-            if (!ok) {
+          const raw = qInput.value.trim();
+          const v = raw || "default";
+          let eff = v.toLowerCase();
+          if (eff === "default") {
+            // Clearing the override hands control to the global value,
+            // which this card cannot see: read it before deciding.
+            const s = await api("/api/v1/settings");
+            eff = String(s.preferred_quality || "").toLowerCase();
+          }
+          // The mode select may hold an unsaved pick: read the live
+          // control, falling back to the effective mode for "global".
+          const liveMode = modeSel.value === "default" ? ch.output_mode : modeSel.value;
+          let prevMode = null;
+          if (eff === "audio_only" && (liveMode === "youtube" || liveMode === "both")) {
+            if (!window.confirm(audioDiskMessage([ch.channel]))) {
               loadChannels();
               return;
             }
+            prevMode = modeSel.value;
+            await migrateChannelToDisk(ch.channel);
+          }
+          try {
             await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
               method: "PATCH",
-              body: JSON.stringify({ output_mode: "disk" }),
+              body: JSON.stringify({ quality: v }),
             });
+          } catch (e) {
+            if (prevMode === null) throw e;
+            // The disk switch already applied: switch it back so a failed
+            // quality change leaves the mode as it found it.
+            let back = true;
+            try {
+              await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
+                method: "PATCH",
+                body: JSON.stringify({ output_mode: prevMode }),
+              });
+            } catch {
+              back = false;
+            }
+            toast(
+              "Quality failed" + (back
+                ? "; output mode was switched back"
+                : " and output mode stuck on disk - fix it by hand"),
+              true
+            );
+            loadChannels();
+            return;
           }
-          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
-            method: "PATCH",
-            body: JSON.stringify({ quality: v }),
-          });
           toast("Quality saved");
         } catch (e) {
           toast(String(e.message || e), true);
@@ -534,8 +564,18 @@ const SETTING_DEFS = [
   { key: "api_enabled", label: "Control API", hint: "Remote HTTP control", type: "bool" },
 ];
 
-function settingControl(def, current) {
-  const lab = document.createElement("label");
+function audioDiskMessage(names) {
+  return "Setting audio-only quality will set output mode to disk for: " + names.join(", ");
+}
+
+async function migrateChannelToDisk(name) {
+  await api("/api/v1/channels/" + encodeURIComponent(name), {
+    method: "PATCH",
+    body: JSON.stringify({ output_mode: "disk" }),
+  });
+}
+
+function settingControl(def, current) {  const lab = document.createElement("label");
   lab.className = "field";
   const caption = document.createElement("span");
   caption.textContent = def.label + " - " + def.hint;
@@ -1535,6 +1575,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   async function saveSettings() {
     let res;
+    const migrated = [];
     try {
       const payload = {};
       for (const def of SETTING_DEFS) {
@@ -1546,8 +1587,16 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         payload[def.key] = value;
       }
-      const chans = await api("/api/v1/channels");
-      const conflicts = (chans.channels || [])
+      // Best effort: when the list will not load, skip the pre-check and
+      // let the server 409 gate decide, like before this confirm existed.
+      let channels = [];
+      try {
+        const chans = await api("/api/v1/channels");
+        channels = chans.channels || [];
+      } catch (e) {
+        channels = [];
+      }
+      const conflicts = channels
         .filter((c) => {
           const q = c.quality_override || payload.preferred_quality;
           const m = c.output_mode_override || payload.output_mode;
@@ -1555,15 +1604,10 @@ document.addEventListener("DOMContentLoaded", () => {
         })
         .map((c) => c.channel);
       if (conflicts.length) {
-        const ok = window.confirm(
-          "Setting audio-only quality will set output mode to disk for: " + conflicts.join(", ")
-        );
-        if (!ok) return;
+        if (!window.confirm(audioDiskMessage(conflicts))) return;
         for (const name of conflicts) {
-          await api("/api/v1/channels/" + encodeURIComponent(name), {
-            method: "PATCH",
-            body: JSON.stringify({ output_mode: "disk" }),
-          });
+          await migrateChannelToDisk(name);
+          migrated.push(name);
         }
       }
       res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });
@@ -1572,10 +1616,14 @@ document.addEventListener("DOMContentLoaded", () => {
       // them and keep the edits for retry instead of reloading.
       const errors = err && err.payload && err.payload.errors;
       if (errors && Object.keys(errors).length) {
-        toast("Some keys failed: " + JSON.stringify(errors), true);
+        let msg = "Some keys failed: " + JSON.stringify(errors);
+        if (migrated.length) msg += " (output already set to disk for: " + migrated.join(", ") + ")";
+        toast(msg, true);
         return;
       }
-      toast(String((err && err.message) || err), true);
+      let msg = String((err && err.message) || err);
+      if (migrated.length) msg += " (output already set to disk for: " + migrated.join(", ") + ")";
+      toast(msg, true);
       return;
     }
     toast("Settings saved");
