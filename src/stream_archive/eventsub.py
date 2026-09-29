@@ -392,6 +392,11 @@ class EventSubClient:
         )
         created: dict[str, str] = {}
         for kind, result in zip(_EVENT_KINDS, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                # gather(return_exceptions=True) reports cancellation as a
+                # value. Re-raise it: a cancelled subscribe must not read
+                # as a plain failure.
+                raise result
             if isinstance(result, BaseException):
                 # A status other than 202/400/403/409 raises. The sibling
                 # call can still have created its subscription, so its id
@@ -520,10 +525,15 @@ class EventSubClient:
         """Drop the dedup marker after a failed dispatch.
 
         The marker is set before the dispatch runs. A failed dispatch must
-        not suppress a redelivery for the rest of the dedup window.
+        not suppress a redelivery for the rest of the dedup window. Only a
+        string id is dropped: the remember path stores string ids only, and
+        a wrong-typed id must not break the error path itself.
         """
-        message_id = msg.get("metadata", {}).get("message_id")
-        if message_id:
+        metadata = msg.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        message_id = metadata.get("message_id")
+        if isinstance(message_id, str) and message_id:
             self._seen_ids.pop(message_id, None)
 
     async def _bounded_dispatch(self, msg: dict[str, Any]) -> None:

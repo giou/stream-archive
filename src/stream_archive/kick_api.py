@@ -187,7 +187,7 @@ class KickAPI:
     async def _top_v2(self, limit: int) -> list[tuple[str, int, int]]:
         """Busiest channels of two v2 pages (global plus English)."""
         headers = await self._headers()
-        rows: list[tuple[str, int, int]] = []
+        best: dict[str, tuple[str, int, int]] = {}
         for params in ({"limit": 1000}, {"limit": 1000, "language_code": "en"}):
             resp = await self._request(
                 "GET", "https://api.kick.com/public/v2/livestreams", headers=headers, params=params
@@ -197,8 +197,13 @@ class KickAPI:
                 slug = (item.get("channel") or {}).get("slug")
                 uid = (item.get("broadcaster_user") or {}).get("id")
                 if slug and uid:
-                    rows.append((slug, int(uid), int(item.get("viewer_count") or 0)))
-        rows.sort(key=lambda row: row[2], reverse=True)
+                    # The two pages overlap. One slug counts once, with its
+                    # highest viewer count.
+                    row = (slug, int(uid), int(item.get("viewer_count") or 0))
+                    prev = best.get(slug)
+                    if prev is None or row[2] > prev[2]:
+                        best[slug] = row
+        rows = sorted(best.values(), key=lambda row: row[2], reverse=True)
         return rows[:limit]
 
     async def get_public_key(self, force: bool = False) -> str | None:

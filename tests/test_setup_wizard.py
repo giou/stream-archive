@@ -149,6 +149,10 @@ def test_youtube_step_saves_mode_and_runs_oauth(monkeypatch, tmp_path):
         ("https://example.com:443", "https://example.com:443"),
         ("https://example.com:99999", None),
         ("http://example.com:0", None),
+        ("https://example.com/app", None),
+        ("https://example.com?x=1", None),
+        ("https://example.com#frag", None),
+        ("https://user@example.com", None),
         ("", None),
         ("not a url at all", None),
         ("ftp://example.com", None),
@@ -518,6 +522,26 @@ def test_verify_needs_credentials_first(tmp_path, capsys):
     config = _write_config(tmp_path, kick={"client_id": "", "client_secret": ""})
     wizard._verify_kick_delivery(config)
     assert "Save Kick credentials first" in capsys.readouterr().out
+
+
+def test_kick_delivery_test_returns_to_menu_on_keyboard_interrupt(monkeypatch, tmp_path):
+    """Ctrl+C during the delivery wait returns to the menu.
+
+    The test call waits minutes for the first delivery. The except-Exception
+    around it let KeyboardInterrupt escape as a traceback, although the menu
+    promises that Ctrl+C returns to the menu from any step.
+    """
+    _write_config(tmp_path, api={"enabled": True, "key": "k"}, kick={"client_id": "cid", "client_secret": "cs"})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wizard, "_app_reachable", lambda config: True)
+
+    def _interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wizard, "_verify_request", _interrupted)
+    config = get_config(tmp_path / "config.json")
+    with pytest.raises(wizard._BackToMenu):
+        wizard._verify_kick_delivery(config)
 
 
 def test_kick_entry_ingress_write_failure_changes_nothing(monkeypatch, tmp_path, capsys):

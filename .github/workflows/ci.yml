@@ -103,5 +103,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Build the image
-        run: docker build --tag stream-archive:ci .
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      # Same cache flags as the release build in publish.yml, so pull request
+      # builds reuse layers across runs. The image is never pushed here: the
+      # job only fails before the merge instead of at release time.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: stream-archive:ci

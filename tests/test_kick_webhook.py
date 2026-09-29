@@ -409,6 +409,39 @@ def test_chat_event_dispatches_normalized_payload(keypair):
     }
 
 
+def test_wrong_typed_chat_body_is_ignored_not_retried(keypair):
+    """A signed body with the wrong JSON types answers 200 and stores nothing.
+
+    Reading .get() on a list or a string raised AttributeError out of the
+    dispatch, which rolled back the dedup mark and answered 500. Kick then
+    retried a delivery that can never succeed.
+    """
+    private_key, public_pem = keypair
+    recorder = FakeRecorder()
+    wh = make_webhook(recorder=recorder, api=FakeKickAPI(public_pem))
+    good = json.loads(chat_event())
+    bodies = [
+        b"[1, 2, 3]",
+        b'"just a string"',
+        json.dumps({**good, "broadcaster": ["xqc"]}).encode(),
+        json.dumps({**good, "sender": "viewer1"}).encode(),
+        json.dumps({**good, "emotes": {"emote-1": "everywhere"}}).encode(),
+        json.dumps({**good, "emotes": [{"emote_id": "e1", "positions": {"s": 0}}]}).encode(),
+        json.dumps({**good, "sender": {**good["sender"], "identity": {"badges": "sub"}}}).encode(),
+    ]
+
+    async def scenario():
+        async with TestClient(TestServer(wh._webhook_app)) as client:
+            statuses = []
+            for index, body in enumerate(bodies):
+                headers = _signed_headers(private_key, f"wt-{index}", _fresh_ts(), body, wh.EVENT_CHAT)
+                statuses.append((await client.post("/kick/webhook", data=body, headers=headers)).status)
+            return statuses
+
+    assert asyncio.run(scenario()) == [200] * len(bodies)
+    assert recorder.chat == []
+
+
 def test_bad_signature_returns_401_and_no_dispatch(keypair):
     private_key, public_pem = keypair
     monitor = FakeMonitor()
@@ -1566,6 +1599,26 @@ def test_verify_delivery_needs_nothing_to_listen_for(keypair):
     assert ok is False
     assert "Enable the endpoint and the Kick webhook first" in message
     assert api.created == []
+
+
+def test_verify_delivery_refuses_when_every_top_channel_is_monitored(keypair):
+    """The test never temp-subscribes to a monitored channel.
+
+    When every top channel was monitored, the pick fell back to the first
+    entry, subscribing to a live monitored channel against the docstring
+    promise. The test refuses instead now, creating nothing.
+    """
+    _, public_pem = keypair
+    api = FakeKickAPI(public_pem)
+    api.top = [("xqc", 123, 5000)]  # the only monitored channel in base_config
+    wh = make_webhook(config=enabled_config(), api=api)
+
+    ok, message = asyncio.run(wh.verify_delivery(timeout=0.05))
+
+    assert ok is False
+    assert "already monitored" in message
+    assert api.created == []
+    assert api.deleted == []
 
 
 def _sync_api_with_test_sub(deletes):

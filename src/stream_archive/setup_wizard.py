@@ -200,7 +200,14 @@ def _normalize_public_url(raw: str, *, require_dot: bool = False) -> str | None:
         return None
     if require_dot and "." not in host:
         return None
-    return normalize_endpoint_url(text)
+    base = normalize_endpoint_url(text)
+    bare = urlparse(base)
+    if bare.path not in ("", "/") or bare.params or bare.query or bare.fragment or bare.username or bare.password:
+        # A path, query, fragment, or userinfo would save verbatim and break
+        # the derived URLs. The known webhook path is already stripped above,
+        # so any rest here is user data.
+        return None
+    return base
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -541,9 +548,11 @@ def _step_mtproto(config: AppConfig) -> None:
         return
     while True:
         raw_id = _read("api id", default=str(config.mtproto.api_id) if config.mtproto.api_id else None)
-        if not raw_id and config.mtproto.api_id:
-            api_id = config.mtproto.api_id
-            break
+        if not raw_id:
+            # A blank answer returns the default, so a blank here means no
+            # stored id exists. The step cannot continue without one.
+            print("The api id is required. Nothing saved.")
+            return
         if raw_id.startswith("${") and raw_id.endswith("}"):
             var = raw_id[2:-1].strip()
             raw_id = os.environ.get(var, "")
@@ -917,6 +926,11 @@ def _verify_kick_delivery(config: AppConfig) -> None:
     print("Testing delivery (up to 3 minutes on a cold setup)...")
     try:
         body = _verify_request(base, "/api/v1/kick/webhook/test", headers, {}, opener)
+    except KeyboardInterrupt:
+        # The wait lasts minutes. Ctrl+C returns to the menu like any other
+        # prompt, instead of a traceback.
+        print()
+        raise _BackToMenu from None
     except Exception as e:
         print(f"Test call failed: {e}")
         return

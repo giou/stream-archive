@@ -74,8 +74,12 @@ class ApiCommands:
 
         A first enable generates the key and shows it. Disabling keeps the
         key, so a later enable works without handing out a new one.
+        Generation needs a private chat: a group enable turns the API on
+        but leaves the key ungenerated, or the group would burn the
+        one-time key unseen.
         """
-        created = enabled and not self._config.api.key
+        is_private = chat_id is None or chat_id == self._admin_id
+        created = enabled and not self._config.api.key and is_private
         key = secrets.token_urlsafe(32) if created else self._config.api.key
 
         def mutate(candidate: AppConfig) -> None:
@@ -108,10 +112,18 @@ class ApiCommands:
                 )
         if created:
             lines.append(self._key_reveal("API key (keep it secret - Show key shows it again):", key, chat_id))
+        elif enabled and not self._config.api.key:
+            lines.append(escape("No API key yet - open our private chat and tap Enable API to generate one."))
         return "\n\n".join(lines)
 
     async def _rotate_api_key(self, chat_id: int | None = None) -> str:
-        """Replace the API key. The old key stops working at once."""
+        """Replace the API key. The old key stops working at once.
+
+        A group chat gets the pointer without rotating: generating here
+        would burn the one-time secret unseen and lock the admin out.
+        """
+        if chat_id is not None and chat_id != self._admin_id:
+            return escape(_KEY_ELSEWHERE)
         key = secrets.token_urlsafe(32)
         existed = bool(self._config.api.key)
 

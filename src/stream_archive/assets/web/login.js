@@ -14,11 +14,11 @@ async function boot() {
     el.hidden = false;
     return;
   }
-  if (s.authenticated) {
+  if (s && s.authenticated) {
     window.location.replace("/");
     return;
   }
-  $("setup-hint").hidden = !s.setup_required;
+  $("setup-hint").hidden = !(s && s.setup_required);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -34,6 +34,8 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const btn = $("login-form").querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
     try {
       const resp = await fetch("/api/login", {
         method: "POST",
@@ -47,6 +49,8 @@ document.addEventListener("DOMContentLoaded", () => {
       const el = $("login-error");
       el.textContent = String(err.message || err);
       el.hidden = false;
+    } finally {
+      if (btn) btn.disabled = false;
     }
   });
   boot();

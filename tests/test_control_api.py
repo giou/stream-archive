@@ -999,6 +999,41 @@ def test_endpoint_url_with_bad_port_rejected(tmp_path):
     assert read_file(tmp_path).get("endpoint", {}).get("public_url", "") == ""
 
 
+def test_endpoint_url_with_path_query_or_userinfo_rejected(tmp_path):
+    """A public URL with a path, query, fragment, or userinfo never saves.
+
+    The validator kept the scheme, host, port, and dot rules but stored
+    the rest verbatim, so the derived webhook and API URLs pointed at
+    dead addresses. The known webhook path still strips first.
+    """
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            statuses = []
+            for bad in (
+                "https://panel.example.com/app",
+                "https://panel.example.com?x=1",
+                "https://panel.example.com#top",
+                "https://user@panel.example.com",
+            ):
+                resp = await client.patch("/api/v1/settings", json={"endpoint_public_url": bad}, headers=auth())
+                body = await resp.json()
+                statuses.append((resp.status, body["errors"]["endpoint_public_url"]))
+            # The known webhook path still strips instead of failing.
+            stripped = await client.patch(
+                "/api/v1/settings",
+                json={"endpoint_public_url": "https://panel.example.com/kick/webhook"},
+                headers=auth(),
+            )
+            return statuses, stripped.status
+
+    statuses, stripped_status = asyncio.run(scenario())
+    assert all(status == 400 and error for status, error in statuses)
+    assert stripped_status == 200
+    assert config.endpoint.public_url == "https://panel.example.com"
+
+
 def test_endpoint_url_clears_only_while_off(tmp_path):
     config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
 

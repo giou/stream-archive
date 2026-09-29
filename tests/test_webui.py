@@ -300,6 +300,53 @@ def test_delete_failure_is_not_reported_as_live(tmp_path):
     assert "recording now" not in body["error"]
 
 
+def test_delete_probe_failure_between_checks_reports_unavailable(tmp_path):
+    """A recorder hiccup at delete time answers 503, never 500.
+
+    The live check passed, then the active-set lookup for the delete
+    failed. That lookup ran inside the delete-failure handler, so the
+    recorder outage masked as a plain delete failure.
+    """
+
+    class FlakyRecorder(FakeRecorder):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def _active_paths(self):
+            self.calls += 1
+            if self.calls > 1:
+                msg = "boom"
+                raise RuntimeError(msg)
+            return set()
+
+    data = valid_config(
+        channels=["twitch:channel1"],
+        telegram_user_id=0,
+        bot_telegram_api="",
+        web={"enabled": True, "password_hash": hash_password(PW)},
+        kick={"client_id": "client_id", "client_secret": "client_secret"},
+    ).model_dump(mode="json", exclude_unset=True)
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    config = get_config(tmp_path / "config.json")
+    recorder = FlakyRecorder()
+    ctrl = TelegramController(config, recorder, FakeMonitor(), FakeEventSub(), kick_webhook=FakeKickWebhook())
+    wh = KickWebhook(config, None, None, None, None)
+    WebUI(config, ctrl, recorder).register_routes(wh)
+    base = rec_dir(config)
+    (base / "gone.mp4").write_bytes(b"x" * 100)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            resp = await client.delete("/api/recordings?id=twitch/channel1/gone.mp4", headers={"X-CSRF-Token": csrf})
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 503
+    assert body == {"error": "recording state unavailable, try again"}
+
+
 def test_status_reports_disk_cap(tmp_path):
     _, _, _, _, wh = make_webui(tmp_path)
 

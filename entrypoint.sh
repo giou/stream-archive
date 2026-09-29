@@ -128,7 +128,9 @@ while [ -n "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
         *) probe="" ;;
     esac
 done
-if ! mkdir -p "$app_home" 2>/dev/null || [ ! -d "$app_home" ]; then
+# mkdir runs with a closed umask and mode 700, so a new home is private from
+# creation. The chmod below still covers a home that already existed.
+if ! (umask 077; mkdir -p -m 700 "$app_home") 2>/dev/null || [ ! -d "$app_home" ]; then
     echo "entrypoint: cannot create '$app_home', and the app must not run with a shared home" >&2; exit 1
 fi
 canonical="$(realpath "$app_home" 2>/dev/null || readlink -f "$app_home" 2>/dev/null || true)"
@@ -145,6 +147,12 @@ if [ "$(id -u)" = "0" ] && [ -n "$uid" ] && [ "$uid" -ne 0 ]; then
     if ! chown "$uid:$gid" "$app_home" 2>/dev/null; then
         echo "entrypoint: cannot give '$app_home' to uid $uid, and the app must not run with a shared home" >&2; exit 1
     fi
+fi
+# Streamlink keeps its plugin cache in $HOME/.cache. A symlink at that path
+# would send those writes outside the private home. Refuse it instead of
+# removing it: the entrypoint did not create it, and it can point at user data.
+if [ -L "$app_home/.cache" ]; then
+    echo "entrypoint: '$app_home/.cache' is a symlink, refusing to run with it" >&2; exit 1
 fi
 HOME="$app_home"
 export HOME

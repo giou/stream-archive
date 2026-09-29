@@ -50,3 +50,12 @@
 **/.coverage
 **/htmlcov/
 **/.DS_Store
+# Runtime scratch and session files. The recorder stages partial output under
+# .tmp and with a .remux.tmp.mp4 suffix (disk.py). Streamlink keeps its plugin
+# cache under .cache. The Telegram paths keep session files, and the web panel
+# keeps web_sessions.json. None of these belong in the image.
+**/.tmp/**
+**/*.remux.tmp.mp4
+**/.cache/
+**/*.session*
+**/web_sessions.json*

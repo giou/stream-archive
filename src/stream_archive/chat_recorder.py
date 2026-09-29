@@ -243,7 +243,9 @@ class ChatRecorder:
                     attempts = 0
                 else:
                     attempts += 1
-            await asyncio.sleep(min(30, 2**attempts))
+            # Cap the exponent: attempts grows without bound during a long
+            # outage, but the wait stays at 30 seconds.
+            await asyncio.sleep(min(30, 2 ** min(attempts, 5)))
 
     async def _load_tp(self, channel_id: str) -> None:
         """Fetch the third-party emote set once. Never raises."""

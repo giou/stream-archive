@@ -753,6 +753,41 @@ def test_disk_recovery_clears_and_starts():
         clear_degraded("disk_full")
 
 
+def test_blocked_alert_fires_again_after_a_successful_start():
+    """A successful start re-arms the blocked-start alert.
+
+    The success path cleared only the start-failure stamp, so a later
+    blocked start stayed silent until the old throttle window expired.
+    """
+    from stream_archive.health import clear_degraded
+
+    rec = FakeRecorder()
+    rec.snapshot["free_gb"] = 0.2
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    live = {"u1": {"title": "T", "game_name": "G"}}
+    api = FakeTwitchAPI(streams=dict(live), user_ids={"ch": "u1"})
+    try:
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == []
+        assert len(notifier.messages) == 1
+        rec.snapshot["free_gb"] = 100.0
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == ["twitch:ch"]
+        api.streams = {}
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.stopped == ["twitch:ch"]
+        rec.snapshot["free_gb"] = 0.2
+        api.streams = dict(live)
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == ["twitch:ch"]  # still blocked: no new recording
+        assert len(notifier.messages) == 2
+        assert "0.2 GB free" in notifier.messages[1]
+    finally:
+        clear_degraded("disk_full")
+
+
 def test_twitch_auth_dead_alerts_once_per_episode():
     """A rejected Twitch credential stalls loudly, then recovers quietly."""
     from stream_archive.health import clear_degraded, degraded

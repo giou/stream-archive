@@ -12,6 +12,11 @@ on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
+concurrency:
+  # One group for all runs, so two runs never push the same branch at the
+  # same time. A run never cancels another, so a push always completes.
+  group: ttvlol-bump
+  cancel-in-progress: false
 permissions:
   contents: write
   pull-requests: write
@@ -21,6 +26,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The runner ships no uv, so the ast.parse gate below would fail on
+      # "uvx is not installed". Pin the same uv as the image build.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Same uv version as the image build (Dockerfile uv stage).
+          version: "0.12.19"
+          python-version: "3.14"
       # Resolve the newest tag through the release asset redirect. This needs
       # no API call: the unauthenticated GitHub API is rate limited per address
       # and answered 403 on a shared runner, and GITHUB_TOKEN cannot read
@@ -48,9 +60,11 @@ jobs:
           fi
       - name: Fetch the new release, repin the Dockerfile, build the diff
         if: steps.check.outputs.bump == 'true'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
         run: |
           set -eu
-          TAG="${{ steps.check.outputs.tag }}"
+          TAG="${TAG}"
           PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
           echo "pinned=${PINNED}" >> "$GITHUB_OUTPUT"
           mkdir -p "vendor/streamlink-ttvlol/${TAG}"
@@ -99,10 +113,12 @@ jobs:
         if: steps.check.outputs.bump == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.check.outputs.tag }}
+          PINNED: ${{ steps.fetch.outputs.pinned }}
         run: |
           set -eu
-          TAG="${{ steps.check.outputs.tag }}"
-          PINNED="${{ steps.fetch.outputs.pinned }}"
+          TAG="${TAG}"
+          PINNED="${PINNED}"
           BRANCH="ttvlol/${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

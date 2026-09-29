@@ -214,6 +214,9 @@ class Monitor:
             else:
                 self._live_channels.add(channel)
                 self._last_failure_notify.pop(channel, None)
+                # A success re-arms both alerts: a later blocked start must
+                # notify again instead of staying silent on the old stamp.
+                self._last_disk_notify.pop(channel, None)
                 if already_live:
                     logger.info("[monitor] %s recording restarted", channel)
                 else:

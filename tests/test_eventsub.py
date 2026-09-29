@@ -454,6 +454,26 @@ def test_failed_dispatch_forgets_the_message_id():
     assert mon.online_calls == [("twitch:ch", "T", "G", "u1")]
 
 
+def test_forget_id_ignores_a_non_string_message_id():
+    """A wrong-typed message id must not break the dispatch error path.
+
+    The forget path popped any truthy id while the remember path stores
+    string ids only, so a list id raised TypeError out of the handler that
+    was already recovering from a failure.
+    """
+    client = make_client()
+    client._seen_ids["m1"] = 1.0
+    for bad in (
+        {"metadata": {"message_id": ["m1"]}},
+        {"metadata": {"message_id": 123}},
+        {"metadata": None},
+        {},
+    ):
+        client._forget_id(bad)  # must not raise
+
+    assert client._seen_ids == {"m1": 1.0}
+
+
 def test_close_cancels_an_in_flight_dispatch():
     """close() cancels and awaits a dispatch that still runs."""
     api = BlockingStreamAPI(user_ids={"ch": "u1"})

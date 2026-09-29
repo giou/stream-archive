@@ -715,9 +715,11 @@ def atomic_write_private_json(path: Path, payload: Any, *, indent: int = 4) -> N
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-    except OSError:
-        # Remove the partial copy: it holds plaintext secrets. A full disk
-        # raises OSError too, so callers can catch one type for any cause.
+    except BaseException:
+        # Remove the partial copy: it holds plaintext secrets. Every error
+        # takes this path, not just OSError: a failed serialize would
+        # otherwise leave secrets on disk. The error is re-raised, so
+        # callers still see its type.
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise

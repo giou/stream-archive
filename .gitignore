@@ -1,11 +1,13 @@
 # Runtime state of a checkout deployment. The app resolves these paths against
 # the config file (config.py _find_config): the repo root in a checkout, or the
 # directory of a config.json that lives elsewhere (data/). The patterns are
-# therefore depth-independent. config.py and updater.py write "<name>.json.tmp";
-# youtube_streamer.py writes a hidden ".<name>.<random>.tmp".
+# therefore depth-independent. config.py, updater.py, and events.py write
+# "<name>.json.tmp"; youtube_streamer.py writes a hidden ".<name>.<random>.tmp".
 config.json
 update_state.json
 youtube_token.json
+events.jsonl
+events.jsonl.tmp
 *.chat.json
 *.json.tmp
 .*.tmp

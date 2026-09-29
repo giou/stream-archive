@@ -2141,13 +2141,13 @@ def test_reply_text_api_hides_the_key_in_a_group(tmp_path):
     asyncio.run(ctrl.handle_reply_text("API", chat_id=group_id))
     asyncio.run(ctrl.handle_reply_text("Enable API", chat_id=group_id))
     enabled, _, _ = api_sent(bot)
-    key = read_file(tmp_path)["api"]["key"]
-    assert key  # the first enable generated the key
-    assert key not in enabled  # a group chat never sees the secret
+    assert read_file(tmp_path)["api"]["enabled"] is True  # the toggle still applies
+    assert read_file(tmp_path)["api"]["key"] == ""  # no key: a group must not burn the one-time secret unseen
+    assert config.api.key == ""
     assert "<code>" not in enabled  # and no code span either
+    assert "private chat" in visible_text(enabled)
     asyncio.run(ctrl.handle_reply_text("Show key", chat_id=group_id))
     sent, parse_mode, markup = api_sent(bot)
-    assert key not in sent  # a group chat never sees the secret
     assert "<code>" not in sent
     assert "private chat" in visible_text(sent)
     assert parse_mode == "HTML"
@@ -2197,6 +2197,96 @@ def test_reply_text_api_rotate_key_replaces_it(tmp_path):
     assert "old key stopped working" in visible_text(sent)
     assert ctrl._kick_webhook.applied == [1]  # rotation never touches the listener
     assert kb_labels(markup) == api_labels(True)
+
+
+def test_reply_text_api_rotate_key_in_group_changes_nothing(tmp_path):
+    """A group Rotate key press keeps the stored key and points at the private chat.
+
+    Without the guard the press would persist a fresh secret that no one
+    saw, and the old key would stop working at once.
+    """
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    group_id = -1001234567890  # a group chat that holds the bot
+    bot = unittest.mock.AsyncMock()
+    ctrl._app = types.SimpleNamespace(bot=bot)
+    open_remote_access(ctrl)
+    asyncio.run(ctrl.handle_reply_text("API"))
+    asyncio.run(ctrl.handle_reply_text("Enable API"))
+    key = read_file(tmp_path)["api"]["key"]
+    assert key  # a key exists before the group press
+    asyncio.run(ctrl.handle_reply_text("Settings", chat_id=group_id))
+    asyncio.run(ctrl.handle_reply_text("Remote access", chat_id=group_id))
+    asyncio.run(ctrl.handle_reply_text("API", chat_id=group_id))
+    assert asyncio.run(ctrl.handle_reply_text("Rotate key", chat_id=group_id)) is None
+    sent, parse_mode, markup = api_sent(bot)
+    assert_valid_html(sent)
+    assert read_file(tmp_path)["api"]["key"] == key  # nothing was rotated
+    assert config.api.key == key
+    assert key not in sent  # the old key stays out of the group too
+    assert "<code>" not in sent
+    assert "private chat" in visible_text(sent)
+    assert parse_mode == "HTML"
+    assert kb_labels(markup) == api_labels(True)
+
+
+def test_channels_empty_returns_a_fallback_line(tmp_path):
+    """With zero channels /channels answers with a hint, not an empty string.
+
+    Telegram rejects an empty message, so the bare join would leave the
+    command with no valid reply.
+    """
+    config, ctrl, _, _, eventsub = make_controller(tmp_path, channels=[])
+    text = ctrl.handle_channels()
+    assert text != ""
+    assert "/add" in text
+
+
+def test_chat_off_stops_remaining_channels_when_one_stop_fails(tmp_path):
+    """One failing chat stop does not abort the fan-out to the rest.
+
+    A bare await would raise on the first failure and leave the later
+    channels recording chat. Both the global and the per-platform paths
+    must isolate each channel.
+    """
+    config, ctrl, recorder, _, eventsub = make_controller(
+        tmp_path, channels=["twitch:a", "twitch:b"], recording=["twitch:a", "twitch:b"]
+    )
+    stopped = []
+    orig = recorder.stop_chat
+
+    async def flaky(channel, platform=None):
+        if channel == "twitch:a":
+            msg = "chat writer busy"
+            raise RuntimeError(msg)
+        stopped.append((channel, platform))
+
+    recorder.stop_chat = flaky  # type: ignore[method-assign]
+    try:
+        text = asyncio.run(ctrl.handle_chat(["off"]))
+    finally:
+        recorder.stop_chat = orig  # type: ignore[method-assign]
+    assert text == "Chat recording disabled"
+    assert ("twitch:b", None) in stopped  # the failure on twitch:a did not stop the fan-out
+
+    config2, ctrl2, recorder2, _, _ = make_controller(
+        tmp_path, channels=["twitch:a", "twitch:b"], recording=["twitch:a", "twitch:b"]
+    )
+    stopped2 = []
+    orig2 = recorder2.stop_chat
+
+    async def flaky2(channel, platform=None):
+        if channel == "twitch:a":
+            msg = "chat writer busy"
+            raise RuntimeError(msg)
+        stopped2.append((channel, platform))
+
+    recorder2.stop_chat = flaky2  # type: ignore[method-assign]
+    try:
+        text2 = asyncio.run(ctrl2.handle_chat(["off", "twitch"]))
+    finally:
+        recorder2.stop_chat = orig2  # type: ignore[method-assign]
+    assert text2 == "Twitch chat recording disabled"
+    assert ("twitch:b", "twitch") in stopped2
 
 
 def test_reply_text_kick_webhook_url_applies(tmp_path):

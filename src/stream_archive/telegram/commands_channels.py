@@ -20,6 +20,13 @@ class ChannelsCommands:
     _kick_webhook: Any
 
     def handle_channels(self) -> str:
+        """List the monitored channels, or a fallback when none exist.
+
+        An empty reply is rejected by Telegram, so zero channels return
+        a hint instead of an empty string.
+        """
+        if not self._config.channels:
+            return "No channels monitored - add one with /add <channel>."
         return "\n".join(f"{i}. {ch}" for i, ch in enumerate(self._config.channels, 1))
 
     def _resolve_channel_arg(self, value: str, *, monitored: bool = True) -> tuple[str, str] | tuple[None, str]:

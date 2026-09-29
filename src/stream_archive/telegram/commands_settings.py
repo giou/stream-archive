@@ -367,7 +367,10 @@ class SettingsCommands:
             )
             if not enabled and not is_error(text):
                 for channel in self._recorder.active_channels():
-                    await self._recorder.stop_chat(channel)
+                    try:
+                        await self._recorder.stop_chat(channel)
+                    except Exception:
+                        logger.exception("[telegram] Failed to stop the chat of %s", channel)
             return text
         if len(args) == 2 and args[0].lower() in ("on", "off") and args[1].lower() in ("twitch", "kick"):
             enabled = args[0].lower() == "on"
@@ -388,9 +391,15 @@ class SettingsCommands:
             if not enabled and not is_error(text):
                 for channel in self._recorder.active_channels():
                     if platform == "twitch" and not is_kick_channel(channel):
-                        await self._recorder.stop_chat(channel, "twitch")
+                        try:
+                            await self._recorder.stop_chat(channel, "twitch")
+                        except Exception:
+                            logger.exception("[telegram] Failed to stop the chat of %s", channel)
                     elif platform == "kick" and is_kick_channel(channel):
-                        await self._recorder.stop_chat(channel, "kick")
+                        try:
+                            await self._recorder.stop_chat(channel, "kick")
+                        except Exception:
+                            logger.exception("[telegram] Failed to stop the chat of %s", channel)
             return text
         return "Usage: /chat <on|off> [twitch|kick]"
 

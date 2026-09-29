@@ -714,6 +714,23 @@ def test_save_removes_the_tmp_copy_when_the_write_fails(monkeypatch, tmp_path):
     assert json.loads(path.read_text())["bot_telegram_api"] == valid_config()["bot_telegram_api"]
 
 
+def test_atomic_write_removes_the_tmp_copy_on_a_serialize_failure(tmp_path):
+    """A non-OSError failure still removes the partial copy.
+
+    An unserializable payload makes json.dump raise TypeError mid-write.
+    The cleanup caught OSError only, so the plaintext tmp file stayed
+    behind, against the docstring promise.
+    """
+    from stream_archive.config import atomic_write_private_json
+
+    path = tmp_path / "secret.json"
+    with pytest.raises(TypeError):
+        atomic_write_private_json(path, {"key": object()})
+
+    assert not path.exists()
+    assert not (tmp_path / "secret.json.tmp").exists()
+
+
 def test_orphaned_env_placeholder_does_not_break_saves(monkeypatch, tmp_path):
     monkeypatch.setenv("DEFINITELY_UNSET_VAR_12345", "resolved-at-load")
     data = valid_config()

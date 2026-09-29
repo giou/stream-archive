@@ -581,6 +581,7 @@ class WebUI:
             self._save_sessions()
             return None
         session.expires = time.time() + _SESSION_TTL_S
+        self._save_sessions()
         return session
 
     def _new_session(self) -> tuple[str, _Session]:
@@ -1153,10 +1154,13 @@ class WebUI:
             msg = f"{path.name} is already gone"
             raise _WebError(404, msg)
         live = self._is_live(path)
+        # Read outside the try: a recorder hiccup here must answer 503, and
+        # the handler below would mask it as a 500 delete failure.
+        active = self._active_set()
         recorder = self._recorder
         if hasattr(recorder, "_remove_if_inactive"):
             try:
-                freed = recorder._remove_if_inactive(path, self._active_set())
+                freed = recorder._remove_if_inactive(path, active)
             except Exception as e:
                 raise _WebError(500, "delete failed") from e
             if freed is None:

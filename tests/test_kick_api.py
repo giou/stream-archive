@@ -491,3 +491,34 @@ def test_top_livestreams_falls_back_to_v2_pages(monkeypatch):
     full, top_one = asyncio.run(scenario())
     assert full == [("en-big", 3, 7000), ("old", 4, 50)]
     assert top_one == [("en-big", 3, 7000)]  # the client-side max truncates past the limit
+
+
+def test_top_v2_dedups_overlapping_pages(monkeypatch):
+    """The global and English pages can list one channel twice.
+
+    A duplicate used to occupy two slots of the limit, pushing a live
+    channel out. One slug counts once now, with its highest viewer count.
+    """
+    # A v1 500 on a GET is retryable, so each call sleeps the retry delays
+    # before it falls back. Zero them: the dedup is what this test owns.
+    monkeypatch.setattr("stream_archive.kick_api._RETRY_DELAYS", (0.0, 0.0))
+
+    def handler(request):
+        if request.url.path == "/public/v1/livestreams":
+            return httpx.Response(500, json={"data": [], "message": "boom"})
+        assert request.url.path == "/public/v2/livestreams"
+        if request.url.params.get("language_code") == "en":
+            data = [{"channel": {"slug": "dup"}, "broadcaster_user": {"id": 3}, "viewer_count": 7000}]
+        else:
+            data = [
+                {"channel": {"slug": "dup"}, "broadcaster_user": {"id": 3}, "viewer_count": 50},
+                {"channel": {"slug": "old"}, "broadcaster_user": {"id": 4}, "viewer_count": 100},
+            ]
+        return httpx.Response(200, json={"data": data})
+
+    api = make_api(handler)
+
+    async def scenario():
+        return await api.get_top_livestreams()
+
+    assert asyncio.run(scenario()) == [("dup", 3, 7000), ("old", 4, 100)]

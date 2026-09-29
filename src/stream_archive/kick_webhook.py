@@ -172,6 +172,33 @@ def _parse_timestamp(value: str) -> float | None:
     return seconds if math.isfinite(seconds) else None
 
 
+def _chat_emotes(raw: Any) -> list[dict[str, Any]] | None:
+    """Normalized emote list of a chat event, or None when malformed.
+
+    A missing field reads as empty, like before. A wrong-typed field makes
+    the delivery malformed: the caller ignores it instead of raising out
+    of the dispatch.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(entry, dict) for entry in raw):
+        return None
+    emotes: list[dict[str, Any]] = []
+    for entry in raw:
+        positions = entry.get("positions")
+        if positions is None:
+            positions = []
+        if not isinstance(positions, list) or not all(isinstance(p, dict) for p in positions):
+            return None
+        emotes.append(
+            {
+                "emote_id": entry.get("emote_id"),
+                "positions": [{"s": p.get("s"), "e": p.get("e")} for p in positions],
+            }
+        )
+    return emotes
+
+
 class KickWebhook:
     EVENT_LIVE = "livestream.status.updated"  # v1
     EVENT_CHAT = "chat.message.sent"  # v1
@@ -648,7 +675,10 @@ class KickWebhook:
         except json.JSONDecodeError:
             logger.warning("[kick_webhook] invalid livestream event body")
             raise
-        broadcaster = event.get("broadcaster") or {}
+        broadcaster = event.get("broadcaster") if isinstance(event, dict) else None
+        if not isinstance(broadcaster, dict):
+            logger.warning("[kick_webhook] livestream event without channel_slug, ignoring")
+            return
         slug = broadcaster.get("channel_slug")
         if not slug:
             logger.warning("[kick_webhook] livestream event without channel_slug, ignoring")
@@ -679,7 +709,13 @@ class KickWebhook:
         except json.JSONDecodeError:
             logger.warning("[kick_webhook] invalid chat event body")
             raise
-        broadcaster = event.get("broadcaster") or {}
+        if not isinstance(event, dict):
+            logger.warning("[kick_webhook] chat event body is not an object, ignoring")
+            return
+        broadcaster = event.get("broadcaster")
+        if not isinstance(broadcaster, dict):
+            logger.warning("[kick_webhook] chat event without a broadcaster, ignoring")
+            return
         slug = broadcaster.get("channel_slug")
         if not slug:
             return
@@ -693,12 +729,25 @@ class KickWebhook:
         if not isinstance(event.get("message_id"), str) or not isinstance(event.get("content"), str):
             logger.warning("[kick_webhook] chat event without a message_id and content, ignoring")
             return
-        sender = event.get("sender") or {}
-        identity = sender.get("identity") or {}
-        badges = [
-            {"text": b.get("text"), "type": b.get("type"), "count": b.get("count")}
-            for b in (identity.get("badges") or [])
-        ]
+        sender = event.get("sender")
+        if not isinstance(sender, dict):
+            logger.warning("[kick_webhook] chat event without a sender, ignoring")
+            return
+        identity = sender.get("identity")
+        if not isinstance(identity, dict):
+            logger.warning("[kick_webhook] chat event without a sender identity, ignoring")
+            return
+        raw_badges = identity.get("badges")
+        if raw_badges is None:
+            raw_badges = []
+        if not isinstance(raw_badges, list) or not all(isinstance(b, dict) for b in raw_badges):
+            logger.warning("[kick_webhook] chat event with malformed badges, ignoring")
+            return
+        badges = [{"text": b.get("text"), "type": b.get("type"), "count": b.get("count")} for b in raw_badges]
+        emotes = _chat_emotes(event.get("emotes"))
+        if emotes is None:
+            logger.warning("[kick_webhook] chat event with malformed emotes, ignoring")
+            return
         payload = {
             "message_id": event.get("message_id"),
             "created_at": event.get("created_at"),
@@ -713,16 +762,10 @@ class KickWebhook:
                 "is_verified": sender.get("is_verified"),
                 "is_anonymous": sender.get("is_anonymous"),
                 "profile_picture": sender.get("profile_picture"),
-                "username_color": (identity or {}).get("username_color"),
+                "username_color": identity.get("username_color"),
             },
             "content": event.get("content"),
-            "emotes": [
-                {
-                    "emote_id": e.get("emote_id"),
-                    "positions": [{"s": p.get("s"), "e": p.get("e")} for p in (e.get("positions") or [])],
-                }
-                for e in (event.get("emotes") or [])
-            ],
+            "emotes": emotes,
             "badges": badges,
         }
         await self._recorder.add_kick_chat(channel, payload)
@@ -828,7 +871,9 @@ class KickWebhook:
         Temp-subscribes to the busiest live channel that is not monitored
         and waits for its first verified event. The test channel never
         enters the channel list, so nothing records and no chat is
-        archived: dispatch ignores unmonitored channels. Returns
+        archived: dispatch ignores unmonitored channels. Fails when every
+        top channel is already monitored: the test never touches a
+        monitored channel. Returns
         (ok, message) with the elapsed time. Always deletes the test
         subscription, even on timeout. Only one test runs at a time.
         """
@@ -853,7 +898,9 @@ class KickWebhook:
         if not top:
             return False, "Kick returned no live channel to test with - try again later."
         monitored = {bare_name(c) for c in self._config.channels if is_kick_channel(c)}
-        pick = next(((s, u, v) for s, u, v in top if s not in monitored), top[0])
+        pick = next(((s, u, v) for s, u, v in top if s not in monitored), None)
+        if pick is None:
+            return False, "Every top live channel is already monitored. Try again when an unmonitored channel is live."
         slug, uid, viewers = pick
         try:
             created = await self._api.create_event_subscriptions(uid, [self.EVENT_LIVE, self.EVENT_CHAT])

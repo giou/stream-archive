@@ -23,8 +23,9 @@ function toast(msg, isError) {
 }
 
 async function api(path, opts = {}) {
+  const method = String(opts.method || "GET").toUpperCase();
   const headers = Object.assign({}, opts.headers || {});
-  if (csrf && opts.method && opts.method !== "GET") {
+  if (csrf && method !== "GET") {
     headers["X-CSRF-Token"] = csrf;
   }
   if (opts.body !== undefined) {
@@ -164,14 +165,20 @@ function guarded(name, fn) {
   inFlight[name] = true;
   Promise.resolve()
     .then(fn)
-    .catch(() => {})
+    .catch((e) => {
+      console.warn("Background refresh failed for " + name, e);
+    })
     .finally(() => {
       inFlight[name] = false;
     });
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) return;
+  if (document.hidden) {
+    const keyOut = $("key-out");
+    if (keyOut) keyOut.value = "";
+    return;
+  }
   guarded("status", loadStatusQuiet);
   if (userWorkingControls()) return;
   if (currentTab === "recordings") guarded("recordings", loadRecordings);
@@ -192,16 +199,17 @@ async function loadEvents() {
       list.appendChild(li);
       return;
     }
-    for (const e of data.events) {
+    for (const raw of data.events) {
+      const e = obj(raw);
       const li = document.createElement("li");
       li.className = "event-item";
       const head = document.createElement("div");
       head.className = "event-head";
       const pill = document.createElement("span");
       pill.className = "pill " + (e.kind === "live" ? "live" : "done");
-      pill.textContent = e.kind;
+      pill.textContent = typeof e.kind === "string" ? e.kind : "";
       head.appendChild(pill);
-      if (e.channel) {
+      if (typeof e.channel === "string" && e.channel) {
         const ch = document.createElement("span");
         ch.textContent = e.channel;
         head.appendChild(ch);
@@ -213,7 +221,7 @@ async function loadEvents() {
       li.appendChild(head);
       const body = document.createElement("div");
       body.className = "event-text";
-      body.textContent = e.text;
+      body.textContent = typeof e.text === "string" ? e.text : "";
       li.appendChild(body);
       list.appendChild(li);
     }
@@ -357,13 +365,21 @@ async function loadChannels() {
       api("/api/v1/channels"),
       api("/api/events?limit=200").catch(() => ({})),
     ]);
+    const chans = obj(data);
+    const feedObj = obj(feed);
+    const channels = arr(chans.channels);
     const lastByChannel = new Map();
-    for (const e of feed.events || []) {
-      if (e.channel && !lastByChannel.has(e.channel)) lastByChannel.set(e.channel, e);
+    for (const raw of arr(feedObj.events)) {
+      const e = obj(raw);
+      if (typeof e.channel === "string" && e.channel && !lastByChannel.has(e.channel)) {
+        lastByChannel.set(e.channel, e);
+      }
     }
     const list = $("channels-list");
     list.textContent = "";
-    for (const ch of data.channels) {
+    for (const raw of channels) {
+      const ch = obj(raw);
+      if (typeof ch.channel !== "string" || !ch.channel) continue;
       const li = document.createElement("li");
       li.className = "channel-card";
       const head = document.createElement("div");
@@ -526,7 +542,7 @@ async function loadChannels() {
       li.appendChild(wrap);
       list.appendChild(li);
     }
-    if (!data.channels.length) {
+    if (!channels.length) {
       const li = document.createElement("li");
       li.className = "channel-card muted";
       li.textContent = "No channels monitored.";
@@ -694,14 +710,17 @@ async function loadSettings() {
 }
 
 function fmtSize(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "unknown";
   if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
   if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
   if (n >= 1024) return Math.floor(n / 1024) + " KB";
-  return (n || 0) + " B";
+  return n + " B";
 }
 
 function timeAgo(ts) {
-  const diff = Math.max(0, Date.now() / 1000 - ts);
+  const t = Number(ts);
+  if (!Number.isFinite(t)) return "unknown";
+  const diff = Math.max(0, Date.now() / 1000 - t);
   if (diff < 60) return "just now";
   if (diff < 3600) return Math.floor(diff / 60) + " min ago";
   if (diff < 86400) return Math.floor(diff / 3600) + " h ago";
@@ -754,7 +773,11 @@ function initSeekTap() {
   };
   player.addEventListener("touchend", (e) => {
     const now = Date.now();
-    const touch = e.changedTouches[0];
+    const touch = e.changedTouches ? e.changedTouches[0] : undefined;
+    if (!touch) {
+      lastTap = now;
+      return;
+    }
     if (now - lastTap < 350) {
       e.preventDefault();
       seek(touch.clientX);
@@ -770,6 +793,7 @@ function initSeekTap() {
 }
 
 function channelOf(id) {
+  if (typeof id !== "string") return "";
   const parts = id.split("/");
   return parts.length >= 2 ? parts[0] + ":" + parts[1] : parts[0];
 }
@@ -790,8 +814,9 @@ const POS_MAX = 200;
 
 function loadPositions() {
   try {
-    return JSON.parse(localStorage.getItem(POS_KEY) || "{}");
+    return obj(JSON.parse(localStorage.getItem(POS_KEY) || "{}"));
   } catch (e) {
+    console.warn("Cannot read saved positions", e);
     return {};
   }
 }
@@ -805,7 +830,9 @@ function savePosition(id, t, d) {
   for (const k of keys.slice(0, Math.max(0, keys.length - POS_MAX))) delete all[k];
   try {
     localStorage.setItem(POS_KEY, JSON.stringify(all));
-  } catch (e) {}
+  } catch (e) {
+    console.warn("Cannot save position", e);
+  }
 }
 
 function savedPosition(id, duration) {
@@ -824,7 +851,9 @@ function forgetPosition(id) {
     delete all[id];
     try {
       localStorage.setItem(POS_KEY, JSON.stringify(all));
-    } catch (e) {}
+    } catch (e) {
+      console.warn("Cannot delete saved position", e);
+    }
   }
 }
 
@@ -847,7 +876,7 @@ async function playRecording(entry, collapse = true) {
   // Measure after the scroll: the rect is viewport-relative, so the fit
   // uses the settled position and shrinks the player on short windows.
   fitPlayer($("player-wrap"), $("player"));
-  loadChat(entry.id, entry.name).catch(() => {});
+  loadChat(entry.id, entry.name).catch((e) => console.warn("Cannot load chat", e));
   player.src = "/api/recordings/stream?id=" + encodeURIComponent(entry.id);
   const stored = loadPositions()[entry.id];
   if (stored && stored.t > 10) {
@@ -860,7 +889,9 @@ async function playRecording(entry, collapse = true) {
         if (my !== playToken || currentPlayId !== entry.id) return;
         try {
           player.currentTime = savedPosition(entry.id, player.duration);
-        } catch (e) {}
+        } catch (e) {
+          console.warn("Cannot jump to saved position", e);
+        }
       },
       { once: true }
     );
@@ -907,7 +938,9 @@ function closePlayer() {
 function stepVideo(delta) {
   const idx = playQueue.findIndex((e) => e.id === currentPlayId);
   const next = playQueue[idx + delta];
-  if (next) playRecording(next, false);
+  if (next) {
+    playRecording(next, false).catch((e) => toast(String((e && e.message) || e || "Cannot play this file"), true));
+  }
 }
 
 function setRate(rate) {
@@ -1067,13 +1100,17 @@ async function loadChat(id, name) {
     let offset = 0;
     let total = Infinity;
     let first = true;
+    let pages = 0;
     for (;;) {
+      pages += 1;
+      if (pages > 200) break;
       if (my !== chatLoadToken) return;
-      const data = await api(
+      const raw = await api(
         "/api/chat?id=" + encodeURIComponent(id) + "&offset=" + offset + "&limit=" + CHAT_PAGE_SIZE
       );
+      const data = obj(raw);
       if (my !== chatLoadToken) return;
-      const page = data.messages || [];
+      const page = arr(data.messages);
       if (typeof data.total === "number" && Number.isFinite(data.total)) {
         total = data.total;
       } else {
@@ -1106,17 +1143,38 @@ async function loadChat(id, name) {
   alignChat();
 }
 
+const EMOTE_HOSTS = new Set([
+  "static-cdn.jtvnw.net",
+  "cdn.7tv.app",
+  "cdn.betterttv.net",
+  "cdn.frankerfacez.com",
+  "files.kick.com",
+]);
+
+function emoteSrcOk(src) {
+  if (typeof src !== "string") return false;
+  if (/^data:image\/(png|gif|jpeg|webp);base64,/.test(src)) return true;
+  if (!src.startsWith("https://")) return false;
+  try {
+    return EMOTE_HOSTS.has(new URL(src).hostname.toLowerCase());
+  } catch (e) {
+    return false;
+  }
+}
+
 function appendChatText(div, text, emotes) {
   if (!emotes || !emotes.length) {
     div.appendChild(document.createTextNode(text));
     return;
   }
-  const spans = [...emotes].sort((a, b) => a.start - b.start);
+  const spans = [...emotes]
+    .filter((s) => s && Number.isFinite(s.start) && Number.isFinite(s.end))
+    .sort((a, b) => a.start - b.start);
   let pos = 0;
   for (const s of spans) {
     if (s.start < pos || s.start >= text.length) continue;
     const end = Math.min(s.end, text.length);
-    if (end <= s.start || typeof s.src !== "string" || !/^https:\/\/|^data:image\//.test(s.src)) continue;
+    if (end <= s.start || !emoteSrcOk(s.src)) continue;
     if (s.start > pos) div.appendChild(document.createTextNode(text.slice(pos, s.start)));
     const img = document.createElement("img");
     img.className = "chat-emote";
@@ -1207,14 +1265,18 @@ function buildRecCard(r, player) {
   if (!r.live) {
     const playIt = () => playRecording({ id: r.id, name: r.name });
     name.classList.add("playable");
-    name.addEventListener("click", playIt);
+    name.setAttribute("role", "button");
+    name.setAttribute("tabindex", "0");
+    activatable(name, playIt);
     const thumb = document.createElement("img");
     thumb.className = "rec-thumb";
     thumb.loading = "lazy";
     thumb.src = "/api/recordings/thumb?id=" + encodeURIComponent(r.id);
     thumb.alt = "";
     thumb.setAttribute("title", "Play");
-    thumb.addEventListener("click", playIt);
+    thumb.setAttribute("role", "button");
+    thumb.setAttribute("tabindex", "0");
+    activatable(thumb, playIt);
     thumb.addEventListener("error", () => thumb.remove());
     li.appendChild(thumb);
   }
@@ -1308,7 +1370,10 @@ function paintRecSelection() {
 }
 
 function refreshChannelGroup(group, ch, files, player, wanted) {
-  const total = files.reduce((n, f) => n + f.size, 0);
+  const total = files.reduce((n, f) => {
+    const v = Number(f.size);
+    return n + (Number.isFinite(v) ? v : 0);
+  }, 0);
   group.dataset.channel = ch;
   group.querySelector(":scope > .channel-head > .channel-name").textContent =
     ch + " (" + files.length + " file" + (files.length === 1 ? "" : "s") + ", " + fmtSize(total) + ")";
@@ -1415,11 +1480,11 @@ async function loadRecordings() {
     paintRecSelection();
     list.querySelectorAll(":scope > li.rec-card.muted").forEach((li) => li.remove());
     const counter = $("rec-count");
-    if (data.total > data.recordings.length) {
+    if (filter || activeChannel || !(data.total > data.recordings.length)) {
+      counter.hidden = true;
+    } else {
       counter.textContent = "Showing " + data.recordings.length + " of " + data.total + " recordings - narrow the filter to see the rest.";
       counter.hidden = false;
-    } else {
-      counter.hidden = true;
     }
     if (!shown) {
       const li = document.createElement("li");
@@ -1477,15 +1542,27 @@ async function pollEventAlerts() {
   if (!events.length) return;
   const seen = lastSeenTs();
   let max = seen;
+  const fresh = [];
   for (const e of events) {
     const ts = Number(e.ts) || 0;
     if (ts > max) max = ts;
-    if (ts > seen) {
+    if (ts > seen) fresh.push(e);
+  }
+  if (fresh.length > 3) {
+    try {
+      new Notification("Stream updates", { body: fresh.length + " streams changed state." });
+    } catch (err) {
+      console.warn("Cannot show notification", err);
+    }
+  } else {
+    for (const e of fresh) {
       try {
         new Notification(e.kind === "live" ? "Live" : "Stream ended", {
           body: (e.channel ? e.channel + ": " : "") + (e.text || ""),
         });
-      } catch (err) {}
+      } catch (err) {
+        console.warn("Cannot show notification", err);
+      }
     }
   }
   markSeen(max);
@@ -1519,7 +1596,7 @@ async function deleteSelected() {
 }
 
 function out(text) {
-  $("ops-out").textContent = text;
+  $("ops-out").textContent = text === undefined || text === null || text === "" ? "Done" : String(text);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1534,6 +1611,8 @@ document.addEventListener("DOMContentLoaded", () => {
       toast(String(e.message || e), true);
       return;
     }
+    const keyOut = $("key-out");
+    if (keyOut) keyOut.value = "";
     window.location.replace("/");
   });
   $("refresh-status").addEventListener("click", () => loadStatus());
@@ -1752,20 +1831,20 @@ document.addEventListener("DOMContentLoaded", () => {
   $("op-reload").addEventListener("click", async () => {
     try {
       const r = await api("/api/reload", { method: "POST" });
-      out(r.message);
+      out(r && r.message);
     } catch (err) { out(String(err.message || err)); }
   });
   $("op-restart").addEventListener("click", async () => {
     if (!window.confirm("Restart the service?")) return;
     try {
       const r = await api("/api/restart", { method: "POST" });
-      out(r.message);
+      out(r && r.message);
     } catch (err) { out(String(err.message || err)); }
   });
   $("op-update").addEventListener("click", async () => {
     try {
       const r = await api("/api/update", {});
-      out(r.message);
+      out(r && r.message);
     } catch (err) { out(String(err.message || err)); }
   });
   $("op-kicktest").addEventListener("click", async () => {
@@ -1773,7 +1852,8 @@ document.addEventListener("DOMContentLoaded", () => {
     btn.disabled = true;
     try {
       const r = await api("/api/v1/kick/webhook/test", { method: "POST", body: "{}" });
-      out((r.ok ? "Delivery works: " : "Delivery failed: ") + r.message);
+      const detail = r && r.message ? r.message : "no detail";
+      out((r && r.ok ? "Delivery works: " : "Delivery failed: ") + detail);
     } catch (err) { out(String(err.message || err)); }
     btn.disabled = false;
   });

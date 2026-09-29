@@ -297,7 +297,15 @@ def _public_url(value: Any, key: str, *, allow_empty: bool = False, require_dot:
     if require_dot and "." not in host:
         msg = f"{key} must be a public hostname with a dot"
         raise _ApiError(400, msg)
-    return normalize_endpoint_url(text)
+    base = normalize_endpoint_url(text)
+    bare = urlparse(base)
+    if bare.path not in ("", "/") or bare.params or bare.query or bare.fragment or bare.username or bare.password:
+        # A path, query, fragment, or userinfo would save verbatim and break
+        # the derived URLs (webhook, API base). The known webhook path is
+        # already stripped above, so any rest here is user data.
+        msg = f"{key} must be a host URL without a path, query, or fragment"
+        raise _ApiError(400, msg)
+    return base
 
 
 class ControlAPI:
