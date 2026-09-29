@@ -6,6 +6,8 @@ The control API is off by default.
 
 ## Enable the control API
 
+The setup wizard offers the control API as one of its steps (**Control API (remote HTTP)**). It is the recommended path. The wizard generates the key on the first enable and shows it once. To enable it by hand, do the steps that follow.
+
 1. Open `/settings` in the Telegram bot.
 2. Choose **Settings → Remote access → API**.
 3. Tap **Enable API**.
@@ -69,7 +71,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
 
 ```json
 {
-  "version": "1.1.4",
+  "version": "1.4.1",
   "channels": 6,
   "recording": [],
   "monitoring_interval_s": 60.0
@@ -101,7 +103,7 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
     "enabled": true,
     "public_url": "https://streamarchive.example.com"
   },
-  "kick_webhook": {"enabled": true},
+  "kick_webhook": {"enabled": true, "public_url": "https://kick.example.com"},
   "api": {"enabled": true, "base_url": "https://streamarchive.example.com/api/v1/"},
   "monitoring_interval_s": 60.0
 }
@@ -124,6 +126,12 @@ The answer never holds a secret. The key and the Telegram bot token stay in `con
 | `kick_record_chat` | `true`, `false` | Record Kick chat |
 | `disk_max_total_gb` | number ≥ 0 | Archive size cap. `0` disables the cap |
 | `disk_delete_oldest` | `true`, `false` | On a full disk, delete the oldest recordings (`true`) or stop new recordings (`false`) |
+| `youtube_hold_seconds` | whole number ≥ 0 | Global YouTube hold delay in seconds. `0` ends the restream at once |
+| `endpoint_enabled` | `true`, `false` | Publish the panel beyond this machine. Enabling needs a saved URL |
+| `endpoint_public_url` | URL or bare hostname | Public address of your own proxy. Saving alone never flips the toggle |
+| `kick_webhook_enabled` | `true`, `false` | Instant Kick signals and chat |
+| `kick_webhook_public_url` | URL, bare hostname, or `""` | Kick entry. Empty follows the panel URL |
+| `api_enabled` | `true`, `false` | Remote HTTP control. A first enable makes a key and shows it once |
 
 ```sh
 curl -X PATCH https://streamarchive.example.com/api/v1/settings \
@@ -239,7 +247,26 @@ The `409` case needs a confirm press in the Telegram bot, because audio-only can
 - Every applied change sends the admin a Telegram message with the origin. The origin is `Control API`, or `Web panel` for a web panel session call.
 - Every change goes through the same validation and the same atomic `config.json` write as a Telegram bot change. A rejected change changes nothing.
 - A change applies on the next poll cycle. A recording in progress keeps the settings of its start.
-- The control API serves the same settings as the Telegram bot. It cannot change secrets, the endpoint, or itself.
+- The control API serves the same settings as the Telegram bot. Most keys stay read-only over the control API. The list that follows names them.
+
+### Read-only keys
+
+Edit these keys by hand in `config.json` or with the setup wizard:
+
+| Key group | Content |
+| --- | --- |
+| `endpoint.listen_host`, `endpoint.listen_port` | Listener bind and port (setup wizard only) |
+| `kick.client_id`, `kick.client_secret` | App credentials (setup wizard only, restart applies them) |
+| `kick.webhook.listen_host`, `kick.webhook.listen_port` | Webhook bind and port (setup wizard only) |
+| `web.*` | Panel password hash, session secret, on/off state |
+| `api.key` | Key itself: the bot shows or rotates it, the wizard shows it once |
+| `youtube.privacy_status` | Global privacy (setup wizard only, restart applies it) |
+| `timezone`, `monitoring_interval` | Timezone and poll interval |
+| `proxy_list`, `plugin_dir`, `recording_dir`, `chat_dir` | Playlist proxies and directories |
+| `mtproto.*` | Uploader credentials and session (file or environment only) |
+| `update_check.*` | Release check state and interval |
+| `eventsub.enabled` | Twitch conduit use |
+| All secrets | Telegram bot token, Twitch credentials, Kick credentials, MTProto api id and hash |
 
 ## Full example
 

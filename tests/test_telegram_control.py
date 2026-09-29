@@ -2671,3 +2671,12 @@ def test_reply_text_kick_webhook_test_delivery_reports_result(tmp_path):
     assert ctrl._kick_webhook.verified == [180.0]
     assert menu_of(ctrl).menu == "kick_webhook"
     assert kb_labels(markup) == webhook_labels(False)
+
+
+def test_hold_sets_the_global_delay(tmp_path):
+    """The /hold slash sets the global delay every channel falls back to."""
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    assert ctrl.handle_global_hold(["90"]) == "Hold delay set to 90s (0 = end immediately)"
+    assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90
+    assert ctrl.handle_global_hold(["soon"]).startswith("❌")
+    assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90

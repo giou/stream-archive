@@ -21,10 +21,19 @@ import math
 import secrets
 from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlparse
 
 from aiohttp import web
 
-from stream_archive.config import AppConfig, api_base_url, effective_quality, endpoint_base_url, normalize_channel_name
+from stream_archive.config import (
+    AppConfig,
+    api_base_url,
+    apply_config_change,
+    effective_quality,
+    endpoint_base_url,
+    normalize_channel_name,
+    normalize_endpoint_url,
+)
 from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.telegram.menu_state import is_error
 from stream_archive.updater import installed_app_version
@@ -62,6 +71,12 @@ _SETTING_KEYS = (
     "kick_record_chat",
     "disk_max_total_gb",
     "disk_delete_oldest",
+    "youtube_hold_seconds",
+    "endpoint_enabled",
+    "endpoint_public_url",
+    "kick_webhook_enabled",
+    "kick_webhook_public_url",
+    "api_enabled",
 )
 
 #: Per-channel settings the API can write. Each maps to one Telegram command.
@@ -124,7 +139,10 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
             "enabled": config.endpoint.enabled,
             "public_url": endpoint_base_url(config),
         },
-        "kick_webhook": {"enabled": config.kick.webhook.enabled},
+        "kick_webhook": {
+            "enabled": config.kick.webhook.enabled,
+            "public_url": normalize_endpoint_url(config.kick.webhook.public_url),
+        },
         "api": {"enabled": config.api.enabled, "base_url": api_base_url(config)},
         "monitoring_interval_s": config.monitoring_interval,
     }
@@ -229,6 +247,48 @@ def _hold_seconds(value: Any) -> str:
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0, or 'default'"
         raise _ApiError(400, msg)
     return str(int(value))
+
+
+def _global_hold_seconds(value: Any) -> str:
+    """Validated global YouTube hold delay: a whole number of seconds >= 0."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
+        raise _ApiError(400, msg)
+    if isinstance(value, float) and (not math.isfinite(value) or int(value) != value):
+        msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
+        raise _ApiError(400, msg)
+    if value < 0:
+        msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
+        raise _ApiError(400, msg)
+    return str(int(value))
+
+
+def _public_url(value: Any, key: str, *, allow_empty: bool = False, require_dot: bool = False) -> str:
+    """Validated public URL: http(s) with a hostname, without a path tail.
+
+    With ``require_dot`` a single label never saves as a Kick entry, like
+    the setup wizard enforces.
+    """
+    if not isinstance(value, str):
+        msg = f"{key} must be a string"
+        raise _ApiError(400, msg)
+    if allow_empty and not value.strip():
+        return ""
+    text = value.strip()
+    if "://" not in text:
+        text = "https://" + text
+    parts = urlparse(text)
+    host = parts.hostname or ""
+    if parts.scheme not in ("http", "https") or not host:
+        msg = f"{key} must be an http(s) URL with a hostname"
+        raise _ApiError(400, msg)
+    if not all(char.isalnum() or char in ".-" for char in host) or not host.strip(".-"):
+        msg = f"{key} must be an http(s) URL with a hostname"
+        raise _ApiError(400, msg)
+    if require_dot and "." not in host:
+        msg = f"{key} must be a public hostname with a dot"
+        raise _ApiError(400, msg)
+    return normalize_endpoint_url(text)
 
 
 class ControlAPI:
@@ -428,8 +488,135 @@ class ControlAPI:
             return await self._run(ctrl.handle_disk, ["maxsize", _scalar(value, key)])
         if key == "disk_delete_oldest":
             return await self._run(ctrl.handle_disk, ["delete_oldest", _switch(value, key)])
+        if key == "youtube_hold_seconds":
+            return await self._run(ctrl.handle_global_hold, [_global_hold_seconds(value)])
+        if key == "endpoint_enabled":
+            return await self._apply_endpoint_enabled(_switch(value, key) == "on")
+        if key == "endpoint_public_url":
+            return await self._apply_endpoint_url(_public_url(value, key))
+        if key == "kick_webhook_enabled":
+            return await self._apply_kick_enabled(_switch(value, key) == "on")
+        if key == "kick_webhook_public_url":
+            return await self._apply_kick_url(_public_url(value, key, allow_empty=True, require_dot=True))
+        if key == "api_enabled":
+            return await self._apply_api_enabled(_switch(value, key) == "on")
         msg = f"unknown setting: {key}"
         raise _ApiError(400, msg)
+
+    async def _reconcile_delivery(self) -> None:
+        """Restart listeners and re-subscribe Kick after an endpoint change.
+
+        The config write already passed validation. A bind failure must not
+        leave the file claiming an endpoint nothing serves, so the caller
+        restores the snapshot on any error here.
+        """
+        target = self._ctrl._kick_webhook
+        if target is None:
+            return
+        await target.apply_state()
+        if self._config.kick.webhook.enabled:
+            await target.sync_channels(self._config.channels)
+
+    def _delivery_snapshot(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Endpoint and Kick webhook state, to restore after a failed reconcile."""
+        return (
+            self._config.endpoint.model_dump(),
+            self._config.kick.webhook.model_dump(),
+        )
+
+    def _restore_delivery(self, snapshot: tuple[dict[str, Any], dict[str, Any]]) -> None:
+        """Write a delivery snapshot back without extra event noise."""
+        endpoint, webhook = snapshot
+
+        def restore(candidate: AppConfig) -> None:
+            for name, value in endpoint.items():
+                setattr(candidate.endpoint, name, value)
+            for name, value in webhook.items():
+                setattr(candidate.kick.webhook, name, value)
+
+        apply_config_change(self._config, restore)
+
+    async def _apply_delivery_change(self, mutate: Any, ok_text: str) -> str:
+        """Apply one endpoint or Kick change, reconcile, and report it."""
+        before = self._delivery_snapshot()
+        text = self._ctrl._apply(mutate, lambda _candidate: ok_text)
+        if is_error(text):
+            raise _ApiError(400, _plain(text))
+        try:
+            await self._reconcile_delivery()
+        except Exception as e:
+            self._restore_delivery(before)
+            msg = f"change saved but not served, restored: {e}"
+            raise _ApiError(500, msg) from e
+        return text
+
+    async def _apply_endpoint_enabled(self, enabled: bool) -> str:
+        """Turn the endpoint on with the saved URL, or off keeping it."""
+
+        def mutate(candidate: AppConfig) -> None:
+            if enabled:
+                # The model requires the URL the moment enabled flips on.
+                # An empty saved URL fails here as a 400, like in the bot.
+                candidate.endpoint.enabled = True
+            else:
+                candidate.endpoint.enabled = False
+
+        state = "enabled" if enabled else "disabled"
+        return await self._apply_delivery_change(mutate, f"Endpoint {state}")
+
+    async def _apply_endpoint_url(self, url: str) -> str:
+        """Save the endpoint public URL, keeping the enabled state."""
+
+        def mutate(candidate: AppConfig) -> None:
+            # The URL goes first: the model requires an http(s) URL the
+            # moment enabled flips to True, and assignment validates
+            # every set.
+            candidate.endpoint.public_url = url
+            if not candidate.kick.webhook.public_url.strip():
+                candidate.kick.webhook.setup_notified = False
+
+        return await self._apply_delivery_change(mutate, f"Endpoint URL saved: {url}")
+
+    async def _apply_kick_enabled(self, enabled: bool) -> str:
+        """Turn Kick deliveries on or off. The entry is untouched."""
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.kick.webhook.enabled = enabled
+            if enabled:
+                candidate.kick.webhook.setup_notified = False
+
+        state = "enabled" if enabled else "disabled"
+        return await self._apply_delivery_change(mutate, f"Kick webhook {state}")
+
+    async def _apply_kick_url(self, url: str) -> str:
+        """Save the Kick entry. Empty follows the endpoint URL."""
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.kick.webhook.public_url = url
+            candidate.kick.webhook.setup_notified = False
+
+        if not url:
+            return await self._apply_delivery_change(mutate, "Kick URL cleared, follows the endpoint")
+        return await self._apply_delivery_change(mutate, f"Kick URL saved: {url}")
+
+    async def _apply_api_enabled(self, enabled: bool) -> str:
+        """Turn the control API on or off. A first enable makes a key."""
+        key = self._config.api.key
+        created = enabled and not key.strip()
+        if created:
+            key = secrets.token_urlsafe(32)
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.api.enabled = enabled
+            if created:
+                candidate.api.key = key
+
+        text = self._ctrl._apply(mutate, lambda _candidate: f"Control API {'enabled' if enabled else 'disabled'}")
+        if is_error(text):
+            raise _ApiError(400, _plain(text))
+        if created:
+            return f"{text}. New API key: {key} (shown once)"
+        return text
 
     async def _apply_each(
         self, payload: dict[str, Any], apply: Callable[[str, Any], Awaitable[str]]

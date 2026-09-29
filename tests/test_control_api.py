@@ -81,6 +81,11 @@ class FakeKickWebhook:
         # The listener never starts in these tests, so a reconcile is a no-op.
         return None
 
+    async def sync_channels(self, channels) -> None:
+        # Subscriptions belong to the webhook tests: here the stub only
+        # proves the reconcile calls through after an endpoint change.
+        return None
+
     async def add_channel(self, channel):
         self.added.append(channel)
 
@@ -227,6 +232,163 @@ def test_status_reports_active_recordings(tmp_path):
     assert status["channels"] == 1
     assert status["recording"] == ["twitch:channel1"]
     assert status["version"]  # installed version or "unknown"
+
+
+def test_patch_global_hold_applies_and_rejects(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            good = await client.patch("/api/v1/settings", json={"youtube_hold_seconds": 90}, headers=auth())
+            bad = await client.patch("/api/v1/settings", json={"youtube_hold_seconds": -1}, headers=auth())
+            text = await client.patch("/api/v1/settings", json={"youtube_hold_seconds": "soon"}, headers=auth())
+            return await good.json(), good.status, await bad.json(), bad.status, await text.json(), text.status
+
+    good, good_status, bad, bad_status, text, text_status = asyncio.run(scenario())
+    assert good_status == 200
+    assert good["applied"]["youtube_hold_seconds"] == "Hold delay set to 90s (0 = end immediately)"
+    assert config.youtube.hold_seconds == 90
+    assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90
+    assert bad_status == 400 and text_status == 400
+    assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90  # bad keys change nothing
+
+
+def test_patch_endpoint_url_saves_without_enabling(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            saved = await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "panel.example.com"}, headers=auth()
+            )
+            bad = await client.patch("/api/v1/settings", json={"endpoint_public_url": "not a url"}, headers=auth())
+            return await saved.json(), saved.status, await bad.json(), bad.status
+
+    saved, saved_status, bad, bad_status = asyncio.run(scenario())
+    assert saved_status == 200
+    assert config.endpoint.enabled is False  # a URL alone never flips the toggle
+    assert config.endpoint.public_url == "https://panel.example.com"
+    assert bad_status == 400
+    assert config.endpoint.public_url == "https://panel.example.com"
+
+
+def test_patch_endpoint_toggle_needs_a_url(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            missing = await client.patch("/api/v1/settings", json={"endpoint_enabled": True}, headers=auth())
+            await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://panel.example.com"}, headers=auth()
+            )
+            on = await client.patch("/api/v1/settings", json={"endpoint_enabled": True}, headers=auth())
+            off = await client.patch("/api/v1/settings", json={"endpoint_enabled": False}, headers=auth())
+            return (
+                await missing.json(),
+                missing.status,
+                await on.json(),
+                on.status,
+                await off.json(),
+                off.status,
+            )
+
+    missing, missing_status, on, on_status, off, off_status = asyncio.run(scenario())
+    assert missing_status == 400  # no saved URL, so enabling fails
+    assert missing["errors"]["endpoint_enabled"] != ""
+    assert on_status == 200
+    assert on["applied"]["endpoint_enabled"] == "Endpoint enabled"
+    assert on["settings"]["endpoint"]["public_url"] == "https://panel.example.com"  # the toggle keeps the URL
+    assert off_status == 200
+    assert config.endpoint.enabled is False
+    assert read_file(tmp_path)["endpoint"]["public_url"] == "https://panel.example.com"
+
+
+def test_patch_kick_url_follows_when_cleared(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            bad = await client.patch("/api/v1/settings", json={"kick_webhook_public_url": "a"}, headers=auth())
+            saved = await client.patch(
+                "/api/v1/settings", json={"kick_webhook_public_url": "https://kick.example.com"}, headers=auth()
+            )
+            cleared = await client.patch("/api/v1/settings", json={"kick_webhook_public_url": ""}, headers=auth())
+            enabled = await client.patch("/api/v1/settings", json={"kick_webhook_enabled": True}, headers=auth())
+            return (
+                await bad.json(),
+                bad.status,
+                await saved.json(),
+                saved.status,
+                await cleared.json(),
+                cleared.status,
+                await enabled.json(),
+                enabled.status,
+            )
+
+    bad, bad_status, saved, saved_status, cleared, cleared_status, enabled, enabled_status = asyncio.run(scenario())
+    assert bad_status == 400  # a single label never saves as a Kick entry
+    assert saved_status == 200
+    assert saved["applied"]["kick_webhook_public_url"] == "Kick URL saved: https://kick.example.com"
+    assert cleared_status == 200
+    assert cleared["applied"]["kick_webhook_public_url"] == "Kick URL cleared, follows the endpoint"
+    assert enabled_status == 200
+    assert config.kick.webhook.public_url == ""
+    assert config.kick.webhook.enabled is True
+
+
+def test_patch_api_disable_keeps_the_key(tmp_path):
+    _, _, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            off = await client.patch("/api/v1/settings", json={"api_enabled": False}, headers=auth())
+            return await off.json(), off.status
+
+    # Disabling answers 404 from here on (key auth is gone with the toggle).
+    off, off_status = asyncio.run(scenario())
+    assert off_status == 200
+    assert off["applied"]["api_enabled"] == "Control API disabled"
+    assert read_file(tmp_path)["api"]["key"] == KEY  # disabling keeps the key
+
+
+def test_api_enable_makes_a_key_when_missing(tmp_path):
+    from stream_archive.api import ControlAPI
+
+    config, ctrl, recorder, _, _, _, _ = make_api(tmp_path)
+    api = ControlAPI(config, ctrl, recorder)
+    config.api.key = ""  # no key saved yet: the next enable must make one
+    text = asyncio.run(api._apply_api_enabled(True))
+    assert "New API key" in text
+    assert read_file(tmp_path)["api"]["key"] not in ("", KEY)
+    assert read_file(tmp_path)["api"]["enabled"] is True
+
+
+def test_patch_delivery_reconcile_failure_restores(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    class FailingWebhook:
+        async def apply_state(self):
+            msg = "bind conflict"
+            raise OSError(msg)
+
+        async def sync_channels(self, channels):
+            msg = "must not sync after a failed reconcile"
+            raise AssertionError(msg)
+
+    ctrl._kick_webhook = FailingWebhook()
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://panel.example.com"}, headers=auth()
+            )
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 400  # the batch layer reports per-key failures as 400
+    assert "endpoint_public_url" not in body["applied"]
+    assert "not served, restored" in body["errors"]["endpoint_public_url"]
+    assert read_file(tmp_path)["endpoint"]["public_url"] == ""  # the file never claims an unserved URL
 
 
 def test_patch_settings_applies_and_persists(tmp_path):

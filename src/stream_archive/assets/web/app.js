@@ -509,6 +509,15 @@ const SETTING_DEFS = [
   { key: "disk_max_total_gb", label: "Disk cap", hint: "Archive size limit", type: "preset-number",
     presets: [["Off", 0], ["25 GB", 25], ["50 GB", 50], ["100 GB", 100], ["200 GB", 200]], unit: "GB" },
   { key: "disk_delete_oldest", label: "Delete oldest when full", hint: "Otherwise new recordings stop", type: "bool" },
+  { key: "youtube_hold_seconds", label: "YouTube hold", hint: "Delay before ending the restream", type: "preset-number",
+    presets: [["Off", 0], ["30 s", 30], ["60 s", 60], ["120 s", 120], ["300 s", 300], ["600 s", 600]], unit: "s" },
+  { key: "endpoint_enabled", label: "Panel access", hint: "Reach the panel beyond this machine", type: "bool" },
+  { key: "endpoint_public_url", label: "Panel URL", hint: "Public address of your own proxy", type: "text", omitEmpty: true,
+    placeholder: "https://example.com" },
+  { key: "kick_webhook_enabled", label: "Kick deliveries", hint: "Instant signals and chat", type: "bool" },
+  { key: "kick_webhook_public_url", label: "Kick URL", hint: "Empty follows the panel URL", type: "text",
+    placeholder: "https://kick.example.com" },
+  { key: "api_enabled", label: "Control API", hint: "Remote HTTP control", type: "bool" },
 ];
 
 function settingControl(def, current) {
@@ -537,6 +546,14 @@ function settingControl(def, current) {
     box.checked = current === true;
     lab.appendChild(box);
     get = () => box.checked;
+  } else if (def.type === "text") {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "set-" + def.key;
+    input.value = current == null ? "" : String(current);
+    if (def.placeholder) input.placeholder = def.placeholder;
+    lab.appendChild(input);
+    get = () => input.value.trim();
   } else {
     const sel = document.createElement("select");
     for (const [label, value] of def.presets) {
@@ -597,6 +614,12 @@ async function loadSettings() {
       kick_record_chat: s.kick_record_chat,
       disk_max_total_gb: s.disk.max_total_gb,
       disk_delete_oldest: s.disk.delete_oldest,
+      youtube_hold_seconds: s.youtube.hold_seconds,
+      endpoint_enabled: s.endpoint.enabled,
+      endpoint_public_url: s.endpoint.public_url,
+      kick_webhook_enabled: s.kick_webhook.enabled,
+      kick_webhook_public_url: s.kick_webhook.public_url,
+      api_enabled: s.api.enabled,
     };
     for (const def of SETTING_DEFS) {
       const { lab, get } = settingControl(def, flat[def.key]);
@@ -1503,6 +1526,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (typeof value === "number" && (!Number.isFinite(value) || value < 0)) {
           throw new Error(def.label + " must be a number of 0 or more");
         }
+        if (def.omitEmpty && value === "") continue;
         payload[def.key] = value;
       }
       res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });
@@ -1518,6 +1542,8 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     toast("Settings saved");
+    const rotated = res && res.applied && res.applied.api_enabled;
+    if (rotated && rotated.indexOf("New API key") !== -1) toast(rotated, false);
     settingsDirty = false;
     loadSettings();
     loadStatus();

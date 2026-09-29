@@ -58,6 +58,7 @@ class SystemCommands:
             "/disk <maxsize|delete_oldest> <value> - set disk limit\n"
             "/disk - show disk limits\n"
             "/chat [on|off] [twitch|kick] - enable or disable live chat recording (add twitch or kick for one platform; off stops in-flight capture)\n"
+            "/hold <seconds> - global YouTube hold delay (0 = end immediately)\n"
             "/recordings - browse stored recordings (send or delete)\n"
             "/settings - open the settings menu (reply keyboard buttons)\n"
             "/start - this help"

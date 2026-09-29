@@ -127,6 +127,22 @@ class SettingsCommands:
 
         return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
 
+    def handle_global_hold(self, args: list[str], chat_id: int | None = None) -> str:
+        """Set the global YouTube hold delay. The control API also calls this."""
+        if len(args) != 1:
+            return "Usage: /hold <seconds>"
+        try:
+            n = int(args[0])
+        except ValueError:
+            return "\u274c hold delay must be a non-negative integer (seconds)"
+        if n < 0:
+            return "\u274c hold delay must be a non-negative integer (seconds)"
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.youtube.hold_seconds = n
+
+        return cast(str, self._apply(mutate, lambda c: f"Hold delay set to {n}s (0 = end immediately)", chat_id))
+
     def handle_channel_hold(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 2:
             return "Usage: /channelhold <channel> <seconds|default>"

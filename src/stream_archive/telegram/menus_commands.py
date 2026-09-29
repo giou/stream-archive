@@ -31,6 +31,7 @@ class CommandsMixin:
     handle_maxyoutube: Any
     handle_disk: Any
     handle_chat: Any
+    handle_global_hold: Any
     _open_recordings: Any
     menu_text: Any
     reply_keyboard: Any
@@ -54,6 +55,7 @@ class CommandsMixin:
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
             BotCommand("chat", "Toggle live chat recording"),
+            BotCommand("hold", "Set global YouTube hold delay in seconds"),
             BotCommand("recordings", "Browse stored recordings"),
             BotCommand("settings", "Open the settings menu (reply keyboard buttons)"),
         ]
@@ -132,6 +134,11 @@ class CommandsMixin:
             await self.handle_chat(context.args or [], chat_id=self._chat_of(update))
         )
         await self._maybe_send_apply_warnings()
+
+    async def _cmd_hold(self, update: Any, context: Any) -> None:
+        await update.effective_message.reply_text(
+            self.handle_global_hold(context.args or [], chat_id=self._chat_of(update))
+        )
 
     async def _cmd_recordings(self, update: Any, context: Any) -> None:
         result = await self._open_recordings(self._chat_of(update))
