@@ -16,6 +16,7 @@ from stream_archive.config import (
     AppConfig,
     channel_url,
 )
+from stream_archive.health import clear_degraded, set_degraded
 from stream_archive.recorder.common import sanitize_filename, sanitize_metadata_text
 from stream_archive.recorder.types import HoldState, Recording
 
@@ -331,6 +332,19 @@ class YoutubeOutputMixin:
                     self._youtube_starts.append(time.time())  # count fresh creates only
             except Exception as e:
                 logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
+                if "stream-archive-setup-youtube" in str(e):
+                    set_degraded("youtube_auth", "YouTube authentication is dead")
+                    msg = (
+                        f"\u26a0\ufe0f YouTube authentication is dead.\n"
+                        f"Channel: {channel}\n"
+                        "Restreaming is stalled: run stream-archive-setup-youtube again."
+                    )
+                    if self._notifier:
+                        try:
+                            await self._notifier.notify(msg)
+                        except Exception:
+                            logger.error("[recorder] auth notification failed for %s", channel, exc_info=True)
+                    raise
                 if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():
                     msg = (
                         f"\u26a0\ufe0f YouTube rate limit reached!\n"
@@ -361,6 +375,7 @@ class YoutubeOutputMixin:
                                 logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
                     return
                 raise
+            clear_degraded("youtube_auth")
             entry = self._recordings.get(channel)
             if entry is None:
                 # The recording vanished while the broadcast was created, so

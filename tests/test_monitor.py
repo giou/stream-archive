@@ -703,3 +703,111 @@ def test_partial_resolve_keeps_unresolved_live_channel():
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
 
     assert rec.stopped == []
+
+
+def _auth_error(code):
+    """An API rejection of the app credentials, like a dead id or secret."""
+    request = httpx.Request("GET", "https://api.twitch.tv/helix/users")
+    response = httpx.Response(code, request=request)
+    return httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+def test_disk_full_blocks_start_and_alerts_once():
+    """A full disk blocks the start instead of crash-looping the restart."""
+    from stream_archive.health import clear_degraded, degraded
+
+    rec = FakeRecorder()
+    rec.snapshot["free_gb"] = 0.2
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    try:
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == []
+        assert len(notifier.messages) == 1
+        assert "0.2 GB free" in notifier.messages[0]
+        assert degraded()["disk_full"].startswith("only 0.2 GB free")
+    finally:
+        clear_degraded("disk_full")
+
+
+def test_disk_recovery_clears_and_starts():
+    """Freed space clears the flag and the next sweep records again."""
+    from stream_archive.health import clear_degraded, degraded
+
+    rec = FakeRecorder()
+    rec.snapshot["free_gb"] = 0.2
+    mon = make_monitor(recorder=rec)
+    config = make_config()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    try:
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == []
+        rec.snapshot["free_gb"] = 100.0
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == ["twitch:ch"]
+        assert "disk_full" not in degraded()
+    finally:
+        clear_degraded("disk_full")
+
+
+def test_twitch_auth_dead_alerts_once_per_episode():
+    """A rejected Twitch credential stalls loudly, then recovers quietly."""
+    from stream_archive.health import clear_degraded, degraded
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    try:
+        api = FakeTwitchAPI(error=_auth_error(401), user_ids={"ch": "u1"})
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert rec.started == []
+        assert len(notifier.messages) == 1
+        assert "Twitch rejected the app credentials (HTTP 401)" in notifier.messages[0]
+        assert "twitch_auth" in degraded()
+        api.error = None
+        asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+        assert "twitch_auth" not in degraded()
+    finally:
+        clear_degraded("twitch_auth")
+
+
+def test_kick_auth_dead_alerts_once_per_episode():
+    """A rejected Kick credential stalls loudly, then recovers quietly."""
+    from stream_archive.health import clear_degraded, degraded
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config(channels=["kick:slug"])
+    try:
+        api = FakeKickAPI(error=_auth_error(403))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
+        assert rec.started == []
+        assert len(notifier.messages) == 1
+        assert "Kick rejected the app credentials (HTTP 403)" in notifier.messages[0]
+        assert "kick_auth" in degraded()
+        api.error = None
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
+        assert "kick_auth" not in degraded()
+    finally:
+        clear_degraded("kick_auth")
+
+
+def test_transport_error_stays_silent():
+    """A down network logs only: only rejections page the operator."""
+    from stream_archive.health import degraded
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    api = FakeTwitchAPI(error=httpx.ConnectError("boom"), user_ids={"ch": "u1"})
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+    assert notifier.messages == []
+    assert degraded() == {}

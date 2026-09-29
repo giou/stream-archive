@@ -282,6 +282,7 @@ async function loadStatus(quiet) {
       ["Channels", String(s.channels.length)],
       ["Monitor every", s.monitoring_interval_s + "s"],
       ["Telegram bot", s.telegram_enabled ? "on" : "off"],
+      ["Health", (s.degraded && s.degraded.length ? "degraded: " + s.degraded.join(", ") : "ok")],
     ]);
     const access = kvCard("Access", [
       ["Endpoint", s.endpoint.enabled ? "on" : "off"],

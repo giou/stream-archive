@@ -47,16 +47,45 @@ def test_readyz_flips_with_ready_flag(monkeypatch):
             async with ClientSession(timeout=ClientTimeout(total=5)) as session:
                 async with session.get(f"http://{host}:{port}/readyz") as resp:
                     assert resp.status == 503
+                    assert await resp.json() == {"ready": False, "degraded": ["starting"]}
                 scheduler_module._READY = True
                 async with session.get(f"http://{host}:{port}/readyz") as resp:
                     assert resp.status == 200
-                    assert await resp.text() == "ready"
+                    assert await resp.json() == {"ready": True, "degraded": []}
                 async with session.get(f"http://{host}:{port}/healthz") as resp:
                     assert resp.status == 200
         finally:
             await runner.cleanup()
 
     asyncio.run(scenario())
+
+
+def test_readyz_names_present_problems(monkeypatch):
+    """A ready process with a dead credential reads ready but degraded."""
+    from stream_archive.health import clear_degraded, set_degraded
+
+    monkeypatch.setattr(scheduler_module, "_READY", True)
+    set_degraded("twitch_auth", "Twitch rejected the app credentials (HTTP 401)")
+    try:
+
+        async def scenario():
+            runner = await _start_health_server(port=0)
+            assert runner is not None
+            try:
+                assert runner.addresses, "health server exposes no bound address"
+                host, port = runner.addresses[0][:2]
+                async with (
+                    ClientSession(timeout=ClientTimeout(total=5)) as session,
+                    session.get(f"http://{host}:{port}/readyz") as resp,
+                ):
+                    assert resp.status == 200
+                    assert await resp.json() == {"ready": True, "degraded": ["twitch_auth"]}
+            finally:
+                await runner.cleanup()
+
+        asyncio.run(scenario())
+    finally:
+        clear_degraded("twitch_auth")
 
 
 def test_health_bind_failure_returns_none(caplog):

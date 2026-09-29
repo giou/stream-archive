@@ -220,6 +220,58 @@ def _listen_host_default(host: str) -> str:
     return host
 
 
+def _check_twitch_credentials(client_id: str, secret: str) -> str | None:
+    """Error text when Twitch rejects the app credentials, else None.
+
+    One client-credentials grant against id.twitch.tv. A typo then
+    surfaces here, not as missed streams days later. Never blocks:
+    the caller prints the text as a warning.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    body = urllib.parse.urlencode(
+        {"client_id": client_id, "client_secret": secret, "grant_type": "client_credentials"}
+    ).encode()
+    try:
+        with urllib.request.urlopen("https://id.twitch.tv/oauth2/token", data=body, timeout=10) as resp:
+            if resp.status == 200:
+                return None
+            return f"Twitch answered HTTP {resp.status}."
+    except urllib.error.HTTPError as e:
+        return f"Twitch rejected the credentials (HTTP {e.code})."
+    except Exception as e:
+        return f"cannot reach Twitch ({e})."
+
+
+def _send_bot_test(token: str, user_id: int) -> str | None:
+    """Error text when the bot test message fails, else None.
+
+    One sendMessage to the admin. It proves the token works and the
+    user id is right. Never blocks: the caller prints the text as
+    a warning.
+    """
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"chat_id": user_id, "text": "StreamArchive setup: the Telegram bot works."}).encode()
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            if resp.status == 200:
+                return None
+            return f"Telegram answered HTTP {resp.status}."
+    except urllib.error.HTTPError as e:
+        return f"Telegram rejected the bot token (HTTP {e.code})."
+    except Exception as e:
+        return f"cannot reach Telegram ({e})."
+
+
 def _step_twitch(config: AppConfig) -> None:
     """Set the Twitch app credentials. Blank keeps a stored value."""
     print("\n-- Twitch credentials --")
@@ -239,7 +291,12 @@ def _step_twitch(config: AppConfig) -> None:
         if secret:
             candidate.twitch_client_secret = secret
 
-    _save(config, mutate, "Twitch credentials")
+    if _save(config, mutate, "Twitch credentials"):
+        error = _check_twitch_credentials(config.twitch_client_id, config.twitch_client_secret)
+        if error is None:
+            print("Twitch credentials work.")
+        else:
+            print(f"Warning: {error} Streams will not record until this is fixed.")
 
 
 def _prompt_kick_creds(config: AppConfig) -> tuple[str, str] | None:
@@ -305,6 +362,7 @@ def _step_control(config: AppConfig, *, required: bool) -> None:
                 break
     user_id = config.telegram_user_id
     token = config.bot_telegram_api
+    token_changed = False
     if want_bot:
         while True:
             raw = _read("Telegram user id", default=str(user_id) if user_id > 0 else None)
@@ -325,6 +383,7 @@ def _step_control(config: AppConfig, *, required: bool) -> None:
                 break
             if entered or not required:
                 token = entered
+                token_changed = True
                 break
             print("The bot token is required.")
     hashed = hash_password(password) if password else config.web.password_hash
@@ -355,7 +414,12 @@ def _step_control(config: AppConfig, *, required: bool) -> None:
                 candidate.telegram_user_id = user_id
                 candidate.bot_telegram_api = token
 
-            _save(config, mutate_bot, "Telegram bot")
+            if _save(config, mutate_bot, "Telegram bot") and (token_changed or required):
+                error = _send_bot_test(token, user_id)
+                if error is None:
+                    print("Telegram bot works. Test message sent.")
+                else:
+                    print(f"Warning: {error} The bot will stay silent until this is fixed.")
     elif not required:
 
         def mutate_bot_off(candidate: AppConfig) -> None:
@@ -449,7 +513,8 @@ def _step_youtube(config: AppConfig) -> None:
     if not secrets_path.is_file():
         print(f"{config.youtube.client_secrets_file} is not a file. Nothing to authorize with.")
         return
-    print("The browser opens for the Google authorization. Paste the redirect URL when asked.")
+    print("Authorize in a browser with the address below.")
+    print("Under Docker no browser opens here: paste the full redirect URL instead.")
     try:
         youtube_main()
     except SystemExit as e:
@@ -1069,6 +1134,11 @@ def _fresh_run() -> AppConfig:
         print(f"ERROR: cannot write config.json: {e}", file=sys.stderr)
         raise SystemExit(1) from e
     print(f"Wrote {workdir / 'config.json'}. Now pick a control surface.")
+    error = _check_twitch_credentials(client_id, client_secret)
+    if error is None:
+        print("Twitch credentials work.")
+    else:
+        print(f"Warning: {error} Streams will not record until this is fixed.")
     _step_control(config, required=True)
     if _yes("Add channels now", default=False):
         _step_channels(config)

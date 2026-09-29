@@ -2560,3 +2560,35 @@ def test_failed_start_discards_the_partial_chat_and_releases_its_path(tmp_path, 
 
     leftovers = list((tmp_path / "chat").rglob("*.tmp")) if (tmp_path / "chat").exists() else []
     assert leftovers == [], f"a failed start must remove its partial chat file: {leftovers}"
+
+
+def test_youtube_auth_dead_notifies_and_marks_health(tmp_path, monkeypatch):
+    """A dead YouTube token pages the operator instead of only logging."""
+    from stream_archive.health import clear_degraded, degraded
+
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    notifier = FakeNotifier()
+    rec = Recorder(
+        config,
+        youtube_streamer=FakeYouTubeStreamer(
+            create_error=RuntimeError(
+                "YouTube token expired and cannot be refreshed. Run 'stream-archive-setup-youtube' again."
+            )
+        ),
+        notifier=notifier,
+    )
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+    try:
+
+        async def scenario():
+            assert await rec.start("ch") is True
+            await wait_until(lambda: not rec.is_recording("ch"))
+
+        asyncio.run(scenario())
+        assert len(notifier.messages) == 1
+        assert "YouTube authentication is dead" in notifier.messages[0]
+        assert degraded()["youtube_auth"] == "YouTube authentication is dead"
+    finally:
+        clear_degraded("youtube_auth")

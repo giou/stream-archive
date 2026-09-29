@@ -68,8 +68,16 @@ async def _healthz(request: web.Request) -> web.Response:
 
 
 async def _readyz(request: web.Request) -> web.Response:
-    """Readiness for orchestrators. 200 only after clients exist."""
-    return web.Response(status=200 if _READY else 503, text="ready" if _READY else "starting")
+    """Readiness for orchestrators. 200 only after clients exist.
+
+    The body names present degradations (full disk, dead credentials),
+    so an orchestrator or a status page tells starting apart from broken.
+    """
+    from stream_archive.health import degraded as _degraded
+
+    if not _READY:
+        return web.json_response({"ready": False, "degraded": ["starting"]}, status=503)
+    return web.json_response({"ready": True, "degraded": sorted(_degraded())})
 
 
 async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_PORT) -> web.AppRunner | None:

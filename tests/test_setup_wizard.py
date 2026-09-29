@@ -59,6 +59,7 @@ def test_fresh_run_creates_valid_config(monkeypatch, tmp_path):
     the bot, or the Channels step.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wizard, "_check_twitch_credentials", lambda *args: None)
     _script(
         monkeypatch,
         inputs=["tid123", "1", "n", "10"],
@@ -114,12 +115,15 @@ def test_control_choice_telegram_enables_bot_only(monkeypatch, tmp_path):
     """The Telegram choice enables the bot and leaves the panel off."""
     _write_config(tmp_path, telegram_user_id=0, bot_telegram_api="")
     monkeypatch.chdir(tmp_path)
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(wizard, "_send_bot_test", lambda token, uid: calls.append((token, uid)))
     _script(monkeypatch, inputs=["2", "2", "42", "10"], secrets=["bottoken123"])
     wizard.main()
     config = get_config(tmp_path / "config.json")
     assert telegram_enabled(config) is True
     assert config.telegram_user_id == 42
     assert config.web.enabled is False
+    assert calls == [("bottoken123", 42)]
 
 
 def test_youtube_step_saves_mode_and_runs_oauth(monkeypatch, tmp_path):
@@ -419,6 +423,8 @@ def test_reset_wipes_config_and_starts_over(monkeypatch, tmp_path):
     """Reset keeps a backup and runs the first-time flow again."""
     _write_config(tmp_path, channels=["twitch:old"])
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wizard, "_check_twitch_credentials", lambda *args: None)
+    monkeypatch.setattr(wizard, "_send_bot_test", lambda *args: None)
     _script(
         monkeypatch,
         inputs=["9", "y", "tid123", "1", "n", "10"],
@@ -735,6 +741,7 @@ def test_menu_marks_missing_steps_and_token(monkeypatch, tmp_path, capsys):
     """
     _write_config(tmp_path, telegram_user_id=0, bot_telegram_api="", web={"enabled": False, "password_hash": ""})
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(wizard, "_send_bot_test", lambda *args: None)
     _script(monkeypatch, inputs=["10", "2", "2", "42", "10"], secrets=["bottoken123"])
     wizard.main()
     out = capsys.readouterr().out
@@ -750,3 +757,89 @@ def test_start_hint_matches_the_machine(monkeypatch):
     assert wizard._start_hint() == "Start the app with `docker compose up -d`."
     monkeypatch.setattr(os.path, "exists", lambda _path: False)
     assert wizard._start_hint() == "Start the app with `stream-archive`."
+
+
+def test_twitch_check_reports_working_and_rejected(monkeypatch):
+    """The Twitch check separates working credentials from typos."""
+    import urllib.error
+    import urllib.request
+
+    class _Ok:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: _Ok())
+    assert wizard._check_twitch_credentials("id", "secret") is None
+
+    def _denied(*args, **kwargs):
+        import io
+
+        url = "https://id.twitch.tv/oauth2/token"
+        err = urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO())
+        err.close()
+        raise err
+
+    monkeypatch.setattr(urllib.request, "urlopen", _denied)
+    assert "HTTP 401" in (wizard._check_twitch_credentials("id", "typo") or "")
+
+
+def test_twitch_step_warns_but_saves_on_reject(monkeypatch, tmp_path, capsys):
+    """A rejected Twitch credential still saves, with a warning attached."""
+    _write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        wizard, "_check_twitch_credentials", lambda *args: "Twitch rejected the credentials (HTTP 401)."
+    )
+    _script(monkeypatch, inputs=["1", "newid", "10"], secrets=["newsecret"])
+    wizard.main()
+    config = get_config(tmp_path / "config.json")
+    assert config.twitch_client_id == "newid"
+    assert "Warning" in capsys.readouterr().out
+
+
+def test_bot_send_reports_ok_and_bad_token(monkeypatch):
+    """The bot test separates a working token from a rejected one."""
+    import urllib.request
+
+    class _Ok:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: _Ok())
+    assert wizard._send_bot_test("token", 42) is None
+
+    import urllib.error
+
+    def _denied(*args, **kwargs):
+        import io
+
+        url = "https://api.telegram.org/botx/sendMessage"
+        err = urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO())
+        err.close()
+        raise err
+
+    monkeypatch.setattr(urllib.request, "urlopen", _denied)
+    assert "HTTP 401" in (wizard._send_bot_test("typo", 42) or "")
+
+
+def test_control_rerun_keeps_token_sends_nothing(monkeypatch, tmp_path, capsys):
+    """Keeping the stored token sends no test message on re-run."""
+    _write_config(tmp_path, telegram_user_id=42, bot_telegram_api="kept-token")
+    monkeypatch.chdir(tmp_path)
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(wizard, "_send_bot_test", lambda token, uid: calls.append((token, uid)))
+    _script(monkeypatch, inputs=["2", "2", "", "10"], secrets=[""])
+    wizard.main()
+    assert calls == []
+    assert get_config(tmp_path / "config.json").bot_telegram_api == "kept-token"
+    assert "Test message sent" not in capsys.readouterr().out

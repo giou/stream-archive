@@ -2680,3 +2680,15 @@ def test_hold_sets_the_global_delay(tmp_path):
     assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90
     assert ctrl.handle_global_hold(["soon"]).startswith("❌")
     assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90
+
+
+def test_status_names_degraded_problems(tmp_path):
+    """The bot status names present problems instead of reading all-green."""
+    from stream_archive.health import clear_degraded, set_degraded
+
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    set_degraded("disk_full", "only 0.2 GB free on the archive disk")
+    try:
+        assert "Degraded: disk_full" in asyncio.run(ctrl.handle_status())
+    finally:
+        clear_degraded("disk_full")

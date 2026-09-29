@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from stream_archive.config import AppConfig, bare_name, is_kick_channel
+from stream_archive.health import clear_degraded, set_degraded
 
 if TYPE_CHECKING:
     from stream_archive.kick_api import KickAPI
@@ -20,6 +21,14 @@ logger = logging.getLogger(__name__)
 FAILURE_NOTIFY_INTERVAL = 1800
 DISK_NOTIFY_INTERVAL = 1800
 
+#: Free archive space below which no recording starts, in GiB. The disk cap
+#: bounds the archive; this floor bounds the filesystem, so a full disk
+#: fails as "blocked" instead of a crash-and-restart loop.
+MIN_FREE_GB = 1.0
+
+#: HTTP statuses that mean the app credentials died, not the network.
+_AUTH_STATUSES = (400, 401, 403)
+
 
 class Monitor:
     def __init__(self, recorder: Recorder, notifier: Notifier) -> None:
@@ -28,9 +37,12 @@ class Monitor:
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
         self._last_disk_notify: dict[str, float] = {}  # blocked-start alerts, per channel
+        self._last_auth_notify: dict[str, float] = {}  # credential-dead alerts, per source
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
         self._kick_api_error_logged = False
+        self._twitch_auth_alerted = False
+        self._kick_auth_alerted = False
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
         return self._locks.setdefault(channel, asyncio.Lock())
@@ -41,11 +53,14 @@ class Monitor:
         # (fail-closed). Keep the difference.
         twitch_channels = [c for c in config.channels if not is_kick_channel(c)]
         if twitch_channels:
+            twitch_ok = True
             try:
                 resolved = await twitch_api.resolve_user_ids([bare_name(c) for c in twitch_channels])
             except (httpx.HTTPError, TimeoutError, ValueError, KeyError) as e:
                 logger.error("[monitor] resolve_user_ids failed: %s", e)
+                await self._note_twitch_error(e)
                 resolved = {}
+                twitch_ok = False
             if not resolved:
                 logger.warning("[monitor] Failed to resolve user IDs")
             else:
@@ -59,6 +74,8 @@ class Monitor:
                     streams = await twitch_api.get_live_streams(user_ids)
                 except (httpx.HTTPError, TimeoutError, ValueError, KeyError) as e:
                     logger.error("[monitor] get_live_streams failed: %s", e)
+                    await self._note_twitch_error(e)
+                    twitch_ok = False
 
                 if streams is not None:
                     user_to_channel = {v: k for k, v in user_ids.items()}
@@ -85,6 +102,8 @@ class Monitor:
                                 continue
                             await self._ensure_stopped(channel, config)
 
+            if twitch_ok:
+                self._clear_twitch_auth()
         kick_channels = [c for c in config.channels if is_kick_channel(c)]
         if kick_channels:
             try:
@@ -92,6 +111,7 @@ class Monitor:
             except Exception as e:
                 # Log one error per failure episode. The loop retries every
                 # interval, so an error per cycle is only noise.
+                await self._note_kick_error(e)
                 if not self._kick_api_error_logged:
                     self._kick_api_error_logged = True
                     logger.error("[monitor] kick get_channel_statuses failed: %s", e)
@@ -99,6 +119,7 @@ class Monitor:
                     logger.debug("[monitor] kick get_channel_statuses still failing: %s", e)
             else:
                 self._kick_api_error_logged = False
+                self._clear_kick_auth()
                 for ch in kick_channels:
                     bare = bare_name(ch)
                     status = statuses.get(bare)
@@ -256,19 +277,31 @@ class Monitor:
         """Return the reason a start is blocked, or None.
 
         This method raises nothing. A snapshot failure fails open and does
-        not block the start.
+        not block the start. A full disk blocks it: without this gate a
+        failed recording restarts every sweep, forever.
         """
         reason = self.recorder.youtube_restart_blocked_reason(channel)
         if reason:
             return reason
         try:
+            # Refresh per start. A tick-level snapshot goes stale when
+            # several channels start in one sweep.
+            snapshot = await self.recorder.disk_snapshot()
+        except Exception as e:
+            logger.error("[monitor] disk gate failed, proceeding: %s", e)
+            return None
+        if snapshot.get("usage_ok", True):
+            free_gb = snapshot.get("free_gb", 0.0)
+            if free_gb < MIN_FREE_GB:
+                reason = f"only {free_gb:g} GB free on the archive disk"
+                set_degraded("disk_full", reason)
+                return reason
+            clear_degraded("disk_full")
+        try:
             disk_cfg = config.disk
             cap = disk_cfg.max_total_gb
             if cap <= 0:
                 return None
-            # Refresh per start. A tick-level snapshot goes stale when
-            # several channels start in one sweep.
-            snapshot = await self.recorder.disk_snapshot()
             if snapshot["archive_gb"] >= cap:
                 if disk_cfg.delete_oldest:
                     await self.recorder.delete_oldest_to_cap()
@@ -282,6 +315,66 @@ class Monitor:
             return None
         else:
             return None
+
+    def _auth_status(self, error: BaseException) -> int | None:
+        """HTTP status when the error rejects the app credentials, else None.
+
+        Transport faults and bad payloads stay log-only. A 400/401/403
+        from the token or API endpoint means the id or secret died.
+        """
+        if (
+            isinstance(error, httpx.HTTPStatusError)
+            and error.response is not None
+            and error.response.status_code in _AUTH_STATUSES
+        ):
+            return error.response.status_code
+        return None
+
+    async def _note_twitch_error(self, error: BaseException) -> None:
+        """Alert once per episode when Twitch rejects the credentials."""
+        code = self._auth_status(error)
+        if code is None:
+            return
+        set_degraded("twitch_auth", f"Twitch rejected the app credentials (HTTP {code})")
+        if self._twitch_auth_alerted:
+            return
+        self._twitch_auth_alerted = True
+        try:
+            await self.notifier.notify(
+                f"\u26a0\ufe0f Twitch rejected the app credentials (HTTP {code}). "
+                "Monitoring is stalled: check the Twitch id and secret."
+            )
+        except Exception:
+            self._twitch_auth_alerted = False
+            logger.error("[monitor] credential notification failed", exc_info=True)
+
+    def _clear_twitch_auth(self) -> None:
+        """Drop the Twitch credential alert after a successful call."""
+        self._twitch_auth_alerted = False
+        clear_degraded("twitch_auth")
+
+    async def _note_kick_error(self, error: BaseException) -> None:
+        """Alert once per episode when Kick rejects the credentials."""
+        code = self._auth_status(error)
+        if code is None:
+            return
+        set_degraded("kick_auth", f"Kick rejected the app credentials (HTTP {code})")
+        if self._kick_auth_alerted:
+            return
+        self._kick_auth_alerted = True
+        try:
+            await self.notifier.notify(
+                f"\u26a0\ufe0f Kick rejected the app credentials (HTTP {code}). "
+                "Kick monitoring is stalled: check the Kick id and secret."
+            )
+        except Exception:
+            self._kick_auth_alerted = False
+            logger.error("[monitor] credential notification failed", exc_info=True)
+
+    def _clear_kick_auth(self) -> None:
+        """Drop the Kick credential alert after a successful call."""
+        self._kick_auth_alerted = False
+        clear_degraded("kick_auth")
 
     async def _notify_blocked(self, channel: str, reason: str) -> None:
         now = time.monotonic()

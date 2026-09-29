@@ -1040,3 +1040,20 @@ def test_panel_settings_routes_are_gone_from_v1_unification(tmp_path):
             return get_settings.status, patch_settings.status, get_channels.status
 
     assert asyncio.run(scenario()) == (404, 404, 404)
+
+
+def test_panel_status_reports_degraded_problems(tmp_path):
+    from stream_archive.health import clear_degraded, set_degraded
+
+    _, _, _, _, wh = make_webui(tmp_path)
+    set_degraded("kick_auth", "Kick rejected the app credentials (HTTP 403)")
+    try:
+
+        async def scenario():
+            async with TestClient(TestServer(wh._app)) as client:
+                await login(client)
+                return await (await client.get("/api/status")).json()
+
+        assert asyncio.run(scenario())["degraded"] == ["kick_auth"]
+    finally:
+        clear_degraded("kick_auth")

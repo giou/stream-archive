@@ -442,12 +442,15 @@ class ControlAPI:
 
     async def _status(self, request: web.Request) -> web.Response:
         """Service summary: version, channel count, active recordings."""
+        from stream_archive.health import degraded as _degraded
+
         return web.json_response(
             {
                 "version": installed_app_version() or "unknown",
                 "channels": len(self._config.channels),
                 "recording": self._recorder.active_channels(),
                 "monitoring_interval_s": self._config.monitoring_interval,
+                "degraded": sorted(_degraded()),
             }
         )
 

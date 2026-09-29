@@ -117,6 +117,10 @@ class SystemCommands:
             # The probe failed, so every filesystem number is 0.0 GB. Say
             # unknown instead of reporting a full disk.
             disk_line = f"Disk: usage unknown \u00b7 archive: {disk_snap['archive_gb']:.1f} GB"
+        from stream_archive.health import degraded as _degraded
+
+        problems = sorted(_degraded())
+        degraded_line = f"Degraded: {', '.join(problems)}\n" if problems else ""
         return (
             f"Channels ({len(c.channels)}): {_status_list(c.channels)}\n"
             f"Output mode: {c.output_mode}\n"
@@ -129,6 +133,7 @@ class SystemCommands:
             f"Kick webhook: {webhook_state}\n"
             f"MTProto upload: {self._mtproto_state_text()}\n"
             f"Web panel: {self._web_state_text()}\n"
+            f"{degraded_line}"
             f"Quality: {c.preferred_quality}\n"
             f"Simultaneous recordings: {rec_limit}\n"
             f"YouTube re-streams: {yt_limit}\n"

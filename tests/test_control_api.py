@@ -900,3 +900,19 @@ def test_disabled_api_never_spends_budget(tmp_path):
             return codes
 
     assert asyncio.run(scenario()) == [404] * 11
+
+
+def test_status_reports_degraded_problems(tmp_path):
+    from stream_archive.health import clear_degraded, set_degraded
+
+    _, _, _, _, wh, _, _ = make_api(tmp_path)
+    set_degraded("twitch_auth", "Twitch rejected the app credentials (HTTP 401)")
+    try:
+
+        async def scenario():
+            async with TestClient(TestServer(wh._app)) as client:
+                return await (await client.get("/api/v1/status", headers=auth())).json()
+
+        assert asyncio.run(scenario())["degraded"] == ["twitch_auth"]
+    finally:
+        clear_degraded("twitch_auth")

@@ -829,11 +829,14 @@ class WebUI:
             now = self._recorder.recording_info()
         except Exception:
             now = []
+        from stream_archive.health import degraded as _degraded
+
         payload = {
             "version": installed_app_version() or "unknown",
             "channels": list(self._config.channels),
             "recording": self._recorder.active_channels(),
             "monitoring_interval_s": self._config.monitoring_interval,
+            "degraded": sorted(_degraded()),
             "telegram_enabled": telegram_enabled(self._config),
             "endpoint": {
                 "enabled": self._config.endpoint.enabled,
