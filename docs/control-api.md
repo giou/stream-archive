@@ -12,7 +12,7 @@ The setup wizard offers the control API as one of its steps (**Control API (remo
 2. Choose **Settings → Remote access → API**.
 3. Tap **Enable API**.
 
-The Telegram bot generates the key and shows it with the base URL. Tap **Show key** to show the key again, and **Rotate key** to replace it. A rotated key stops the old key at once. Disabling the control API keeps the key, so a later enable uses the same key.
+The Telegram bot generates the key and shows it with the base URL. Tap **Show key** to show the key again, and **Rotate key** to replace it. The web panel has the same pair under an **API key** card. A rotated key stops the old key at once. Disabling the control API keeps the key, so a later enable uses the same key.
 
 The Telegram bot shows the key in the private chat with the admin only. In a group chat the Telegram bot answers with a pointer to that chat, because every member of the group can read the reply.
 
@@ -58,6 +58,8 @@ Keep the key secret. Anyone who has it can change your channels and settings.
 | `PATCH` | `/api/v1/channels/<channel>` | Change per-channel settings |
 | `DELETE` | `/api/v1/channels/<channel>` | Remove a channel |
 | `POST` | `/api/v1/kick/webhook/test` | Run the Kick delivery test, report its timed result |
+| `GET` | `/api/v1/api-key` | Show the key. Reads `404` with no key saved yet |
+| `POST` | `/api/v1/api-key/rotate` | Replace the key, return the new one. The old key dies at once |
 
 A channel name carries its platform prefix, for example `twitch:example` or `kick:example`. If your client encodes it, use `%3A` for the colon (`/api/v1/channels/kick%3Aexample`). Both forms work.
 

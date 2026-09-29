@@ -1,6 +1,6 @@
 # Web panel
 
-The browser panel controls the app without Telegram. It replaces the Telegram bot: status, channels, settings, recordings with a video player, reload, restart, update check, and password change. The Telegram bot and the web panel can run at once.
+The browser panel controls the app without Telegram. It replaces the Telegram bot: status, channels, settings, recordings with a video player, reload, restart, update check, Kick delivery test, API key show and rotate, and password change. The Telegram bot and the web panel can run at once.
 
 The web panel lives on the private listener at the domain root. It runs while the endpoint, the control API, or the web panel itself is on.
 
@@ -40,7 +40,7 @@ The web panel is powerful. Keep it off the open internet when you can.
 
 The panel edits the same 15 global keys as `PATCH /api/v1/settings`: `output_mode`, `preferred_quality`, `retention_days`, `max_concurrent_recordings`, `max_concurrent_youtube_streams`, `record_chat`, `kick_record_chat`, `disk_max_total_gb`, `disk_delete_oldest`, `youtube_hold_seconds`, `endpoint_enabled`, `endpoint_public_url`, `kick_webhook_enabled`, `kick_webhook_public_url`, `api_enabled`. It also adds and removes channels and edits per-channel `output_mode`, `quality`, and `youtube_hold_seconds`. Picking audio-only quality for a channel that restreams asks to confirm first: on confirm the panel switches that channel to disk output and then sets the quality, like the Telegram bot.
 
-It cannot touch the read-only keys of the control API: listener binds and ports, `kick.client_id` and `kick.client_secret`, `web.*`, `api.key`, `youtube.privacy_status`, `timezone`, `monitoring_interval`, `proxy_list`, the plugin, recording, chat, and session dirs, `eventsub.enabled`, `update_check.*`, and all secrets. See [Control API](control-api.md) for the full read-only list.
+It cannot touch the read-only keys of the control API: listener binds and ports, `kick.client_id` and `kick.client_secret`, `web.*`, `youtube.privacy_status`, `timezone`, `monitoring_interval`, `proxy_list`, the plugin, recording, chat, and session dirs, `eventsub.enabled`, `update_check.*`, and all secrets except the API key card, which shows and rotates `api.key`. See [Control API](control-api.md) for the full read-only list.
 
 ## Related guides
 

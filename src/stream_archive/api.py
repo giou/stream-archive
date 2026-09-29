@@ -336,6 +336,8 @@ class ControlAPI:
         app.router.add_patch("/api/v1/channels/{channel}", self._guarded(self._patch_channel))
         app.router.add_delete("/api/v1/channels/{channel}", self._guarded(self._remove_channel))
         app.router.add_post("/api/v1/kick/webhook/test", self._guarded(self._test_kick_delivery))
+        app.router.add_get("/api/v1/api-key", self._guarded(self._show_api_key))
+        app.router.add_post("/api/v1/api-key/rotate", self._guarded(self._rotate_api_key))
 
     def _guarded(self, handler: Any) -> Any:
         """Wrap one handler with key-or-session checks and JSON error responses."""
@@ -707,6 +709,29 @@ class ControlAPI:
             raise _ApiError(503, msg)
         ok, message = await kick_webhook.verify_delivery()
         return web.json_response({"ok": ok, "message": message})
+
+    async def _show_api_key(self, request: web.Request) -> web.Response:
+        """Return the API key. The panel shows it on demand, like the bot."""
+        key = self._config.api.key
+        if not key.strip():
+            msg = "no API key yet - enable the API to generate one"
+            raise _ApiError(404, msg)
+        return web.json_response({"key": key})
+
+    async def _rotate_api_key(self, request: web.Request) -> web.Response:
+        """Replace the API key and return the new one. The old key dies at once."""
+        key = secrets.token_urlsafe(32)
+        existed = bool(self._config.api.key.strip())
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.api.key = key
+
+        summary = "API key rotated - the old key stopped working" if existed else "API key generated"
+        text = self._ctrl._apply(mutate, lambda _candidate: summary)
+        if is_error(text):
+            raise _ApiError(400, _plain(text))
+        await self._notify([summary], request[_ORIGIN_KEY])
+        return web.json_response({"key": key, "message": summary})
 
     async def _channels(self, request: web.Request) -> web.Response:
         """Every monitored channel with its effective settings."""

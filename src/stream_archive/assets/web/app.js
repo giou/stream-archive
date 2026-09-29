@@ -1714,6 +1714,29 @@ document.addEventListener("DOMContentLoaded", () => {
       out(r.message);
     } catch (err) { out(String(err.message || err)); }
   });
+  $("op-kicktest").addEventListener("click", async () => {
+    const btn = $("op-kicktest");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/v1/kick/webhook/test", { method: "POST", body: "{}" });
+      out((r.ok ? "Delivery works: " : "Delivery failed: ") + r.message);
+    } catch (err) { out(String(err.message || err)); }
+    btn.disabled = false;
+  });
+  $("key-show").addEventListener("click", async () => {
+    try {
+      const r = await api("/api/v1/api-key", {});
+      $("key-out").value = r.key;
+    } catch (err) { toast(String(err.message || err), true); }
+  });
+  $("key-rotate").addEventListener("click", async () => {
+    if (!window.confirm("Rotate the API key? The old key stops working at once.")) return;
+    try {
+      const r = await api("/api/v1/api-key/rotate", { method: "POST", body: "{}" });
+      $("key-out").value = r.key;
+      toast("API key rotated - update every script that uses it");
+    } catch (err) { toast(String(err.message || err), true); }
+  });
   $("pw-form").addEventListener("submit", (e) => {
     e.preventDefault();
     changePassword().catch((err) => out(String(err.message || err)));

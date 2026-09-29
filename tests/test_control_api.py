@@ -1071,3 +1071,71 @@ def test_patch_channel_quality_before_output_conflicts(tmp_path):
     assert body["applied"]["output_mode"] == "Output mode for twitch:channel1 set to disk"
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "disk"}
     assert "twitch:channel1" not in read_file(tmp_path).get("channel_preferred_qualities", {})
+
+
+def test_api_key_show_and_rotate(tmp_path):
+    """The panel shows the key on demand and rotates it like the bot."""
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            shown = await client.get("/api/v1/api-key", headers=auth())
+            bad = await client.get("/api/v1/api-key", headers=auth("nope"))
+            rotated = await client.post("/api/v1/api-key/rotate", json={}, headers=auth())
+            return (
+                shown.status,
+                await shown.json(),
+                bad.status,
+                rotated.status,
+                await rotated.json(),
+            )
+
+    shown_status, shown, bad_status, rotated_status, rotated = asyncio.run(scenario())
+    assert shown_status == 200
+    assert shown == {"key": KEY}
+    assert bad_status == 401
+    assert rotated_status == 200
+    assert rotated["key"] not in ("", KEY)
+    assert read_file(tmp_path)["api"]["key"] == rotated["key"]
+    assert sent_messages(ctrl)[-1].endswith("API key rotated - the old key stopped working")
+
+
+def test_rotated_key_replaces_the_old_one_over_http(tmp_path):
+    """After a POST rotate, the old key answers 401 and the new one works."""
+    _, _, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            rotated = await client.post("/api/v1/api-key/rotate", json={}, headers=auth())
+            new_key = (await rotated.json())["key"]
+            old = await client.get("/api/v1/settings", headers=auth())
+            new = await client.get("/api/v1/settings", headers=auth(new_key))
+            return old.status, new.status
+
+    assert asyncio.run(scenario()) == (401, 200)
+
+
+def test_api_key_show_empty_and_disabled(tmp_path):
+    """No key reads 404; a disabled API hides the routes from key auth."""
+    config, _, _, _, wh, _, webui = make_api(tmp_path)
+    config.api.key = ""  # no key saved yet: bootstrap reads through the panel session
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            cookie, _ = session_auth(webui)
+            return await (await client.get("/api/v1/api-key", headers=cookie)).json()
+
+    assert asyncio.run(scenario()) == {"error": "no API key yet - enable the API to generate one"}
+
+    _, _, _, _, wh_off, _, webui_off = make_api(tmp_path, enabled=False)
+
+    async def off_scenario():
+        async with TestClient(TestServer(wh_off._app)) as client:
+            show = await client.get("/api/v1/api-key", headers=auth())
+            rotate = await client.post("/api/v1/api-key/rotate", json={}, headers=auth())
+            cookie, _ = session_auth(webui_off)
+            session_show = await client.get("/api/v1/api-key", headers=cookie)
+            return show.status, rotate.status, session_show.status
+
+    # Key auth sees nothing while disabled; the panel session still manages keys.
+    assert asyncio.run(off_scenario()) == (404, 404, 200)
