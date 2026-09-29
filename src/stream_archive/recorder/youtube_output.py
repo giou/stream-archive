@@ -53,6 +53,7 @@ class YoutubeOutputMixin:
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
+    _youtube_auth_alerted: bool
     _youtube_budget_lock: asyncio.Lock
     # Set by sibling mixins and Recorder (core.py). Exact call shapes so
     # a signature drift fails type checks instead of failing at runtime.
@@ -334,16 +335,19 @@ class YoutubeOutputMixin:
                 logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
                 if "stream-archive-setup-youtube" in str(e):
                     set_degraded("youtube_auth", "YouTube authentication is dead")
-                    msg = (
-                        f"\u26a0\ufe0f YouTube authentication is dead.\n"
-                        f"Channel: {channel}\n"
-                        "Restreaming is stalled: run stream-archive-setup-youtube again."
-                    )
-                    if self._notifier:
-                        try:
-                            await self._notifier.notify(msg)
-                        except Exception:
-                            logger.error("[recorder] auth notification failed for %s", channel, exc_info=True)
+                    if not self._youtube_auth_alerted:
+                        self._youtube_auth_alerted = True
+                        msg = (
+                            f"\u26a0\ufe0f YouTube authentication is dead.\n"
+                            f"Channel: {channel}\n"
+                            "Restreaming is stalled: run stream-archive-setup-youtube again."
+                        )
+                        if self._notifier:
+                            try:
+                                await self._notifier.notify(msg)
+                            except Exception:
+                                self._youtube_auth_alerted = False
+                                logger.error("[recorder] auth notification failed for %s", channel, exc_info=True)
                     raise
                 if "rate limit" in str(e).lower() or "403" in str(e) or "quota" in str(e).lower():
                     msg = (
@@ -375,6 +379,7 @@ class YoutubeOutputMixin:
                                 logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
                     return
                 raise
+            self._youtube_auth_alerted = False
             clear_degraded("youtube_auth")
             entry = self._recordings.get(channel)
             if entry is None:

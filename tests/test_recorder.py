@@ -2585,6 +2585,8 @@ def test_youtube_auth_dead_notifies_and_marks_health(tmp_path, monkeypatch):
         async def scenario():
             assert await rec.start("ch") is True
             await wait_until(lambda: not rec.is_recording("ch"))
+            assert await rec.start("ch") is True
+            await wait_until(lambda: not rec.is_recording("ch"))
 
         asyncio.run(scenario())
         assert len(notifier.messages) == 1

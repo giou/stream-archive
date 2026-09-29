@@ -26,8 +26,11 @@ DISK_NOTIFY_INTERVAL = 1800
 #: fails as "blocked" instead of a crash-and-restart loop.
 MIN_FREE_GB = 1.0
 
-#: HTTP statuses that mean the app credentials died, not the network.
-_AUTH_STATUSES = (400, 401, 403)
+#: Token endpoints. A 400/401/403 here means the id or secret died. The
+#: Kick edge also emits transient 400/403 waves on API calls for valid
+#: tokens (see kick_api), so those statuses only count there on a 401.
+TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
 
 
 class Monitor:
@@ -37,7 +40,6 @@ class Monitor:
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
         self._last_disk_notify: dict[str, float] = {}  # blocked-start alerts, per channel
-        self._last_auth_notify: dict[str, float] = {}  # credential-dead alerts, per source
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
         self._kick_api_error_logged = False
@@ -52,7 +54,9 @@ class Monitor:
         # warning (fail-open). Unknown Kick slugs count as offline
         # (fail-closed). Keep the difference.
         twitch_channels = [c for c in config.channels if not is_kick_channel(c)]
-        if twitch_channels:
+        if not twitch_channels:
+            self._clear_twitch_auth()
+        else:
             twitch_ok = True
             try:
                 resolved = await twitch_api.resolve_user_ids([bare_name(c) for c in twitch_channels])
@@ -105,7 +109,9 @@ class Monitor:
             if twitch_ok:
                 self._clear_twitch_auth()
         kick_channels = [c for c in config.channels if is_kick_channel(c)]
-        if kick_channels:
+        if not kick_channels:
+            self._clear_kick_auth()
+        else:
             try:
                 statuses = await kick_api.get_channel_statuses([bare_name(c) for c in kick_channels])
             except Exception as e:
@@ -316,23 +322,29 @@ class Monitor:
         else:
             return None
 
-    def _auth_status(self, error: BaseException) -> int | None:
+    def _auth_status(self, error: BaseException, token_url: str) -> int | None:
         """HTTP status when the error rejects the app credentials, else None.
 
-        Transport faults and bad payloads stay log-only. A 400/401/403
-        from the token or API endpoint means the id or secret died.
+        Transport faults stay log-only. A 401 always means the id or
+        secret died. A 400/403 counts only from the token endpoint: the
+        Kick edge emits transient waves of those on API calls for valid
+        tokens, and they recover on their own.
         """
         if (
             isinstance(error, httpx.HTTPStatusError)
             and error.response is not None
-            and error.response.status_code in _AUTH_STATUSES
+            and error.request is not None
+            and (
+                error.response.status_code == 401
+                or (error.response.status_code in (400, 403) and str(error.request.url) == token_url)
+            )
         ):
             return error.response.status_code
         return None
 
     async def _note_twitch_error(self, error: BaseException) -> None:
         """Alert once per episode when Twitch rejects the credentials."""
-        code = self._auth_status(error)
+        code = self._auth_status(error, TWITCH_TOKEN_URL)
         if code is None:
             return
         set_degraded("twitch_auth", f"Twitch rejected the app credentials (HTTP {code})")
@@ -355,7 +367,7 @@ class Monitor:
 
     async def _note_kick_error(self, error: BaseException) -> None:
         """Alert once per episode when Kick rejects the credentials."""
-        code = self._auth_status(error)
+        code = self._auth_status(error, KICK_TOKEN_URL)
         if code is None:
             return
         set_degraded("kick_auth", f"Kick rejected the app credentials (HTTP {code})")

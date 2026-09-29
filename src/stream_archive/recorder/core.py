@@ -73,6 +73,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
+    _youtube_auth_alerted: bool
     _youtube_budget_lock: asyncio.Lock
     _held: dict[str, HoldState]
     _reserve_lock: asyncio.Lock
@@ -107,6 +108,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._quick_ends = {}  # channel -> consecutive short YouTube recordings
         self._backoff_until = {}  # channel -> monotonic time before restart allowed
         self._youtube_starts = []
+        self._youtube_auth_alerted = False
         # Serializes the budget check, the broadcast create and the budget
         # record, so concurrent starts cannot all pass the check.
         self._youtube_budget_lock = asyncio.Lock()

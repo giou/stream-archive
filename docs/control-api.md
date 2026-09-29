@@ -128,7 +128,7 @@ The answer never holds a secret. The key and the Telegram bot token stay in `con
 | `disk_delete_oldest` | `true`, `false` | On a full disk, delete the oldest recordings (`true`) or stop new recordings (`false`) |
 | `youtube_hold_seconds` | whole number ≥ 0 | Global YouTube hold delay in seconds. `0` ends the restream at once |
 | `endpoint_enabled` | `true`, `false` | Publish the panel beyond this machine. Enabling needs a saved URL |
-| `endpoint_public_url` | URL or bare hostname | Public address of your own proxy. Saving alone never flips the toggle |
+| `endpoint_public_url` | URL or bare hostname | Public address of your own proxy. Saving alone never flips the toggle. Empty clears a saved URL while the endpoint stays off. Ports must be usable (1-65535) |
 | `kick_webhook_enabled` | `true`, `false` | Instant Kick signals and chat |
 | `kick_webhook_public_url` | URL, bare hostname, or `""` | Kick entry. Empty follows the panel URL |
 | `api_enabled` | `true`, `false` | Remote HTTP control. A first enable makes a key and shows it once |

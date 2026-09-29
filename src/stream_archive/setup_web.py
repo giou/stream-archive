@@ -49,5 +49,9 @@ def main() -> None:
         raise SystemExit(1) from e
     workdir = Path(config.config_path).parent
     print(f"Panel password set in {workdir / 'config.json'}.")
-    print(f"Open the panel at {config.endpoint.public_url}/ when the endpoint is on,")
-    print(f"or at http://{config.endpoint.listen_host}:{config.endpoint.listen_port}/ on this machine.")
+    if config.endpoint.public_url.strip():
+        print(f"Open the panel at {config.endpoint.public_url}/ when the endpoint is on,")
+        print(f"or at http://{config.endpoint.listen_host}:{config.endpoint.listen_port}/ on this machine.")
+    else:
+        print("Set endpoint.public_url to reach the panel beyond this machine,")
+        print(f"or open it at http://{config.endpoint.listen_host}:{config.endpoint.listen_port}/ on this machine.")

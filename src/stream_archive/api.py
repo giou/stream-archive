@@ -13,6 +13,7 @@ applied change also sends the admin a Telegram message, so the admin sees
 what an API client did.
 """
 
+import contextlib
 import functools
 import hmac
 import inspect
@@ -282,6 +283,14 @@ def _public_url(value: Any, key: str, *, allow_empty: bool = False, require_dot:
     if parts.scheme not in ("http", "https") or not host:
         msg = f"{key} must be an http(s) URL with a hostname"
         raise _ApiError(400, msg)
+    try:
+        port = parts.port
+    except ValueError:
+        msg = f"{key} must be an http(s) URL with a usable port"
+        raise _ApiError(400, msg) from None
+    if port is not None and not 1 <= port <= 65535:
+        msg = f"{key} must be an http(s) URL with a usable port"
+        raise _ApiError(400, msg)
     if not all(char.isalnum() or char in ".-" for char in host) or not host.strip(".-"):
         msg = f"{key} must be an http(s) URL with a hostname"
         raise _ApiError(400, msg)
@@ -496,7 +505,7 @@ class ControlAPI:
         if key == "endpoint_enabled":
             return await self._apply_endpoint_enabled(_switch(value, key) == "on")
         if key == "endpoint_public_url":
-            return await self._apply_endpoint_url(_public_url(value, key))
+            return await self._apply_endpoint_url(_public_url(value, key, allow_empty=True))
         if key == "kick_webhook_enabled":
             return await self._apply_kick_enabled(_switch(value, key) == "on")
         if key == "kick_webhook_public_url":
@@ -511,47 +520,67 @@ class ControlAPI:
 
         The config write already passed validation. A bind failure must not
         leave the file claiming an endpoint nothing serves, so the caller
-        restores the snapshot on any error here.
+        restores the snapshot on any error here. Subscriptions need the
+        endpoint and the webhook both on: with nowhere to deliver, the
+        app drops them instead of recreating them.
         """
         target = self._ctrl._kick_webhook
         if target is None:
             return
         await target.apply_state()
-        if self._config.kick.webhook.enabled:
+        if self._config.kick.webhook.enabled and self._config.endpoint.enabled:
             await target.sync_channels(self._config.channels)
 
-    def _delivery_snapshot(self) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Endpoint and Kick webhook state, to restore after a failed reconcile."""
+    def _delivery_snapshot(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Endpoint, Kick, and API state, to restore after a failed reconcile."""
         return (
             self._config.endpoint.model_dump(),
             self._config.kick.webhook.model_dump(),
+            self._config.api.model_dump(),
         )
 
-    def _restore_delivery(self, snapshot: tuple[dict[str, Any], dict[str, Any]]) -> None:
+    def _restore_delivery(self, snapshot: tuple[dict[str, Any], dict[str, Any], dict[str, Any]]) -> None:
         """Write a delivery snapshot back without extra event noise."""
-        endpoint, webhook = snapshot
+        endpoint, webhook, api = snapshot
 
         def restore(candidate: AppConfig) -> None:
             for name, value in endpoint.items():
                 setattr(candidate.endpoint, name, value)
             for name, value in webhook.items():
                 setattr(candidate.kick.webhook, name, value)
+            for name, value in api.items():
+                setattr(candidate.api, name, value)
 
         apply_config_change(self._config, restore)
 
     async def _apply_delivery_change(self, mutate: Any, ok_text: str) -> str:
-        """Apply one endpoint or Kick change, reconcile, and report it."""
+        """Apply one endpoint, Kick, or API change, reconcile, and report it.
+
+        The success event lands only after the reconcile: a rolled-back
+        change must not leave a false success in the feed. These keys
+        never touch recording settings, so no apply-warning applies.
+        """
+        from stream_archive import events as _events
+
         before = self._delivery_snapshot()
-        text = self._ctrl._apply(mutate, lambda _candidate: ok_text)
-        if is_error(text):
-            raise _ApiError(400, _plain(text))
+        try:
+            apply_config_change(self._config, mutate)
+        except ValueError as e:
+            raise _ApiError(400, _plain(f"\u274c {e}")) from None
         try:
             await self._reconcile_delivery()
         except Exception as e:
             self._restore_delivery(before)
+            # The failed attempt unbound the listeners on its way out.
+            # Re-converge them on the restored state, so runtime matches
+            # the file again.
+            with contextlib.suppress(Exception):
+                if self._ctrl._kick_webhook is not None:
+                    await self._ctrl._kick_webhook.apply_state()
             msg = f"change saved but not served, restored: {e}"
             raise _ApiError(500, msg) from e
-        return text
+        _events.record("config", None, ok_text)
+        return ok_text
 
     async def _apply_endpoint_enabled(self, enabled: bool) -> str:
         """Turn the endpoint on with the saved URL, or off keeping it."""
@@ -568,7 +597,15 @@ class ControlAPI:
         return await self._apply_delivery_change(mutate, f"Endpoint {state}")
 
     async def _apply_endpoint_url(self, url: str) -> str:
-        """Save the endpoint public URL, keeping the enabled state."""
+        """Save the endpoint public URL, keeping the enabled state.
+
+        Empty clears a saved URL while the endpoint stays off. It never
+        clears the URL of a running endpoint: the model would reject
+        the state at once.
+        """
+        if not url and self._config.endpoint.enabled:
+            msg = "cannot clear the URL while the endpoint is on"
+            raise _ApiError(400, msg)
 
         def mutate(candidate: AppConfig) -> None:
             # The URL goes first: the model requires an http(s) URL the
@@ -578,6 +615,8 @@ class ControlAPI:
             if not candidate.kick.webhook.public_url.strip():
                 candidate.kick.webhook.setup_notified = False
 
+        if not url:
+            return await self._apply_delivery_change(mutate, "Endpoint URL cleared")
         return await self._apply_delivery_change(mutate, f"Endpoint URL saved: {url}")
 
     async def _apply_kick_enabled(self, enabled: bool) -> str:
@@ -603,7 +642,12 @@ class ControlAPI:
         return await self._apply_delivery_change(mutate, f"Kick URL saved: {url}")
 
     async def _apply_api_enabled(self, enabled: bool) -> str:
-        """Turn the control API on or off. A first enable makes a key."""
+        """Turn the control API on or off. A first enable makes a key.
+
+        The key itself never reaches the event feed: the reconcile path
+        records the toggle message, and the key travels only in the
+        API answer, shown once.
+        """
         key = self._config.api.key
         created = enabled and not key.strip()
         if created:
@@ -614,9 +658,7 @@ class ControlAPI:
             if created:
                 candidate.api.key = key
 
-        text = self._ctrl._apply(mutate, lambda _candidate: f"Control API {'enabled' if enabled else 'disabled'}")
-        if is_error(text):
-            raise _ApiError(400, _plain(text))
+        text = await self._apply_delivery_change(mutate, f"Control API {'enabled' if enabled else 'disabled'}")
         if created:
             return f"{text}. New API key: {key} (shown once)"
         return text

@@ -76,14 +76,18 @@ class FakeKickWebhook:
         self.added = []
         self.removed = []
         self.verified = []
+        self.state_calls = []
+        self.synced = []
 
     async def apply_state(self) -> None:
         # The listener never starts in these tests, so a reconcile is a no-op.
+        self.state_calls.append(1)
         return None
 
     async def sync_channels(self, channels) -> None:
         # Subscriptions belong to the webhook tests: here the stub only
         # proves the reconcile calls through after an endpoint change.
+        self.synced.append(list(channels))
         return None
 
     async def add_channel(self, channel):
@@ -363,11 +367,19 @@ def test_api_enable_makes_a_key_when_missing(tmp_path):
     assert read_file(tmp_path)["api"]["enabled"] is True
 
 
-def test_patch_delivery_reconcile_failure_restores(tmp_path):
+def test_patch_delivery_reconcile_failure_restores(tmp_path, monkeypatch):
+    from stream_archive import events as _events
+
     config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+    recorded: list[str] = []
+    monkeypatch.setattr(_events, "record", lambda kind, channel, text: recorded.append(text))
 
     class FailingWebhook:
+        def __init__(self):
+            self.calls = 0
+
         async def apply_state(self):
+            self.calls += 1
             msg = "bind conflict"
             raise OSError(msg)
 
@@ -375,7 +387,8 @@ def test_patch_delivery_reconcile_failure_restores(tmp_path):
             msg = "must not sync after a failed reconcile"
             raise AssertionError(msg)
 
-    ctrl._kick_webhook = FailingWebhook()
+    failing = FailingWebhook()
+    ctrl._kick_webhook = failing
 
     async def scenario():
         async with TestClient(TestServer(wh._app)) as client:
@@ -389,6 +402,8 @@ def test_patch_delivery_reconcile_failure_restores(tmp_path):
     assert "endpoint_public_url" not in body["applied"]
     assert "not served, restored" in body["errors"]["endpoint_public_url"]
     assert read_file(tmp_path)["endpoint"]["public_url"] == ""  # the file never claims an unserved URL
+    assert failing.calls == 2  # the failed attempt plus the re-converge on the restored state
+    assert all("Endpoint URL saved" not in text for text in recorded)  # no false success in the feed
 
 
 def test_patch_settings_applies_and_persists(tmp_path):
@@ -916,3 +931,92 @@ def test_status_reports_degraded_problems(tmp_path):
         assert asyncio.run(scenario())["degraded"] == ["twitch_auth"]
     finally:
         clear_degraded("twitch_auth")
+
+
+def test_kick_enable_without_endpoint_skips_sync(tmp_path):
+    """Sync needs somewhere to deliver: endpoint off means no re-subscribe."""
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch("/api/v1/settings", json={"kick_webhook_enabled": True}, headers=auth())
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 200
+    assert config.kick.webhook.enabled is True
+    assert ctrl._kick_webhook.synced == []
+
+
+def test_endpoint_and_kick_on_syncs_subscriptions(tmp_path):
+    """With both toggles on, the reconcile re-subscribes the channels."""
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://panel.example.com"}, headers=auth()
+            )
+            await client.patch("/api/v1/settings", json={"endpoint_enabled": True}, headers=auth())
+            resp = await client.patch("/api/v1/settings", json={"kick_webhook_enabled": True}, headers=auth())
+            return resp.status, await resp.json()
+
+    status, _ = asyncio.run(scenario())
+    assert status == 200
+    assert ctrl._kick_webhook.synced[-1] == ["twitch:channel1"]
+
+
+def test_api_toggle_reconciles_the_listener(tmp_path):
+    """Disabling the API rebinds: the listener must not serve a dead toggle."""
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            resp = await client.patch("/api/v1/settings", json={"api_enabled": False}, headers=auth())
+            return resp.status, await resp.json()
+
+    status, _ = asyncio.run(scenario())
+    assert status == 200
+    assert len(ctrl._kick_webhook.state_calls) == 1
+
+
+def test_endpoint_url_with_bad_port_rejected(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            big = await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://host.example.com:99999"}, headers=auth()
+            )
+            text = await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://host.example.com:abc"}, headers=auth()
+            )
+            return big.status, text.status
+
+    big_status, text_status = asyncio.run(scenario())
+    assert big_status == 400
+    assert text_status == 400
+    assert read_file(tmp_path).get("endpoint", {}).get("public_url", "") == ""
+
+
+def test_endpoint_url_clears_only_while_off(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://panel.example.com"}, headers=auth()
+            )
+            cleared = await client.patch("/api/v1/settings", json={"endpoint_public_url": ""}, headers=auth())
+            await client.patch(
+                "/api/v1/settings", json={"endpoint_public_url": "https://panel.example.com"}, headers=auth()
+            )
+            await client.patch("/api/v1/settings", json={"endpoint_enabled": True}, headers=auth())
+            locked = await client.patch("/api/v1/settings", json={"endpoint_public_url": ""}, headers=auth())
+            return await cleared.json(), cleared.status, await locked.json(), locked.status
+
+    cleared, cleared_status, locked, locked_status = asyncio.run(scenario())
+    assert cleared_status == 200
+    assert cleared["applied"]["endpoint_public_url"] == "Endpoint URL cleared"
+    assert locked_status == 400
+    assert config.endpoint.public_url == "https://panel.example.com"

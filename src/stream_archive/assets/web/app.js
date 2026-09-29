@@ -282,7 +282,7 @@ async function loadStatus(quiet) {
       ["Channels", String(s.channels.length)],
       ["Monitor every", s.monitoring_interval_s + "s"],
       ["Telegram bot", s.telegram_enabled ? "on" : "off"],
-      ["Health", (s.degraded && s.degraded.length ? "degraded: " + s.degraded.join(", ") : "ok")],
+      ["Health", (arr(s.degraded).length ? "degraded: " + arr(s.degraded).join(", ") : "ok")],
     ]);
     const access = kvCard("Access", [
       ["Endpoint", s.endpoint.enabled ? "on" : "off"],
@@ -513,7 +513,7 @@ const SETTING_DEFS = [
   { key: "youtube_hold_seconds", label: "YouTube hold", hint: "Delay before ending the restream", type: "preset-number",
     presets: [["Off", 0], ["30 s", 30], ["60 s", 60], ["120 s", 120], ["300 s", 300], ["600 s", 600]], unit: "s" },
   { key: "endpoint_enabled", label: "Panel access", hint: "Reach the panel beyond this machine", type: "bool" },
-  { key: "endpoint_public_url", label: "Panel URL", hint: "Public address of your own proxy", type: "text", omitEmpty: true,
+  { key: "endpoint_public_url", label: "Panel URL", hint: "Public address of your own proxy", type: "text",
     placeholder: "https://example.com" },
   { key: "kick_webhook_enabled", label: "Kick deliveries", hint: "Instant signals and chat", type: "bool" },
   { key: "kick_webhook_public_url", label: "Kick URL", hint: "Empty follows the panel URL", type: "text",
@@ -603,6 +603,10 @@ async function loadSettings() {
   try {
     const s = await api("/api/v1/settings");
     s.disk = obj(s.disk);
+    s.youtube = obj(s.youtube);
+    s.endpoint = obj(s.endpoint);
+    s.kick_webhook = obj(s.kick_webhook);
+    s.api = obj(s.api);
     const form = $("settings-form");
     form.textContent = "";
     const flat = {
@@ -1527,7 +1531,6 @@ document.addEventListener("DOMContentLoaded", () => {
         if (typeof value === "number" && (!Number.isFinite(value) || value < 0)) {
           throw new Error(def.label + " must be a number of 0 or more");
         }
-        if (def.omitEmpty && value === "") continue;
         payload[def.key] = value;
       }
       res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });

@@ -705,9 +705,9 @@ def test_partial_resolve_keeps_unresolved_live_channel():
     assert rec.stopped == []
 
 
-def _auth_error(code):
+def _auth_error(code, url="https://api.twitch.tv/helix/users"):
     """An API rejection of the app credentials, like a dead id or secret."""
-    request = httpx.Request("GET", "https://api.twitch.tv/helix/users")
+    request = httpx.Request("GET", url)
     response = httpx.Response(code, request=request)
     return httpx.HTTPStatusError("rejected", request=request, response=response)
 
@@ -785,16 +785,48 @@ def test_kick_auth_dead_alerts_once_per_episode():
     mon = make_monitor(recorder=rec, notifier=notifier)
     config = make_config(channels=["kick:slug"])
     try:
-        api = FakeKickAPI(error=_auth_error(403))
+        api = FakeKickAPI(error=_auth_error(401, "https://kick.com/api/v1/channels"))
         asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
         asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
         assert rec.started == []
         assert len(notifier.messages) == 1
-        assert "Kick rejected the app credentials (HTTP 403)" in notifier.messages[0]
+        assert "Kick rejected the app credentials (HTTP 401)" in notifier.messages[0]
         assert "kick_auth" in degraded()
         api.error = None
         asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
         assert "kick_auth" not in degraded()
+    finally:
+        clear_degraded("kick_auth")
+
+
+def test_kick_edge_wave_stays_silent():
+    """A 403 wave on a Kick API call is transient, not dead credentials."""
+    from stream_archive.health import degraded
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config(channels=["kick:slug"])
+    api = FakeKickAPI(error=_auth_error(403, "https://kick.com/api/v1/channels"))
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
+    assert rec.started == []
+    assert notifier.messages == []
+    assert "kick_auth" not in degraded()
+
+
+def test_kick_token_rejection_alerts():
+    """A 403 from the Kick token endpoint means the secret died."""
+    from stream_archive.health import clear_degraded, degraded
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config(channels=["kick:slug"])
+    try:
+        api = FakeKickAPI(error=_auth_error(403, "https://id.kick.com/oauth/token"))
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), api, config))
+        assert len(notifier.messages) == 1
+        assert "kick_auth" in degraded()
     finally:
         clear_degraded("kick_auth")
 
@@ -811,3 +843,19 @@ def test_transport_error_stays_silent():
     asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
     assert notifier.messages == []
     assert degraded() == {}
+
+
+def test_removing_all_channels_clears_stale_auth_flags():
+    """No channels means nothing to stall: empty sweeps drop old flags."""
+    from stream_archive.health import clear_degraded, degraded, set_degraded
+
+    mon = make_monitor()
+    set_degraded("twitch_auth", "old")
+    set_degraded("kick_auth", "old")
+    try:
+        config = make_config(channels=[])
+        asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(), config))
+        assert degraded() == {}
+    finally:
+        clear_degraded("twitch_auth")
+        clear_degraded("kick_auth")
