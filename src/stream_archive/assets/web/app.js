@@ -426,16 +426,16 @@ async function loadChannels() {
         try {
           const raw = qInput.value.trim();
           const v = raw || "default";
+          // The mode select may hold an unsaved pick: read the live
+          // control, falling back to the effective mode for "global".
+          const liveMode = modeSel.value === "default" ? ch.output_mode : modeSel.value;
           let eff = v.toLowerCase();
-          if (eff === "default") {
+          if (eff === "default" && (liveMode === "youtube" || liveMode === "both")) {
             // Clearing the override hands control to the global value,
             // which this card cannot see: read it before deciding.
             const s = await api("/api/v1/settings");
             eff = String(s.preferred_quality || "").toLowerCase();
           }
-          // The mode select may hold an unsaved pick: read the live
-          // control, falling back to the effective mode for "global".
-          const liveMode = modeSel.value === "default" ? ch.output_mode : modeSel.value;
           let prevMode = null;
           if (eff === "audio_only" && (liveMode === "youtube" || liveMode === "both")) {
             if (!window.confirm(audioDiskMessage([ch.channel]))) {
@@ -464,7 +464,7 @@ async function loadChannels() {
               back = false;
             }
             toast(
-              "Quality failed" + (back
+              "Quality failed: " + String(e.message || e) + (back
                 ? "; output mode was switched back"
                 : " and output mode stuck on disk - fix it by hand"),
               true
@@ -573,6 +573,10 @@ async function migrateChannelToDisk(name) {
     method: "PATCH",
     body: JSON.stringify({ output_mode: "disk" }),
   });
+}
+
+function withMigratedNote(msg, migrated) {
+  return migrated.length ? msg + " (output already set to disk for: " + migrated.join(", ") + ")" : msg;
 }
 
 function settingControl(def, current) {  const lab = document.createElement("label");
@@ -1598,16 +1602,21 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       const conflicts = channels
         .filter((c) => {
-          const q = c.quality_override || payload.preferred_quality;
-          const m = c.output_mode_override || payload.output_mode;
+          const q = String(c.quality_override || payload.preferred_quality || "").toLowerCase();
+          const m = String(c.output_mode_override || payload.output_mode || "").toLowerCase();
           return q === "audio_only" && (m === "youtube" || m === "both");
         })
         .map((c) => c.channel);
       if (conflicts.length) {
         if (!window.confirm(audioDiskMessage(conflicts))) return;
-        for (const name of conflicts) {
-          await migrateChannelToDisk(name);
-          migrated.push(name);
+        try {
+          for (const name of conflicts) {
+            await migrateChannelToDisk(name);
+            migrated.push(name);
+          }
+        } catch (migrateErr) {
+          toast(withMigratedNote(String(migrateErr.message || migrateErr), migrated), true);
+          return;
         }
       }
       res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });
@@ -1616,14 +1625,10 @@ document.addEventListener("DOMContentLoaded", () => {
       // them and keep the edits for retry instead of reloading.
       const errors = err && err.payload && err.payload.errors;
       if (errors && Object.keys(errors).length) {
-        let msg = "Some keys failed: " + JSON.stringify(errors);
-        if (migrated.length) msg += " (output already set to disk for: " + migrated.join(", ") + ")";
-        toast(msg, true);
+        toast(withMigratedNote("Some keys failed: " + JSON.stringify(errors), migrated), true);
         return;
       }
-      let msg = String((err && err.message) || err);
-      if (migrated.length) msg += " (output already set to disk for: " + migrated.join(", ") + ")";
-      toast(msg, true);
+      toast(withMigratedNote(String((err && err.message) || err), migrated), true);
       return;
     }
     toast("Settings saved");
@@ -1631,6 +1636,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (rotated && rotated.indexOf("New API key") !== -1) toast(rotated, false);
     settingsDirty = false;
     loadSettings();
+    loadChannels();
     loadStatus();
   }
 
