@@ -38,7 +38,7 @@ The web panel is powerful. Keep it off the open internet when you can.
 
 ## Settings the panel edits
 
-The panel edits the same 15 global keys as `PATCH /api/v1/settings`: `output_mode`, `preferred_quality`, `retention_days`, `max_concurrent_recordings`, `max_concurrent_youtube_streams`, `record_chat`, `kick_record_chat`, `disk_max_total_gb`, `disk_delete_oldest`, `youtube_hold_seconds`, `endpoint_enabled`, `endpoint_public_url`, `kick_webhook_enabled`, `kick_webhook_public_url`, `api_enabled`. It also adds and removes channels and edits per-channel `output_mode`, `quality`, and `youtube_hold_seconds`.
+The panel edits the same 15 global keys as `PATCH /api/v1/settings`: `output_mode`, `preferred_quality`, `retention_days`, `max_concurrent_recordings`, `max_concurrent_youtube_streams`, `record_chat`, `kick_record_chat`, `disk_max_total_gb`, `disk_delete_oldest`, `youtube_hold_seconds`, `endpoint_enabled`, `endpoint_public_url`, `kick_webhook_enabled`, `kick_webhook_public_url`, `api_enabled`. It also adds and removes channels and edits per-channel `output_mode`, `quality`, and `youtube_hold_seconds`. Picking audio-only quality for a channel that restreams asks to confirm first: on confirm the panel switches that channel to disk output and then sets the quality, like the Telegram bot.
 
 It cannot touch the read-only keys of the control API: listener binds and ports, `kick.client_id` and `kick.client_secret`, `web.*`, `api.key`, `youtube.privacy_status`, `timezone`, `monitoring_interval`, `proxy_list`, the plugin, recording, chat, and session dirs, `eventsub.enabled`, `update_check.*`, and all secrets. See [Control API](control-api.md) for the full read-only list.
 

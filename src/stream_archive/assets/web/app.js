@@ -425,6 +425,19 @@ async function loadChannels() {
       qInput.addEventListener("change", async () => {
         try {
           const v = qInput.value.trim() || "default";
+          if (v === "audio_only" && (ch.output_mode === "youtube" || ch.output_mode === "both")) {
+            const ok = window.confirm(
+              "Setting audio-only quality will set output mode to disk for: " + ch.channel
+            );
+            if (!ok) {
+              loadChannels();
+              return;
+            }
+            await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
+              method: "PATCH",
+              body: JSON.stringify({ output_mode: "disk" }),
+            });
+          }
           await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
             method: "PATCH",
             body: JSON.stringify({ quality: v }),
@@ -1532,6 +1545,26 @@ document.addEventListener("DOMContentLoaded", () => {
           throw new Error(def.label + " must be a number of 0 or more");
         }
         payload[def.key] = value;
+      }
+      const chans = await api("/api/v1/channels");
+      const conflicts = (chans.channels || [])
+        .filter((c) => {
+          const q = c.quality_override || payload.preferred_quality;
+          const m = c.output_mode_override || payload.output_mode;
+          return q === "audio_only" && (m === "youtube" || m === "both");
+        })
+        .map((c) => c.channel);
+      if (conflicts.length) {
+        const ok = window.confirm(
+          "Setting audio-only quality will set output mode to disk for: " + conflicts.join(", ")
+        );
+        if (!ok) return;
+        for (const name of conflicts) {
+          await api("/api/v1/channels/" + encodeURIComponent(name), {
+            method: "PATCH",
+            body: JSON.stringify({ output_mode: "disk" }),
+          });
+        }
       }
       res = await api("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) });
     } catch (err) {

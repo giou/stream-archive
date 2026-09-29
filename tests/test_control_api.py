@@ -1020,3 +1020,54 @@ def test_endpoint_url_clears_only_while_off(tmp_path):
     assert cleared["applied"]["endpoint_public_url"] == "Endpoint URL cleared"
     assert locked_status == 400
     assert config.endpoint.public_url == "https://panel.example.com"
+
+
+def test_patch_channel_output_before_quality_applies_together(tmp_path):
+    """Output-first ordering clears the audio-only gate in one request.
+
+    The panel confirms the disk switch up front and sends output first,
+    so the quality gate re-probes the disk state and passes.
+    """
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await client.patch("/api/v1/channels/twitch:channel1", json={"output_mode": "youtube"}, headers=auth())
+            resp = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"output_mode": "disk", "quality": "audio_only"},
+                headers=auth(),
+            )
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 200
+    assert body["errors"] == {}
+    assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "disk"}
+    assert read_file(tmp_path)["channel_preferred_qualities"] == {"twitch:channel1": "audio_only"}
+
+
+def test_patch_channel_quality_before_output_conflicts(tmp_path):
+    """Quality-first ordering still hits the gate: the probe sees YouTube.
+
+    The gate probes live config per key, so payload order decides. The
+    panel sends output first for exactly this reason.
+    """
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await client.patch("/api/v1/channels/twitch:channel1", json={"output_mode": "youtube"}, headers=auth())
+            resp = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"quality": "audio_only", "output_mode": "disk"},
+                headers=auth(),
+            )
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 409
+    assert "quality" in body["errors"]
+    assert body["applied"]["output_mode"] == "Output mode for twitch:channel1 set to disk"
+    assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "disk"}
+    assert "twitch:channel1" not in read_file(tmp_path).get("channel_preferred_qualities", {})
