@@ -43,6 +43,57 @@ _YOUTUBE_BUDGET_WINDOW_S = 86400
 # 3s loop) fed into a held broadcast with `-c copy` - no runtime encoding.
 _RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect_clip.mp4"
 
+#: Delay between broadcast status polls during a restream, in seconds. A
+#: takedown shows as ``revoked`` while the ingest stays open, so ffmpeg
+#: never errors. One ``liveBroadcasts.list`` costs one API unit: one call
+#: every two minutes per restream is 720 units a day, which leaves the
+#: shared daily pool for the calls that matter (broadcast creates). The
+#: alert goes to a human, so minute-scale latency costs nothing.
+_STATUS_POLL_S = 120.0
+
+#: Substrings that mark an ffmpeg stderr line as an output failure. The
+#: caller consults them only when the capture already failed (broken pipe
+#: or a bad ffmpeg exit), so a passing capture with noisy warnings never
+#: alerts.
+_YOUTUBE_OUTPUT_HINTS = (
+    "failed",
+    "failure",
+    "error",
+    "broken pipe",
+    "connection reset",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "server",
+    "denied",
+    "forbidden",
+    "rejected",
+    "closed",
+    "terminated",
+    "interrupted",
+    "av_interleaved_write_frame",
+    "error writing",
+    "failed to open",
+    "rtmp",
+    "403",
+    "401",
+)
+
+
+def youtube_output_hint(returncode: int | None, pipe_clean: bool, stderr_lines: list[str]) -> str | None:
+    """First output-failure hint in ``stderr_lines``, or None.
+
+    Only a failed capture asks: a clean source EOF with a zero ffmpeg exit
+    never alerts, whatever the warnings say. The lines are already
+    redacted, so the result is safe in a Telegram message.
+    """
+    if pipe_clean and returncode in (0, None):
+        return None
+    for line in reversed(stderr_lines):
+        if any(hint in line.lower() for hint in _YOUTUBE_OUTPUT_HINTS):
+            return line[:200]
+    return None
+
 
 class YoutubeOutputMixin:
     _config: AppConfig
@@ -59,8 +110,10 @@ class YoutubeOutputMixin:
     # a signature drift fails type checks instead of failing at runtime.
     _track: Callable[[str, Coroutine[Any, Any, Any]], asyncio.Task[Any]]
     _record_disk: Callable[[str, str, Any], Coroutine[Any, Any, None]]
-    _pipe_stream: Callable[[str, Any, Any, str | None], Coroutine[Any, Any, bool]]
-    _read_ffmpeg_stderr: Callable[[str, Any], Coroutine[Any, Any, None]]
+    _pipe_stream: Callable[
+        [str, Any, Any, str | None, asyncio.Event | None], Coroutine[Any, Any, tuple[bool, str | None, bool]]
+    ]
+    _read_ffmpeg_stderr: Callable[[str, Any], Coroutine[Any, Any, list[str]]]
     _channel_dir: Callable[[str], str]
 
     def _note_youtube_end(self, channel: str, entry: Recording) -> None:
@@ -397,6 +450,19 @@ class YoutubeOutputMixin:
                 )
             except Exception:
                 logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
+        # A takedown revokes the broadcast but leaves the ingest open, so
+        # ffmpeg never errors. Poll the broadcast status beside the pipe.
+        # On revoked the watcher alerts once, marks the broadcast abandoned,
+        # and returns; the pipe then drops the ingest and, in ``both`` mode,
+        # keeps writing the disk file alone. The recording ends normally, so
+        # the monitor does not restart a restream of flagged content.
+        status_stop = asyncio.Event()
+        youtube_abandoned = asyncio.Event()
+        status_task = asyncio.create_task(
+            self._watch_broadcast_status(
+                channel, youtube_info, title, filepath is not None, youtube_abandoned, status_stop
+            )
+        )
         rtmp_url = youtube_info["rtmp_url"]
         ffmpeg_cmd = [
             "ffmpeg",
@@ -429,28 +495,161 @@ class YoutubeOutputMixin:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        pipe_task = asyncio.create_task(self._pipe_stream(channel, stream, process, filepath))
+        pipe_task = asyncio.create_task(self._pipe_stream(channel, stream, process, filepath, youtube_abandoned))
         stderr_task = asyncio.create_task(self._read_ffmpeg_stderr(channel, process))
 
         try:
             results = await asyncio.gather(pipe_task, stderr_task)
         except asyncio.CancelledError:
-            # Both readers hold the ffmpeg pipes, so both must stop and be
-            # awaited here. A task left pending masks the ffmpeg stderr and
-            # warns "Task was destroyed but it is pending" at shutdown.
-            for task in (pipe_task, stderr_task):
+            # Every reader holds a pipe or a poll, so all of them must stop
+            # and be awaited here. A task left pending masks the ffmpeg
+            # stderr and warns "Task was destroyed but it is pending" at
+            # shutdown.
+            for task in (pipe_task, stderr_task, status_task):
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.gather(pipe_task, stderr_task, return_exceptions=True)
+                await asyncio.gather(pipe_task, stderr_task, status_task, return_exceptions=True)
             logger.info("[recorder] [youtube] %s cancelled", channel)
             raise
+        else:
+            status_stop.set()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.gather(status_task, return_exceptions=True)
         finally:
             await self._terminate(process)
             logger.info("[recorder] [youtube] %s ffmpeg stopped (rc=%s)", channel, process.returncode)
 
-        if not results[0]:
+        pipe_clean, pipe_youtube_error, pipe_abandoned = results[0]
+        stderr_lines: list[str] = results[1]
+        if pipe_youtube_error is not None:
+            await self._notify_youtube_failure(channel, youtube_info, title, pipe_youtube_error, filepath is not None)
             msg = f"[youtube] {channel} stream interrupted"
             raise RuntimeError(msg)
+        if pipe_abandoned or youtube_abandoned.is_set():
+            # The takedown alert already went out. End normally: the disk
+            # file finalizes, and the monitor does not restart a restream
+            # of flagged content.
+            logger.info("[recorder] [youtube] %s stopped feeding the revoked broadcast", channel)
+            return
+        reason = youtube_output_hint(process.returncode, pipe_clean, stderr_lines)
+        if reason is not None:
+            await self._notify_youtube_failure(channel, youtube_info, title, reason, filepath is not None)
+
+        if not pipe_clean:
+            msg = f"[youtube] {channel} stream interrupted"
+            raise RuntimeError(msg)
+
+    async def _notify_youtube_failure(
+        self, channel: str, youtube_info: dict[str, Any], title: str | None, reason: str, has_disk: bool
+    ) -> None:
+        """Tell the operator that the restream died. Never raises.
+
+        A takedown closes the RTMP connection mid-capture, so the disk
+        file of ``both`` mode also stops here and the monitor restarts.
+        The lines stay short and the cause stays redacted: ffmpeg can
+        echo the ingest URL, which holds the stream key.
+        """
+        if self._notifier is None:
+            return
+        safe_title = sanitize_metadata_text(title or "Unknown")
+        youtube_url = (youtube_info or {}).get("youtube_url") or ""
+        lines = [
+            f"\u26a0\ufe0f YouTube restream failed for {channel}.",
+            f"Stream: {safe_title}",
+            f"Source: {channel_url(channel)}",
+        ]
+        if youtube_url:
+            lines.append(f"YouTube: {youtube_url}")
+        lines.append(f"Cause: {sanitize_metadata_text(reason)}")
+        if has_disk:
+            lines.append("The disk file stopped here and is finalized. The monitor restarts automatically.")
+        else:
+            lines.append("There is no local backup in youtube mode.")
+        lines.append("Check YouTube Studio for a copyright or policy notice.")
+        try:
+            await self._notifier.notify("\n".join(lines))
+        except Exception:
+            logger.error("[recorder] restream-failure notification failed for %s", channel, exc_info=True)
+
+    async def _watch_broadcast_status(
+        self,
+        channel: str,
+        youtube_info: dict[str, Any],
+        title: str | None,
+        has_disk: bool,
+        abandoned: asyncio.Event,
+        stop: asyncio.Event,
+    ) -> None:
+        """Alert once when YouTube revokes the broadcast mid-restream. Never raises.
+
+        A takedown flips ``lifeCycleStatus`` to ``revoked`` while the RTMP
+        ingest stays open, so the pipe and ffmpeg both look healthy. This
+        poll catches that state and marks the broadcast abandoned, so the
+        pipe drops the ingest: in ``both`` mode the disk file carries on
+        alone, and the recording ends normally instead of restarting a
+        restream of flagged content. Other states need no alert: ``live``
+        is normal, and a missing broadcast is logged at debug level until
+        the capture ends.
+        """
+        streamer = self._youtube
+        broadcast_id = (youtube_info or {}).get("broadcast_id")
+        if streamer is None or not broadcast_id:
+            return
+        try:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=_STATUS_POLL_S)
+                except TimeoutError:
+                    pass
+                else:
+                    return
+                try:
+                    status = await streamer.get_broadcast_status(broadcast_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug("[recorder] [youtube] %s broadcast status check failed: %s", channel, e)
+                    continue
+                if status == "revoked":
+                    abandoned.set()
+                    await self._notify_youtube_takedown(channel, youtube_info, title, has_disk)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("[recorder] broadcast watch failed for %s", channel, exc_info=True)
+
+    async def _notify_youtube_takedown(
+        self, channel: str, youtube_info: dict[str, Any], title: str | None, has_disk: bool
+    ) -> None:
+        """Tell the operator that YouTube took the restream down. Never raises.
+
+        The pipe drops the dead ingest when this goes out: in ``both`` mode
+        the disk file carries on alone, in ``youtube`` mode the recording
+        ends with nothing saved. Either way no new broadcast starts, so a
+        flagged restream cannot loop into fresh strikes.
+        """
+        if self._notifier is None:
+            return
+        safe_title = sanitize_metadata_text(title or "Unknown")
+        youtube_url = (youtube_info or {}).get("youtube_url") or ""
+        lines = [
+            f"\u26a0\ufe0f YouTube took down the restream for {channel}.",
+            f"Stream: {safe_title}",
+            f"Source: {channel_url(channel)}",
+        ]
+        if youtube_url:
+            lines.append(f"YouTube: {youtube_url}")
+        lines.append("The broadcast is revoked. The app stopped feeding it.")
+        if has_disk:
+            lines.append("The disk recording continues.")
+        else:
+            lines.append("There is no local backup in youtube mode, so the recording ended.")
+        lines.append("Check YouTube Studio for the copyright or policy notice.")
+        try:
+            await self._notifier.notify("\n".join(lines))
+        except Exception:
+            logger.error("[recorder] takedown notification failed for %s", channel, exc_info=True)
 
     def youtube_active_count(self) -> int:
         """Active recordings whose mode uses a YouTube re-stream (for the uplink cap)."""

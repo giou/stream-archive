@@ -87,16 +87,29 @@ class DiskOutputMixin:
                 except Exception as e:
                     logger.error("[recorder] [disk] %s stream close failed: %s", channel, e)
 
-    async def _read_ffmpeg_stderr(self, channel: str, process: Any) -> None:
+    async def _read_ffmpeg_stderr(self, channel: str, process: Any) -> list[str]:
+        """Drain one ffmpeg stderr, log it redacted, and return the lines.
+
+        The lines stay redacted like the log: ffmpeg can echo the ingest
+        URL, which holds the stream key. The restream path keeps the tail
+        (at most 100 lines) to name the cause when the ingest dies, for
+        example a takedown that closes the RTMP connection.
+        """
+        errors: list[str] = []
         if process.stderr is None:
-            return
+            return errors
         # Let a cancellation propagate to the awaiter.
         async for line in process.stderr:
             text = line.decode(errors="replace").strip()
             if text and "Resumed reading" not in text:
                 # ffmpeg can echo the output URL, which holds the
                 # YouTube stream key.
-                logger.info("[recorder] [ffmpeg:%s] %s", channel, _redact_credentials(text))
+                redacted = _redact_credentials(text)
+                logger.info("[recorder] [ffmpeg:%s] %s", channel, redacted)
+                errors.append(redacted)
+                if len(errors) > 100:
+                    del errors[: len(errors) - 100]
+        return errors
 
     async def _watch_growth(self, channel: str) -> None:
         while True:

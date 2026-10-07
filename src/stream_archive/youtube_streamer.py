@@ -294,6 +294,23 @@ class YouTubeStreamer:
         logger.info("[youtube] Ending broadcast: %s", broadcast_id)
         await self._request("POST", "liveBroadcasts/transition", params=params)
 
+    async def get_broadcast_status(self, broadcast_id: str) -> str | None:
+        """lifeCycleStatus of one broadcast, or None when it is gone.
+
+        A takedown shows as ``revoked`` while the RTMP ingest stays open,
+        so ffmpeg never errors. The restream polls this during the capture
+        to catch that state. ``live``, ``liveStarting``, and ``testing``
+        all mean the broadcast still exists.
+        """
+        payload = await self._request("GET", "liveBroadcasts", params={"id": broadcast_id, "part": "status"})
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            return None
+        first = items[0]
+        status = first.get("status") if isinstance(first, dict) else None
+        life = status.get("lifeCycleStatus") if isinstance(status, dict) else None
+        return life if isinstance(life, str) else None
+
     async def close(self) -> None:
         # Let an in-flight rollback finish first: it is removing resources that
         # would otherwise stay on the account with nothing tracking them.

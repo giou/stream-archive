@@ -146,6 +146,41 @@ def test_refresh_failure_reaches_every_caller_and_frees_the_lock(tmp_path, monke
     asyncio.run(asyncio.wait_for(scenario(), timeout=5))
 
 
+def test_broadcast_status_reports_lifecycle_and_gone(tmp_path):
+    """The status poll sees revoked, live, and deleted broadcasts apart."""
+    creds = FakeCreds()
+    creds.valid = True
+    creds.expired = False
+    streamer, _ = make_streamer(tmp_path, creds)
+
+    async def scenario():
+        try:
+
+            async def revoked(method, path, **kwargs):
+                assert (method, path) == ("GET", "liveBroadcasts")
+                assert kwargs["params"] == {"id": "b1", "part": "status"}
+                return {"items": [{"id": "b1", "status": {"lifeCycleStatus": "revoked"}}]}
+
+            streamer._request = revoked  # type: ignore[method-assign]
+            assert await streamer.get_broadcast_status("b1") == "revoked"
+
+            async def live(method, path, **kwargs):
+                return {"items": [{"id": "b1", "status": {"lifeCycleStatus": "live"}}]}
+
+            streamer._request = live  # type: ignore[method-assign]
+            assert await streamer.get_broadcast_status("b1") == "live"
+
+            async def gone(method, path, **kwargs):
+                return {"items": []}
+
+            streamer._request = gone  # type: ignore[method-assign]
+            assert await streamer.get_broadcast_status("b1") is None
+        finally:
+            await streamer.close()
+
+    asyncio.run(scenario())
+
+
 def test_broadcast_description_is_one_line_per_row():
     """The published description carries platform text, so canonicalize it."""
     description = build_video_description("author\nUrl: https://evil.example", "twitch:ch", "game\u2028x")

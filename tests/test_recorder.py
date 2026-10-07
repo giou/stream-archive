@@ -417,25 +417,136 @@ class FakeFailingStream:
 class FakeYouTubeStreamer:
     def __init__(self, create_error=None):
         self.create_error = create_error
+        self.status = "live"
 
     async def create_stream(self, author, title, channel, game):
         if self.create_error:
             raise self.create_error
         return {"youtube_url": "https://youtu.be/x", "rtmp_url": "rtmp://x", "broadcast_id": "b1"}
 
+    async def get_broadcast_status(self, broadcast_id):
+        return self.status
+
 
 def test_pipe_stream_clean_eof_returns_true(tmp_path, monkeypatch):
     rec = Recorder(make_config(tmp_path))
     process = types.SimpleNamespace(stdin=None)
-    result = asyncio.run(rec._pipe_stream("ch", FakeStream(), process, None))
-    assert result is True
+    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", FakeStream(), process, None))
+    assert clean is True
+    assert youtube_error is None
+    assert youtube_abandoned is False
 
 
 def test_pipe_stream_read_error_returns_false(tmp_path, monkeypatch):
     rec = Recorder(make_config(tmp_path))
     process = types.SimpleNamespace(stdin=None)
-    result = asyncio.run(rec._pipe_stream("ch", RaisingReadStream(), process, None))
-    assert result is False
+    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", RaisingReadStream(), process, None))
+    assert clean is False
+    assert youtube_error is None
+    assert youtube_abandoned is False
+
+
+def test_pipe_stream_reports_youtube_failure_and_keeps_disk_bytes(tmp_path):
+    """An RTMP write failure reports the ingest cause and keeps disk bytes.
+
+    A takedown closes the ingest mid-capture. The pipe must name the
+    ingest as the cause (not the feed), and the disk file must keep the
+    bytes written before the break, so the finalizer archives them.
+    """
+    rec = Recorder(make_config(tmp_path))
+
+    class OneChunk:
+        def __init__(self):
+            self._sent = False
+
+        def open(self):
+            return self
+
+        def read(self, n):
+            if not self._sent:
+                self._sent = True
+                return b"x" * 1024
+            return b""
+
+        def close(self):
+            pass
+
+    class FailingStdin:
+        def write(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    process = types.SimpleNamespace(stdin=FailingStdin())
+    path = str(tmp_path / "out.ts")
+
+    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", OneChunk(), process, path))
+
+    assert clean is False
+    assert youtube_error is not None
+    assert "ingest" in youtube_error.lower()
+    assert youtube_abandoned is False
+    assert os.path.getsize(path) == 1024
+
+
+def test_pipe_stream_stop_event_drops_ingest_and_keeps_disk(tmp_path):
+    """A revoked broadcast stops the ingest while the disk file carries on.
+
+    The watcher sets the stop event when the broadcast flips to revoked.
+    The pipe must close the ffmpeg stdin, skip every later RTMP write, and
+    still copy the full source to disk, reporting the abandonment apart
+    from an ingest failure.
+    """
+    rec = Recorder(make_config(tmp_path))
+
+    class OneChunk:
+        def __init__(self):
+            self._sent = False
+
+        def open(self):
+            return self
+
+        def read(self, n):
+            if not self._sent:
+                self._sent = True
+                return b"x" * 1024
+            return b""
+
+        def close(self):
+            pass
+
+    class DummyStdin:
+        def __init__(self):
+            self.writes = 0
+            self.closed = False
+
+        def write(self, data):
+            self.writes += 1
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    stdin = DummyStdin()
+    process = types.SimpleNamespace(stdin=stdin)
+    path = str(tmp_path / "out.ts")
+    stop = asyncio.Event()
+    stop.set()
+
+    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", OneChunk(), process, path, stop))
+
+    assert clean is True
+    assert youtube_error is None
+    assert youtube_abandoned is True
+    assert stdin.writes == 0
+    assert stdin.closed is True
+    assert os.path.getsize(path) == 1024
 
 
 def test_recording_task_failure_removes_entry(tmp_path, monkeypatch):
@@ -683,6 +794,221 @@ def test_youtube_rate_limit_alert_keeps_the_title_on_one_line(tmp_path, monkeypa
     assert len(notifier.messages) == 1
     assert "Win Offline: twitch:other" in notifier.messages[0]
     assert "Win\nOffline" not in notifier.messages[0]
+
+
+def test_youtube_output_failure_alerts_with_redacted_cause(tmp_path, monkeypatch):
+    """A dead ingest alerts the operator without leaking the stream key.
+
+    A takedown closes the RTMP connection, so ffmpeg exits bad with the
+    ingest URL in stderr. The alert must name the channel and the cause,
+    and must carry the redacted URL, never the key.
+    """
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    notifier = FakeNotifier()
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer(), notifier=notifier)
+    rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": None}
+
+    class DummyStdin:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FailingStderr:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __aiter__(self):
+            async def gen():
+                for line in self._lines:
+                    yield line
+
+            return gen()
+
+    class FailingProcess:
+        stdin = DummyStdin()
+        stderr = FailingStderr(
+            [
+                b"av_interleaved_write_frame(): Broken pipe",
+                b"[rtmp @ 0x1] Failed to open rtmp://a.rtmp.youtube.com/live2/secret-key",
+            ]
+        )
+        returncode = 1
+
+    async def fake_exec(*args, **kwargs):
+        return FailingProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def scenario():
+        await rec._stream_youtube("ch", "author", "Title", "Game", FakeStream(), None)
+
+    asyncio.run(scenario())
+
+    assert len(notifier.messages) == 1
+    alert = notifier.messages[0]
+    assert "YouTube restream failed for ch." in alert
+    assert "secret-key" not in alert
+    assert "live2/***" in alert
+
+
+def test_revoked_broadcast_alerts_once_while_ingest_runs(tmp_path, monkeypatch):
+    """A takedown with a healthy ingest alerts once and keeps recording.
+
+    YouTube revokes the watch page but leaves RTMP open, so ffmpeg never
+    errors and the pipe stays clean. The status poll must catch the
+    revoked state and alert exactly once while the capture runs on.
+    """
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    notifier = FakeNotifier()
+    streamer = FakeYouTubeStreamer()
+    streamer.status = "revoked"
+    rec = Recorder(config, youtube_streamer=streamer, notifier=notifier)
+    rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": None}
+    monkeypatch.setattr("stream_archive.recorder.youtube_output._STATUS_POLL_S", 0.01)
+
+    class SlowEof:
+        def __init__(self):
+            self._reads = 0
+
+        def open(self):
+            return self
+
+        def read(self, n):
+            self._reads += 1
+            if self._reads == 1:
+                return b"x" * 1024
+            time.sleep(0.05)
+            return b""
+
+        def close(self):
+            pass
+
+    class DummyStdin:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    class QuietStderr:
+        def __aiter__(self):
+            async def gen():
+                return
+                yield
+
+            return gen()
+
+    class HealthyProcess:
+        stdin = DummyStdin()
+        stderr = QuietStderr()
+        returncode = 0
+
+    async def fake_exec(*args, **kwargs):
+        return HealthyProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def scenario():
+        await rec._stream_youtube("ch", "author", "Title", "Game", SlowEof(), None)
+
+    asyncio.run(scenario())
+
+    assert len(notifier.messages) == 1
+    alert = notifier.messages[0]
+    assert "YouTube took down the restream for ch." in alert
+    assert "no local backup" in alert
+
+
+def test_revoked_broadcast_stops_ingest_but_finishes_disk(tmp_path, monkeypatch):
+    """A revoked ``both`` restream drops the ingest and still archives disk.
+
+    The user's live case: the watch page is gone while RTMP stays open.
+    The capture must stop feeding the dead broadcast, copy the whole
+    source to disk, alert once, and return normally, so the monitor does
+    not restart a restream of flagged content.
+    """
+    config = make_config(tmp_path)
+    config.output_mode = "both"
+    notifier = FakeNotifier()
+    streamer = FakeYouTubeStreamer()
+    streamer.status = "revoked"
+    rec = Recorder(config, youtube_streamer=streamer, notifier=notifier)
+    rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": None}
+    monkeypatch.setattr("stream_archive.recorder.youtube_output._STATUS_POLL_S", 0.01)
+    disk_path = str(tmp_path / "disk.ts")
+
+    class SlowEof:
+        def __init__(self):
+            self._reads = 0
+
+        def open(self):
+            return self
+
+        def read(self, n):
+            self._reads += 1
+            if self._reads == 1:
+                return b"x" * 1024
+            time.sleep(0.05)
+            return b""
+
+        def close(self):
+            pass
+
+    class DummyStdin:
+        def __init__(self):
+            self.writes = 0
+
+        def write(self, data):
+            self.writes += 1
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    stdin = DummyStdin()
+
+    class QuietStderr:
+        def __aiter__(self):
+            async def gen():
+                return
+                yield
+
+            return gen()
+
+    class HealthyProcess:
+        stderr = QuietStderr()
+        returncode = 0
+
+        def __init__(self):
+            self.stdin = stdin
+
+    async def fake_exec(*args, **kwargs):
+        return HealthyProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def scenario():
+        await rec._stream_youtube("ch", "author", "Title", "Game", SlowEof(), disk_path)
+
+    asyncio.run(scenario())
+
+    assert stdin.writes <= 1
+    assert os.path.getsize(disk_path) == 1024
+    assert len(notifier.messages) == 1
+    assert "YouTube took down the restream for ch." in notifier.messages[0]
+    assert "disk recording continues" in notifier.messages[0]
 
 
 def test_start_records_chat_when_enabled(tmp_path, monkeypatch):

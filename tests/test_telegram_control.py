@@ -544,6 +544,25 @@ def test_mode_change_sets_pending_apply(tmp_path):
     assert channels == ["twitch:channel1"]
 
 
+def test_unrelated_channel_edit_creates_no_new_warning(tmp_path):
+    """An idle-channel edit must not re-warn about a diverged recording.
+
+    A bulk reset of idle overrides once stashed one warning per edit, each
+    naming the idle channel but blaming the one live recording. Only an
+    edit that changes a recording channel's expected settings warns.
+    """
+    config, ctrl, _, _, eventsub = make_controller(
+        tmp_path, channels=["twitch:livechan", "twitch:idlechan"], recording=["twitch:livechan"]
+    )
+    ctrl.handle_mode(["twitch:livechan", "youtube"])
+    assert len(ctrl._pending_apply) == 1
+    ctrl.handle_mode(["twitch:idlechan", "disk"])
+    assert len(ctrl._pending_apply) == 1
+    summary, channels = next(iter(ctrl._pending_apply.values()))
+    assert summary == "Output mode for twitch:livechan set to youtube"
+    assert channels == ["twitch:livechan"]
+
+
 def test_apply_warning_sent_with_inline_keyboard(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path, recording=["twitch:channel1"])
     ctrl._pending_apply[(ADMIN_ID, "abcd")] = ("Output mode set to youtube", ["twitch:channel1"])

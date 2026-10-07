@@ -39,6 +39,22 @@ from stream_archive.telegram.menus_commands import CommandsMixin
 logger = logging.getLogger(__name__)
 
 
+def _effective_expected(config: AppConfig, channel: str) -> tuple[str, str, bool, bool]:
+    """Effective deferred settings of ``channel`` under ``config``.
+
+    The tuple holds the output mode (with the audio-only guard), the
+    effective quality, and the two chat-capture flags. ``_apply`` compares
+    it before and after a change, so a change warns only for recordings
+    whose expected settings it really alters. Without this gate every later
+    change re-warned about a divergence an earlier change left behind,
+    naming a channel the change never touched.
+    """
+    mode = config.channel_output_modes.get(channel, config.output_mode)
+    if mode != "disk" and effective_quality(config, channel) == AUDIO_ONLY_QUALITY:
+        mode = "disk"
+    return (mode, effective_quality(config, channel), config.record_chat, config.kick.record_chat)
+
+
 def _deferred_affected_channels(new: AppConfig, recordings: dict[str, dict[str, Any]]) -> list[str]:
     """Active channels whose in-flight recording a config change affects.
 
@@ -274,11 +290,18 @@ class TelegramController(
     def _apply(
         self, mutate: Callable[[AppConfig], Any], ok_text: Callable[[AppConfig], str], chat_id: ChatId | None = None
     ) -> str:
+        recordings = self._recorder.recording_settings()
+        before = {ch: _effective_expected(self._config, ch) for ch in recordings if ch in self._config.channels}
         try:
             candidate = apply_config_change(self._config, mutate)
         except ValueError as e:
             return f"\u274c {e}"
-        affected = _deferred_affected_channels(candidate, self._recorder.recording_settings())
+        changed = {
+            ch
+            for ch in recordings
+            if ch in candidate.channels and ch in before and before[ch] != _effective_expected(candidate, ch)
+        }
+        affected = [ch for ch in _deferred_affected_channels(candidate, recordings) if ch in changed]
         if affected:
             chat = chat_id if chat_id is not None else self._admin_id
             self._pending_apply[(chat, secrets.token_hex(4))] = (ok_text(candidate), affected)
