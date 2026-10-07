@@ -51,7 +51,7 @@ from stream_archive.emotes import (
     fetch_global_emotes,
     sniff_mime,
 )
-from stream_archive.http import build_http_client
+from stream_archive.http_client import build_http_client
 from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.kick_chat import EMOTE_URL as _KICK_EMOTE_URL
 from stream_archive.updater import installed_app_version

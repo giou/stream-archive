@@ -11,7 +11,7 @@ from stream_archive import events
 from stream_archive.api import ControlAPI
 from stream_archive.config import AppConfig, get_config, telegram_enabled
 from stream_archive.eventsub import EventSubClient
-from stream_archive.http import build_http_client
+from stream_archive.http_client import build_http_client
 from stream_archive.kick_api import KickAPI
 from stream_archive.kick_webhook import KickWebhook
 from stream_archive.monitor import Monitor

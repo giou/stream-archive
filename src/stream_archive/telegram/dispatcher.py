@@ -23,7 +23,7 @@ from stream_archive.config import (
     effective_quality,
     is_kick_channel,
 )
-from stream_archive.http import build_http_client
+from stream_archive.http_client import build_http_client
 from stream_archive.telegram import menus
 from stream_archive.telegram import menus_callbacks as callbacks
 from stream_archive.telegram.commands_api import ApiCommands
