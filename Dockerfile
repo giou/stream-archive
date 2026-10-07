@@ -1,5 +1,6 @@
 # Pinned uv version used to build the image. A separate stage keeps the tag
-# visible to Dependabot.
+# visible to Dependabot. This tag is the only copy: ci.yml and publish.yml
+# read it at runtime, so a bump needs no other change.
 FROM ghcr.io/astral-sh/uv:0.12.19 AS uv
 
 FROM python:3.14.7-slim

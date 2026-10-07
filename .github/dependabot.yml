@@ -14,9 +14,8 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
-  # Dockerfile base images: python, uv. A uv bump also moves the
-  # version input of setup-uv in both workflows, which the ci.yml check enforces
-  # because the github-actions ecosystem does not touch that input.
+  # Dockerfile base images: python, uv. The workflows read the uv tag from
+  # the Dockerfile at runtime, so a uv bump needs no other change.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:

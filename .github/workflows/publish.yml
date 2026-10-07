@@ -18,10 +18,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Read the uv version from the Dockerfile
+        id: uv
+        run: |
+          UV=$(sed -n 's|^FROM ghcr.io/astral-sh/uv:\([^ ]*\) AS uv$|\1|p' Dockerfile)
+          if [ -z "$UV" ]; then
+            echo "cannot read the uv version from the Dockerfile" >&2; exit 1
+          fi
+          echo "version=$UV" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          # Same uv version as the image build (Dockerfile uv stage).
-          version: "0.12.19"
+          # Version comes from the Dockerfile step above: one copy only.
+          version: ${{ steps.uv.outputs.version }}
           python-version: "3.14"
           enable-cache: true
           # The cache key tracks the lockfile and the project metadata.
