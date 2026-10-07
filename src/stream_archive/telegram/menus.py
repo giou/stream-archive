@@ -17,7 +17,6 @@ from telegram import ReplyKeyboardMarkup
 from stream_archive.config import api_base_url, webhook_public_url
 from stream_archive.telegram import menus_api as api_menus
 from stream_archive.telegram import menus_kick as kick_menus
-from stream_archive.telegram import menus_mtproto as mtproto_menus
 from stream_archive.telegram import menus_recordings as rec_menus
 from stream_archive.telegram import menus_root as root_menus
 from stream_archive.telegram import menus_settings as settings_menus
@@ -497,6 +496,18 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "rec_detail": _text_rec_detail,
 }
 
+
+async def menu_mtproto(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route the MTProto toggle. Credentials stay in config.json, never here."""
+    if text == "Enable MTProto upload":
+        result = await ctrl._set_mtproto_enabled(True, chat_id=chat_id)
+        return result, ctrl.reply_keyboard("mtproto", chat_id=chat_id)
+    if text == "Disable MTProto upload":
+        result = await ctrl._set_mtproto_enabled(False, chat_id=chat_id)
+        return result, ctrl.reply_keyboard("mtproto", chat_id=chat_id)
+    return None
+
+
 HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuResult]]] = {
     "root": root_menus.menu_root,
     "channels": root_menus.menu_channels,
@@ -519,7 +530,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "remote_access": kick_menus.menu_remote_access,
     "api": api_menus.menu_api,
     "web": web_menus.menu_web,
-    "mtproto": mtproto_menus.menu_mtproto,
+    "mtproto": menu_mtproto,
     "recordings": rec_menus.menu_recordings,
     "rec_channel": rec_menus.menu_rec_channel,
     "rec_detail": rec_menus.menu_rec_detail,
