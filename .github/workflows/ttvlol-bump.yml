@@ -26,13 +26,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # The runner ships no uv, so the ast.parse gate below would fail on
-      # "uvx is not installed". Pin the same uv as the image build.
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          # Same uv version as the image build (Dockerfile uv stage).
-          version: "0.12.19"
-          python-version: "3.14"
       # Resolve the newest tag through the release asset redirect. This needs
       # no API call: the unauthenticated GitHub API is rate limited per address
       # and answered 403 on a shared runner, and GITHUB_TOKEN cannot read
@@ -74,15 +67,11 @@ jobs:
           if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$'; then
             echo "cannot hash the streamlink-ttvlol asset" >&2; exit 1
           fi
-          # A plugin that does not parse must never reach a pull request. The
-          # runner's python3 can be older than the 3.14 the image and CI pin,
-          # so the ast.parse gate would fail a plugin that uses 3.14-only
-          # syntax. Run it with the project's own pinned interpreter.
-          PY="$(command -v uvx || true)"
-          if [ -z "$PY" ]; then
-            echo "uvx is not installed on this runner" >&2; exit 1
-          fi
-          uvx --python 3.14 python -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
+          # A plugin that does not parse must never reach a pull request.
+          # The image build parses again with 3.14, and CI builds the
+          # image on every pull request, so this gate only stops a
+          # broken PR early. System python3 is enough for that.
+          python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
             "vendor/streamlink-ttvlol/${TAG}/twitch.py"
           sed -i "s|^ARG TTVLOL_PLUGIN_VERSION=.*|ARG TTVLOL_PLUGIN_VERSION=${TAG}|" Dockerfile
           sed -i "s|^ARG TTVLOL_PLUGIN_SHA256=.*|ARG TTVLOL_PLUGIN_SHA256=${SHA}|" Dockerfile
