@@ -240,6 +240,53 @@ class TwitchAPI:
         data = resp.json()["data"]
         return data[0] if data else None
 
+    async def get_games_by_names(self, names: list[str]) -> dict[str, str]:
+        """Map each known name (lowercased) to its canonical Twitch game name.
+
+        The Helix Get Games endpoint matches names exactly. Unknown names
+        are absent. Empty input makes no request.
+        """
+        if not names:
+            return {}
+        found: dict[str, str] = {}
+        try:
+            # Twitch rejects more than 100 names in one request.
+            for start in range(0, len(names), _MAX_QUERY_ITEMS):
+                chunk = names[start : start + _MAX_QUERY_ITEMS]
+                resp = await self._request(
+                    "GET",
+                    "https://api.twitch.tv/helix/games",
+                    params={"name": chunk},
+                )
+                resp.raise_for_status()
+                for game in resp.json()["data"]:
+                    found[game["name"].lower()] = game["name"]
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+            logger.error("[twitch_api] get_games_by_names failed: %s", e)
+            raise
+        return found
+
+    async def search_categories(self, query: str, first: int = 5) -> list[str]:
+        """Canonical names of categories that start with the query.
+
+        The Helix Search Categories endpoint matches from the start of the
+        name. A blank query makes no request.
+        """
+        query = query.strip()
+        if not query:
+            return []
+        try:
+            resp = await self._request(
+                "GET",
+                "https://api.twitch.tv/helix/search/categories",
+                params={"query": query, "first": first},
+            )
+            resp.raise_for_status()
+            return [item["name"] for item in resp.json()["data"]]
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+            logger.error("[twitch_api] search_categories failed: %s", e)
+            raise
+
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()

@@ -81,7 +81,7 @@ _SETTING_KEYS = (
 )
 
 #: Per-channel settings the API can write. Each maps to one Telegram command.
-_CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds")
+_CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds", "categories")
 
 #: Output modes, plus 'default' to clear a per-channel override.
 _OUTPUT_MODES = ("disk", "youtube", "both", "default")
@@ -151,6 +151,7 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
 
 def _channel_json(config: AppConfig, channel: str, recording: bool) -> dict[str, Any]:
     """One monitored channel: effective settings plus its overrides."""
+    cats = config.channel_categories.get(channel)
     return {
         "channel": channel,
         "recording": recording,
@@ -160,6 +161,8 @@ def _channel_json(config: AppConfig, channel: str, recording: bool) -> dict[str,
         "quality_override": config.channel_preferred_qualities.get(channel),
         "youtube_hold_seconds": config.channel_youtube_hold_seconds.get(channel, config.youtube.hold_seconds),
         "youtube_hold_seconds_override": config.channel_youtube_hold_seconds.get(channel),
+        "categories": list(cats) if cats is not None else None,
+        "categories_override": list(cats) if cats is not None else None,
     }
 
 
@@ -262,6 +265,52 @@ def _global_hold_seconds(value: Any) -> str:
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
         raise _ApiError(400, msg)
     return str(int(value))
+
+
+def _categories(value: Any) -> list[str] | str:
+    """Validated category filter, or 'default' to clear it.
+
+    The API takes a JSON list of names. A blank entry, a name longer
+    than 100 characters, more than 50 names, or the word 'default' as a
+    name all fail with 400. The word 'default' alone clears the filter.
+    """
+    from stream_archive.config import MAX_CATEGORIES_PER_CHANNEL, MAX_CATEGORY_LEN
+
+    if isinstance(value, str):
+        if value.strip().lower() != "default":
+            msg = "categories must be a list of names, or 'default'"
+            raise _ApiError(400, msg)
+        return "default"
+    if not isinstance(value, list):
+        msg = "categories must be a list of names, or 'default'"
+        raise _ApiError(400, msg)
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            msg = "categories must hold strings only"
+            raise _ApiError(400, msg)
+        name = entry.strip()
+        if not name:
+            msg = "categories must hold non-empty names"
+            raise _ApiError(400, msg)
+        if len(name) > MAX_CATEGORY_LEN:
+            msg = f"{name!r} is longer than 100 characters"
+            raise _ApiError(400, msg)
+        if name.lower() == "default":
+            msg = "'default' clears a filter, so it is not a value"
+            raise _ApiError(400, msg)
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    if not out:
+        msg = "categories must hold at least one name (use 'default' to clear it)"
+        raise _ApiError(400, msg)
+    if len(out) > MAX_CATEGORIES_PER_CHANNEL:
+        msg = "categories must hold at most 50 names"
+        raise _ApiError(400, msg)
+    return out
 
 
 def _public_url(value: Any, key: str, *, allow_empty: bool = False, require_dot: bool = False) -> str:
@@ -799,5 +848,11 @@ class ControlAPI:
             return await self._run(ctrl.handle_quality, [channel, _quality(value)])
         if key == "youtube_hold_seconds":
             return await self._run(ctrl.handle_channel_hold, [channel, _hold_seconds(value)])
+        if key == "categories":
+            parsed = _categories(value)
+            if parsed == "default":
+                return await self._run(ctrl.handle_category, [channel, "default"])
+            names = cast(list[str], parsed)
+            return await self._run(ctrl.handle_category, [channel, ", ".join(names)])
         msg = f"unknown setting: {key}"
         raise _ApiError(400, msg)

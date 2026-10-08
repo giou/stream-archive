@@ -699,7 +699,25 @@ class KickWebhook:
         if is_live:
             # title/game are None on purpose: the recorder fills them from the
             # streamlink kick plugin's metadata (no extra API call on the hot path).
-            await self._monitor.handle_online(channel, None, None, None, self._config)
+            # A channel with a category filter needs its live category now:
+            # the event body carries no category, so one status lookup fills
+            # it. The monitor then drops the event when the category misses.
+            if self._config.channel_categories.get(channel):
+                try:
+                    statuses = await self._api.get_channel_statuses([slug])
+                except Exception as e:
+                    logger.warning("[kick_webhook] category lookup failed for %s: %s", channel, e)
+                    return
+                status = statuses.get(slug)
+                if status is None:
+                    logger.warning("[kick_webhook] category lookup found no channel for %s", channel)
+                    return
+                if not status.get("is_live"):
+                    await self._monitor.handle_offline(channel, self._config)
+                    return
+                await self._monitor.handle_online(channel, status.get("title"), status.get("game"), None, self._config)
+            else:
+                await self._monitor.handle_online(channel, None, None, None, self._config)
         else:
             await self._monitor.handle_offline(channel, self._config)
 

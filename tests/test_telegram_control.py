@@ -1173,7 +1173,7 @@ def test_reply_keyboard_channels_layout(tmp_path):
 def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"] == [
-        [{"text": "Mode"}, {"text": "Quality"}],
+        [{"text": "Mode"}, {"text": "Quality"}, {"text": "Categories"}],
         [{"text": "Hold delay"}, {"text": "Remove channel"}],
         [{"text": "Back"}],
     ]
@@ -2801,3 +2801,156 @@ def test_status_names_degraded_problems(tmp_path):
         assert "Degraded: disk_full" in asyncio.run(ctrl.handle_status())
     finally:
         clear_degraded("disk_full")
+
+
+def test_category_set_show_and_clear(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    assert "No category filter" in asyncio.run(ctrl.handle_category([]))
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "Just Chatting, Music"]))
+    assert text == "twitch:channel1 records only: Just Chatting, Music"
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Just Chatting", "Music"]}
+    assert "Just Chatting" in asyncio.run(ctrl.handle_category(["twitch:channel1"]))
+    assert "twitch:channel1" in asyncio.run(ctrl.handle_category([]))
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "default"]))
+    assert "cleared" in text
+    assert read_file(tmp_path)["channel_categories"] == {}
+
+
+def test_category_multiword_name_without_comma_is_one_category(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "Just Chatting"]))
+    assert text == "twitch:channel1 records only: Just Chatting"
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Just Chatting"]}
+
+
+def test_category_invalid_leaves_the_file_untouched(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    before = read_file(tmp_path)
+    assert "not in the monitored list" in asyncio.run(ctrl.handle_category(["twitch:ghost", "Music"]))
+    assert "Invalid channel name" in asyncio.run(ctrl.handle_category(["bad name!", "Music"]))
+    assert asyncio.run(ctrl.handle_category(["twitch:channel1", "   "])).startswith("\u274c")
+    assert read_file(tmp_path) == before
+
+
+def test_category_remove_clears_the_filter(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path, channels=["twitch:channel1"])
+    asyncio.run(ctrl.handle_category(["twitch:channel1", "Music"]))
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Music"]}
+    asyncio.run(ctrl.handle_remove(["twitch:channel1"]))
+    assert read_file(tmp_path).get("channel_categories", {}) == {}
+
+
+class FakeTwitchCategories:
+    """Twitch category lookup with a fixed known set."""
+
+    def __init__(self, known=None, suggestions=None, error=None):
+        self.known = {k.lower(): v for k, v in (known or {}).items()}
+        self.suggestions = suggestions or {}
+        self.error = error
+
+    async def get_games_by_names(self, names):
+        if self.error is not None:
+            raise self.error
+        return {name.lower(): self.known[name.lower()] for name in names if name.lower() in self.known}
+
+    async def search_categories(self, query):
+        return self.suggestions.get(query, [])
+
+
+class FakeKickCategories:
+    """Kick category lookup with a fixed known set."""
+
+    def __init__(self, known=None, error=None):
+        self.known = {k.lower(): v for k, v in (known or {}).items()}
+        self.error = error
+
+    async def get_categories_by_names(self, names):
+        if self.error is not None:
+            raise self.error
+        return {name.lower(): self.known[name.lower()] for name in names if name.lower() in self.known}
+
+
+def test_category_unknown_twitch_name_is_refused_with_a_hint(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    ctrl.bind_live_check(
+        FakeTwitchCategories(known={"Just Chatting": "Just Chatting"}, suggestions={"Just Chating": ["Just Chatting"]}),
+        FakeKickCategories(),
+    )
+    before = read_file(tmp_path)
+
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "Just Chating"]))
+
+    assert "Unknown category" in text
+    assert "Just Chatting" in text
+    assert read_file(tmp_path) == before
+
+
+def test_category_unknown_kick_name_is_refused(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path, channels=["kick:xqc"])
+    ctrl.bind_live_check(FakeTwitchCategories(), FakeKickCategories(known={"Just Chatting": "Just Chatting"}))
+    before = read_file(tmp_path)
+
+    text = asyncio.run(ctrl.handle_category(["kick:xqc", "No Such Game"]))
+
+    assert "Unknown category" in text
+    assert read_file(tmp_path) == before
+
+
+def test_category_check_failure_saves_as_typed_with_a_warning(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    ctrl.bind_live_check(FakeTwitchCategories(error=RuntimeError("boom")), FakeKickCategories())
+
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "Just Chatting"]))
+
+    assert "records only: Just Chatting" in text
+    assert "check failed" in text
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Just Chatting"]}
+
+
+def test_category_stores_the_canonical_platform_name(tmp_path):
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+    ctrl.bind_live_check(FakeTwitchCategories(known={"just chatting": "Just Chatting"}), FakeKickCategories())
+
+    text = asyncio.run(ctrl.handle_category(["twitch:channel1", "just chatting"]))
+
+    assert text == "twitch:channel1 records only: Just Chatting"
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Just Chatting"]}
+
+
+def test_reply_text_channel_submenu_categories(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_reply_text("Channels"))
+    asyncio.run(ctrl.handle_reply_text("• twitch:channel1"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Categories"))
+    assert "Categories for twitch:channel1: all (no filter)" in text
+    assert kb_labels(markup) == ["Clear filter", "Back"]
+    assert menu_of(ctrl).menu == "channel_categories"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Just Chatting, Music"))
+    assert text == "twitch:channel1 records only: Just Chatting, Music"
+    assert read_file(tmp_path)["channel_categories"] == {"twitch:channel1": ["Just Chatting", "Music"]}
+    assert menu_of(ctrl).menu == "channel"
+    assert "Just Chatting, Music" in asyncio.run(ctrl.menu_text("channel", "twitch:channel1"))
+
+
+def test_categories_submenu_clear_and_failed_entry(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    asyncio.run(ctrl.handle_category(["twitch:channel1", "Music"]))
+    menu_of(ctrl).menu, menu_of(ctrl).channel = "channel_categories", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Clear filter"))
+    assert "cleared" in text
+    assert read_file(tmp_path)["channel_categories"] == {}
+    assert menu_of(ctrl).menu == "channel"
+    menu_of(ctrl).menu, menu_of(ctrl).channel = "channel_categories", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("   "))
+    assert text.startswith("❌")
+    assert menu_of(ctrl).menu == "channel_categories"
+    assert read_file(tmp_path)["channel_categories"] == {}
+
+
+def test_back_from_channel_categories_to_channel(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    menu_of(ctrl).menu, menu_of(ctrl).channel = "channel_categories", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("Back"))
+    assert menu_of(ctrl).menu == "channel"
+    assert menu_of(ctrl).channel == "twitch:channel1"
+    assert "Channel: twitch:channel1" in text

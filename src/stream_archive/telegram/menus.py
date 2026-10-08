@@ -98,7 +98,7 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         # Back stays in the first row: a long channel list would push it out of view.
         return _frame([["Back"], ["Add channel"], *([f"{CHANNEL_BUTTON_PREFIX}{ch}"] for ch in c.channels)])
     if menu == "channel":
-        return _frame([["Mode", "Quality"], ["Hold delay", "Remove channel"], ["Back"]])
+        return _frame([["Mode", "Quality", "Categories"], ["Hold delay", "Remove channel"], ["Back"]])
     if menu == "channel_mode":
         ch = state.channel or ""
         mode_override = c.channel_output_modes.get(ch)
@@ -123,6 +123,8 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         rows.append([_mark("Global", quality_override is None)])
         rows.append(["Back"])
         return _frame(rows)
+    if menu == "channel_categories":
+        return _frame([["Clear filter"], ["Back"]])
     if menu == "chat":
         return _frame(
             [
@@ -339,7 +341,11 @@ async def _text_channel(ctrl: TelegramController, state: MenuState) -> str:
     quality_text = q_override or f"global ({c.preferred_quality})"
     hold_override = c.channel_youtube_hold_seconds.get(ch)
     hold_text = f"{hold_override:g}s" if hold_override is not None else f"global ({c.youtube.hold_seconds:g}s)"
-    return f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}"
+    cats = c.channel_categories.get(ch)
+    cats_text = ", ".join(cats) if cats else "all"
+    return (
+        f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}\nCategories: {cats_text}"
+    )
 
 
 async def _text_channel_mode(ctrl: TelegramController, state: MenuState) -> str:
@@ -374,6 +380,18 @@ async def _text_channel_quality(ctrl: TelegramController, state: MenuState) -> s
     return (
         f"Recording quality for {ch}: {q_override or f'global ({c.preferred_quality})'}\n\n"
         "Audio only records sound only. It forces output to disk (no YouTube re-stream)."
+    )
+
+
+async def _text_channel_categories(ctrl: TelegramController, state: MenuState) -> str:
+    c = ctrl._config
+    ch = state.channel or ""
+    cats = c.channel_categories.get(ch)
+    current = ", ".join(cats) if cats else "all (no filter)"
+    return (
+        f"Categories for {ch}: {current}\n\n"
+        "Send comma-separated names to record only those. "
+        "Each name must exist on Twitch or Kick."
     )
 
 
@@ -474,6 +492,7 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "channel_mode": _text_channel_mode,
     "channel_hold": _text_channel_hold,
     "channel_quality": _text_channel_quality,
+    "channel_categories": _text_channel_categories,
     "chat": _text_chat,
     "mode": _text_mode,
     "quality": _text_quality,
@@ -516,6 +535,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "channel_mode": root_menus.menu_channel_mode,
     "channel_hold": root_menus.menu_channel_hold,
     "channel_quality": root_menus.menu_channel_quality,
+    "channel_categories": root_menus.menu_channel_categories,
     "chat": settings_menus.menu_chat,
     "mode": settings_menus.menu_mode,
     "quality": settings_menus.menu_quality,
@@ -546,6 +566,7 @@ PARENT: dict[str, str] = {
     "channel_mode": "channel",
     "channel_hold": "channel",
     "channel_quality": "channel",
+    "channel_categories": "channel",
     "chat": "settings",
     "mode": "settings",
     "quality": "settings",

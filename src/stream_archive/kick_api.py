@@ -206,6 +206,69 @@ class KickAPI:
         rows = sorted(best.values(), key=lambda row: row[2], reverse=True)
         return rows[:limit]
 
+    #: Most unfiltered category pages read during a short-name fallback.
+    #: Short names skip the ``name`` filter (Kick rejects filters under 3
+    #: characters with 400), so the lookup pages the full list instead.
+    _CATEGORY_FALLBACK_PAGES = 3
+
+    async def get_categories_by_names(self, names: list[str]) -> dict[str, str]:
+        """Map each known name (lowercased) to its canonical Kick category name.
+
+        Only exact (case-insensitive) matches count: the endpoint may
+        return partial matches, and those stay out. Unknown names are
+        absent. Empty input makes no request. Names under 3 characters
+        cannot use the ``name`` filter, so they match against the
+        unfiltered list instead.
+        """
+        if not names:
+            return {}
+        headers = await self._headers()
+        wanted = {name.strip().lower() for name in names if name.strip()}
+        found: dict[str, str] = {}
+        queryable = [name for name in names if len(name.strip()) >= 3]
+        for start in range(0, len(queryable), 100):
+            chunk = queryable[start : start + 100]
+            resp = await self._request(
+                "GET",
+                "https://api.kick.com/public/v2/categories",
+                headers=headers,
+                params=[("name", name) for name in chunk] + [("limit", 100)],
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            for item in payload.get("data") or []:
+                name = item.get("name")
+                if isinstance(name, str) and name.lower() in wanted:
+                    found[name.lower()] = name
+        missing = wanted - found.keys()
+        short = {name for name in missing if len(name) < 3}
+        cursor: str | None = None
+        pages = 0
+        # Long names missed the exact filter, so they are unknown. Short
+        # names never reached a filter, so they match against the list.
+        while short and pages < self._CATEGORY_FALLBACK_PAGES:
+            params: list[tuple[str, Any]] = [("limit", 1000)]
+            if cursor:
+                params.append(("cursor", cursor))
+            resp = await self._request(
+                "GET",
+                "https://api.kick.com/public/v2/categories",
+                headers=headers,
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            for item in payload.get("data") or []:
+                name = item.get("name")
+                if isinstance(name, str) and name.lower() in short:
+                    found[name.lower()] = name
+                    short.discard(name.lower())
+            cursor = (payload.get("pagination") or {}).get("next_cursor")
+            pages += 1
+            if not cursor:
+                break
+        return found
+
     async def get_public_key(self, force: bool = False) -> str | None:
         """Return the PEM string used to verify webhook signatures.
 

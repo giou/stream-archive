@@ -27,6 +27,7 @@ class CommandsMixin:
     handle_restart: Any
     handle_update: Any
     handle_quality: Any
+    handle_category: Any
     handle_maxrecordings: Any
     handle_maxyoutube: Any
     handle_disk: Any
@@ -51,6 +52,7 @@ class CommandsMixin:
             BotCommand("restart", "Restart the service"),
             BotCommand("update", "Check for available updates"),
             BotCommand("quality", "Show or set quality (global or per-channel)"),
+            BotCommand("category", "Record only these categories (per-channel)"),
             BotCommand("maxrecordings", "Set concurrent recording limit"),
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
@@ -115,6 +117,11 @@ class CommandsMixin:
             self.handle_quality(context.args or [], chat_id=self._chat_of(update))
         )
         await self._maybe_send_apply_warnings()
+
+    async def _cmd_category(self, update: Any, context: Any) -> None:
+        await update.effective_message.reply_text(
+            await self.handle_category(context.args or [], chat_id=self._chat_of(update))
+        )
 
     async def _cmd_maxrecordings(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(

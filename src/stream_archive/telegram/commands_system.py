@@ -55,6 +55,7 @@ class SystemCommands:
             "/maxrecordings <n> - concurrent recording limit (0 = unlimited)\n"
             "/maxyoutube <n> - concurrent YouTube re-stream limit (0 = unlimited)\n"
             "/quality [channel] <value|default> - preferred stream quality (best, 1080p, ..., audio_only; per-channel override)\n"
+            "/category [channel] <names|default> - record only these Twitch or Kick categories (comma-separated; per-channel)\n"
             "/disk <maxsize|delete_oldest> <value> - set disk limit\n"
             "/disk - show disk limits\n"
             "/chat [on|off] [twitch|kick] - enable or disable live chat recording (add twitch or kick for one platform; off stops in-flight capture)\n"
@@ -87,6 +88,14 @@ class SystemCommands:
             per_channel_q = (
                 "Per-channel quality: "
                 + _status_list([f"{ch} \u2192 {q}" for ch, q in sorted(q_overrides.items())])
+                + "\n"
+            )
+        cat_overrides = c.channel_categories
+        per_channel_cats = ""
+        if cat_overrides:
+            per_channel_cats = (
+                "Per-channel categories: "
+                + _status_list([f"{ch} \u2192 {', '.join(cats)}" for ch, cats in sorted(cat_overrides.items())])
                 + "\n"
             )
         rec_parts = []
@@ -126,6 +135,7 @@ class SystemCommands:
             f"Output mode: {c.output_mode}\n"
             f"{per_channel}"
             f"{per_channel_q}"
+            f"{per_channel_cats}"
             f"{retention}\n"
             f"Chat recording: {chat_state}\n"
             f"Kick chat recording: {'enabled' if k.record_chat else 'disabled'}\n"

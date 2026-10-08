@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from stream_archive.config import AppConfig, bare_name, is_kick_channel
+from stream_archive.config import AppConfig, bare_name, category_allowed, is_kick_channel
 from stream_archive.health import clear_degraded, set_degraded
 
 if TYPE_CHECKING:
@@ -90,10 +90,16 @@ class Monitor:
                             # Fail-open. The stream may resolve next tick.
                             logger.warning("[monitor] Got stream for unknown user %s, skipping", user_id)
                             continue
+                        game = stream.get("game_name")
+                        if not category_allowed(config, channel, game):
+                            logger.info("[monitor] %s live in category %r, not in filter - skipping", channel, game)
+                            if channel in self._live_channels:
+                                await self._ensure_stopped(channel, config)
+                            continue
                         await self._ensure_recording(
                             channel,
                             stream.get("title"),
-                            stream.get("game_name"),
+                            game,
                             user_id,
                             config,
                         )
@@ -139,7 +145,13 @@ class Monitor:
                             await self._ensure_stopped(ch, config)
                     elif status.get("is_live"):
                         # Fail-closed. A payload without is_live counts as offline.
-                        await self._ensure_recording(ch, status.get("title"), status.get("game"), None, config)
+                        game = status.get("game")
+                        if not category_allowed(config, ch, game):
+                            logger.info("[monitor] %s live in category %r, not in filter - skipping", ch, game)
+                            if ch in self._live_channels:
+                                await self._ensure_stopped(ch, config)
+                            continue
+                        await self._ensure_recording(ch, status.get("title"), game, None, config)
                     elif ch in self._live_channels:
                         await self._ensure_stopped(ch, config)
 
@@ -148,6 +160,11 @@ class Monitor:
     ) -> None:
         """EventSub stream.online entry point."""
         if channel not in config.channels:
+            return
+        if not category_allowed(config, channel, game):
+            logger.info("[monitor] %s live in category %r, not in filter - skipping", channel, game)
+            if channel in self._live_channels:
+                await self._ensure_stopped(channel, config)
             return
         await self._ensure_recording(channel, title, game, user_id, config)
 

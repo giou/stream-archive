@@ -40,6 +40,7 @@ Two blocks need extra steps:
 ## Features
 
 - **Channels.** One settings file covers both platforms. A name is `twitch:<name>` or `kick:<slug>`.
+- **Category filters.** A channel records only while its live Twitch or Kick category is in its list. A channel without a list records every live stream.
 - **Output modes.** `disk` writes `.ts` files (`.m4a` for audio-only). `youtube` restreams to a YouTube broadcast. `both` runs disk and `youtube` together.
 - **Chat recording.** Twitch IRC chat and Kick webhook chat land in TwitchDownloader-compatible JSON. See [Chat recording](docs/chat-recording.md).
 - **Retention and disk cap.** Old files expire after `retention_days`. An optional `disk.max_total_gb` cap deletes the oldest files or stops new recordings.

@@ -70,6 +70,8 @@ class SettingsCommands:
     _recorder: Any
     _eventsub: Any
     _kick_webhook: Any
+    _twitch_api: Any
+    _kick_api: Any
     _admin_id: int
     #: Provided by the other mixins of the controller that composes this one.
     rebind_admin: Any
@@ -258,6 +260,116 @@ class SettingsCommands:
 
             return self._apply_quality(mutate, f"Quality for {ch} set to {q}", chat_id)
         return "Usage: /quality <best|1080p|720p|...> or /quality <channel> <quality|default>"
+
+    async def handle_category(self, args: list[str], chat_id: int | None = None) -> str:
+        """Show or set the per-channel category filter.
+
+        With no args the reply lists every filter. With a channel it shows
+        that channel. With a channel and names it sets the filter. The
+        names are comma-separated, so multi-word names keep working:
+        ``/category twitch:foo Just Chatting, Music``. ``default`` clears it.
+        Each name must exist on the channel platform: unknown names refuse
+        the whole change, so a typo never leaves a filter that matches
+        nothing.
+        """
+        from stream_archive.config import MAX_CATEGORIES_PER_CHANNEL, MAX_CATEGORY_LEN
+
+        c = self._config
+        if not args:
+            if not c.channel_categories:
+                return "No category filter is set. The app records every live stream."
+            lines = [f"{ch} \u2192 {', '.join(cats)}" for ch, cats in sorted(c.channel_categories.items())]
+            return "Category filters:\n" + "\n".join(lines)
+        ch, err = self._resolve_channel_arg(args[0])
+        if ch is None:
+            return err
+        if len(args) == 1:
+            cats = c.channel_categories.get(ch)
+            if not cats:
+                return f"{ch} has no category filter. The app records every live stream."
+            return f"{ch} records only: {', '.join(cats)}"
+        rest = " ".join(args[1:]).strip()
+        if rest.lower() in ("default", "clear", "off"):
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.channel_categories.pop(ch, None)
+
+            return cast(
+                str,
+                self._apply(
+                    mutate,
+                    lambda _candidate: f"Category filter for {ch} cleared. The app records every live stream.",
+                    chat_id,
+                ),
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for part in rest.split(","):
+            name = part.strip()
+            if not name:
+                continue
+            if len(name) > MAX_CATEGORY_LEN:
+                return f"\u274c {name!r} is longer than 100 characters"
+            if name.lower() == "default":
+                return "\u274c 'default' clears a filter, so it is not a value"
+            if name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append(name)
+        if not out:
+            return "\u274c Give at least one category, or 'default' to clear it"
+        if len(out) > MAX_CATEGORIES_PER_CHANNEL:
+            return "\u274c Give at most 50 categories"
+        to_store, note = await self._verify_categories(ch, out)
+        if to_store is None:
+            # note holds the refusal: unknown names, and the file is untouched.
+            return cast(str, note)
+
+        def set_cats(candidate: AppConfig, out: list[str] = to_store) -> None:
+            candidate.channel_categories[ch] = list(out)
+
+        text = cast(str, self._apply(set_cats, lambda _candidate: f"{ch} records only: {', '.join(to_store)}", chat_id))
+        return text if note is None else f"{text}\n{note}"
+
+    async def _verify_categories(self, channel: str, names: list[str]) -> tuple[list[str] | None, str | None]:
+        """Check category names against the channel platform.
+
+        Returns ``(to_store, note)``. ``to_store`` holds the canonical
+        platform names, or the typed names when no API client exists.
+        ``None`` refuses the change, and ``note`` is the refusal. A
+        transport failure stores the typed names with a warning: the
+        filter then matches nothing until the names are fixed, and the
+        poll loop keeps the recordings stopped.
+        """
+        twitch_api = self._twitch_api
+        kick_api = self._kick_api
+        api = kick_api if is_kick_channel(channel) else twitch_api
+        if api is None:
+            return list(names), None
+        try:
+            if is_kick_channel(channel):
+                known = await kick_api.get_categories_by_names(names)
+                unknown = [name for name in names if name.lower() not in known]
+                hints: dict[str, list[str]] = {}
+            else:
+                known = await twitch_api.get_games_by_names(names)
+                unknown = [name for name in names if name.lower() not in known]
+                hints = {}
+                for name in unknown:
+                    try:
+                        hints[name] = (await twitch_api.search_categories(name))[:3]
+                    except Exception:
+                        hints[name] = []
+        except Exception as e:
+            logger.warning("[telegram] Category check failed for %s: %s", channel, e)
+            return list(names), f"\u26a0\ufe0f Saved as typed: the category check failed ({e})."
+        if not unknown:
+            return [known[name.lower()] for name in names], None
+        parts = []
+        for name in unknown:
+            options = hints.get(name, [])
+            parts.append(f"{name!r} (did you mean: {', '.join(options)})" if options else repr(name))
+        return None, f"\u274c Unknown category: {', '.join(parts)}. Nothing saved."
 
     def _set_count(self, field: str, label: str, usage: str, args: list[str], chat_id: int | None) -> str:
         """Show or set one concurrency count of the config.

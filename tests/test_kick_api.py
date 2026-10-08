@@ -522,3 +522,62 @@ def test_top_v2_dedups_overlapping_pages(monkeypatch):
         return await api.get_top_livestreams()
 
     assert asyncio.run(scenario()) == [("dup", 3, 7000), ("old", 4, 100)]
+
+
+def test_get_categories_by_names_keeps_exact_matches_only():
+    def handler(request):
+        assert request.url.path == "/public/v2/categories"
+        assert request.headers["Authorization"] == "Bearer tok-1"
+        names = [v for k, v in request.url.params.multi_items() if k == "name"]
+        assert names == ["Just Chatting", "Music"]
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": 1, "name": "Just Chatting"}, {"id": 2, "name": "Just Chatting 2"}],
+                "message": "",
+                "pagination": {},
+            },
+        )
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_categories_by_names(["Just Chatting", "Music"])) == {"just chatting": "Just Chatting"}
+
+
+def test_get_categories_by_names_empty_list_makes_no_request():
+    def token(request):
+        pytest.fail(f"unexpected token fetch: {request.method} {request.url}")
+
+    api = make_api(token=token)
+    assert asyncio.run(api.get_categories_by_names([])) == {}
+
+
+def test_get_categories_by_names_short_name_uses_the_unfiltered_fallback():
+    requests = []
+
+    def handler(request):
+        assert request.url.path == "/public/v2/categories"
+        params = dict(request.url.params.multi_items())
+        requests.append(params)
+        if "name" in params:
+            assert params["name"] == "IRL"
+            return httpx.Response(200, json={"data": [{"id": 1, "name": "IRL"}], "message": "", "pagination": {}})
+        return httpx.Response(
+            200,
+            json={"data": [{"id": 9, "name": "IR"}], "message": "", "pagination": {}},
+        )
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_categories_by_names(["IRL", "IR"])) == {"irl": "IRL", "ir": "IR"}
+    assert [r.get("name") for r in requests] == ["IRL", None]
+
+
+def test_get_categories_by_names_unknown_short_name_reads_one_page_only():
+    requests = []
+
+    def handler(request):
+        requests.append(1)
+        return httpx.Response(200, json={"data": [{"id": 1, "name": "IRL"}], "message": "", "pagination": {}})
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_categories_by_names(["ZZ"])) == {}
+    assert len(requests) == 1

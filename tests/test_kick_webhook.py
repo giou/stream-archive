@@ -1717,3 +1717,78 @@ def test_verify_delivery_rejects_a_second_run(keypair):
     assert (second_ok, second_msg) == (False, "A delivery test already runs.")
     assert first_ok is True
     assert api.deleted == [["sub-999-0", "sub-999-1"]]  # one test, one cleanup
+
+
+def test_live_event_with_filter_looks_up_the_live_category(keypair):
+    """A filtered channel gets its live category from the status lookup.
+
+    The event body carries no category, so the webhook fills it. The
+    monitor then decides. The lookup runs only for filtered channels.
+    """
+    private_key, public_pem = keypair
+
+    class StatusAPI(FakeKickAPI):
+        def __init__(self):
+            super().__init__(public_pem)
+            self.slugs = []
+
+        async def get_channel_statuses(self, slugs):
+            self.slugs.append(list(slugs))
+            return {"xqc": {"title": "T", "game": "Just Chatting", "is_live": True, "broadcaster_user_id": 123}}
+
+    api = StatusAPI()
+    monitor = FakeMonitor()
+    config = base_config()
+    config["channel_categories"] = {"kick:xqc": ["Just Chatting"]}
+    wh = make_webhook(config=config, monitor=monitor, api=api)
+
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
+
+    assert api.slugs == [["xqc"]]
+    assert len(monitor.online) == 1
+    channel, title, game, user_id, _cfg = monitor.online[0]
+    assert channel == "kick:xqc"
+    assert game == "Just Chatting"
+
+
+def test_live_event_with_filter_passes_a_blocked_category_to_the_monitor(keypair):
+    """A blocked category still reaches the monitor with its name.
+
+    The monitor owns the filter decision (see test_monitor). The webhook
+    contract is only that it does not pass None, which would hide the miss.
+    """
+    private_key, public_pem = keypair
+
+    class StatusAPI(FakeKickAPI):
+        async def get_channel_statuses(self, slugs):
+            return {"xqc": {"title": "T", "game": "Music", "is_live": True, "broadcaster_user_id": 123}}
+
+    monitor = FakeMonitor()
+    config = base_config()
+    config["channel_categories"] = {"kick:xqc": ["Just Chatting"]}
+    wh = make_webhook(config=config, monitor=monitor, api=StatusAPI(public_pem))
+
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
+
+    assert len(monitor.online) == 1
+    assert monitor.online[0][2] == "Music"
+
+
+def test_live_event_with_filter_lookup_failure_starts_nothing(keypair):
+    """A failed lookup delivers nothing: the poll loop retries it."""
+    private_key, public_pem = keypair
+
+    class FailingAPI(FakeKickAPI):
+        async def get_channel_statuses(self, slugs):
+            msg = "boom"
+            raise RuntimeError(msg)
+
+    monitor = FakeMonitor()
+    config = base_config()
+    config["channel_categories"] = {"kick:xqc": ["Just Chatting"]}
+    wh = make_webhook(config=config, monitor=monitor, api=FailingAPI(public_pem))
+
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
+
+    assert monitor.online == []
+    assert monitor.offline == []

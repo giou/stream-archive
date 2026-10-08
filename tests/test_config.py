@@ -836,3 +836,41 @@ def test_save_does_not_follow_a_symlink_at_the_temp_path(tmp_path):
     assert target.read_text() == "original"
     assert not (tmp_path / "config.json.tmp").exists()
     assert read_file(tmp_path)["bot_telegram_api"] == "bot_token"
+
+
+def test_channel_categories_normalized_trimmed_and_deduped():
+    config = build(channel_categories={"channel1": ["  Just Chatting ", "just chatting", "Music"]})
+    assert config.channel_categories == {"twitch:channel1": ["Just Chatting", "Music"]}
+
+
+@pytest.mark.parametrize(
+    "value,match",
+    [
+        ({"channel1": []}, "at least one category"),
+        ({"channel1": ["  "]}, "non-empty category names"),
+        ({"channel1": ["default"]}, "'default' clears an override"),
+        ({"channel1": ["DEFAULT"]}, "'default' clears an override"),
+        ({"channel1": ["x" * 101]}, "longer than 100 characters"),
+        ({"channel1": "Just Chatting"}, "valid list"),
+        ({"channel1": [f"game-{n}" for n in range(51)]}, "at most 50 categories"),
+        ({"bad name!": ["Music"]}, "Invalid channel name in channel_categories"),
+    ],
+)
+def test_invalid_channel_categories_raise(value, match):
+    with pytest.raises(ValueError, match=match):
+        build(channel_categories=value)
+
+
+def test_category_allowed_match_is_case_insensitive_and_fail_closed():
+    from stream_archive.config import category_allowed, effective_categories
+
+    config = build(channel_categories={"channel1": ["Just Chatting"]})
+    assert category_allowed(config, "twitch:channel1", "just chatting") is True
+    assert category_allowed(config, "twitch:channel1", "  Just Chatting ") is True
+    assert category_allowed(config, "twitch:channel1", "Music") is False
+    assert category_allowed(config, "twitch:channel1", "") is False
+    assert category_allowed(config, "twitch:channel1", None) is False
+    assert category_allowed(config, "twitch:other", "Music") is True
+    assert category_allowed(config, "twitch:other", None) is True
+    assert effective_categories(config, "twitch:channel1") == ["Just Chatting"]
+    assert effective_categories(config, "twitch:other") is None

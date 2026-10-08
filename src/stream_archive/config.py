@@ -100,6 +100,40 @@ def effective_quality(config: AppConfig, channel: str) -> str:
     return config.channel_preferred_qualities.get(channel, config.preferred_quality)
 
 
+#: Longest accepted category name, in characters. Twitch and Kick names
+#: are short. The bound keeps a typo from storing a paragraph.
+MAX_CATEGORY_LEN = 100
+
+#: Most categories stored for one channel. The bound keeps the config
+#: file small and the match loop cheap.
+MAX_CATEGORIES_PER_CHANNEL = 50
+
+
+def effective_categories(config: AppConfig, channel: str) -> list[str] | None:
+    """Category filter of a channel, or None when it records everything."""
+    cats = config.channel_categories.get(channel)
+    return list(cats) if cats is not None else None
+
+
+def category_allowed(config: AppConfig, channel: str, category: str | None) -> bool:
+    """True when the channel records the given category.
+
+    A channel without a filter records every category. A channel with a
+    filter records only its listed categories. The match ignores case
+    and edge spaces. A missing or blank category never matches a filter.
+    """
+    allowed = config.channel_categories.get(channel)
+    if not allowed:
+        return True
+    if category is None:
+        return False
+    name = category.strip()
+    if not name:
+        return False
+    lowered = name.lower()
+    return any(entry.lower() == lowered for entry in allowed)
+
+
 def normalize_channel_name(name: str) -> str | None:
     """Canonical monitored-channel identity, or None when invalid.
 
@@ -329,6 +363,7 @@ class AppConfig(BaseModel):
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, NonNegativeFloat] = {}
     channel_preferred_qualities: dict[str, str] = {}
+    channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
@@ -408,6 +443,43 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_hold_keys(cls, v: dict[str, NonNegativeFloat]) -> dict[str, NonNegativeFloat]:
         return _normalize_channel_map(v, "channel_youtube_hold_seconds")
+
+    @field_validator("channel_categories")
+    @classmethod
+    def _normalize_category_keys(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        cleaned: dict[str, list[str]] = {}
+        for raw_key, raw_cats in v.items():
+            if not isinstance(raw_cats, list):
+                msg = f"channel_categories.{raw_key} must be a list of category names"
+                raise ValueError(msg)
+            seen: set[str] = set()
+            out: list[str] = []
+            for entry in raw_cats:
+                if not isinstance(entry, str):
+                    msg = f"channel_categories.{raw_key} must hold strings only"
+                    raise ValueError(msg)
+                name = entry.strip()
+                if not name:
+                    msg = f"channel_categories.{raw_key} must hold non-empty category names"
+                    raise ValueError(msg)
+                if len(name) > MAX_CATEGORY_LEN:
+                    msg = f"channel_categories.{raw_key}: {name!r} is longer than 100 characters"
+                    raise ValueError(msg)
+                if name.lower() == "default":
+                    msg = f"channel_categories.{raw_key}: 'default' clears an override, so it is not a value"
+                    raise ValueError(msg)
+                if name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                out.append(name)
+            if not out:
+                msg = f"channel_categories.{raw_key} must hold at least one category"
+                raise ValueError(msg)
+            if len(out) > MAX_CATEGORIES_PER_CHANNEL:
+                msg = f"channel_categories.{raw_key} must hold at most 50 categories"
+                raise ValueError(msg)
+            cleaned[raw_key] = out
+        return _normalize_channel_map(cleaned, "channel_categories")
 
     @field_validator("timezone")
     @classmethod

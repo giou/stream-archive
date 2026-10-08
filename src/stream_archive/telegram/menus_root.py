@@ -100,6 +100,8 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
         return await open_menu(ctrl, "channel_hold", chat_id, channel=ch)
     if text == "Quality":
         return await open_menu(ctrl, "channel_quality", chat_id, channel=ch)
+    if text == "Categories":
+        return await open_menu(ctrl, "channel_categories", chat_id, channel=ch)
     return None
 
 
@@ -162,3 +164,26 @@ async def menu_channel_quality(ctrl: TelegramController, chat_id: ChatId, text: 
         chat_id,
         global_value="default",
     )
+
+
+async def menu_channel_categories(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route typed category names or the clear button for one channel.
+
+    Any other text is comma-separated category names. A refused change
+    stays on this menu, so the admin can fix the names at once.
+    """
+    state = ctrl._state_for(chat_id)
+    ch = state.channel or ""
+    gone = _channel_gone(ctrl, state)
+    if gone is not None:
+        ctrl._enter_menu(chat_id, "channels")
+        return gone, ctrl.reply_keyboard("channels", chat_id=chat_id)
+    if text == "Clear filter":
+        result = await ctrl.handle_category([ch, "default"], chat_id=chat_id)
+        ctrl._enter_menu(chat_id, "channel")
+        return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
+    result = await ctrl.handle_category([ch, text], chat_id=chat_id)
+    if is_error(result):
+        return result, ctrl.reply_keyboard("channel_categories", chat_id=chat_id)
+    ctrl._enter_menu(chat_id, "channel")
+    return result, ctrl.reply_keyboard("channel", chat_id=chat_id)

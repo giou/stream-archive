@@ -1174,3 +1174,79 @@ def test_api_key_show_empty_and_disabled(tmp_path):
 
     # Key auth sees nothing while disabled; the panel session still manages keys.
     assert asyncio.run(off_scenario()) == (404, 404, 200)
+
+
+def test_patch_channel_sets_clears_and_lists_categories(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path, channels=("twitch:channel1",))
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            set_resp = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"categories": ["Just Chatting", "Music"]},
+                headers=auth(),
+            )
+            set_body = await set_resp.json()
+            one = await (await client.get("/api/v1/channels/twitch:channel1", headers=auth())).json()
+            bad = await client.patch("/api/v1/channels/twitch:channel1", json={"categories": []}, headers=auth())
+            cleared = await client.patch(
+                "/api/v1/channels/twitch:channel1", json={"categories": "default"}, headers=auth()
+            )
+            return set_resp.status, set_body, one, bad.status, cleared.status
+
+    set_status, body, one, bad_status, cleared_status = asyncio.run(scenario())
+    assert set_status == 200
+    assert body["applied"]["categories"] == "twitch:channel1 records only: Just Chatting, Music"
+    assert one["categories"] == ["Just Chatting", "Music"]
+    assert one["categories_override"] == ["Just Chatting", "Music"]
+    assert bad_status == 400
+    assert cleared_status == 200
+    assert config.channel_categories == {}
+
+
+class FakeTwitchCategories:
+    """Twitch category lookup with a fixed known set."""
+
+    def __init__(self, known=None):
+        self.known = {k.lower(): v for k, v in (known or {}).items()}
+
+    async def get_games_by_names(self, names):
+        return {name.lower(): self.known[name.lower()] for name in names if name.lower() in self.known}
+
+    async def search_categories(self, query):
+        return []
+
+
+class FakeKickCategories:
+    """Kick category lookup with a fixed known set."""
+
+    def __init__(self, known=None):
+        self.known = {k.lower(): v for k, v in (known or {}).items()}
+
+    async def get_categories_by_names(self, names):
+        return {name.lower(): self.known[name.lower()] for name in names if name.lower() in self.known}
+
+
+def test_patch_channel_rejects_unknown_categories(tmp_path):
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path, channels=("twitch:channel1",))
+    ctrl.bind_live_check(FakeTwitchCategories({"Just Chatting": "Just Chatting"}), FakeKickCategories())
+    before = read_file(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            bad = await client.patch(
+                "/api/v1/channels/twitch:channel1", json={"categories": ["No Such Game"]}, headers=auth()
+            )
+            bad_body = await bad.json()
+            after_bad = read_file(tmp_path)
+            good = await client.patch(
+                "/api/v1/channels/twitch:channel1", json={"categories": ["just chatting"]}, headers=auth()
+            )
+            return bad.status, bad_body, after_bad, good.status, await good.json()
+
+    bad_status, bad_body, after_bad, good_status, good_body = asyncio.run(scenario())
+    assert bad_status == 400
+    assert "Unknown category" in bad_body["errors"]["categories"]
+    assert after_bad == before
+    assert good_status == 200
+    assert config.channel_categories == {"twitch:channel1": ["Just Chatting"]}

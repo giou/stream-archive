@@ -894,3 +894,73 @@ def test_removing_all_channels_clears_stale_auth_flags():
     finally:
         clear_degraded("twitch_auth")
         clear_degraded("kick_auth")
+
+
+def test_twitch_category_filter_skips_disallowed_live_stream():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "Music"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = make_config(channel_categories={"twitch:ch": ["Just Chatting"]})
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.started == []
+    assert "twitch:ch" not in mon._live_channels
+
+
+def test_twitch_category_filter_starts_allowed_stream():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "just chatting"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = make_config(channel_categories={"twitch:ch": ["Just Chatting"]})
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.started == ["twitch:ch"]
+
+
+def test_twitch_category_change_stops_live_recording():
+    rec = FakeRecorder()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "Just Chatting"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec)
+    config = make_config(channel_categories={"twitch:ch": ["Just Chatting"]})
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+    assert rec.started == ["twitch:ch"]
+    api.streams = {"u1": {"title": "T", "game_name": "Music"}}
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.stopped == ["twitch:ch"]
+    assert "twitch:ch" not in mon._live_channels
+
+
+def test_kick_category_filter_skips_and_stops():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = make_config(
+        channels=["kick:xqc"],
+        channel_categories={"kick:xqc": ["Just Chatting"]},
+        kick={"client_id": "c", "client_secret": "s"},
+    )
+    live_allowed = {"xqc": {"title": "T", "game": "Just Chatting", "is_live": True, "broadcaster_user_id": 1}}
+    live_blocked = {"xqc": {"title": "T", "game": "Music", "is_live": True, "broadcaster_user_id": 1}}
+
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(statuses=live_blocked), config))
+    assert rec.started == []
+
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(statuses=live_allowed), config))
+    assert rec.started == ["kick:xqc"]
+
+    asyncio.run(mon.check_channels(FakeTwitchAPI(), FakeKickAPI(statuses=live_blocked), config))
+    assert rec.stopped == ["kick:xqc"]
+
+
+def test_handle_online_respects_category_filter():
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = make_config(channel_categories={"twitch:ch": ["Just Chatting"]})
+
+    asyncio.run(mon.handle_online("twitch:ch", "T", "Music", "u1", config))
+    assert rec.started == []
+    asyncio.run(mon.handle_online("twitch:ch", "T", "Just Chatting", "u1", config))
+    assert rec.started == ["twitch:ch"]

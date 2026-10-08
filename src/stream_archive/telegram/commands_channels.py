@@ -104,6 +104,7 @@ class ChannelsCommands:
             candidate.channel_output_modes.pop(ch, None)
             candidate.channel_youtube_hold_seconds.pop(ch, None)
             candidate.channel_preferred_qualities.pop(ch, None)
+            candidate.channel_categories.pop(ch, None)
 
         result: str = self._apply(mutate, lambda c: f"Removed {ch} - {len(c.channels)} channel(s) monitored", chat_id)
         if is_error(result):

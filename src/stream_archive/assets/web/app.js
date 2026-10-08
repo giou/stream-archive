@@ -530,6 +530,35 @@ async function loadChannels() {
       });
       hField.appendChild(holdInput);
       li.appendChild(hField);
+      const cField = document.createElement("label");
+      cField.className = "field";
+      const cCaption = document.createElement("span");
+      cCaption.textContent = "Categories (comma-separated, blank means all)";
+      cField.appendChild(cCaption);
+      const catInput = document.createElement("input");
+      const catOverride = ch.categories_override !== null && ch.categories_override !== undefined
+        ? ch.categories_override
+        : ch.categories;
+      catInput.value = Array.isArray(catOverride) ? catOverride.join(", ") : "";
+      catInput.placeholder = "all";
+      catInput.size = 24;
+      catInput.setAttribute("aria-label", "Categories for " + ch.channel);
+      catInput.addEventListener("change", async () => {
+        try {
+          const raw = catInput.value.trim();
+          const v = raw === "" ? "default" : raw.split(",").map((s) => s.trim()).filter((s) => s !== "");
+          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
+            method: "PATCH",
+            body: JSON.stringify({ categories: v }),
+          });
+          toast("Categories saved");
+        } catch (e) {
+          toast(String(e.message || e), true);
+        }
+        loadChannels();
+      });
+      cField.appendChild(catInput);
+      li.appendChild(cField);
       const wrap = document.createElement("div");
       wrap.className = "row-actions";
       wrap.appendChild(actionBtn("Remove", "danger", async () => {

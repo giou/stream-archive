@@ -304,3 +304,44 @@ def test_create_eventsub_subscription_raises_for_an_unhandled_status():
             await api.client.aclose()
 
     asyncio.run(scenario())
+
+
+def test_get_games_by_names_maps_exact_names_only():
+    def handler(request):
+        assert_auth_headers(request)
+        assert request.url.path == "/helix/games"
+        names = [v for k, v in request.url.params.multi_items() if k == "name"]
+        assert names == ["Just Chatting", "Nope"]
+        return httpx.Response(200, json={"data": [{"id": "509658", "name": "Just Chatting", "box_art_url": ""}]})
+
+    api = make_api(handler)
+
+    async def scenario():
+        try:
+            assert await api.get_games_by_names(["Just Chatting", "Nope"]) == {"just chatting": "Just Chatting"}
+            assert await api.get_games_by_names([]) == {}
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_search_categories_returns_names_in_order():
+    def handler(request):
+        assert_auth_headers(request)
+        assert request.url.path == "/helix/search/categories"
+        assert request.url.params["query"] == "Just Chat"
+        return httpx.Response(
+            200, json={"data": [{"id": "509658", "name": "Just Chatting"}, {"id": "123", "name": "Just Chatting 2"}]}
+        )
+
+    api = make_api(handler)
+
+    async def scenario():
+        try:
+            assert await api.search_categories("Just Chat") == ["Just Chatting", "Just Chatting 2"]
+            assert await api.search_categories("   ") == []
+        finally:
+            await api.client.aclose()
+
+    asyncio.run(scenario())

@@ -75,6 +75,7 @@ _OWNED_FIELDS: dict[str, frozenset[str]] = {
     "channel_mode": frozenset({"channel"}),
     "channel_hold": frozenset({"channel"}),
     "channel_quality": frozenset({"channel"}),
+    "channel_categories": frozenset({"channel"}),
     # The custom menu waits for a value, so it owns the pending key. It keeps
     # the channel: the channel_hold key names the channel to change.
     "custom": frozenset({"channel", "custom"}),

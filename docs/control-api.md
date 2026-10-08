@@ -174,13 +174,15 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
       "quality": "best",
       "quality_override": null,
       "youtube_hold_seconds": 0.0,
-      "youtube_hold_seconds_override": null
+      "youtube_hold_seconds_override": null,
+      "categories": null,
+      "categories_override": null
     }
   ]
 }
 ```
 
-The fields without `_override` are the values that the monitor uses. A value with `_override` applies to that channel alone. `null` means "use the global setting".
+The fields without `_override` are the values that the monitor uses. A value with `_override` applies to that channel alone. `null` means "use the global setting". `categories` has no global setting: `null` means the channel records every live stream.
 
 ### Add
 
@@ -202,6 +204,7 @@ The control API takes a channel name with a platform prefix or a profile URL (`h
 | `output_mode` | `disk`, `youtube`, `both`, `default` | Output override for this channel. `default` clears the override |
 | `quality` | `best`, `1080p`, `720p`, `480p`, `360p`, `audio_only`, `default` | Quality override. `default` clears the override |
 | `youtube_hold_seconds` | whole number ≥ 0, or `"default"` | Keep the YouTube broadcast open this long after the source stops. `"default"` clears the override |
+| `categories` | list of names, or `"default"` | Record only these Twitch or Kick categories. `["Just Chatting", "Music"]` records those two. Each name must exist on the platform: an unknown name refuses the whole change. `"default"` clears the filter and records every live stream |
 
 ```sh
 curl -X PATCH https://streamarchive.example.com/api/v1/channels/twitch:example \
