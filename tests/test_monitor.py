@@ -51,6 +51,7 @@ class FakeRecorder:
         # live recordings, keyed by channel like Recorder._recordings.
         self._recording = {}
         self._ended_clean = {}  # channel -> monotonic end time (mirrors Recorder)
+        self._ended_clean_path = {}  # channel -> final filepath (mirrors Recorder)
         self.snapshot = {
             "free_gb": 100.0,
             "total_fs_gb": 500.0,
@@ -90,6 +91,9 @@ class FakeRecorder:
 
     async def disk_snapshot(self):
         return self.snapshot
+
+    def pop_ended_clean_path(self, channel):
+        return self._ended_clean_path.pop(channel, None)
 
     async def delete_oldest_to_cap(self):
         self.delete_oldest_calls.append(1)
@@ -496,6 +500,87 @@ def test_handle_offline_ignores_when_not_live():
 
     assert rec.stopped == []
     assert notifier.offline == []
+
+
+def test_handle_offline_calls_on_stopped_hook_with_filepath():
+    """A clean stop hands the finished file to the auto-upload hook."""
+
+    async def stop_with_file(channel):
+        rec.stopped.append(channel)
+        return {"file_info": {"name": "f.mp4"}, "youtube_info": None, "filepath": "/data/f.mp4"}
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    calls = []
+
+    async def hook(channel, filepath):
+        calls.append((channel, filepath))
+
+    mon.on_stopped = hook
+    rec.stop = stop_with_file  # type: ignore[method-assign]
+
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_offline("twitch:ch", config))
+
+    assert calls == [("twitch:ch", "/data/f.mp4")]
+    assert len(notifier.offline) == 1
+
+
+def test_handle_offline_hook_failure_keeps_offline_notify():
+    """A failing auto-upload hook must not drop the offline notification."""
+
+    async def stop_with_file(channel):
+        return {"file_info": {"name": "f.mp4"}, "youtube_info": None, "filepath": "/data/f.mp4"}
+
+    async def boom(channel, filepath):
+        msg = "hook failed"
+        raise RuntimeError(msg)
+
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    mon.on_stopped = boom
+    rec.stop = stop_with_file  # type: ignore[method-assign]
+
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+    asyncio.run(mon.handle_offline("twitch:ch", config))
+
+    assert len(notifier.offline) == 1
+
+
+def test_handle_offline_uses_remembered_clean_path():
+    """Offline after a clean feed end still hands the file to the hook.
+
+    The feed that ends on its own releases its entry before the offline
+    event arrives, so stop() answers None. The remembered clean-end path
+    fills that gap, exactly once.
+    """
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config()
+    calls = []
+
+    async def hook(channel, filepath):
+        calls.append((channel, filepath))
+
+    async def stop_gone(channel):
+        rec.stopped.append(channel)
+        return None
+
+    mon.on_stopped = hook
+    rec.stop = stop_gone  # type: ignore[method-assign]
+
+    asyncio.run(mon.handle_online("twitch:ch", "T", "G", "u1", config))
+    rec._ended_clean_path["twitch:ch"] = "/data/f.mp4"
+    asyncio.run(mon.handle_offline("twitch:ch", config))
+
+    assert calls == [("twitch:ch", "/data/f.mp4")]
+    assert len(notifier.offline) == 1
+    assert rec.pop_ended_clean_path("twitch:ch") is None
 
 
 def test_poll_and_event_lock_same_channel():

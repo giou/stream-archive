@@ -600,6 +600,36 @@ def test_clean_task_end_removes_entry_and_ends_broadcast(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_clean_end_flag_set_before_finalize(tmp_path, monkeypatch):
+    """A clean task end flags the clean end before the finalize completes.
+
+    The remux of a large file takes seconds. The monitor tick runs in
+    that window and must see the clean end. Otherwise it restarts a dead
+    feed and sends a start-failure alert for a stream that just ended.
+    """
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_finalize(channel, entry, chat_recorder):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(rec, "_finalize_entry", gated_finalize)
+
+    async def scenario():
+        task = seed_finished_entry(rec)
+        await asyncio.wait_for(entered.wait(), 5.0)
+        assert not rec.is_recording("ch")
+        assert rec.ended_clean("ch")
+        release.set()
+        await wait_until(lambda: not rec._bg_tasks)
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
     """A task that ends with an exception must not look like a clean end.
 
@@ -639,6 +669,67 @@ def test_clean_end_latch_expires_after_grace(tmp_path):
     rec._ended_clean["ch"] = time.monotonic() - _ENDED_CLEAN_GRACE_S - 1
     assert not rec.ended_clean("ch")  # expired -> monitor restarts instead of suppressing
     assert "ch" not in rec._ended_clean  # expired entries are lazily popped
+    assert rec.pop_ended_clean_path("ch") is None  # expiry drops the path too
+
+
+def test_clean_end_remembers_final_filepath_and_pops_once(tmp_path, monkeypatch):
+    """A clean task end remembers the finalized path for the monitor hook.
+
+    The feed that ends on its own releases its entry before the offline
+    event arrives, so stop() answers None. Without the remembered path the
+    auto-upload hook would never fire on that path.
+    """
+    rec = Recorder(make_config(tmp_path))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        target = tmp_path / "f.mp4"
+        target.write_bytes(b"x" * 10)
+        task = seed_finished_entry(rec, filepath=str(target), mode="disk")
+        await task
+        await wait_until(lambda: "ch" not in rec._recordings)
+        assert rec.pop_ended_clean_path("ch") == str(target)
+        assert rec.pop_ended_clean_path("ch") is None  # each path hands out once
+
+    asyncio.run(scenario())
+
+
+def test_live_stop_and_start_discard_remembered_path(tmp_path, monkeypatch):
+    """A live stop or a new start supersedes a remembered clean end."""
+    rec = make_recorder(tmp_path, monkeypatch, output_mode="disk")
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        rec._ended_clean_path["ch"] = "/old.mp4"
+        await rec.stop("ch")
+        assert rec.pop_ended_clean_path("ch") is None
+        rec._ended_clean_path["ch"] = "/old.mp4"
+        assert await rec.start("ch") is True
+        assert rec.pop_ended_clean_path("ch") is None
+        await rec.stop("ch")
+
+    asyncio.run(scenario())
+
+
+def test_remove_if_inactive_drops_youtube_sidecar(tmp_path):
+    """Deleting a recording forgets its remembered YouTube URL too."""
+    import os
+
+    from stream_archive.youtube_upload import read_youtube_url, write_youtube_url, youtube_sidecar
+
+    rec = Recorder(make_config(tmp_path))
+    target = tmp_path / "show.mp4"
+    target.write_bytes(b"x" * 10)
+    write_youtube_url(target, "https://www.youtube.com/watch?v=vid1")
+    assert rec._remove_if_inactive(target, set()) == 10
+    assert not target.exists()
+    assert not youtube_sidecar(target).exists()
+
+    live = tmp_path / "live.mp4"
+    live.write_bytes(b"x" * 10)
+    write_youtube_url(live, "https://www.youtube.com/watch?v=vid2")
+    assert rec._remove_if_inactive(live, {os.path.realpath(live)}) is None
+    assert read_youtube_url(live) == "https://www.youtube.com/watch?v=vid2"
 
 
 def test_reserve_start_blocks_when_capacity_taken(tmp_path):
@@ -927,6 +1018,33 @@ def test_revoked_broadcast_alerts_once_while_ingest_runs(tmp_path, monkeypatch):
     alert = notifier.messages[0]
     assert "YouTube took down the restream for ch." in alert
     assert "no local backup" in alert
+
+
+def test_spawn_failure_leaks_no_watcher(tmp_path, monkeypatch):
+    """A failed ffmpeg spawn must not orphan the broadcast-status watcher.
+
+    The watcher polls for 120s holding the streamer. A missing ffmpeg
+    would otherwise leak one such loop per restream attempt.
+    """
+    config = make_config(tmp_path)
+    config.output_mode = "youtube"
+    rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
+    rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": None}
+
+    async def failing_exec(*args, **kwargs):
+        msg = "ffmpeg is missing"
+        raise FileNotFoundError(msg)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_exec)
+
+    async def scenario():
+        with pytest.raises(FileNotFoundError, match="ffmpeg is missing"):
+            await rec._stream_youtube("ch", "author", "Title", "Game", FakeStream(), None)
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert len(asyncio.all_tasks()) == 1  # only this task: no orphaned watcher
+
+    asyncio.run(scenario())
 
 
 def test_revoked_broadcast_stops_ingest_but_finishes_disk(tmp_path, monkeypatch):
@@ -1775,7 +1893,7 @@ def test_abort_serializes_with_stop(tmp_path):
         # The loser sees no entry. stop() returns None when abort wins, or a
         # result with no file info when stop wins. Either way no RuntimeError
         # surfaces.
-        assert results[1] is None or results[1] == {"file_info": None, "youtube_info": None}
+        assert results[1] is None or results[1] == {"file_info": None, "youtube_info": None, "filepath": None}
 
     asyncio.run(scenario())
 

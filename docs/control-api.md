@@ -175,6 +175,8 @@ curl -H "Authorization: Bearer $API_KEY" https://streamarchive.example.com/api/v
       "quality_override": null,
       "youtube_hold_seconds": 0.0,
       "youtube_hold_seconds_override": null,
+      "youtube_vod_upload": false,
+      "youtube_vod_upload_override": null,
       "categories": null,
       "categories_override": null
     }
@@ -204,6 +206,7 @@ The control API takes a channel name with a platform prefix or a profile URL (`h
 | `output_mode` | `disk`, `youtube`, `both`, `default` | Output override for this channel. `default` clears the override |
 | `quality` | `best`, `1080p`, `720p`, `480p`, `360p`, `audio_only`, `default` | Quality override. `default` clears the override |
 | `youtube_hold_seconds` | whole number ≥ 0, or `"default"` | Keep the YouTube broadcast open this long after the source stops. `"default"` clears the override |
+| `youtube_vod_upload` | `true`, `false`, or `"default"` | Upload each finished recording to YouTube. `"default"` clears the override (off) |
 | `categories` | list of names, or `"default"` | Record only these Twitch or Kick categories. `["Just Chatting", "Music"]` records those two. Each name must exist on the platform: an unknown name refuses the whole change. `"default"` clears the filter and records every live stream |
 
 ```sh

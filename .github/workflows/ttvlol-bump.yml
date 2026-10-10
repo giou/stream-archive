@@ -51,14 +51,19 @@ jobs:
           else
             echo "bump=true" >> "$GITHUB_OUTPUT"
           fi
+      # The parse gate below must run the same Python as the image
+      # (3.14). The runner system python3 is older and rejects valid
+      # 3.14-only syntax, which fails a good bump before review.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
       - name: Fetch the new release, repin the Dockerfile, build the diff
         if: steps.check.outputs.bump == 'true'
         env:
           TAG: ${{ steps.check.outputs.tag }}
         run: |
           set -eu
-          TAG="${TAG}"
-          PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
+          TAG="${TAG}"          PINNED="$(sed -n 's/^ARG TTVLOL_PLUGIN_VERSION=//p' Dockerfile)"
           echo "pinned=${PINNED}" >> "$GITHUB_OUTPUT"
           mkdir -p "vendor/streamlink-ttvlol/${TAG}"
           curl -fsSL -o "vendor/streamlink-ttvlol/${TAG}/twitch.py" \
@@ -70,7 +75,7 @@ jobs:
           # A plugin that does not parse must never reach a pull request.
           # The image build parses again with 3.14, and CI builds the
           # image on every pull request, so this gate only stops a
-          # broken PR early. System python3 is enough for that.
+          # broken PR early.
           python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" \
             "vendor/streamlink-ttvlol/${TAG}/twitch.py"
           sed -i "s|^ARG TTVLOL_PLUGIN_VERSION=.*|ARG TTVLOL_PLUGIN_VERSION=${TAG}|" Dockerfile

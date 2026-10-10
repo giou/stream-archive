@@ -30,6 +30,7 @@ from stream_archive.telegram.commands_settings import (
     RETENTION_CHOICES,
 )
 from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult, MenuState, custom_parent
+from stream_archive.youtube_upload import youtube_available
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -98,7 +99,7 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         # Back stays in the first row: a long channel list would push it out of view.
         return _frame([["Back"], ["Add channel"], *([f"{CHANNEL_BUTTON_PREFIX}{ch}"] for ch in c.channels)])
     if menu == "channel":
-        return _frame([["Mode", "Quality", "Categories"], ["Hold delay", "Remove channel"], ["Back"]])
+        return _frame([["Mode", "Quality", "Categories"], ["Hold delay", "VOD upload"], ["Remove channel"], ["Back"]])
     if menu == "channel_mode":
         ch = state.channel or ""
         mode_override = c.channel_output_modes.get(ch)
@@ -114,6 +115,11 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
         rows.append([_mark("Global", hold_override is None), _custom_mark(HOLD_CHOICES, current)])
         rows.append(["Back"])
         return _frame(rows)
+    if menu == "channel_vod":
+        ch = state.channel or ""
+        vod_on = bool(c.channel_youtube_vod_upload.get(ch, False))
+        action = "Disable" if vod_on else "Enable"
+        return _frame([[f"{action} VOD upload"], ["Back"]])
     if menu == "channel_quality":
         ch = state.channel or ""
         quality_override = c.channel_preferred_qualities.get(ch)
@@ -180,10 +186,15 @@ def _keyboard(ctrl: TelegramController, state: MenuState, menu: str) -> ReplyKey
             rows.append([rec_menus.DELETE_ALL_LABEL])
         return _frame(rows)
     if menu == "rec_detail":
-        rows = [[rec_menus.SEND_LABEL, rec_menus.DELETE_LABEL]]
-        if state.rec_path and not rec_menus.sendable_path(state.rec_path):
+        rows = [[rec_menus.UPLOAD_LABEL, rec_menus.DELETE_LABEL]]
+        if state.rec_path and not rec_menus.uploadable_path(ctrl, state.rec_path):
             rows = [[rec_menus.DELETE_LABEL]]
         rows.insert(0, ["Back"])
+        return _frame(rows)
+    if menu == "rec_upload":
+        rows = [["Back"], [rec_menus.TELEGRAM_LABEL]]
+        if youtube_available(ctrl._config):
+            rows.append([rec_menus.YOUTUBE_LABEL])
         return _frame(rows)
     if menu == "kick_webhook":
         rows = [[f"{_toggle_action(c.kick.webhook.enabled)} Kick webhook"]]
@@ -243,7 +254,7 @@ async def _text_mtproto(ctrl: TelegramController, state: MenuState) -> str:
         )
     return (
         f"MTProto upload: {ctrl._mtproto_state_text()}\n\n"
-        "The client logs in with the bot token. Open Recordings and tap Send on a file."
+        "The client logs in with the bot token. Open Recordings and tap Upload on a file, then Telegram."
     )
 
 
@@ -272,6 +283,22 @@ async def _text_rec_detail(ctrl: TelegramController, state: MenuState) -> str:
         body = rec_menus._detail_body(ctrl, Path(state.rec_path))
         if body is not None:
             return body[0]
+    files = rec_menus._scan(ctrl)
+    if not files:
+        return "No recordings stored yet."
+    return f"Recordings ({len(files)}). Tap a file to manage it:"
+
+
+async def _text_rec_upload(ctrl: TelegramController, state: MenuState) -> str:
+    from stream_archive.telegram import menus_recordings as rec_menus
+
+    if state.rec_path:
+        path = Path(state.rec_path)
+        try:
+            path.stat()
+        except OSError:
+            return f"{path.name} is gone."
+        return rec_menus._upload_menu_text(ctrl, path)
     files = rec_menus._scan(ctrl)
     if not files:
         return "No recordings stored yet."
@@ -341,10 +368,12 @@ async def _text_channel(ctrl: TelegramController, state: MenuState) -> str:
     quality_text = q_override or f"global ({c.preferred_quality})"
     hold_override = c.channel_youtube_hold_seconds.get(ch)
     hold_text = f"{hold_override:g}s" if hold_override is not None else f"global ({c.youtube.hold_seconds:g}s)"
+    vod = "on" if c.channel_youtube_vod_upload.get(ch, False) else "off"
     cats = c.channel_categories.get(ch)
     cats_text = ", ".join(cats) if cats else "all"
     return (
-        f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}\nCategories: {cats_text}"
+        f"Channel: {ch}\nOutput mode: {mode}\nQuality: {quality_text}\nHold delay: {hold_text}\n"
+        f"VOD upload: {vod}\nCategories: {cats_text}"
     )
 
 
@@ -370,6 +399,17 @@ async def _text_channel_hold(ctrl: TelegramController, state: MenuState) -> str:
         "When the source stream stops, the broadcast stays open this long, waiting for the "
         "streamer to return - a return within the delay reuses the same broadcast instead "
         "of creating a new one."
+    )
+
+
+async def _text_channel_vod(ctrl: TelegramController, state: MenuState) -> str:
+    c = ctrl._config
+    ch = state.channel or ""
+    current = "on" if c.channel_youtube_vod_upload.get(ch, False) else "off"
+    return (
+        f"YouTube auto-upload for {ch}: {current}\n\n"
+        "On uploads each finished recording to YouTube as a video. "
+        "The title comes from the file name and the privacy from the YouTube settings."
     )
 
 
@@ -491,6 +531,7 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "channel": _text_channel,
     "channel_mode": _text_channel_mode,
     "channel_hold": _text_channel_hold,
+    "channel_vod": _text_channel_vod,
     "channel_quality": _text_channel_quality,
     "channel_categories": _text_channel_categories,
     "chat": _text_chat,
@@ -513,6 +554,7 @@ TEXT: dict[str, Callable[[TelegramController, MenuState], Awaitable[str]]] = {
     "recordings": _text_recordings,
     "rec_channel": _text_rec_channel,
     "rec_detail": _text_rec_detail,
+    "rec_upload": _text_rec_upload,
 }
 
 
@@ -534,6 +576,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "channel": root_menus.menu_channel,
     "channel_mode": root_menus.menu_channel_mode,
     "channel_hold": root_menus.menu_channel_hold,
+    "channel_vod": root_menus.menu_channel_vod,
     "channel_quality": root_menus.menu_channel_quality,
     "channel_categories": root_menus.menu_channel_categories,
     "chat": settings_menus.menu_chat,
@@ -554,6 +597,7 @@ HANDLERS: dict[str, Callable[[TelegramController, ChatId, str], Awaitable[MenuRe
     "recordings": rec_menus.menu_recordings,
     "rec_channel": rec_menus.menu_rec_channel,
     "rec_detail": rec_menus.menu_rec_detail,
+    "rec_upload": rec_menus.menu_rec_upload,
     "kick_webhook": kick_menus.menu_kick_webhook,
     "kick_webhook_url": kick_menus.menu_kick_webhook_url,
 }
@@ -565,6 +609,7 @@ PARENT: dict[str, str] = {
     "channel": "channels",
     "channel_mode": "channel",
     "channel_hold": "channel",
+    "channel_vod": "channel",
     "channel_quality": "channel",
     "channel_categories": "channel",
     "chat": "settings",
@@ -584,6 +629,7 @@ PARENT: dict[str, str] = {
     "recordings": "root",
     "rec_channel": "recordings",
     "rec_detail": "rec_channel",
+    "rec_upload": "rec_detail",
     "kick_webhook": "remote_access",
     "kick_webhook_url": "kick_webhook",
 }

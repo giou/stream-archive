@@ -33,6 +33,7 @@ from stream_archive.telegram.commands_settings import SettingsCommands
 from stream_archive.telegram.commands_system import SystemCommands
 from stream_archive.telegram.commands_web import WebCommands
 from stream_archive.telegram.commands_webhook import WebhookCommands
+from stream_archive.telegram.commands_youtube import YoutubeCommands
 from stream_archive.telegram.menu_state import ChatId, ChatStateMixin, MenuResult
 from stream_archive.telegram.menus_commands import CommandsMixin
 
@@ -96,6 +97,7 @@ class TelegramController(
     WebhookCommands,
     SystemCommands,
     MtprotoCommands,
+    YoutubeCommands,
 ):
     _config: AppConfig
     _recorder: Any
@@ -109,6 +111,10 @@ class TelegramController(
     _mtproto_tasks: set[asyncio.Task[None]]
     _sending_paths: set[str]
     _mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]]
+    _youtube_tasks: set[asyncio.Task[None]]
+    _youtube_sends: dict[tuple[ChatId, str], str]
+    _youtube_runner: Any
+    _uploads: Any
     _http: Any
     _owns_http: bool
     _app: Any
@@ -127,6 +133,8 @@ class TelegramController(
         kick_webhook: Any = None,
         http: Any = None,
         mtproto: Any = None,
+        uploads: Any = None,
+        youtube_runner: Any = None,
     ) -> None:
         self._config = config
         self._recorder = recorder
@@ -136,6 +144,12 @@ class TelegramController(
         self._updater = updater
         self._kick_webhook = kick_webhook
         self._mtproto = mtproto
+        if uploads is not None:
+            self._uploads = uploads
+        else:
+            from stream_archive.uploads import UploadHub
+
+            self._uploads = UploadHub()
         self._twitch_api: Any = None
         self._kick_api: Any = None
         if http is not None:
@@ -158,8 +172,12 @@ class TelegramController(
         self._mtproto_tasks: set[asyncio.Task[None]] = set()
         self._sending_paths: set[str] = set()
         self._mtproto_sends: dict[tuple[ChatId, str], asyncio.Task[None]] = {}
+        self._youtube_tasks: set[asyncio.Task[None]] = set()
+        self._youtube_sends: dict[tuple[ChatId, str], str] = {}
+        self._youtube_runner = youtube_runner
         self._pending_delete: dict[tuple[ChatId, str], str] = {}
         self._pending_bulk_delete: dict[tuple[ChatId, str], str | None] = {}
+        self._pending_yt_upload: dict[tuple[ChatId, str], str] = {}
         self._callback_handler: Any = None
 
     @property
@@ -225,6 +243,7 @@ class TelegramController(
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("hold", self._cmd_hold, filters=admin),
+            CommandHandler("vodupload", self._cmd_vodupload, filters=admin),
             CommandHandler("recordings", self._cmd_recordings, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
             CommandHandler("start", self._cmd_help, filters=admin),

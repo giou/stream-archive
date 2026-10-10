@@ -384,7 +384,7 @@ def test_detail_back_returns_to_channel_page(tmp_path):
     assert any("twitch:channel1" in label for label in labels)
 
 
-def test_detail_hides_send_over_cap(tmp_path):
+def test_detail_hides_upload_over_cap(tmp_path):
     from unittest import mock
 
     _, ctrl = make_bot(tmp_path, files=[("big.ts", 10)])
@@ -394,15 +394,15 @@ def test_detail_hides_send_over_cap(tmp_path):
     with mock.patch("stream_archive.telegram.menus_recordings.check_sendable", return_value=(False, "too big")):
         text, markup = asyncio.run(ctrl.handle_reply_text(first))
         labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-        assert "Send" not in labels
+        assert "Upload" not in labels
         assert "Delete" in labels
-        assert "Cannot send" in text
-        # A typed Send press is refused too, not just hidden.
-        text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
-        assert "Cannot send" in text
+        assert "Cannot upload" in text
+        # A typed Upload press is refused too, not just hidden.
+        text, _ = asyncio.run(ctrl.handle_reply_text("Upload"))
+        assert "Cannot upload" in text
 
 
-def test_detail_shows_send_for_splittable_file(tmp_path):
+def test_detail_shows_upload_for_splittable_file(tmp_path):
     from unittest import mock
 
     from stream_archive import mtproto_upload as mtproto_mod
@@ -418,8 +418,8 @@ def test_detail_shows_send_for_splittable_file(tmp_path):
     ):
         text, markup = asyncio.run(ctrl.handle_reply_text(first))
         labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-        assert "Send" in labels
-        assert "Cannot send" not in text
+        assert "Upload" in labels
+        assert "Cannot upload" not in text
 
 
 def test_channel_tap_lands_despite_size_drift(tmp_path):
@@ -457,6 +457,41 @@ def test_channel_bulk_delete_flow(tmp_path):
     rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
     assert list(rec_dir.iterdir()) == []
     assert disk._snapshot_cache == {}
+
+
+def test_channel_bulk_delete_skips_running_upload(tmp_path):
+    """Bulk delete leaves a file with a running upload alone and says so."""
+    from stream_archive.uploads import UploadHub
+
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10), ("b.ts", 20)])
+    hub = UploadHub()
+    ctrl._uploads = hub
+    gate = asyncio.Event()
+
+    async def runner(progress):
+        await gate.wait()
+        return "https://www.youtube.com/watch?v=x"
+
+    async def scenario():
+        rec_dir = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1"
+        hub.submit("twitch:channel1", str(rec_dir / "a.ts"), runner)
+        _, markup = await ctrl.handle_reply_text("Recordings")
+        rows = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+        channel_row = next(label for label in rows if "twitch:channel1" in label)
+        _, markup = await ctrl.handle_reply_text(channel_row)
+        _, markup = await ctrl.handle_reply_text("Delete channel files")
+        result = await ctrl.handle_callback(_bulk_confirm_data(markup), 12345)
+        assert result is not None and "Deleted 1 file" in result[0]
+        assert "1 upload in flight, left alone" in result[0]
+        assert (rec_dir / "a.ts").exists()
+        assert not (rec_dir / "b.ts").exists()
+        gate.set()
+        for _ in range(500):
+            if not hub._tasks:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
 
 
 def test_root_bulk_delete_flow(tmp_path):
@@ -598,9 +633,10 @@ def test_recordings_list_and_pick(tmp_path):
     text, markup = asyncio.run(ctrl.handle_reply_text(first))
     assert ctrl._state_for(12345).menu == "rec_detail"
     assert ctrl._state_for(12345).rec_path is not None
-    assert "Sendable over MTProto" in text
+    assert "Uploadable" not in text
+    assert "a.ts" in text or "b.ts" in text
     labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
-    assert "Send" in labels
+    assert "Upload" in labels
     assert "Delete" in labels
     assert "Back" in labels
 
@@ -657,18 +693,22 @@ def test_channel_grouping_two_channels(tmp_path):
     assert any("twitch:channel1" in label for label in labels)
 
 
-def test_recordings_send_requires_mtproto(tmp_path):
+def test_recordings_upload_requires_mtproto(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)], mtproto=None)
     ctrl._mtproto = None
     asyncio.run(ctrl.handle_reply_text("Recordings"))
     state = ctrl._state_for(12345)
     state.rec_path = str(disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1" / "a.ts")
     ctrl._enter_menu(12345, "rec_detail")
-    text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
+    text, markup = asyncio.run(ctrl.handle_reply_text("Upload"))
+    assert ctrl._state_for(12345).menu == "rec_upload"
+    labels = [b["text"] for row in markup.to_dict()["keyboard"] for b in row]
+    assert "Telegram" in labels
+    text, _ = asyncio.run(ctrl.handle_reply_text("Telegram"))
     assert "MTProto upload is off" in text
 
 
-def test_recordings_send_starts_upload(tmp_path):
+def test_recordings_upload_starts_telegram_send(tmp_path):
     mt = FakeMtproto()
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)], mtproto=mt)
     asyncio.run(ctrl.handle_reply_text("Recordings"))
@@ -676,6 +716,8 @@ def test_recordings_send_starts_upload(tmp_path):
     target = str(disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1" / "a.ts")
     state.rec_path = target
     ctrl._enter_menu(12345, "rec_detail")
+    asyncio.run(ctrl.handle_reply_text("Upload"))
+    assert ctrl._state_for(12345).menu == "rec_upload"
     started = []
     orig = ctrl._start_mtproto_send
 
@@ -684,7 +726,7 @@ def test_recordings_send_starts_upload(tmp_path):
 
     ctrl._start_mtproto_send = _fake  # type: ignore[method-assign]
     try:
-        result = asyncio.run(ctrl.handle_reply_text("Send"))
+        result = asyncio.run(ctrl.handle_reply_text("Telegram"))
     finally:
         ctrl._start_mtproto_send = orig
     assert result is None
@@ -734,6 +776,41 @@ def test_recordings_delete_blocked_when_live(tmp_path):
     assert target.exists()
 
 
+def test_recordings_delete_blocked_while_upload_runs(tmp_path):
+    """A file with a running upload cannot be deleted until it finishes."""
+    from stream_archive.uploads import UploadHub
+
+    _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
+    hub = UploadHub()
+    ctrl._uploads = hub
+    gate = asyncio.Event()
+
+    async def runner(progress):
+        await gate.wait()
+        return "https://www.youtube.com/watch?v=x"
+
+    async def scenario():
+        target = disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1" / "a.ts"
+        upload_id = hub.submit("twitch:channel1", str(target), runner)
+        assert hub.running_id(str(target)) == upload_id
+        state = ctrl._state_for(12345)
+        state.rec_path = str(target)
+        ctrl._enter_menu(12345, "rec_detail")
+        text, markup = await ctrl.handle_reply_text("Delete")
+        cb = markup.to_dict()["inline_keyboard"][0][0]["callback_data"]
+        result = await ctrl.handle_callback(cb, 12345)
+        assert result is not None and "uploading now" in result[0]
+        assert target.exists()
+        gate.set()
+        for _ in range(500):
+            if not hub._tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert hub.result(upload_id)["status"] == "done"
+
+    asyncio.run(scenario())
+
+
 def test_mtproto_toggle_needs_creds(tmp_path):
     _, ctrl = make_bot(tmp_path)
     text = asyncio.run(ctrl._set_mtproto_enabled(True))
@@ -777,15 +854,15 @@ def test_status_hides_mtproto_secret(tmp_path):
     assert "12345678" not in text
 
 
-def test_double_send_is_rejected(tmp_path):
+def test_double_upload_is_rejected(tmp_path):
     _, ctrl = make_bot(tmp_path, files=[("a.ts", 10)])
     asyncio.run(ctrl.handle_reply_text("Recordings"))
     state = ctrl._state_for(12345)
     target = str(disk.resolve_recording_dir(ctrl._config) / "twitch" / "channel1" / "a.ts")
     state.rec_path = target
-    ctrl._enter_menu(12345, "rec_detail")
+    ctrl._enter_menu(12345, "rec_upload")
     ctrl._sending_paths.add(target)
-    text, _ = asyncio.run(ctrl.handle_reply_text("Send"))
+    text, _ = asyncio.run(ctrl.handle_reply_text("Telegram"))
     assert "already runs" in text
 
 

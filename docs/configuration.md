@@ -66,9 +66,10 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `update_check.enabled` | no, hand edit | `true` | Periodic check for a newer app release, with a Telegram notification when one is available |
 | `update_check.interval_hours` | no, hand edit | `24` | Hours between update checks |
 | `youtube.client_secrets_file` | no, hand edit | `client_secret.json` | Path to the Google OAuth client file |
-| `youtube.privacy_status` | no, hand edit | `unlisted` | Privacy of created YouTube broadcasts: `public`, `unlisted`, or `private` |
+| `youtube.privacy_status` | no, hand edit | `unlisted` | Privacy of created YouTube broadcasts and VOD uploads: `public`, `unlisted`, or `private` |
 | `youtube.hold_seconds` | no, hand edit | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast. `0` ends the broadcast at once |
 | `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"twitch:channel": 60}`. An absent entry uses the global value. A bare key means `twitch:` |
+| `channel_youtube_vod_upload` | no | `{}` | Per-channel YouTube auto-upload of finished recordings, for example `{"twitch:channel": true}`. An absent entry means off |
 
 ¹ Required when the channel list holds a `kick:` entry.
 ² Required when the endpoint is enabled.

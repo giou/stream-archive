@@ -176,3 +176,68 @@ def test_shutdown_bounds_the_recorder_close(monkeypatch):
     assert recorder.cancelled is True
     # The cancellation still ran the close path's cleanup, not just the wait.
     assert recorder.closed is True
+
+
+class _OrderHub:
+    """Upload hub double holding one controllable in-flight task."""
+
+    def __init__(self):
+        self._tasks = {}
+
+
+class _OrderStreamer:
+    """YouTube streamer double asserting uploads already cancelled."""
+
+    def __init__(self, hub_task, calls):
+        self._hub_task = hub_task
+        self._calls = calls
+
+    async def close(self):
+        assert self._hub_task.done(), "uploads must cancel before the streamer closes"
+        self._calls.append("streamer")
+
+
+class _OrderNotifier:
+    def __init__(self, calls):
+        self._calls = calls
+
+    async def notify_shutdown(self):
+        pass
+
+    async def close(self):
+        self._calls.append("notifier")
+
+
+def test_shutdown_cancels_uploads_before_streamer_close():
+    """In-flight VOD uploads must see a clean cancel, not a closed client.
+
+    The cancel used to run after the streamer and the notifier closed, so
+    an upload in flight at shutdown hit a closed httpx client and was
+    recorded as failed with an exception log.
+    """
+    calls = []
+
+    async def scenario():
+        hub_task = asyncio.create_task(asyncio.sleep(3600))
+        hub = _OrderHub()
+        hub._tasks["up1"] = hub_task
+        hub_task.add_done_callback(lambda t: hub._tasks.pop("up1", None))
+        await scheduler_module._shutdown(
+            health_runner=None,
+            kick_webhook=None,
+            eventsub=None,
+            twitch_api=None,
+            kick_api=None,
+            recorder=None,
+            notifier=_OrderNotifier(calls),
+            updater=None,
+            updater_task=None,
+            telegram=None,
+            youtube_streamer=_OrderStreamer(hub_task, calls),
+            shared_http=None,
+            upload_hub=hub,
+        )
+        assert hub_task.cancelled()
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert calls == ["streamer", "notifier"]

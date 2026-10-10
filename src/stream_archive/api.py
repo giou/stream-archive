@@ -81,7 +81,7 @@ _SETTING_KEYS = (
 )
 
 #: Per-channel settings the API can write. Each maps to one Telegram command.
-_CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds", "categories")
+_CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds", "youtube_vod_upload", "categories")
 
 #: Output modes, plus 'default' to clear a per-channel override.
 _OUTPUT_MODES = ("disk", "youtube", "both", "default")
@@ -161,6 +161,8 @@ def _channel_json(config: AppConfig, channel: str, recording: bool) -> dict[str,
         "quality_override": config.channel_preferred_qualities.get(channel),
         "youtube_hold_seconds": config.channel_youtube_hold_seconds.get(channel, config.youtube.hold_seconds),
         "youtube_hold_seconds_override": config.channel_youtube_hold_seconds.get(channel),
+        "youtube_vod_upload": config.channel_youtube_vod_upload.get(channel, False),
+        "youtube_vod_upload_override": config.channel_youtube_vod_upload.get(channel),
         "categories": list(cats) if cats is not None else None,
         "categories_override": list(cats) if cats is not None else None,
     }
@@ -265,6 +267,16 @@ def _global_hold_seconds(value: Any) -> str:
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
         raise _ApiError(400, msg)
     return str(int(value))
+
+
+def _vod_upload(value: Any) -> str:
+    """Validated YouTube auto-upload flag: true/false, or 'default' to clear it."""
+    if isinstance(value, str) and value.strip().lower() == "default":
+        return "default"
+    if not isinstance(value, bool):
+        msg = "youtube_vod_upload must be true or false, or 'default'"
+        raise _ApiError(400, msg)
+    return "on" if value else "off"
 
 
 def _categories(value: Any) -> list[str] | str:
@@ -848,6 +860,8 @@ class ControlAPI:
             return await self._run(ctrl.handle_quality, [channel, _quality(value)])
         if key == "youtube_hold_seconds":
             return await self._run(ctrl.handle_channel_hold, [channel, _hold_seconds(value)])
+        if key == "youtube_vod_upload":
+            return await self._run(ctrl.handle_channel_vod_upload, [channel, _vod_upload(value)])
         if key == "categories":
             parsed = _categories(value)
             if parsed == "default":

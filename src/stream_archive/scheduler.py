@@ -21,8 +21,10 @@ from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
 from stream_archive.twitch_api import TwitchAPI
 from stream_archive.updater import UpdateChecker, installed_app_version
+from stream_archive.uploads import UploadHub
 from stream_archive.webui import WebUI
 from stream_archive.youtube_streamer import YouTubeStreamer
+from stream_archive.youtube_upload import upload_description, upload_title, youtube_available
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,7 @@ async def run_scheduler() -> None:
     telegram: TelegramController | None = None
     mtproto: MtprotoUploader | None = None
     repair_task: asyncio.Task[None] | None = None
+    upload_hub: Any = None
     # Every resource inside the try below shuts down in order. A failed
     # Telegram start, for example, must not leave a recording or a held
     # YouTube broadcast behind.
@@ -160,6 +163,41 @@ async def run_scheduler() -> None:
 
         recorder = Recorder(config, youtube_streamer, notifier)
         monitor = Monitor(recorder, notifier)
+
+        upload_hub = UploadHub()
+
+        def _youtube_runner(channel: str, path: str) -> Any:
+            """Runner of one VOD upload: file metadata plus the upload call."""
+            from pathlib import Path
+
+            file_path = Path(path)
+            title = upload_title(file_path)
+            description = upload_description(file_path, channel)
+
+            async def _run(progress: Any) -> str:
+                if youtube_streamer is None:
+                    msg = "YouTube is not configured"
+                    raise RuntimeError(msg)
+                result = await youtube_streamer.upload_video_file(path, title, description, progress=progress)
+                return result["youtube_url"]
+
+            return _run
+
+        async def _maybe_auto_upload(channel: str, filepath: str) -> None:
+            """Start the per-channel YouTube auto-upload of a finished file."""
+            try:
+                await _auto_upload_file(
+                    channel,
+                    filepath,
+                    config=config,
+                    hub=upload_hub,
+                    runner_factory=_youtube_runner,
+                    notifier=notifier,
+                )
+            except Exception:
+                logger.error("[scheduler] auto-upload submit failed for %s", channel, exc_info=True)
+
+        monitor.on_stopped = _maybe_auto_upload
 
         kick_api = KickAPI(config, http=shared_http)
 
@@ -190,10 +228,12 @@ async def run_scheduler() -> None:
             kick_webhook=kick_webhook,
             http=shared_http,
             mtproto=mtproto,
+            uploads=upload_hub,
+            youtube_runner=_youtube_runner,
         )
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)
-        webui = WebUI(config, telegram, recorder, http=shared_http)
+        webui = WebUI(config, telegram, recorder, http=shared_http, uploads=upload_hub, youtube_runner=_youtube_runner)
         # The panel and scripts share /api/v1: a live panel session also
         # authenticates there. Sessions end with the panel being off.
         control_api.set_session_checker(lambda request: webui._session_of(request) if config.web.enabled else None)
@@ -243,7 +283,61 @@ async def run_scheduler() -> None:
             shared_http=shared_http,
             mtproto=mtproto,
             repair_task=repair_task,
+            upload_hub=upload_hub,
         )
+
+
+async def _auto_upload_file(
+    channel: str,
+    filepath: str,
+    *,
+    config: AppConfig,
+    hub: Any,
+    runner_factory: Any,
+    notifier: Any,
+) -> None:
+    """Submit one finished file to the YouTube hub when its channel opts in.
+
+    The manual surfaces (Telegram, panel) validate before they submit; the
+    automatic path must hold the same bar, or a gone file becomes a scary
+    failure notice and an already-uploaded file uploads twice.
+    """
+    from pathlib import Path
+
+    from stream_archive.youtube_upload import check_uploadable, read_youtube_url
+
+    if not config.channel_youtube_vod_upload.get(channel):
+        return
+    if not youtube_available(config):
+        logger.warning("[scheduler] Skipping YouTube auto-upload of %s: not authenticated", channel)
+        return
+    if hub.running_id(filepath) is not None:
+        return
+    file_path = Path(filepath)
+    ok, note = check_uploadable(file_path)
+    if not ok:
+        logger.info("[scheduler] Skipping YouTube auto-upload of %s: %s", channel, note)
+        return
+    if read_youtube_url(file_path) is not None:
+        return
+    name = file_path.name
+    runner = runner_factory(channel, filepath)
+
+    async def _run_with_events(progress: Any) -> str:
+        events.record("notice", channel, f"YouTube upload started: {name}")
+        try:
+            url: str = await runner(progress)
+        except Exception as e:
+            events.record("notice", channel, f"YouTube upload failed: {name}")
+            with contextlib.suppress(Exception):
+                await notifier.notify(f"\u26a0\ufe0f YouTube upload failed for {channel}: {name} ({e})")
+            raise
+        events.record("notice", channel, f"YouTube upload done: {name} {url}")
+        with contextlib.suppress(Exception):
+            await notifier.notify(f"\U0001f4e4 YouTube upload done for {channel}: {url}")
+        return url
+
+    hub.submit(channel, filepath, _run_with_events)
 
 
 async def _repair_after_boot(recorder: Recorder) -> None:
@@ -341,6 +435,7 @@ async def _shutdown(
     shared_http: Any,
     mtproto: MtprotoUploader | None = None,
     repair_task: asyncio.Task[None] | None = None,
+    upload_hub: Any = None,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest.
 
@@ -383,6 +478,7 @@ async def _shutdown(
     if active is not None or telegram is not None:
         try:
             tasks = list(telegram._mtproto_tasks) if telegram is not None else []
+            tasks += list(telegram._youtube_tasks) if telegram is not None else []
             for task in tasks:
                 task.cancel()
             if tasks:
@@ -391,6 +487,18 @@ async def _shutdown(
                 await active.disconnect()
         except Exception:
             logger.error("[scheduler] mtproto disconnect failed", exc_info=True)
+    if upload_hub is not None:
+        # Cancel VOD uploads before the streamer and the notifier close
+        # below: an in-flight upload must see a clean cancel, not a closed
+        # httpx client or bot that records it as failed.
+        try:
+            tasks = list(upload_hub._tasks.values())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            logger.error("[scheduler] upload hub cancel failed", exc_info=True)
     if health_runner is not None:
         try:
             await health_runner.cleanup()

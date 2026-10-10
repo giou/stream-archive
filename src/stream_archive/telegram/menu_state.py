@@ -74,6 +74,7 @@ _OWNED_FIELDS: dict[str, frozenset[str]] = {
     "channel": frozenset({"channel"}),
     "channel_mode": frozenset({"channel"}),
     "channel_hold": frozenset({"channel"}),
+    "channel_vod": frozenset({"channel"}),
     "channel_quality": frozenset({"channel"}),
     "channel_categories": frozenset({"channel"}),
     # The custom menu waits for a value, so it owns the pending key. It keeps
@@ -84,6 +85,7 @@ _OWNED_FIELDS: dict[str, frozenset[str]] = {
     "recordings": frozenset({"rec_offset"}),
     "rec_channel": frozenset({"rec_offset", "rec_channel"}),
     "rec_detail": frozenset({"rec_offset", "rec_path", "rec_channel"}),
+    "rec_upload": frozenset({"rec_offset", "rec_path", "rec_channel"}),
 }
 
 #: Menu that owns each custom value setting.

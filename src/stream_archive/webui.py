@@ -55,6 +55,7 @@ from stream_archive.http_client import build_http_client
 from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.kick_chat import EMOTE_URL as _KICK_EMOTE_URL
 from stream_archive.updater import installed_app_version
+from stream_archive.youtube_upload import check_uploadable, drop_youtube_url, read_youtube_url, youtube_available
 
 if TYPE_CHECKING:
     from stream_archive.recorder import Recorder
@@ -362,12 +363,18 @@ class WebUI:
         controller: TelegramController,
         recorder: Recorder,
         http: Any = None,
+        uploads: Any = None,
+        youtube_runner: Any = None,
     ) -> None:
         self._config = config
         self._ctrl = controller
         self._recorder = recorder
         self._http = http if http is not None else build_http_client()
         self._owns_http = http is None
+        #: Shared VOD upload hub (Telegram and the panel show one state).
+        self._uploads = uploads
+        #: Factory of YouTube upload runners: (channel, path) -> runner.
+        self._youtube_runner = youtube_runner
         self._emote_sets: dict[str, tuple[float, dict[str, str]]] = {}
         self._emote_globals: tuple[float, dict[str, str]] | None = None
         # Parsed chat files by path: (mtime, size, channel id, base
@@ -497,6 +504,9 @@ class WebUI:
         app.router.add_get("/api/recordings", self._guarded(self._recordings))
         app.router.add_get("/api/recordings/stream", self._guarded(self._stream))
         app.router.add_get("/api/recordings/thumb", self._guarded(self._thumb))
+        app.router.add_get("/api/uploads", self._guarded(self._uploads_list))
+        app.router.add_post("/api/uploads", self._guarded_csrf(self._uploads_start))
+        app.router.add_delete("/api/uploads", self._guarded_csrf(self._uploads_cancel))
         app.router.add_get("/api/chat", self._guarded(self._chat))
         app.router.add_delete("/api/recordings", self._guarded_csrf(self._delete_recording))
         app.router.add_post("/api/reload", self._guarded_csrf(self._reload))
@@ -845,6 +855,7 @@ class WebUI:
             },
             "kick_webhook": {"enabled": self._config.kick.webhook.enabled},
             "mtproto": {"enabled": self._config.mtproto.enabled},
+            "youtube": {"configured": youtube_available(self._config)},
             "update_check": {
                 "enabled": self._config.update_check.enabled,
                 "interval_hours": self._config.update_check.interval_hours,
@@ -983,6 +994,7 @@ class WebUI:
                     "mtime": mtime,
                     "live": os.path.realpath(path) in live,
                     "playable": path.suffix.lower() in _PLAYABLE_SUFFIXES,
+                    "youtube_url": read_youtube_url(path),
                 }
             )
         total = len(items)
@@ -1157,6 +1169,13 @@ class WebUI:
         # Read outside the try: a recorder hiccup here must answer 503, and
         # the handler below would mask it as a 500 delete failure.
         active = self._active_set()
+        hub = self._uploads
+        if hub is not None and hub.running_id(str(path)) is not None:
+            # A running upload holds the file (or fails on its own when it
+            # is gone). Deleting under it confuses both paths, so refuse
+            # like a live capture instead.
+            msg = f"{path.name} is uploading now"
+            raise _WebError(409, msg)
         recorder = self._recorder
         if hasattr(recorder, "_remove_if_inactive"):
             try:
@@ -1181,10 +1200,60 @@ class WebUI:
                 path.unlink(missing_ok=True)
             except OSError as e:
                 raise _WebError(500, "delete failed") from e
+            drop_youtube_url(path)
         disk.drop_thumbnail(self._config, path)
         disk.invalidate_snapshot()
         logger.info("[web] deleted %s from %s", path.name, request.remote)
         return self._json(request, {"message": f"Deleted {path.name}", "freed": freed})
+
+    # ---- uploads ---------------------------------------------------------------
+
+    async def _uploads_list(self, request: web.Request, session: _Session) -> web.Response:
+        hub = self._uploads
+        items = hub.snapshot() if hub is not None else []
+        return self._json(request, {"uploads": items, "youtube_configured": youtube_available(self._config)})
+
+    async def _uploads_start(self, request: web.Request, session: _Session) -> web.Response:
+        payload = await read_json_object(request, _MAX_BODY_BYTES, _WebError)
+        rel = payload.get("id", "")
+        if not isinstance(rel, str) or not rel:
+            msg = "recording id is required"
+            raise _WebError(400, msg)
+        path = self._recording_path(rel)
+        if self._is_live(path):
+            msg = f"{path.name} is recording now"
+            raise _WebError(409, msg)
+        hub = self._uploads
+        if hub is None or self._youtube_runner is None or not youtube_available(self._config):
+            msg = "YouTube upload is not configured - run stream-archive-setup-youtube first"
+            raise _WebError(503, msg)
+        ok, note = check_uploadable(path)
+        if not ok:
+            msg = f"Cannot upload {path.name}: {note}"
+            raise _WebError(400, msg)
+        running = hub.running_id(str(path))
+        if running is not None:
+            return self._json(request, {"upload_id": running, "name": path.name, "resumed": True})
+        existing = read_youtube_url(path)
+        if existing and payload.get("force") is not True:
+            return self._json(
+                request,
+                {"error": f"Already on YouTube: {existing}", "youtube_url": existing},
+                status=409,
+            )
+        channel = _channel_of_rel(rel)
+        upload_id = hub.submit(channel, str(path), self._youtube_runner(channel, str(path)))
+        logger.info("[web] YouTube upload started for %s from %s", path.name, request.remote)
+        return self._json(request, {"upload_id": upload_id, "name": path.name})
+
+    async def _uploads_cancel(self, request: web.Request, session: _Session) -> web.Response:
+        upload_id = request.query.get("id", "")
+        hub = self._uploads
+        if hub is None or not upload_id or not hub.cancel(upload_id):
+            msg = "no such upload"
+            raise _WebError(404, msg)
+        logger.info("[web] YouTube upload cancelled from %s", request.remote)
+        return self._json(request, {"ok": True})
 
     # ---- ops ---------------------------------------------------------------------
 
@@ -1228,6 +1297,14 @@ class WebUI:
         _events_mod.clear()
         logger.info("[web] events cleared from %s", request.remote)
         return self._json(request, {"message": "Events cleared."})
+
+
+def _channel_of_rel(rel: str) -> str:
+    """Channel tag of a recording id (``twitch/name/file``), or ``unknown``."""
+    parts = rel.split("/")
+    if len(parts) >= 3 and parts[0] in ("twitch", "kick"):
+        return f"{parts[0]}:{parts[1]}"
+    return "unknown"
 
 
 def _parse_range(header: str | None, size: int) -> tuple[int | None, int | None]:

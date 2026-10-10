@@ -98,13 +98,26 @@ async def handle_stop_upload(ctrl: TelegramController, data: str, chat_id: ChatI
     return None
 
 
+async def handle_stop_youtube_upload(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
+    """Stop a running YouTube upload: ``youtube_stop:<nonce>``."""
+    nonce = data.split(":", 1)[1] if ":" in data else ""
+    if ctrl._press_handled(chat_id, nonce):
+        return None
+    upload_id = ctrl._youtube_sends.pop((chat_id, nonce), None)
+    if upload_id is None or not ctrl._uploads.cancel(upload_id):
+        ctrl._mark_confirm_done(chat_id, nonce)
+        return "No upload runs for that button. Upload the file again.", None
+    ctrl._mark_confirm_done(chat_id, nonce)
+    return None
+
+
 async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
     """Apply one confirmation-button press for ``chat_id``.
 
     Return ``(reply_text, markup)`` on success or ``None`` for an unknown
     or already handled press. Wire format (from ``confirm_keyboard``):
     ``confirm_<action>:<value>:<nonce>`` and ``cancel:<nonce>``. Upload stop
-    buttons use ``mtproto_stop:<nonce>``. Apply-now warnings use
+    buttons use ``mtproto_stop:<nonce>`` and ``youtube_stop:<nonce>``. Apply-now warnings use
     ``apply_now:<nonce>``, audio-only switches use ``audio_confirm:<nonce>``.
     The nonce is the last field of every form, and it guards the whole
     prompt: the two buttons of one message are mutually exclusive, so a
@@ -113,6 +126,8 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
     """
     if data.startswith("mtproto_stop:"):
         return await handle_stop_upload(ctrl, data, chat_id)
+    if data.startswith("youtube_stop:"):
+        return await handle_stop_youtube_upload(ctrl, data, chat_id)
     parts = data.split(":")
     action = parts[0]
     nonce = parts[-1]
@@ -124,6 +139,7 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         # The caller drops the inline keyboard after a cancel, so the
         # Apply-now button of the same nonce is gone. Do not keep its entry.
         ctrl._pending_apply.pop(pending_key, None)
+        ctrl._pending_yt_upload.pop(pending_key, None)
         ctrl._apply_warnings_sent.discard(pending_key)
         ctrl._mark_confirm_done(chat_id, nonce)
         return "Cancelled - nothing changed", None
@@ -141,6 +157,13 @@ async def handle_callback(ctrl: TelegramController, data: str, chat_id: ChatId) 
         from stream_archive.telegram import menus_recordings as rec
 
         return await rec.handle_bulk_callback(ctrl, data, chat_id)
+    if action == "confirm_ytupload" and len(parts) >= 3:
+        if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
+            return None
+        ctrl._mark_confirm_done(chat_id, nonce)  # a re-tap must not re-upload
+        from stream_archive.telegram import menus_recordings as rec
+
+        return await rec.handle_yt_upload_callback(ctrl, data, chat_id)
     if action == "confirm_remove" and len(parts) >= 3:
         if ctrl._press_handled(chat_id, nonce):  # double-tap on the same message
             return None

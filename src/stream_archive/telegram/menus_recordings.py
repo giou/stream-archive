@@ -1,10 +1,11 @@
-"""Recordings browser: list, send, and delete stored recordings.
+"""Recordings browser: list, upload, and delete stored recordings.
 
 The browser reads the archive through ``disk.iter_recordings`` and reuses
 the recorder guards: a live capture is never a delete candidate, and every
 delete invalidates the disk snapshot. The list and the per-file detail view
-are plain reply-keyboard submenus: a picked file opens Send / Delete / Back
-rows under its name. Destructive deletes still ask for confirm through the
+are plain reply-keyboard submenus: a picked file opens Upload / Delete /
+Back rows under its name, and Upload offers the Telegram and YouTube
+targets. Destructive deletes still ask for confirm through the
 shared inline confirm buttons.
 """
 
@@ -19,6 +20,7 @@ from telegram import ReplyKeyboardMarkup
 from stream_archive import disk
 from stream_archive.mtproto_upload import MAX_UPLOAD_BYTES, check_sendable
 from stream_archive.telegram.menu_state import CHANNEL_BUTTON_PREFIX, ChatId, MenuResult
+from stream_archive.youtube_upload import check_uploadable, drop_youtube_url, youtube_available
 
 if TYPE_CHECKING:
     from stream_archive.telegram.dispatcher import TelegramController
@@ -26,8 +28,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #: Reply labels of the per-file detail submenu.
-SEND_LABEL = "Send"
+UPLOAD_LABEL = "Upload"
 DELETE_LABEL = "Delete"
+
+#: Upload targets of the upload submenu.
+TELEGRAM_LABEL = "Telegram"
+YOUTUBE_LABEL = "YouTube"
 
 #: Bulk delete of a channel file page, last row.
 DELETE_CHANNEL_LABEL = "Delete channel files"
@@ -81,28 +87,81 @@ def _display_name(path: Path) -> str:
     return path.name if len(path.name) <= 40 else path.name[:37] + "..."
 
 
-def _detail_text(path: Path, size: int, mtime: float, live: bool) -> str:
-    """Detail body for one recording: name, size, date, send state."""
-    ok, note = check_sendable(path)
-    if ok:
-        send_note = "Sendable over MTProto."
-    elif sendable_path(path):
-        send_note = "Over 2 GB: sends as split parts."
+def _detail_text(path: Path, size: int, mtime: float, live: bool, youtube_url: str | None = None) -> str:
+    """Detail body for one recording: name, size, date, and remembered link."""
+    lines = [f"{path.name}\n{disk.format_bytes(size)} · {datetime.fromtimestamp(mtime).strftime('%d-%m-%Y %H:%M')}"]
+    if youtube_url:
+        lines.append(f"YouTube: {youtube_url}")
+    notes: list[str] = []
+    if live:
+        notes.append("Recording now, delete is blocked.")
     else:
-        send_note = f"Cannot send: {note}."
-    live_note = " Recording now, delete is blocked." if live else ""
-    date = datetime.fromtimestamp(mtime).strftime("%d-%m-%Y %H:%M")
-    return f"{path.name}\n{disk.format_bytes(size)} · {date}\n{send_note}{live_note}"
+        ok, note = check_sendable(path)
+        if not ok and not sendable_path(path):
+            notes.append(f"Cannot upload: {note}.")
+    if notes:
+        lines.append(" ".join(notes))
+    return "\n".join(lines)
 
 
-def _detail_keyboard(*, sendable: bool = True) -> ReplyKeyboardMarkup:
-    """Back / Send / Delete rows of the per-file detail submenu.
+def _detail_keyboard(*, uploadable: bool = True) -> ReplyKeyboardMarkup:
+    """Back / Upload / Delete rows of the per-file detail submenu.
 
     Files at or over the 2 GiB cap get Delete / Back only, unless ffmpeg can
-    split them into chunks below the cap.
+    split them into chunks below the cap and YouTube has no such file to take.
     """
-    rows = [["Back"], [SEND_LABEL, DELETE_LABEL]] if sendable else [["Back"], [DELETE_LABEL]]
+    rows = [["Back"], [UPLOAD_LABEL, DELETE_LABEL]] if uploadable else [["Back"], [DELETE_LABEL]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def uploadable_path(ctrl: TelegramController, path: str | Path) -> bool:
+    """True when ``path`` can go to at least one upload target.
+
+    Telegram takes files through the MTProto size gate (or as split parts).
+    YouTube takes any finished file when the operator authenticated.
+    """
+    if sendable_path(path):
+        return True
+    if not youtube_available(ctrl._config):
+        return False
+    ok, _ = check_uploadable(Path(path))
+    if not ok:
+        return False
+    return os.path.realpath(path) not in _live_paths(ctrl)
+
+
+def _upload_menu_keyboard(ctrl: TelegramController) -> Any:
+    """Upload submenu keyboard: one row per available target, plus Back."""
+    from telegram import ReplyKeyboardMarkup
+
+    rows = [["Back"], [TELEGRAM_LABEL]]
+    if youtube_available(ctrl._config):
+        rows.append([YOUTUBE_LABEL])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _upload_menu_text(ctrl: TelegramController, path: Path) -> str:
+    """Upload submenu body: the file, plus its remembered link when set."""
+    from stream_archive.youtube_upload import read_youtube_url
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return f"{path.name} is gone."
+    lines = [f"{path.name} ({disk.format_bytes(size)}). Upload where:"]
+    existing = read_youtube_url(path)
+    if existing:
+        lines.append(f"Already on YouTube: {existing}")
+    if os.path.realpath(path) in _live_paths(ctrl):
+        lines.append("YouTube: waits until the recording ends.")
+    else:
+        ok, note = check_uploadable(path)
+        if not ok:
+            lines.append(f"YouTube: cannot upload ({note}).")
+    ok, note = check_sendable(path)
+    if not ok and not sendable_path(path):
+        lines.append(f"Telegram: cannot upload ({note}).")
+    return "\n".join(lines)
 
 
 def last_page_start(count: int) -> int:
@@ -251,12 +310,15 @@ def sendable_path(path: str | Path) -> bool:
 
 def _detail_body(ctrl: TelegramController, path: Path) -> tuple[str, Any] | None:
     """Detail text plus detail keyboard for ``path``, or None when it is gone."""
+    from stream_archive.youtube_upload import read_youtube_url
+
     try:
         st = path.stat()
     except OSError:
         return None
     live = os.path.realpath(path) in _live_paths(ctrl)
-    return _detail_text(path, st.st_size, st.st_mtime, live), _detail_keyboard(sendable=sendable_path(path))
+    text = _detail_text(path, st.st_size, st.st_mtime, live, read_youtube_url(path))
+    return text, _detail_keyboard(uploadable=uploadable_path(ctrl, path))
 
 
 def _clamp_offset(ctrl: TelegramController, chat_id: ChatId, count: int) -> int:
@@ -291,7 +353,7 @@ def _open_detail(ctrl: TelegramController, chat_id: ChatId, path: Path) -> MenuR
     return text, markup
 
 
-async def _send_picked(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
+async def _send_picked(ctrl: TelegramController, chat_id: ChatId, menu: str = "rec_detail") -> MenuResult:
     """Start the MTProto upload of the picked file. Reports why not when blocked."""
     state = ctrl._state_for(chat_id)
     picked = state.rec_path
@@ -302,22 +364,105 @@ async def _send_picked(ctrl: TelegramController, chat_id: ChatId) -> MenuResult:
         text = "That upload already runs. Wait for it to finish."
         if body is not None:
             text = f"{text}\n\n{body[0]}"
-        return text, ctrl.reply_keyboard("rec_detail", chat_id=chat_id)
+        return text, ctrl.reply_keyboard(menu, chat_id=chat_id)
     uploader = getattr(ctrl, "_mtproto", None)
     if uploader is None or not uploader.enabled:
         return "MTProto upload is off. Enable it under Settings, then MTProto upload.", ctrl.reply_keyboard(
-            "rec_detail", chat_id=chat_id
+            menu, chat_id=chat_id
         )
     path = Path(picked)
     ok, note = check_sendable(path)
     if not ok and not sendable_path(path):
         body = _detail_body(ctrl, path)
-        text = f"Cannot send {path.name}: {note}."
+        text = f"Cannot upload {path.name} to Telegram: {note}."
         if body is not None:
             text = f"{text}\n\n{body[0]}"
-        return text, ctrl.reply_keyboard("rec_detail", chat_id=chat_id)
+        return text, ctrl.reply_keyboard(menu, chat_id=chat_id)
     await ctrl._start_mtproto_send(chat_id, str(path))
     return None
+
+
+def _picked_channel(ctrl: TelegramController, chat_id: ChatId, path: Path) -> str:
+    """Channel tag of the picked file: its archive dir, else the picked channel."""
+    base = disk.resolve_recording_dir(ctrl._config)
+    tag = channel_of(base, path)
+    if tag != "unknown":
+        return tag
+    return ctrl._state_for(chat_id).rec_channel or "unknown"
+
+
+async def _youtube_picked(ctrl: TelegramController, chat_id: ChatId, confirmed: bool = False) -> MenuResult:
+    """Start the YouTube upload of the picked file. Reports why not when blocked."""
+    from stream_archive.youtube_upload import read_youtube_url
+
+    state = ctrl._state_for(chat_id)
+    picked = state.rec_path
+    if not picked:
+        return "No recording picked. Open Recordings again.", ctrl.reply_keyboard("recordings", chat_id=chat_id)
+    hub = getattr(ctrl, "_uploads", None)
+    if hub is not None and hub.running_id(picked) is not None:
+        return "That upload already runs. Wait for it to finish.", ctrl.reply_keyboard("rec_upload", chat_id=chat_id)
+    if not youtube_available(ctrl._config):
+        return "YouTube upload is not configured. Run 'stream-archive-setup-youtube' first.", ctrl.reply_keyboard(
+            "rec_upload", chat_id=chat_id
+        )
+    path = Path(picked)
+    if os.path.realpath(path) in _live_paths(ctrl):
+        return f"{path.name} is recording now. Upload waits until the stream ends.", ctrl.reply_keyboard(
+            "rec_upload", chat_id=chat_id
+        )
+    ok, note = check_uploadable(path)
+    if not ok:
+        return f"Cannot upload {path.name} to YouTube: {note}.", ctrl.reply_keyboard("rec_upload", chat_id=chat_id)
+    existing = read_youtube_url(path)
+    if existing and not confirmed:
+        from stream_archive.telegram.menus_callbacks import confirm_keyboard
+
+        nonce = _store_pending_yt_upload(ctrl, chat_id, picked)
+        return (
+            f"Already on YouTube: {existing}\nUpload {path.name} again and replace it?",
+            confirm_keyboard("confirm_ytupload", nonce),
+        )
+    await ctrl._start_youtube_upload(chat_id, str(path), _picked_channel(ctrl, chat_id, path))
+    return None
+
+
+def _store_pending_yt_upload(ctrl: TelegramController, chat_id: ChatId, path: str) -> str:
+    """Stash ``path`` for the YouTube re-upload confirm of ``chat_id``."""
+    import secrets
+
+    store = ctrl._pending_yt_upload
+    for _ in range(16):
+        nonce = secrets.token_hex(4)
+        if (chat_id, nonce) not in store:
+            store[(chat_id, nonce)] = path
+            break
+    else:
+        nonce = secrets.token_hex(8)
+        store[(chat_id, nonce)] = path
+    ctrl._prune_pending(store, chat_id)
+    return nonce
+
+
+def _confirm_yt_upload_target(ctrl: TelegramController, chat_id: ChatId, nonce: str) -> str | None:
+    """Path the YouTube re-upload confirm targets, or None when stale."""
+    pending = ctrl._pending_yt_upload.pop((chat_id, nonce), None)
+    if pending is None:
+        return None
+    picked = ctrl._state_for(chat_id).rec_path
+    if not picked or picked != pending:
+        return None
+    return picked
+
+
+async def handle_yt_upload_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
+    """Apply one YouTube re-upload confirm press for ``chat_id``."""
+    rest = data.split(":", 1)[1] if ":" in data else ""
+    nonce = rest.split(":")[0] if rest else ""
+    target = _confirm_yt_upload_target(ctrl, chat_id, nonce)
+    if target is None:
+        return "That button expired. Open Recordings again.", None
+    return await _youtube_picked(ctrl, chat_id, confirmed=True)
 
 
 def _store_pending_delete(ctrl: TelegramController, chat_id: ChatId, path: str) -> str:
@@ -453,12 +598,17 @@ async def _delete_bulk(ctrl: TelegramController, chat_id: ChatId, channel: str |
         return _channel_list_text(ctrl), _channel_keyboard(ctrl)
     live = _live_paths(ctrl)
     recorder = ctrl._recorder
+    uploads = getattr(ctrl, "_uploads", None)
     deleted = 0
     freed = 0
     skipped = 0
+    uploading = 0
     for _, _, path in files:
         if os.path.realpath(path) in live:
             skipped += 1
+            continue
+        if uploads is not None and uploads.running_id(str(path)) is not None:
+            uploading += 1
             continue
         if hasattr(recorder, "_remove_if_inactive"):
             try:
@@ -478,12 +628,15 @@ async def _delete_bulk(ctrl: TelegramController, chat_id: ChatId, channel: str |
         except OSError:
             logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
             continue
+        drop_youtube_url(path)
         disk_mod.drop_thumbnail(ctrl._config, path)
         deleted += 1
     disk_mod.invalidate_snapshot()
     parts = [f"Deleted {deleted} file{'s' if deleted != 1 else ''} ({disk.format_bytes(freed)})."]
     if skipped:
         parts.append(f"{skipped} live capture{'s stay' if skipped != 1 else ' stays'}.")
+    if uploading:
+        parts.append(f"{uploading} upload{'s' if uploading != 1 else ''} in flight, left alone.")
     state = ctrl._state_for(chat_id)
     state.rec_path = None
     if channel is not None and _channel_files(ctrl, channel):
@@ -595,19 +748,46 @@ def _channel_page_keyboard(ctrl: TelegramController, chat_id: ChatId) -> Any:
 
 
 async def menu_rec_detail(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
-    """Route one press in the per-file detail submenu: Send, Delete, or Back."""
-    if text == SEND_LABEL:
+    """Route one press in the per-file detail submenu: Upload, Delete, or Back."""
+    if text == UPLOAD_LABEL:
         picked = ctrl._state_for(chat_id).rec_path
+        if picked:
+            ok, note = check_sendable(Path(picked))
+            if not ok and not uploadable_path(ctrl, picked):
+                return (
+                    f"Cannot upload {Path(picked).name}: {note}.",
+                    ctrl.reply_keyboard("rec_detail", chat_id=chat_id),
+                )
+        ctrl._enter_menu(chat_id, "rec_upload")
+        picked_after = ctrl._state_for(chat_id).rec_path
+        if picked_after is None:
+            return "No recording picked. Open Recordings again.", ctrl.reply_keyboard("recordings", chat_id=chat_id)
+        path = Path(picked_after)
+        return _upload_menu_text(ctrl, path), _upload_menu_keyboard(ctrl)
+    if text == DELETE_LABEL:
+        return await _ask_delete(ctrl, chat_id)
+    return None
+
+
+async def menu_rec_upload(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route one press in the upload submenu: Telegram, YouTube, or Back."""
+    if text == TELEGRAM_LABEL:
+        state = ctrl._state_for(chat_id)
+        picked = state.rec_path
         if picked:
             ok, note = check_sendable(Path(picked))
             if not ok and not sendable_path(picked):
                 return (
-                    f"Cannot send {Path(picked).name}: {note}.",
-                    ctrl.reply_keyboard("rec_detail", chat_id=chat_id),
+                    f"Cannot upload {Path(picked).name} to Telegram: {note}.",
+                    ctrl.reply_keyboard("rec_upload", chat_id=chat_id),
                 )
-        return await _send_picked(ctrl, chat_id)
-    if text == DELETE_LABEL:
-        return await _ask_delete(ctrl, chat_id)
+        return await _send_picked(ctrl, chat_id, menu="rec_upload")
+    if text == YOUTUBE_LABEL:
+        if not youtube_available(ctrl._config):
+            return "YouTube upload is not configured. Run 'stream-archive-setup-youtube' first.", ctrl.reply_keyboard(
+                "rec_upload", chat_id=chat_id
+            )
+        return await _youtube_picked(ctrl, chat_id)
     return None
 
 
@@ -629,9 +809,10 @@ def _confirm_delete_target(ctrl: TelegramController, chat_id: ChatId, nonce: str
 async def handle_rec_callback(ctrl: TelegramController, data: str, chat_id: ChatId) -> tuple[str, Any] | None:
     """Apply one recordings inline-button press for ``chat_id``.
 
-    Only the delete confirm travels inline now: the detail submenu owns Send
-    and Delete as reply-keyboard rows. The confirm binds the exact path it
-    was asked for, so a re-pick between Delete and Confirm cannot retarget it.
+    Delete and YouTube re-upload confirms travel inline now: the detail
+    submenu owns Upload and Delete as reply-keyboard rows. Each confirm
+    binds the exact path it was asked for, so a re-pick between the prompt
+    and Confirm cannot retarget it.
     """
     if data == "confirm_recdel" or data.startswith("confirm_recdel:"):
         # Wire form is confirm_recdel:<nonce>:<guard-nonce>; the path lives
@@ -662,6 +843,9 @@ async def _delete_picked(ctrl: TelegramController, chat_id: ChatId) -> tuple[str
     path = Path(picked)
     recorder = ctrl._recorder
     active = _live_paths(ctrl)
+    uploads = getattr(ctrl, "_uploads", None)
+    if uploads is not None and uploads.running_id(str(path)) is not None:
+        return f"{path.name} is uploading now. Delete is blocked.", None
     if hasattr(recorder, "_remove_if_inactive"):
         freed = recorder._remove_if_inactive(path, active)
         if freed is None:
@@ -678,6 +862,7 @@ async def _delete_picked(ctrl: TelegramController, chat_id: ChatId) -> tuple[str
     except OSError:
         logger.warning("[telegram] Failed to delete %s", path, exc_info=True)
         return f"Could not delete {path.name}. See logs.", None
+    drop_youtube_url(path)
     disk_mod.drop_thumbnail(ctrl._config, path)
     disk_mod.invalidate_snapshot()
     return f"Deleted {path.name} ({disk.format_bytes(size)}).", _after_delete_keyboard(ctrl, chat_id, channel)

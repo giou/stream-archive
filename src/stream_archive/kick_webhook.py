@@ -715,7 +715,9 @@ class KickWebhook:
                 if not status.get("is_live"):
                     await self._monitor.handle_offline(channel, self._config)
                     return
-                await self._monitor.handle_online(channel, status.get("title"), status.get("game"), None, self._config)
+                await self._monitor.handle_online(
+                    channel, status.get("title") or None, status.get("game") or None, None, self._config
+                )
             else:
                 await self._monitor.handle_online(channel, None, None, None, self._config)
         else:

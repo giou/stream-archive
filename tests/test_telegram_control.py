@@ -1174,7 +1174,8 @@ def test_reply_keyboard_channel_layout(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     assert ctrl.reply_keyboard("channel", "twitch:channel1").to_dict()["keyboard"] == [
         [{"text": "Mode"}, {"text": "Quality"}, {"text": "Categories"}],
-        [{"text": "Hold delay"}, {"text": "Remove channel"}],
+        [{"text": "Hold delay"}, {"text": "VOD upload"}],
+        [{"text": "Remove channel"}],
         [{"text": "Back"}],
     ]
     assert ctrl.reply_keyboard("channel_mode", "twitch:channel1").to_dict()["keyboard"] == [
@@ -2556,6 +2557,25 @@ def test_reply_text_channel_hold_default_resets(tmp_path):
     assert read_file(tmp_path)["channel_youtube_hold_seconds"] == {}
     assert menu_of(ctrl).menu == "channel"
     assert menu_of(ctrl).channel == "twitch:channel1"
+
+
+def test_reply_text_channel_vod_toggle(tmp_path):
+    config, ctrl, _, _, eventsub = make_controller(tmp_path)
+    menu_of(ctrl).menu, menu_of(ctrl).channel = "channel", "twitch:channel1"
+    text, markup = asyncio.run(ctrl.handle_reply_text("VOD upload"))
+    assert menu_of(ctrl).menu == "channel_vod"
+    assert "auto-upload for twitch:channel1: off" in text
+    assert kb_labels(markup) == ["Enable VOD upload", "Back"]
+    text, markup = asyncio.run(ctrl.handle_reply_text("Enable VOD upload"))
+    assert "YouTube auto-upload for twitch:channel1 enabled" in text
+    assert config.channel_youtube_vod_upload == {"twitch:channel1": True}
+    assert read_file(tmp_path)["channel_youtube_vod_upload"] == {"twitch:channel1": True}
+    assert menu_of(ctrl).menu == "channel"
+    text, markup = asyncio.run(ctrl.handle_reply_text("VOD upload"))
+    assert kb_labels(markup) == ["Disable VOD upload", "Back"]
+    text, _ = asyncio.run(ctrl.handle_reply_text("Disable VOD upload"))
+    assert "disabled" in text
+    assert config.channel_youtube_vod_upload == {"twitch:channel1": False}
 
 
 def test_reply_text_channel_hold_custom(tmp_path):

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import UTC
 from pathlib import Path
@@ -40,6 +41,25 @@ def save_token(credentials: Credentials, path: Path) -> None:
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _resume_offset(resp: Any, default: int) -> int:
+    """Next byte the server wants, from a 308 Range header or ``default``.
+
+    A 308 answers ``Range: bytes=0-<last>`` for the bytes it holds. With
+    no header nothing landed, so the caller resends from ``default``.
+    """
+    match = re.match(r"bytes=0-(\d+)", resp.headers.get("range", ""))
+    if match is None:
+        return default
+    return int(match.group(1)) + 1
+
+
+def _read_upload_chunk(handle: Any, offset: int, size: int) -> bytes:
+    """Seek to ``offset`` and read up to ``size`` bytes. Runs off the loop."""
+    handle.seek(offset)
+    data: bytes = handle.read(size)
+    return data
 
 
 def _required_field(payload: Any, path: str, what: str) -> str:
@@ -322,3 +342,241 @@ class YouTubeStreamer:
                 await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         finally:
             await self._client.aclose()
+
+    async def upload_video_file(
+        self,
+        path: str | Path,
+        title: str,
+        description: str,
+        progress: Any = None,
+    ) -> dict[str, str]:
+        """Upload ``path`` as a video-on-demand. Return its id and watch URL.
+
+        The upload follows the resumable protocol: a session POST answers
+        the session URI, then chunked PUTs fill it. Each chunk reports
+        progress. A 5xx answer or a transport error retries the chunk with
+        backoff. A cancellation aborts the upload: the session URI simply
+        expires server-side, so no rollback runs here.
+        """
+        import mimetypes
+        import os
+
+        file_path = Path(path)
+        try:
+            size = os.path.getsize(file_path)
+        except FileNotFoundError:
+            msg = f"the file is gone: {file_path.name}"
+            raise ValueError(msg) from None
+        if size <= 0:
+            msg = f"the file is empty: {file_path.name}"
+            raise ValueError(msg)
+        mime, _ = mimetypes.guess_type(file_path.name)
+        content_type = mime if mime and mime.startswith("video/") else "application/octet-stream"
+        body = {
+            "snippet": {"title": title, "description": description, "categoryId": "22"},
+            "status": {
+                "privacyStatus": self._privacy_status,
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+        session_url = await self._start_upload_session(body, size, content_type)
+        video_id = await self._send_upload_chunks(session_url, file_path, size, content_type, progress)
+        return {"video_id": video_id, "youtube_url": f"https://www.youtube.com/watch?v={video_id}"}
+
+    async def _upload_headers(self) -> dict[str, str]:
+        """Bearer headers of the current credentials."""
+        creds = await self._get_credentials()
+        return {"Authorization": f"Bearer {creds.token}"}
+
+    async def _start_upload_session(self, body: dict[str, Any], size: int, content_type: str) -> str:
+        """Open a resumable session. Return its session URI."""
+        from stream_archive.youtube_upload import UPLOAD_BASE
+
+        params = {"uploadType": "resumable", "part": "snippet,status"}
+        headers = await self._upload_headers()
+        headers.update(
+            {
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Length": str(size),
+                "X-Upload-Content-Type": content_type,
+            }
+        )
+        resp = await self._client.post(UPLOAD_BASE, params=params, headers=headers, json=body)
+        if resp.status_code == 401:
+            # Refresh into the same dict: a replace would drop the
+            # Content-Type and X-Upload-* headers the session needs.
+            headers.update(await self._upload_headers_refresh())
+            resp = await self._client.post(UPLOAD_BASE, params=params, headers=headers, json=body)
+        if resp.status_code >= 400:
+            logger.error("[youtube] Upload session failed (%d): %s", resp.status_code, resp.text[:500])
+        resp.raise_for_status()
+        session_url = resp.headers.get("location")
+        if not session_url or not isinstance(session_url, str):
+            msg = f"YouTube answered the upload session without a session URI: {resp.text[:200]!r}"
+            raise RuntimeError(msg)
+        return session_url
+
+    async def _upload_headers_refresh(self) -> dict[str, str]:
+        """Bearer headers after a forced token refresh."""
+        creds = await self._get_credentials(refresh=True)
+        return {"Authorization": f"Bearer {creds.token}"}
+
+    async def _put_upload_chunk(
+        self, session_url: str, headers: dict[str, str], chunk: bytes, timeout: httpx.Timeout, auth: dict[str, str]
+    ) -> Any:
+        """One chunk PUT, with one retry after a forced token refresh on 401.
+
+        A refresh updates ``auth`` too, so later chunks reuse the fresh
+        token instead of each 401ing and refreshing again.
+        """
+        resp = await self._client.put(session_url, headers=headers, content=chunk, timeout=timeout)
+        if resp.status_code == 401:
+            refreshed = await self._upload_headers_refresh()
+            headers.update(refreshed)
+            auth.update(refreshed)
+            resp = await self._client.put(session_url, headers=headers, content=chunk, timeout=timeout)
+        return resp
+
+    async def _send_upload_chunks(
+        self,
+        session_url: str,
+        file_path: Path,
+        size: int,
+        content_type: str,
+        progress: Any,
+    ) -> str:
+        """PUT ``size`` bytes to ``session_url`` in chunks. Return the video id."""
+        from stream_archive.youtube_upload import (
+            MAX_CHUNK_RETRIES,
+            RETRIABLE_STATUS_CODES,
+            UPLOAD_CHUNK_BYTES,
+            report_upload_progress,
+        )
+
+        completed_id: str | None = None
+
+        async def resend_from_server(current: int) -> int:
+            """Resume point after a failed chunk: what the server holds.
+
+            A failed status query must not fail the chunk: the chunk is
+            resent from its start instead. Resending stored bytes is safe.
+            When the server answers that the upload already finished, the
+            video id rides back out through ``completed_id`` below.
+            """
+            nonlocal completed_id
+            try:
+                offset, video_id = await self._query_upload_offset(session_url, size)
+            except Exception:
+                logger.warning("[youtube] Upload status query failed, resending the current chunk")
+                return current
+            if video_id is not None:
+                completed_id = video_id
+            return offset
+
+        # Bearer headers up front: without them every chunk 401s first and
+        # each one forces a token refresh. The 401 path below only covers a
+        # token that expires mid-upload.
+        auth = await self._upload_headers()
+        offset = 0
+        retries = 0
+        backoff = 1.0
+        chunk_timeout = httpx.Timeout(120.0, connect=10.0)
+        with open(file_path, "rb") as handle:
+            while offset < size:
+                chunk = await asyncio.to_thread(_read_upload_chunk, handle, offset, UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                end = offset + len(chunk) - 1
+                headers = {
+                    "Content-Type": content_type,
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{size}",
+                    **auth,
+                }
+                try:
+                    resp = await self._put_upload_chunk(session_url, headers, chunk, chunk_timeout, auth)
+                except (httpx.TransportError, httpx.TimeoutException) as e:
+                    # The chunk may or may not have landed: ask the server
+                    # where the upload stands instead of resending blindly.
+                    retries += 1
+                    if retries > MAX_CHUNK_RETRIES:
+                        raise
+                    logger.warning("[youtube] Upload chunk failed (%s), retry %d", e, retries)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    offset = await resend_from_server(offset)
+                    continue
+                if resp.status_code in (200, 201):
+                    report_upload_progress(progress, size, size, "upload")
+                    return _required_field(resp.json(), "id", "video id")
+                if resp.status_code == 308:
+                    # Incomplete: the server kept the chunk (all of it or a
+                    # prefix) and waits for the rest. Without a Range header
+                    # nothing landed, so the same chunk goes again: resuming
+                    # past it would leave a gap in the object.
+                    offset = _resume_offset(resp, offset)
+                    report_upload_progress(progress, offset, size, "upload")
+                    retries = 0
+                    backoff = 1.0
+                    continue
+                if resp.status_code in RETRIABLE_STATUS_CODES:
+                    retries += 1
+                    if retries > MAX_CHUNK_RETRIES:
+                        logger.error("[youtube] Upload chunk failed (%d): %s", resp.status_code, resp.text[:500])
+                        resp.raise_for_status()
+                    logger.warning("[youtube] Upload chunk got %d, retry %d", resp.status_code, retries)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    offset = await resend_from_server(offset)
+                    continue
+                logger.error("[youtube] Upload chunk failed (%d): %s", resp.status_code, resp.text[:500])
+                resp.raise_for_status()
+        if completed_id is not None:
+            # A retry probe found the upload already finished (the final
+            # chunk landed despite its failed answer). Report the success
+            # with its id instead of a bogus "no video id" failure, which
+            # would also orphan the sidecar and invite a duplicate retry.
+            report_upload_progress(progress, size, size, "upload")
+            return completed_id
+        # A complete upload answers 200/201 above, so reaching here means
+        # the stream ended early without an answer.
+        msg = f"YouTube upload of {file_path.name} ended without a video id"
+        raise RuntimeError(msg)
+
+    async def _query_upload_offset(self, session_url: str, size: int) -> tuple[int, str | None]:
+        """Resume point of ``session_url`` plus the video id when finished.
+
+        A status query is a zero-length PUT with an unknown range. The
+        server answers 308 with a Range header, or 200/201 with the video
+        resource when the upload already finished. Returns
+        ``(offset, video_id)``; the id is None unless finished.
+        """
+        headers = await self._upload_headers()
+        resp = await self._client.put(
+            session_url,
+            headers={"Content-Length": "0", "Content-Range": f"bytes */{size}", **headers},
+            content=b"",
+        )
+        if resp.status_code in (200, 201):
+            return size, _required_field(resp.json(), "id", "video id")
+        if resp.status_code == 308:
+            return _resume_offset(resp, 0), None
+        if resp.status_code == 401:
+            headers = await self._upload_headers_refresh()
+            resp = await self._client.put(
+                session_url,
+                headers={
+                    "Content-Length": "0",
+                    "Content-Range": f"bytes */{size}",
+                    **headers,
+                },
+                content=b"",
+            )
+            if resp.status_code in (200, 201):
+                return size, _required_field(resp.json(), "id", "video id")
+            if resp.status_code == 308:
+                return _resume_offset(resp, 0), None
+        if resp.status_code >= 400:
+            logger.error("[youtube] Upload status query failed (%d): %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+        return 0, None

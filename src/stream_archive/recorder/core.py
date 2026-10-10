@@ -114,6 +114,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self._youtube_budget_lock = asyncio.Lock()
         self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
         self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
+        #: Final filepath of a clean end, for the monitor auto-upload hook.
+        #: Set after finalize (the remux can rename the file) and consumed
+        #: once by pop_ended_clean_path, a new start, a live stop, or expiry.
+        self._ended_clean_path: dict[str, str] = {}
         self._reserve_lock = asyncio.Lock()
         self._reserved_channels = {}  # channel -> output mode, reserved but not yet started
         # Fire-and-forget finalize tasks. The set holds a reference, so the
@@ -386,6 +390,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             entry["watchdog"] = asyncio.create_task(self._watch_growth(channel))
 
             self._ended_clean.pop(channel, None)
+            self._ended_clean_path.pop(channel, None)
             logger.info("[recorder] Started recording %s (mode=%s)", channel, mode)
             if mode == "disk" and notify and self._notifier:
                 try:
@@ -455,6 +460,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             return None
 
         entry = self._recordings.pop(channel)
+        # A live stop supersedes any remembered clean end: the result below
+        # carries this entry's filepath. The no-entry path above keeps the
+        # remembered path for the monitor hook to consume.
+        self._ended_clean_path.pop(channel, None)
         wd = entry.pop("watchdog", None)
         if wd:
             wd.cancel()
@@ -482,7 +491,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                     "date": mtime.astimezone(ZoneInfo(self._config.timezone)).strftime("%d-%m-%Y %H:%M"),
                 }
 
-        return {"file_info": file_info, "youtube_info": youtube_info}
+        return {"file_info": file_info, "youtube_info": youtube_info, "filepath": filepath}
 
     async def restart(self, channel: str) -> bool:
         """Stop and immediately restart a recording with the current config.
@@ -647,8 +656,14 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 logger.info("[recorder] [%s] Recording task ended", channel)
             if entry["tasks"]:
                 return  # other recording tasks (for example the disk fallback) still running
-            self._recordings.pop(channel, None)
-            # Cancel the watchdog here too, like the stop and abort paths. It
+            clean = not entry.get("failed")
+            if clean:
+                # Stamp before finalize. The remux and thumbnail below take
+                # seconds on large files, and the monitor tick runs during
+                # that window. Without the early stamp it sees no recording
+                # and no clean end, restarts a dead feed, and alerts.
+                self._ended_clean[channel] = time.monotonic()
+            self._recordings.pop(channel, None)  # Cancel the watchdog here too, like the stop and abort paths. It
             # only stops once it sees no entry for the channel, and a restart
             # inside that window would leave a second, untracked watchdog
             # behind.
@@ -658,11 +673,16 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             await self._finalize_entry(channel, entry, entry.pop("chat_recorder", None))
             if entry.get("mode") in ("youtube", "both"):
                 self._note_youtube_end(channel, entry)
-            # Remember that the stream ended on its own, not through a task failure.
-            # The monitor then skips restart attempts until the offline event catches
-            # up. Otherwise a dead stream just resolves to a 404.
-            if not entry.get("failed"):
-                self._ended_clean[channel] = time.monotonic()
+            if clean:
+                # Remember the finalized filepath with the clean stamp. The
+                # remux above can rename .ts to .mp4, so only the path read
+                # here names the file the monitor hook must upload. A later
+                # offline event finds no live entry (stop() answers None),
+                # and without this the auto-upload never fires on the common
+                # feed-ended-first path.
+                final = entry.get("filepath")
+                if isinstance(final, str) and final:
+                    self._ended_clean_path[channel] = final
 
     def ended_clean(self, channel: str) -> bool:
         """True when the channel's last recording ended cleanly and recently."""
@@ -671,8 +691,18 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             return False
         if time.monotonic() - ts >= _ENDED_CLEAN_GRACE_S:
             self._ended_clean.pop(channel, None)
+            self._ended_clean_path.pop(channel, None)
             return False
         return True
+
+    def pop_ended_clean_path(self, channel: str) -> str | None:
+        """Final filepath of the channel's clean end, once. None when absent.
+
+        The monitor consumes this after an offline event finds no live
+        entry: the feed ended on its own and the entry is already gone.
+        Each path hands out once, so a later stop cannot re-upload it.
+        """
+        return self._ended_clean_path.pop(channel, None)
 
     async def _abort(self, channel: str, reason: str) -> None:
         # The disk-cap watchdog calls this from outside any per-channel lock.

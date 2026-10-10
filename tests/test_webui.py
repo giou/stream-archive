@@ -121,7 +121,7 @@ class FakeKickWebhook:
         return None
 
 
-def make_webui(tmp_path, *, web_enabled=True, password=True, channels=("twitch:channel1",)):
+def make_webui(tmp_path, *, web_enabled=True, password=True, channels=("twitch:channel1",), youtube=False):
     """Controller (Telegram disabled) plus panel on a real listener app."""
     data = valid_config(
         channels=list(channels),
@@ -132,6 +132,8 @@ def make_webui(tmp_path, *, web_enabled=True, password=True, channels=("twitch:c
     ).model_dump(mode="json", exclude_unset=True)
     (tmp_path / "config.json").write_text(json.dumps(data))
     config = get_config(tmp_path / "config.json")
+    if youtube:
+        (tmp_path / "youtube_token.json").write_text(json.dumps({"refresh_token": "rt"}))
     recorder = FakeRecorder()
     monitor = FakeMonitor()
     eventsub = FakeEventSub()
@@ -360,6 +362,208 @@ def test_status_reports_disk_cap(tmp_path):
     assert status["disk"]["archive_gb"] == 1.0
 
 
+def test_status_reports_youtube_flag(tmp_path):
+    _, _, _, _, wh = make_webui(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await login(client)
+            before = await (await client.get("/api/status")).json()
+            (tmp_path / "youtube_token.json").write_text(json.dumps({"refresh_token": "rt"}))
+            after = await (await client.get("/api/status")).json()
+            return before, after
+
+    before, after = asyncio.run(scenario())
+    assert before["youtube"] == {"configured": False}
+    assert after["youtube"] == {"configured": True}
+
+
+def test_uploads_start_list_and_cancel(tmp_path):
+    """POST starts a VOD upload, GET shows its progress, DELETE cancels it."""
+    from stream_archive.uploads import UploadHub
+
+    config, _, _, webui, wh = make_webui(tmp_path, youtube=True)
+    hub = UploadHub()
+    webui._uploads = hub
+    gate = asyncio.Event()
+
+    async def runner(progress):
+        progress(10, 100, "upload")
+        await gate.wait()
+        return "https://www.youtube.com/watch?v=web1"
+
+    webui._youtube_runner = lambda channel, path: runner
+    base = rec_dir(config)
+    (base / "show.mp4").write_bytes(b"x" * 100)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            started = await client.post("/api/uploads", json={"id": "twitch/channel1/show.mp4"}, headers=headers)
+            started_body = await started.json()
+            listed = await client.get("/api/uploads", headers=headers)
+            listed_body = await listed.json()
+            dup = await client.post("/api/uploads", json={"id": "twitch/channel1/show.mp4"}, headers=headers)
+            cancelled = await client.delete(f"/api/uploads?id={started_body['upload_id']}", headers=headers)
+            gate.set()
+            for _ in range(500):
+                if not hub._tasks:
+                    break
+                await asyncio.sleep(0.01)
+            final = await client.get("/api/uploads", headers=headers)
+            return started.status, started_body, listed_body, dup.status, cancelled.status, await final.json()
+
+    started_status, started_body, listed_body, dup_status, cancel_status, final = asyncio.run(scenario())
+    assert started_status == 200
+    assert started_body["name"] == "show.mp4"
+    assert listed_body["youtube_configured"] is True
+    assert listed_body["uploads"][0]["sent"] == 10
+    assert listed_body["uploads"][0]["channel"] == "twitch:channel1"
+    assert dup_status == 200
+    assert cancel_status == 200
+    by_id = {u["id"]: u for u in final["uploads"]}
+    assert by_id[started_body["upload_id"]]["status"] == "cancelled"
+
+
+def test_delete_refuses_while_upload_runs(tmp_path):
+    """Deleting a file mid-upload answers 409 and keeps the file.
+
+    The upload would otherwise keep reading a deleted file and re-create
+    its sidecar for it on success.
+    """
+    from stream_archive.uploads import UploadHub
+
+    config, _, _, webui, wh = make_webui(tmp_path, youtube=True)
+    hub = UploadHub()
+    webui._uploads = hub
+    gate = asyncio.Event()
+
+    async def runner(progress):
+        await gate.wait()
+        return "https://www.youtube.com/watch?v=web1"
+
+    webui._youtube_runner = lambda channel, path: runner
+    base = rec_dir(config)
+    (base / "show.mp4").write_bytes(b"x" * 100)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            started = await client.post("/api/uploads", json={"id": "twitch/channel1/show.mp4"}, headers=headers)
+            assert started.status == 200
+            for _ in range(500):
+                if hub._tasks:
+                    break
+                await asyncio.sleep(0.01)
+            refused = await client.delete("/api/recordings?id=twitch/channel1/show.mp4", headers=headers)
+            refused_body = await refused.json()
+            gate.set()
+            for _ in range(500):
+                if not hub._tasks:
+                    break
+                await asyncio.sleep(0.01)
+            deleted = await client.delete("/api/recordings?id=twitch/channel1/show.mp4", headers=headers)
+            return refused.status, refused_body, deleted.status
+
+    refused_status, refused_body, deleted_status = asyncio.run(scenario())
+    assert refused_status == 409
+    assert "uploading" in refused_body.get("error", "")
+    assert deleted_status == 200
+    assert not (rec_dir(config) / "show.mp4").exists()
+
+
+def test_uploads_reject_unconfigured_live_and_gone(tmp_path):
+    config, _, recorder, webui, wh = make_webui(tmp_path, youtube=True)
+    from stream_archive.uploads import UploadHub
+
+    webui._uploads = UploadHub()
+    webui._youtube_runner = lambda channel, path: None
+    base = rec_dir(config)
+    target = base / "live.mp4"
+    target.write_bytes(b"x" * 100)
+    recorder._active_paths = lambda: {os.path.realpath(target)}  # type: ignore[method-assign]
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            live = await client.post("/api/uploads", json={"id": "twitch/channel1/live.mp4"}, headers=headers)
+            gone = await client.post("/api/uploads", json={"id": "twitch/channel1/gone.mp4"}, headers=headers)
+            missing = await client.delete("/api/uploads?id=nope", headers=headers)
+            return live.status, gone.status, missing.status
+
+    live_status, gone_status, missing_status = asyncio.run(scenario())
+    assert live_status == 409
+    assert gone_status == 400
+    assert missing_status == 404
+
+
+def test_uploads_start_needs_youtube(tmp_path):
+    """Without a token the panel refuses the upload instead of failing it."""
+    config, _, _, webui, wh = make_webui(tmp_path)
+    from stream_archive.uploads import UploadHub
+
+    webui._uploads = UploadHub()
+    webui._youtube_runner = lambda channel, path: None
+    base = rec_dir(config)
+    (base / "show.mp4").write_bytes(b"x" * 100)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            resp = await client.post("/api/uploads", json={"id": "twitch/channel1/show.mp4"}, headers=headers)
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(scenario())
+    assert status == 503
+    assert "not configured" in body.get("error", "")
+
+
+def test_uploads_reupload_needs_force(tmp_path):
+    """An already-uploaded file answers 409 with its URL; force re-uploads."""
+    from stream_archive.uploads import UploadHub
+    from stream_archive.youtube_upload import write_youtube_url
+
+    config, _, _, webui, wh = make_webui(tmp_path, youtube=True)
+    hub = UploadHub()
+    webui._uploads = hub
+
+    async def runner(progress):
+        return "https://www.youtube.com/watch?v=new"
+
+    webui._youtube_runner = lambda channel, path: runner
+    base = rec_dir(config)
+    target = base / "show.mp4"
+    target.write_bytes(b"x" * 100)
+    write_youtube_url(target, "https://www.youtube.com/watch?v=old")
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            csrf = await login(client)
+            headers = {"X-CSRF-Token": csrf}
+            denied = await client.post("/api/uploads", json={"id": "twitch/channel1/show.mp4"}, headers=headers)
+            denied_body = await denied.json()
+            assert not hub._tasks, "a denied re-upload must not start a task"
+            forced = await client.post(
+                "/api/uploads", json={"id": "twitch/channel1/show.mp4", "force": True}, headers=headers
+            )
+            forced_body = await forced.json()
+            for _ in range(500):
+                if not hub._tasks:
+                    break
+                await asyncio.sleep(0.01)
+            return denied.status, denied_body, forced.status, forced_body
+
+    denied_status, denied_body, forced_status, forced_body = asyncio.run(scenario())
+    assert denied_status == 409
+    assert denied_body["youtube_url"] == "https://www.youtube.com/watch?v=old"
+    assert forced_status == 200
+    assert forced_body["name"] == "show.mp4"
+
+
 def test_patch_settings_bad_value_is_400_not_500(tmp_path):
     """Shared validators must answer 400 on /api/v1 with a panel session."""
     _, _, _, _, wh = make_webui(tmp_path)
@@ -392,6 +596,25 @@ def test_listing_hides_unserved_suffixes(tmp_path):
     body = asyncio.run(scenario())
     names = [r["name"] for r in body["recordings"]]
     assert names == ["show.mp4"]
+
+
+def test_listing_carries_remembered_youtube_url(tmp_path):
+    """A finished upload's sidecar resurfaces as the listing URL after a restart."""
+    from stream_archive.youtube_upload import write_youtube_url
+
+    config, _, _, _, wh = make_webui(tmp_path)
+    base = rec_dir(config)
+    target = base / "show.mp4"
+    target.write_bytes(b"y" * 10)
+    write_youtube_url(target, "https://www.youtube.com/watch?v=kept")
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            await login(client)
+            return await (await client.get("/api/recordings")).json()
+
+    body = asyncio.run(scenario())
+    assert body["recordings"][0]["youtube_url"] == "https://www.youtube.com/watch?v=kept"
 
 
 def test_plain_http_login_cookie_is_not_secure(tmp_path):

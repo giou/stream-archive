@@ -34,9 +34,12 @@ KICK_TOKEN_URL = "https://id.kick.com/oauth/token"
 
 
 class Monitor:
-    def __init__(self, recorder: Recorder, notifier: Notifier) -> None:
+    def __init__(self, recorder: Recorder, notifier: Notifier, on_stopped: Any = None) -> None:
         self.recorder: Recorder = recorder
         self.notifier: Notifier = notifier
+        #: Called with (channel, filepath) after a recording stops cleanly.
+        #: The scheduler sets it to start per-channel YouTube auto-uploads.
+        self.on_stopped: Any = on_stopped
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
         self._last_disk_notify: dict[str, float] = {}  # blocked-start alerts, per channel
@@ -269,6 +272,12 @@ class Monitor:
             file_info = result.get("file_info") if result else None
             yt_info = result.get("youtube_info") if result else None
             youtube_url = yt_info.get("youtube_url") if yt_info else None
+            filepath = result.get("filepath") if result else None
+            if filepath is None:
+                # The feed ended on its own before the offline event: the
+                # recorder already released the entry (stop() answers None)
+                # and left the finalized filepath for this hook.
+                filepath = self.recorder.pop_ended_clean_path(channel)
         logger.info("[monitor] %s is OFFLINE", channel)
         # The send is network I/O. Keep it out of the per-channel critical
         # section, so a slow Telegram call cannot stall start/stop handling.
@@ -276,6 +285,13 @@ class Monitor:
             await self.notifier.notify_offline(channel, file_info, youtube_url)
         except Exception:
             logger.error("[monitor] offline notification failed for %s", channel, exc_info=True)
+        if filepath:
+            try:
+                hook = self.on_stopped
+                if hook is not None:
+                    await hook(channel, filepath)
+            except Exception:
+                logger.error("[monitor] auto-upload hook failed for %s", channel, exc_info=True)
 
     def _evict(self, channel: str) -> None:
         """Drop per-channel state for a removed channel.

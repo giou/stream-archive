@@ -452,17 +452,14 @@ class YoutubeOutputMixin:
                 logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
         # A takedown revokes the broadcast but leaves the ingest open, so
         # ffmpeg never errors. Poll the broadcast status beside the pipe.
+        # The task starts after the spawn below, so a spawn failure leaks
+        # nothing: see below.
         # On revoked the watcher alerts once, marks the broadcast abandoned,
         # and returns; the pipe then drops the ingest and, in ``both`` mode,
         # keeps writing the disk file alone. The recording ends normally, so
         # the monitor does not restart a restream of flagged content.
         status_stop = asyncio.Event()
         youtube_abandoned = asyncio.Event()
-        status_task = asyncio.create_task(
-            self._watch_broadcast_status(
-                channel, youtube_info, title, filepath is not None, youtube_abandoned, status_stop
-            )
-        )
         rtmp_url = youtube_info["rtmp_url"]
         ffmpeg_cmd = [
             "ffmpeg",
@@ -495,6 +492,13 @@ class YoutubeOutputMixin:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Created after the spawn: a spawn failure must not orphan the
+        # 120s poll loop holding the streamer reference.
+        status_task = asyncio.create_task(
+            self._watch_broadcast_status(
+                channel, youtube_info, title, filepath is not None, youtube_abandoned, status_stop
+            )
+        )
         pipe_task = asyncio.create_task(self._pipe_stream(channel, stream, process, filepath, youtube_abandoned))
         stderr_task = asyncio.create_task(self._read_ffmpeg_stderr(channel, process))
 
@@ -511,11 +515,14 @@ class YoutubeOutputMixin:
                 await asyncio.gather(pipe_task, stderr_task, status_task, return_exceptions=True)
             logger.info("[recorder] [youtube] %s cancelled", channel)
             raise
-        else:
+        finally:
+            # The watcher stops on every path, not just success: a gather
+            # failure must not orphan its poll loop either. Awaiting a
+            # finished task returns at once, so the cancel path above pays
+            # nothing extra here.
             status_stop.set()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.gather(status_task, return_exceptions=True)
-        finally:
             await self._terminate(process)
             logger.info("[recorder] [youtube] %s ffmpeg stopped (rc=%s)", channel, process.returncode)
 

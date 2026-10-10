@@ -1774,6 +1774,31 @@ def test_live_event_with_filter_passes_a_blocked_category_to_the_monitor(keypair
     assert monitor.online[0][2] == "Music"
 
 
+def test_live_event_with_blank_title_passes_none_to_the_monitor(keypair):
+    """A Kick status without title or game reaches the monitor as None.
+
+    The API normalizes missing values to "", but the recorder only falls
+    back to plugin metadata on None. Passing "" through would record with
+    an empty title instead of the stream metadata.
+    """
+    private_key, public_pem = keypair
+
+    class BlankAPI(FakeKickAPI):
+        async def get_channel_statuses(self, slugs):
+            return {"xqc": {"title": "", "game": "", "is_live": True, "broadcaster_user_id": 123}}
+
+    monitor = FakeMonitor()
+    config = base_config()
+    config["channel_categories"] = {"kick:xqc": ["Just Chatting"]}
+    wh = make_webhook(config=config, monitor=monitor, api=BlankAPI(public_pem))
+
+    assert post_event(wh, private_key, live_event(is_live=True), wh.EVENT_LIVE) == 200
+
+    assert len(monitor.online) == 1
+    assert monitor.online[0][1] is None
+    assert monitor.online[0][2] is None
+
+
 def test_live_event_with_filter_lookup_failure_starts_nothing(keypair):
     """A failed lookup delivers nothing: the poll loop retries it."""
     private_key, public_pem = keypair

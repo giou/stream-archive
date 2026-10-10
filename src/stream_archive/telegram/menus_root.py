@@ -98,6 +98,8 @@ async def menu_channel(ctrl: TelegramController, chat_id: ChatId, text: str) -> 
         return await open_menu(ctrl, "channel_mode", chat_id, channel=ch)
     if text == "Hold delay":
         return await open_menu(ctrl, "channel_hold", chat_id, channel=ch)
+    if text == "VOD upload":
+        return await open_menu(ctrl, "channel_vod", chat_id, channel=ch)
     if text == "Quality":
         return await open_menu(ctrl, "channel_quality", chat_id, channel=ch)
     if text == "Categories":
@@ -144,6 +146,22 @@ async def menu_channel_hold(ctrl: TelegramController, chat_id: ChatId, text: str
         state.custom = "channel_hold"
         ctrl._enter_menu(chat_id, "custom")
         return await ctrl.menu_text("custom", chat_id=chat_id), ctrl.reply_keyboard("custom", chat_id=chat_id)
+    return None
+
+
+async def menu_channel_vod(ctrl: TelegramController, chat_id: ChatId, text: str) -> MenuResult:
+    """Route the per-channel YouTube auto-upload toggle."""
+    state = ctrl._state_for(chat_id)
+    ch = state.channel or ""
+    gone = _channel_gone(ctrl, state)
+    if gone is not None:
+        ctrl._enter_menu(chat_id, "channels")
+        return gone, ctrl.reply_keyboard("channels", chat_id=chat_id)
+    if text in ("Enable VOD upload", "Disable VOD upload"):
+        want = "on" if text.startswith("Enable") else "off"
+        result = ctrl.handle_channel_vod_upload([ch, want], chat_id=chat_id)
+        ctrl._enter_menu(chat_id, "channel")
+        return result, ctrl.reply_keyboard("channel", chat_id=chat_id)
     return None
 
 

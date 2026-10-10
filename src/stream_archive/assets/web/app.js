@@ -1,6 +1,7 @@
 "use strict";
 let csrf = "";
 let currentTab = "recordings";
+let ytUploadsConfigured = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -75,6 +76,7 @@ function showApp() {
   loadChannels();
   loadSettings();
   loadRecordings();
+  loadUploads();
   fetchUpdateChip();
 }
 
@@ -118,7 +120,10 @@ function switchTab(name) {
   }
   if (name === "status") loadStatus();
   if (name === "channels") loadChannels();
-  if (name === "recordings") loadRecordings();
+  if (name === "recordings") {
+    loadRecordings();
+    loadUploads();
+  }
   if (name === "events") loadEvents();
 }
 
@@ -159,6 +164,13 @@ setInterval(() => {
   if (currentTab === "events") guarded("events", loadEvents);
 }, 30000);
 
+setInterval(() => {
+  if (document.hidden) return;
+  if (currentTab !== "recordings" || !ytUploadsConfigured) return;
+  if (userWorkingControls()) return;
+  guarded("uploads", loadUploads);
+}, 5000);
+
 const inFlight = {};
 function guarded(name, fn) {
   if (inFlight[name]) return;
@@ -181,7 +193,10 @@ document.addEventListener("visibilitychange", () => {
   }
   guarded("status", loadStatusQuiet);
   if (userWorkingControls()) return;
-  if (currentTab === "recordings") guarded("recordings", loadRecordings);
+  if (currentTab === "recordings") {
+    guarded("recordings", loadRecordings);
+    guarded("uploads", loadUploads);
+  }
   if (currentTab === "channels") guarded("channels", loadChannels);
   if (currentTab === "events") guarded("events", loadEvents);
 });
@@ -283,6 +298,14 @@ async function loadStatus(quiet) {
     s.endpoint = obj(s.endpoint);
     s.kick_webhook = obj(s.kick_webhook);
     s.mtproto = obj(s.mtproto);
+    s.youtube = obj(s.youtube);
+    if ((s.youtube.configured === true) !== ytUploadsConfigured) {
+      ytUploadsConfigured = s.youtube.configured === true;
+      if (currentTab === "recordings") {
+        loadRecordings();
+        loadUploads();
+      }
+    }
     s.disk = obj(s.disk);
     s.update_check = obj(s.update_check);
     const host = kvCard("Service", [
@@ -530,6 +553,29 @@ async function loadChannels() {
       });
       hField.appendChild(holdInput);
       li.appendChild(hField);
+      const vField = document.createElement("label");
+      vField.className = "field";
+      const vCaption = document.createElement("span");
+      vCaption.textContent = "YouTube auto-upload of finished recordings";
+      vField.appendChild(vCaption);
+      const vodBox = document.createElement("input");
+      vodBox.type = "checkbox";
+      vodBox.checked = ch.youtube_vod_upload === true;
+      vodBox.setAttribute("aria-label", "YouTube auto-upload for " + ch.channel);
+      vodBox.addEventListener("change", async () => {
+        try {
+          await api("/api/v1/channels/" + encodeURIComponent(ch.channel), {
+            method: "PATCH",
+            body: JSON.stringify({ youtube_vod_upload: vodBox.checked }),
+          });
+          toast("Auto-upload saved");
+        } catch (e) {
+          toast(String(e.message || e), true);
+        }
+        loadChannels();
+      });
+      vField.appendChild(vodBox);
+      li.appendChild(vField);
       const cField = document.createElement("label");
       cField.className = "field";
       const cCaption = document.createElement("span");
@@ -1270,6 +1316,7 @@ function buildRecCard(r, player) {
   const li = document.createElement("li");
   li.className = "rec-card";
   li.dataset.live = r.live ? "1" : "";
+  li.dataset.youtubeUrl = typeof r.youtube_url === "string" ? r.youtube_url : "";
   const top = document.createElement("div");
   top.className = "rec-top";
   if (!r.live) {
@@ -1311,7 +1358,16 @@ function buildRecCard(r, player) {
   }
   const meta = document.createElement("div");
   meta.className = "rec-meta";
-  meta.textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  const sizeSpan = document.createElement("span");
+  sizeSpan.className = "rec-size";
+  sizeSpan.textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  meta.appendChild(sizeSpan);
+  const ytLink = document.createElement("a");
+  ytLink.className = "rec-yt";
+  ytLink.hidden = true;
+  ytLink.target = "_blank";
+  ytLink.rel = "noopener";
+  meta.appendChild(ytLink);
   li.appendChild(meta);
   const wrap = document.createElement("div");
   wrap.className = "row-actions";
@@ -1329,6 +1385,28 @@ function buildRecCard(r, player) {
     dl.href = "/api/recordings/stream?id=" + encodeURIComponent(r.id) + "&download=1";
     dl.textContent = "Download";
     wrap.appendChild(dl);
+    if (ytUploadsConfigured) {
+      wrap.appendChild(actionBtn("Upload", "", async () => {
+        const card = recCards.get(r.id);
+        const existing = (card && card.dataset.youtubeUrl) || r.youtube_url || "";
+        const force = Boolean(existing);
+        if (existing && !window.confirm("Already on YouTube: " + existing + "\nUpload again and replace it?")) return;
+        try {
+          const started = await api("/api/uploads", { method: "POST", body: JSON.stringify({ id: r.id, force }) });
+          toast(obj(started).resumed ? "Upload already runs" : "Upload started");
+        } catch (e) {
+          const known = e && e.payload && e.payload.youtube_url;
+          if (e && e.payload && !force && known) {
+            if (!window.confirm("Already on YouTube: " + known + "\nUpload again and replace it?")) return;
+            const started = await api("/api/uploads", { method: "POST", body: JSON.stringify({ id: r.id, force: true }) });
+            toast(obj(started).resumed ? "Upload already runs" : "Upload started");
+          } else {
+            throw e;
+          }
+        }
+        loadUploads();
+      }));
+    }
     wrap.appendChild(actionBtn("Delete", "danger", async () => {
       if (!window.confirm("Delete " + r.name + "?")) return;
       await api("/api/recordings?id=" + encodeURIComponent(r.id), { method: "DELETE" });
@@ -1338,7 +1416,19 @@ function buildRecCard(r, player) {
     }));
   }
   li.appendChild(wrap);
+  const slot = document.createElement("div");
+  slot.className = "upload-slot";
+  slot.hidden = true;
+  li.appendChild(slot);
   return li;
+}
+
+function hasUploadButton(li) {
+  const btns = li.querySelectorAll(":scope > .row-actions button");
+  for (const b of btns) {
+    if (b.textContent === "Upload") return true;
+  }
+  return false;
 }
 
 function refreshRecCard(li, r, player) {
@@ -1348,7 +1438,17 @@ function refreshRecCard(li, r, player) {
     recCards.set(r.id, fresh);
     return;
   }
-  li.querySelector(":scope > .rec-meta").textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  // The status flag can arrive after the first listing built the cards.
+  // Without this rebuild an Upload button that should exist never appears.
+  if (!r.live && hasUploadButton(li) !== ytUploadsConfigured) {
+    const fresh = buildRecCard(r, player);
+    li.replaceWith(fresh);
+    recCards.set(r.id, fresh);
+    return;
+  }
+  li.querySelector(":scope > .rec-meta > .rec-size").textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  const remembered = typeof r.youtube_url === "string" ? r.youtube_url : "";
+  if ((li.dataset.youtubeUrl || "") !== remembered) li.dataset.youtubeUrl = remembered;
   const box = li.querySelector(":scope > .rec-top > .rec-select");
   if (box) box.checked = selectedRecs.has(r.id);
 }
@@ -1521,6 +1621,7 @@ async function loadRecordings() {
       li.textContent = "No recordings match.";
       list.appendChild(li);
     }
+    loadUploads();
   } catch (e) {
     toast(String(e.message || e), true);
   }
@@ -1530,6 +1631,112 @@ function updateBulkButton() {
   const btn = $("rec-delete-selected");
   btn.hidden = selectedRecs.size === 0;
   btn.textContent = "Delete selected (" + selectedRecs.size + ")";
+}
+
+function fmtETA(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours) return hours + ":" + String(minutes).padStart(2, "0") + ":" + String(secs).padStart(2, "0");
+  return minutes + ":" + String(secs).padStart(2, "0");
+}
+
+function uploadRecId(path) {
+  const m = typeof path === "string" ? path.match(/\/(twitch|kick)\/.+/) : null;
+  return m ? m[0].slice(1) : null;
+}
+
+function paintUpload(li, u) {
+  const slot = li.querySelector(":scope > .upload-slot");
+  if (!slot) return;
+  const ytLink = li.querySelector(":scope > .rec-meta > .rec-yt");
+  if (ytLink) {
+    ytLink.hidden = true;
+    ytLink.removeAttribute("href");
+    ytLink.textContent = "";
+  }
+  slot.textContent = "";
+  if (!u) {
+    // No live upload: fall back to the URL the listing remembered.
+    slot.hidden = true;
+    if (ytLink && li.dataset.youtubeUrl) {
+      ytLink.href = li.dataset.youtubeUrl;
+      ytLink.textContent = li.dataset.youtubeUrl;
+      ytLink.hidden = false;
+    }
+    return;
+  }
+  if (u.status === "done" && u.result_url) {
+    // Steady state lives inline next to the size: no extra card height.
+    slot.hidden = true;
+    if (ytLink) {
+      ytLink.href = String(u.result_url);
+      ytLink.textContent = String(u.result_url);
+      ytLink.hidden = false;
+    }
+    return;
+  }
+  slot.hidden = false;
+  if (u.status === "failed" || u.status === "cancelled") {
+    const meta = document.createElement("div");
+    meta.className = "rec-meta";
+    meta.textContent = u.status === "failed"
+      ? "Upload failed" + (u.error ? ": " + u.error : "")
+      : "Upload cancelled";
+    slot.appendChild(meta);
+    return;
+  }
+  if (u.status !== "running") {
+    slot.hidden = true;
+    return;
+  }
+  const total = Number(u.total) || 0;
+  const sent = Math.min(Number(u.sent) || 0, total);
+  const frac = total > 0 ? sent / total : 0;
+  const meter = document.createElement("div");
+  meter.className = "meter";
+  const fill = document.createElement("div");
+  fill.style.width = (frac * 100).toFixed(1) + "%";
+  meter.appendChild(fill);
+  slot.appendChild(meter);
+  const meta = document.createElement("div");
+  meta.className = "rec-meta";
+  const speed = u.elapsed_s > 0 ? sent / u.elapsed_s : 0;
+  let detail = Math.floor(frac * 100) + "%";
+  if (speed > 0) detail += " · " + (speed / 125000).toFixed(1) + " Mbps";
+  if (speed > 0 && frac < 1) {
+    detail += " · ETA " + fmtETA((total - sent) / speed);
+  }
+  meta.textContent = detail;
+  slot.appendChild(meta);
+  const row = document.createElement("div");
+  row.className = "row-actions";
+  const id = String(u.id || "");
+  row.appendChild(actionBtn("Cancel", "danger", async () => {
+    await api("/api/uploads?id=" + encodeURIComponent(id), { method: "DELETE" });
+    toast("Upload cancelled");
+    loadUploads();
+  }));
+  slot.appendChild(row);
+}
+
+async function loadUploads() {
+  if (!ytUploadsConfigured) return;
+  try {
+    const data = obj(await api("/api/uploads"));
+    const byRec = new Map();
+    for (const raw of arr(data.uploads)) {
+      const u = obj(raw);
+      const rel = uploadRecId(u.path);
+      if (rel && !byRec.has(rel)) byRec.set(rel, u);
+    }
+    for (const [id, li] of recCards) {
+      paintUpload(li, byRec.get(id) || null);
+    }
+  } catch (e) {
+    console.warn("Upload refresh failed", e);
+  }
 }
 
 const NOTIFY_KEY = "sa:notify";

@@ -585,6 +585,12 @@ def test_channel_hold_override_normalized():
     assert config.channel_youtube_hold_seconds == {"twitch:channel1": 60}
 
 
+def test_channel_vod_upload_override_normalized():
+    """Per-channel auto-upload keys normalize like the other channel maps."""
+    config = build(channel_youtube_vod_upload={"Channel1": True})
+    assert config.channel_youtube_vod_upload == {"twitch:channel1": True}
+
+
 def test_config_example_is_valid_json_and_appconfig():
     data = json.loads((Path(__file__).resolve().parent.parent / "config.json.example").read_text())
     data["telegram_user_id"] = 12345  # placeholder string fails StrictInt by design

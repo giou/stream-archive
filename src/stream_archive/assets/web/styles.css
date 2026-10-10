@@ -143,6 +143,9 @@ input, select {
   #channels-list .channel-card > .field { margin-bottom: 0; }
 }
 #rec-list, #channels-list { margin: 0; padding: 0; }
+.upload-slot { margin-top: 0.5rem; }
+.upload-slot a { overflow-wrap: anywhere; }
+.rec-yt { margin-left: 0.5rem; overflow-wrap: anywhere; }
 .channel-group {
   list-style: none;
   background: var(--panel);

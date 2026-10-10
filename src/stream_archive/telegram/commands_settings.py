@@ -177,6 +177,38 @@ class SettingsCommands:
             str, self._apply(set_hold, lambda c: f"Hold delay for {ch} set to {n}s (0 = end immediately)", chat_id)
         )
 
+    def handle_channel_vod_upload(self, args: list[str], chat_id: int | None = None) -> str:
+        """Set the per-channel YouTube auto-upload. The control API also calls this."""
+        if len(args) != 2:
+            return "Usage: /vodupload <channel> <on|off|default>"
+        ch, err = self._resolve_channel_arg(args[0])
+        if ch is None:
+            return err
+        if args[1] == "default":
+
+            def mutate(candidate: AppConfig) -> None:
+                candidate.channel_youtube_vod_upload.pop(ch, None)
+
+            return cast(
+                str,
+                self._apply(mutate, lambda c: f"YouTube auto-upload for {ch} reset to off", chat_id),
+            )
+        if args[1] not in ("on", "off"):
+            return "\u274c auto-upload must be 'on', 'off', or 'default'"
+        enabled = args[1] == "on"
+
+        def set_vod(candidate: AppConfig) -> None:
+            candidate.channel_youtube_vod_upload[ch] = enabled
+
+        return cast(
+            str,
+            self._apply(
+                set_vod,
+                lambda c: f"YouTube auto-upload for {ch} {'enabled' if enabled else 'disabled'}",
+                chat_id,
+            ),
+        )
+
     def _audio_conflicts(self, candidate: AppConfig) -> list[str]:
         """Channels that would record audio-only into YouTube after this change."""
         return sorted(

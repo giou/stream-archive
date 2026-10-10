@@ -717,6 +717,43 @@ def test_patch_channel_sets_and_clears_overrides(tmp_path):
     assert read_file(tmp_path)["channel_output_modes"] == {}
 
 
+def test_patch_channel_sets_and_clears_vod_upload(tmp_path):
+    """The per-channel YouTube auto-upload flag sets, clears, and rejects garbage."""
+    config, _, _, _, wh, _, _ = make_api(tmp_path, channels=("twitch:channel1",))
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            set_resp = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"youtube_vod_upload": True},
+                headers=auth(),
+            )
+            set_body = await set_resp.json()
+            after_set = dict(config.channel_youtube_vod_upload)
+            bad_resp = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"youtube_vod_upload": "soon"},
+                headers=auth(),
+            )
+            cleared = await client.patch(
+                "/api/v1/channels/twitch:channel1",
+                json={"youtube_vod_upload": "default"},
+                headers=auth(),
+            )
+            channel = await client.get("/api/v1/channels/twitch:channel1", headers=auth())
+            return set_resp.status, set_body, after_set, bad_resp.status, cleared.status, await channel.json()
+
+    set_status, body, after_set, bad_status, cleared_status, channel = asyncio.run(scenario())
+    assert set_status == 200
+    assert body["applied"] == {"youtube_vod_upload": "YouTube auto-upload for twitch:channel1 enabled"}
+    assert after_set == {"twitch:channel1": True}
+    assert bad_status == 400
+    assert cleared_status == 200
+    assert config.channel_youtube_vod_upload == {}
+    assert channel["youtube_vod_upload"] is False
+    assert channel["youtube_vod_upload_override"] is None
+
+
 def test_patch_channel_rejects_an_audio_only_youtube_conflict(tmp_path):
     config, _, _, _, wh, _, _ = make_api(tmp_path, channels=("twitch:channel1",))
     config.output_mode = "youtube"

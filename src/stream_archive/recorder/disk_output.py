@@ -189,6 +189,11 @@ class DiskOutputMixin:
         except OSError as e:
             logger.warning("[recorder] Failed to delete %s: %s", path, e)
             return None
+        # Local import: this module loads inside the recorder package init,
+        # which the upload module itself pulls in through recorder.common.
+        from stream_archive.youtube_upload import drop_youtube_url
+
+        drop_youtube_url(path)
         disk.drop_thumbnail(self._config, path)
         return size
 

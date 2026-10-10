@@ -362,6 +362,7 @@ class AppConfig(BaseModel):
     output_mode: OutputMode = "disk"
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, NonNegativeFloat] = {}
+    channel_youtube_vod_upload: dict[str, StrictBool] = {}
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()
@@ -443,6 +444,11 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_hold_keys(cls, v: dict[str, NonNegativeFloat]) -> dict[str, NonNegativeFloat]:
         return _normalize_channel_map(v, "channel_youtube_hold_seconds")
+
+    @field_validator("channel_youtube_vod_upload")
+    @classmethod
+    def _normalize_vod_upload_keys(cls, v: dict[str, StrictBool]) -> dict[str, StrictBool]:
+        return _normalize_channel_map(v, "channel_youtube_vod_upload")
 
     @field_validator("channel_categories")
     @classmethod
