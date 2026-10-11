@@ -1331,6 +1331,7 @@ function buildRecCard(r, player) {
       paintRecSelection();
     });
     top.appendChild(box);
+    li._selectBox = box;
   }
   const name = document.createElement("div");
   name.className = "rec-name";
@@ -1420,6 +1421,11 @@ function buildRecCard(r, player) {
   slot.className = "upload-slot";
   slot.hidden = true;
   li.appendChild(slot);
+  li._slot = slot;
+  li._ytLink = ytLink;
+  li._sizeSpan = sizeSpan;
+  // Paint steady state now: the card must not wait for the uploads tick.
+  if (!r.live) setCardLink(li, typeof r.youtube_url === "string" ? r.youtube_url : "");
   return li;
 }
 
@@ -1446,10 +1452,11 @@ function refreshRecCard(li, r, player) {
     recCards.set(r.id, fresh);
     return;
   }
-  li.querySelector(":scope > .rec-meta > .rec-size").textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
+  const sizeEl = li._sizeSpan || li.querySelector(":scope > .rec-meta > .rec-size");
+  if (sizeEl) sizeEl.textContent = fmtSize(r.size) + " · " + timeAgo(r.mtime);
   const remembered = typeof r.youtube_url === "string" ? r.youtube_url : "";
   if ((li.dataset.youtubeUrl || "") !== remembered) li.dataset.youtubeUrl = remembered;
-  const box = li.querySelector(":scope > .rec-top > .rec-select");
+  const box = li._selectBox || li.querySelector(":scope > .rec-top > .rec-select");
   if (box) box.checked = selectedRecs.has(r.id);
 }
 
@@ -1518,6 +1525,7 @@ function refreshChannelGroup(group, ch, files, player, wanted) {
     head.querySelector(":scope > .pill").remove();
   }
   const filesList = group.querySelector(":scope > ul.files-list");
+  let idx = 0;
   for (const r of files) {
     wanted.add(r.id);
     let li = recCards.get(r.id);
@@ -1528,7 +1536,11 @@ function refreshChannelGroup(group, ch, files, player, wanted) {
       refreshRecCard(li, r, player);
       li = recCards.get(r.id);
     }
-    filesList.appendChild(li);
+    // Move only when out of place: re-appending every card each poll
+    // churns layout for no visible change.
+    const cur = filesList.children[idx];
+    if (cur !== li) filesList.insertBefore(li, cur || null);
+    idx++;
   }
 }
 
@@ -1582,6 +1594,7 @@ async function loadRecordings() {
     const wanted = new Set();
     visibleRecIds = files.filter((r) => !r.live).map((r) => r.id);
     visibleByChannel.clear();
+    let gidx = 0;
     for (const [ch, chFiles] of groups) {
       shown += chFiles.length;
       wantedGroups.add(ch);
@@ -1591,7 +1604,9 @@ async function loadRecordings() {
         group = buildChannelGroup();
         recGroups.set(ch, group);
       }
-      list.appendChild(group);
+      const cur = list.children[gidx];
+      if (cur !== group) list.insertBefore(group, cur || null);
+      gidx++;
       refreshChannelGroup(group, ch, chFiles, player, wanted);
     }
     for (const [ch, group] of [...recGroups]) {
@@ -1647,61 +1662,83 @@ function uploadRecId(path) {
   return m ? m[0].slice(1) : null;
 }
 
-function paintUpload(li, u) {
-  const slot = li.querySelector(":scope > .upload-slot");
-  if (!slot) return;
-  const ytLink = li.querySelector(":scope > .rec-meta > .rec-yt");
-  if (ytLink) {
+function setCardLink(li, url) {
+  const ytLink = li._ytLink || li.querySelector(":scope > .rec-meta > .rec-yt");
+  if (!ytLink) return;
+  if (url) {
+    ytLink.href = url;
+    ytLink.textContent = url;
+    ytLink.hidden = false;
+  } else {
     ytLink.hidden = true;
     ytLink.removeAttribute("href");
     ytLink.textContent = "";
   }
-  slot.textContent = "";
-  if (!u) {
-    // No live upload: fall back to the URL the listing remembered.
-    slot.hidden = true;
-    if (ytLink && li.dataset.youtubeUrl) {
-      ytLink.href = li.dataset.youtubeUrl;
-      ytLink.textContent = li.dataset.youtubeUrl;
-      ytLink.hidden = false;
+}
+
+function paintUpload(li, u) {
+  const slot = li._slot || li.querySelector(":scope > .upload-slot");
+  if (!slot) return;
+  const running = !!u && u.status === "running";
+  if (!running) {
+    // Terminal states render once per signature. Rebuilding them every
+    // poll flashes the link and the buttons.
+    const linkUrl = u && u.status === "done" && u.result_url
+      ? String(u.result_url)
+      : (!u && li.dataset.youtubeUrl ? li.dataset.youtubeUrl : "");
+    const failedText = u && (u.status === "failed" || u.status === "cancelled")
+      ? (u.status === "failed" ? "Upload failed" + (u.error ? ": " + u.error : "") : "Upload cancelled")
+      : "";
+    const sig = "still|" + linkUrl + "|" + failedText;
+    if (li.dataset.uploadSig === sig) return;
+    li.dataset.uploadSig = sig;
+    slot.dataset.uploadId = "";
+    setCardLink(li, linkUrl);
+    slot.textContent = "";
+    if (failedText) {
+      slot.hidden = false;
+      const meta = document.createElement("div");
+      meta.className = "rec-meta";
+      meta.textContent = failedText;
+      slot.appendChild(meta);
+    } else {
+      slot.hidden = true;
     }
     return;
   }
-  if (u.status === "done" && u.result_url) {
-    // Steady state lives inline next to the size: no extra card height.
-    slot.hidden = true;
-    if (ytLink) {
-      ytLink.href = String(u.result_url);
-      ytLink.textContent = String(u.result_url);
-      ytLink.hidden = false;
-    }
-    return;
-  }
-  slot.hidden = false;
-  if (u.status === "failed" || u.status === "cancelled") {
-    const meta = document.createElement("div");
+  // Running: one meter row per upload, moved in place. Rebuilding it
+  // every poll flashes the bar and drops the Cancel focus.
+  li.dataset.uploadSig = "run|" + String(u.id || "");
+  const id = String(u.id || "");
+  let meter = slot.querySelector(":scope > .meter");
+  let meta = slot.querySelector(":scope > .rec-meta");
+  let row = slot.querySelector(":scope > .row-actions");
+  const fill = meter ? meter.firstElementChild : null;
+  if (slot.dataset.uploadId !== id || !meter || !meta || !row || !fill) {
+    slot.textContent = "";
+    slot.dataset.uploadId = id;
+    setCardLink(li, "");
+    meter = document.createElement("div");
+    meter.className = "meter";
+    meter.appendChild(document.createElement("div"));
+    slot.appendChild(meter);
+    meta = document.createElement("div");
     meta.className = "rec-meta";
-    meta.textContent = u.status === "failed"
-      ? "Upload failed" + (u.error ? ": " + u.error : "")
-      : "Upload cancelled";
     slot.appendChild(meta);
-    return;
-  }
-  if (u.status !== "running") {
-    slot.hidden = true;
-    return;
+    row = document.createElement("div");
+    row.className = "row-actions";
+    row.appendChild(actionBtn("Cancel", "danger", async () => {
+      await api("/api/uploads?id=" + encodeURIComponent(id), { method: "DELETE" });
+      toast("Upload cancelled");
+      loadUploads();
+    }));
+    slot.appendChild(row);
+    slot.hidden = false;
   }
   const total = Number(u.total) || 0;
   const sent = Math.min(Number(u.sent) || 0, total);
   const frac = total > 0 ? sent / total : 0;
-  const meter = document.createElement("div");
-  meter.className = "meter";
-  const fill = document.createElement("div");
-  fill.style.width = (frac * 100).toFixed(1) + "%";
-  meter.appendChild(fill);
-  slot.appendChild(meter);
-  const meta = document.createElement("div");
-  meta.className = "rec-meta";
+  meter.firstElementChild.style.width = (frac * 100).toFixed(1) + "%";
   const speed = u.elapsed_s > 0 ? sent / u.elapsed_s : 0;
   let detail = Math.floor(frac * 100) + "%";
   if (speed > 0) detail += " · " + (speed / 125000).toFixed(1) + " Mbps";
@@ -1709,20 +1746,14 @@ function paintUpload(li, u) {
     detail += " · ETA " + fmtETA((total - sent) / speed);
   }
   meta.textContent = detail;
-  slot.appendChild(meta);
-  const row = document.createElement("div");
-  row.className = "row-actions";
-  const id = String(u.id || "");
-  row.appendChild(actionBtn("Cancel", "danger", async () => {
-    await api("/api/uploads?id=" + encodeURIComponent(id), { method: "DELETE" });
-    toast("Upload cancelled");
-    loadUploads();
-  }));
-  slot.appendChild(row);
 }
 
 async function loadUploads() {
   if (!ytUploadsConfigured) return;
+  // No cards, nothing to paint and no progress to show: skip the fetch.
+  // Uploads can only exist for listed files, and Telegram-started ones
+  // appear here as soon as their cards do.
+  if (!recCards.size) return;
   try {
     const data = obj(await api("/api/uploads"));
     const byRec = new Map();

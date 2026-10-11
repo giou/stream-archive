@@ -14,6 +14,10 @@
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+a:not(.btn) { color: var(--accent); }
+a:not(.btn):visited { color: var(--accent); }
+a:not(.btn):hover { text-decoration: underline; }
+a:not(.btn):active { color: var(--accent); }
 body {
   margin: 0;
   background: var(--bg);
