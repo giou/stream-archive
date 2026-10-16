@@ -8,7 +8,7 @@ The data directory holds all state of the app. Back it up by copying the folder 
 | --- | --- |
 | `config.json` | Settings and secrets. Mode `0600`. The app tightens the mode to `0600` on write |
 | `config.json.bak` | Copy of the prior `config.json`. The reset step of the setup wizard writes it |
-| `recordings/` | Video and audio captures (`.ts`, `.m4a`, `.mp4`) |
+| `recordings/` | Video and audio captures (`.ts`, `.m4a`, `.mp4`). A `.youtube.json` file next to a recording remembers its YouTube upload link |
 | `chat/` | Chat files (`.chat.json`), plus in-progress `.chat.json.tmp` files |
 | `youtube_token.json` | YouTube OAuth token. Mode `0600` |
 | `client_secret.json` | Google OAuth client file. You place it here before the authorization flow |

@@ -1,6 +1,6 @@
 # StreamArchive
 
-StreamArchive monitors Twitch and Kick channels and records live streams with streamlink. It restreams to YouTube Live when you enable that. It sends alerts and takes admin commands through the Telegram bot or the web panel.
+StreamArchive monitors Twitch and Kick channels and records live streams with streamlink. It restreams to YouTube Live when you enable that. It also uploads finished recordings to YouTube, on demand or automatically. It sends alerts and takes admin commands through the Telegram bot or the web panel.
 
 Live signals arrive in seconds. Twitch uses an EventSub conduit. Kick uses signed webhooks. A poll loop stays as fallback. The fallback catches missed events and restarts recordings that died mid-stream.
 
@@ -34,7 +34,7 @@ docker compose pull && docker compose up -d
 
 Two blocks need extra steps:
 
-- [YouTube restream](docs/youtube-setup.md) for `output_mode: youtube` or `both`.
+- [YouTube restream and upload](docs/youtube-setup.md) for `output_mode: youtube` or `both`, or for VOD uploads.
 - [Kick webhook](docs/kick-webhook.md) for instant Kick signals and Kick chat.
 
 ## Features
@@ -50,6 +50,7 @@ Two blocks need extra steps:
 - **Web panel.** The browser replaces the Telegram bot: status, channels, settings, recordings with a player, reload, restart, and update. See [Web panel](docs/web-control.md).
 - **Control API.** Scripts change the same settings over HTTP with a key. See [Control API](docs/control-api.md).
 - **Telegram upload.** Large recordings go to your chat through MTProto (up to 2 GB). The Bot API allows 50 MB only.
+- **YouTube upload.** A finished recording goes to YouTube as a video from the Telegram **Recordings** menu or the web panel. A per-channel auto-upload sends each finished recording at once. See [YouTube restream and VOD upload](docs/youtube-setup.md).
 
 ## Guides
 
@@ -58,7 +59,7 @@ Two blocks need extra steps:
 | [Settings](docs/configuration.md) | All keys of `config.json`, and secrets from the environment |
 | [Running](docs/running.md) | Data directory, container identity, logs, shutdown |
 | [Backup and restore](docs/backup-restore.md) | Data directory contents, backup, restore rules |
-| [YouTube restream](docs/youtube-setup.md) | OAuth client and the one-time authorization flow |
+| [YouTube restream and upload](docs/youtube-setup.md) | OAuth client, the one-time authorization flow, and VOD uploads |
 | [Kick webhook](docs/kick-webhook.md) | Public URLs, proxy setup, delivery test |
 | [Telegram control](docs/telegram-control.md) | Telegram bot menu and command list |
 | [Control API](docs/control-api.md) | HTTP endpoints, accepted values, error answers |

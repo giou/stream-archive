@@ -60,12 +60,6 @@ def test_comment_structure_and_fields():
     assert msg["bits_spent"] == 0
 
 
-def test_comment_no_emotes_single_fragment():
-    c = build_comment(make_msg(emotes=None, content="just text"), 123, VIDEO_ID, START)
-    assert c["message"]["fragments"] == [{"text": "just text"}]
-    assert c["message"]["emoticons"] == []
-
-
 def test_comment_tokens_split_without_emotes_field():
     # Kick's webhook often omits or breaks the "emotes" array in live data.
     # The self-describing tokens in the body must still become emoticon

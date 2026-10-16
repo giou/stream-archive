@@ -4,7 +4,7 @@ import httpx
 import pytest
 from conftest import make_config
 
-from stream_archive.setup_youtube import _CallbackHandler, extract_code, extract_code_and_state
+from stream_archive.setup_youtube import _CallbackHandler, extract_code_and_state
 
 
 def _start_server():
@@ -22,32 +22,6 @@ def _start_server():
 def _stop_server(server):
     server.shutdown()
     server.server_close()
-
-
-def test_extract_code_passthrough_bare_code():
-    assert extract_code("4/0AX4XfGc...") == "4/0AX4XfGc..."
-
-
-def test_extract_code_from_full_redirect_url():
-    # Google percent-encodes the slash in the code, as a real redirect does.
-    url = "http://localhost:53421/?code=4%2F0AX4XfGc&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
-    assert extract_code(url) == "4/0AX4XfGc"
-
-
-def test_extract_code_rejects_error_url():
-    with pytest.raises(ValueError, match="access_denied"):
-        extract_code("http://localhost:53421/?error=access_denied")
-
-
-def test_extract_code_returns_empty_string_for_blank_code():
-    # parse_qs drops blank values. main() then falls back to server.auth_code.
-    assert extract_code("http://localhost:53421/?code=") == ""
-
-
-def test_extract_code_returns_url_when_code_is_absent():
-    # The text holds no code= or error= substring, so it stays untouched.
-    url = "http://localhost:53421/?state=xyz"
-    assert extract_code(url) == url
 
 
 def test_extract_code_and_state_returns_both_values():

@@ -84,11 +84,6 @@ def extract_code_and_state(text: str) -> tuple[str, str | None]:
     return (codes[0] if codes else ""), (states[0] if states else None)
 
 
-def extract_code(text: str) -> str:
-    """Return the code from a pasted redirect URL, or the text itself if it is already a code."""
-    return extract_code_and_state(text)[0]
-
-
 def main() -> None:
     try:
         config = get_config()

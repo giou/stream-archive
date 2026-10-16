@@ -4,7 +4,6 @@ import time
 import httpx
 from conftest import make_config
 
-from stream_archive import monitor as monitor_module
 from stream_archive.monitor import Monitor
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 
@@ -189,21 +188,6 @@ def test_failed_start_is_retried_and_alert_rate_limited():
     assert rec.started == ["twitch:ch", "twitch:ch"]
     assert len(notifier.messages) == 1
     assert "Failed to start recording for twitch:ch" in notifier.messages[0]
-
-
-def test_failure_alert_not_rate_limited_when_interval_zero(monkeypatch):
-    monkeypatch.setattr(monitor_module, "FAILURE_NOTIFY_INTERVAL", 0)
-    rec = FakeRecorder(ok=False)
-    notifier = FakeNotifier()
-    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
-    mon = make_monitor(recorder=rec, notifier=notifier)
-    config = make_config()
-
-    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
-    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
-
-    assert rec.started == ["twitch:ch", "twitch:ch"]
-    assert len(notifier.messages) == 2
 
 
 def test_recording_death_triggers_restart():

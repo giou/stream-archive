@@ -14,7 +14,6 @@ from stream_archive.youtube_upload import (
     upload_description,
     upload_metadata,
     upload_title,
-    watch_url,
     youtube_available,
 )
 
@@ -55,10 +54,6 @@ def test_upload_description_channel_lines():
         "Originally streamed at: https://twitch.tv/ch",
         "Recorded by StreamArchive",
     ]
-
-
-def test_watch_url():
-    assert watch_url("abc123") == "https://www.youtube.com/watch?v=abc123"
 
 
 def test_sidecar_round_trip(tmp_path):

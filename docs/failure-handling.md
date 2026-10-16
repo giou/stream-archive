@@ -11,6 +11,9 @@ The app logs each failure, sends an alert, and retries on the next poll cycle. T
 | Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, stalled feed) | Entry removed (chat and broadcast finalized). Restart on the next cycle. No alert if the recovery succeeds. A rate-limited alert only if the restart also fails |
 | YouTube restream keeps ending shortly after start (flaky feed) | Restart delays grow for each channel. They double from 120 s to a cap of 30 min. A rolling 24-hour budget of 10 broadcast creations across all channels blocks further restarts until a slot frees (one alert with the next-slot time) |
 | Source drops briefly with a hold delay set | The broadcast stays open, fed by a bundled pre-encoded "Reconnecting..." clip. A return within the delay reuses the same broadcast (no new creation, no quota cost). On expiry the broadcast ends as usual |
+| YouTube takes down the live broadcast (status `revoked`) | One alert naming the channel. The app stops feeding the broadcast and starts no new one. The disk recording continues in `both` mode. In `youtube` mode the recording ends with nothing saved |
+| YouTube ingest dies mid-capture | One alert naming the channel and the cause. The disk file stops here and is finalized in `both` mode. The monitor restarts automatically. In `youtube` mode there is no local backup |
+| YouTube VOD upload fails | Logged with the cause. The upload record shows `failed` with the error. Nothing retries on its own |
 | Transient Twitch or Kick API error (token or request) | Logged. The app takes no action. Retry on the next cycle |
 | Twitch or Kick rejects the app credentials (HTTP 400/401/403) | One alert until calls succeed again. Monitoring stays stalled. `/readyz` and `/status` name it `twitch_auth` or `kick_auth` |
 | YouTube token dead or broken | One alert naming `stream-archive-setup-youtube`. Restreaming stays stalled. `/readyz` and `/status` name it `youtube_auth` |

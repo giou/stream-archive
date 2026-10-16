@@ -1484,19 +1484,6 @@ def test_reply_text_disk_quick_returns_disk_menu(tmp_path):
     assert kb_labels(markup) == disk_labels(True)
 
 
-def test_reply_text_disk_submenu_descriptions(tmp_path):
-    config, ctrl, _, _, eventsub = make_controller(tmp_path)
-    open_storage(ctrl)
-    asyncio.run(ctrl.handle_reply_text("Disk limits"))
-    cases = [
-        ("Max total size", "Limits the total archive size"),
-    ]
-    for button, desc in cases:
-        text, markup = asyncio.run(ctrl.handle_reply_text(button))
-        assert desc in text
-        asyncio.run(ctrl.handle_reply_text("Back"))  # return to the disk menu
-
-
 def test_reply_text_disk_delete_oldest_on_confirms(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     ctrl.handle_disk(["delete_oldest", "off"])

@@ -150,11 +150,6 @@ def upload_metadata(path: Path, config: AppConfig, channel: str | None = None) -
     }
 
 
-def watch_url(video_id: str) -> str:
-    """Public watch URL of an uploaded video."""
-    return f"https://www.youtube.com/watch?v={video_id}"
-
-
 def youtube_sidecar(path: str | Path) -> Path:
     """Sidecar path that remembers the upload of ``path``."""
     file_path = Path(path)

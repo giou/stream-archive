@@ -1,6 +1,6 @@
 # Web panel
 
-The browser panel controls the app without Telegram. It replaces the Telegram bot: status, channels, settings, recordings with a video player, reload, restart, update check, Kick delivery test, API key show and rotate, and password change. The Telegram bot and the web panel can run at once.
+The browser panel controls the app without Telegram. It replaces the Telegram bot: status, channels, settings, recordings with a video player and YouTube upload, reload, restart, and update check. It also runs the Kick delivery test, shows and rotates the API key, and changes the password. The Telegram bot and the web panel can run at once.
 
 The web panel lives on the private listener at the domain root. It runs while the endpoint, the control API, or the web panel itself is on.
 

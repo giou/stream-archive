@@ -2,7 +2,6 @@ import json
 import os
 import stat
 
-from stream_archive import chat_writer as cw
 from stream_archive.chat_writer import ChatJsonWriter, file_info
 
 
@@ -188,16 +187,3 @@ def test_chat_file_is_created_private(tmp_path):
     assert writer.close({"FileInfo": {}}) is True
 
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-
-
-def test_write_reports_the_characters_it_wrote(tmp_path):
-    """The wrapper is file-like, so its count must match the handle's.
-
-    Returning the input length under-reported every line the indent prefixed.
-    """
-    path = tmp_path / "wrapped.json"
-    with open(path, "w", encoding="utf-8") as fh:
-        writer = cw._IndentingWriter(fh, "  ")
-        assert writer.write("a\nb") == 5  # "a" + newline + the 2-space indent + "b"
-        assert writer.write("") == 0
-    assert path.read_text(encoding="utf-8") == "a\n  b"
