@@ -1857,7 +1857,13 @@ def test_watchdog_aborts_at_cap_without_delete_oldest(tmp_path, monkeypatch):
     monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
 
     async def fake_snapshot(config):
-        return {"free_gb": 100.0, "dir_gb": 6.0, "archive_gb": 6.0, "file_count": 1}
+        return {
+            "free_gb": 100.0,
+            "dir_gb": 6.0,
+            "archive_bytes": 6 * 1024**3,
+            "archive_gb": 6.0,
+            "file_count": 1,
+        }
 
     monkeypatch.setattr("stream_archive.disk.disk_snapshot", fake_snapshot)
 
@@ -2008,9 +2014,10 @@ def test_disk_snapshot_counts_chat_files(tmp_path):
 
     assert snap["file_count"] == 1
     assert snap["chat_count"] == 2  # the in-progress .tmp file counts
+    assert snap["archive_bytes"] == 3 * sized  # exact total drives the cap checks
     assert snap["dir_gb"] == pytest.approx(0.01, abs=0.005)
     assert snap["chat_gb"] == pytest.approx(0.01, abs=0.005)
-    assert snap["archive_gb"] == pytest.approx(0.02, abs=0.005)  # the watchdog measures this against the cap
+    assert snap["archive_gb"] == pytest.approx(0.02, abs=0.005)
 
 
 def make_kick_config(tmp_path, record_chat=True):

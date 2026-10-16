@@ -158,8 +158,8 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
 
     The slow scans run in the default executor. `dir_gb` covers the
     recordings, `chat_gb` covers the chat files, and `archive_gb` is their
-    total. The disk watchdog measures `archive_gb` against
-    `disk.max_total_gb`.
+    rounded total for display. The cap checks compare `archive_bytes`
+    against `disk.max_total_gb`. See `cap_reached`.
 
     The result is cached for one cap-check interval (between 1s and 60s),
     because the monitor and every active recording watchdog ask for the same
@@ -222,10 +222,22 @@ async def disk_snapshot(config: AppConfig) -> dict[str, Any]:
         "file_count": count,
         "chat_gb": round(chat_bytes / 1024**3, 2),
         "chat_count": chat_count,
+        # Exact total: the rounded archive_gb must not drive a cap check.
+        "archive_bytes": dir_bytes + chat_bytes,
         "archive_gb": round((dir_bytes + chat_bytes) / 1024**3, 2),
     }
     _snapshot_cache[key] = (time.monotonic(), result)
     return dict(result)
+
+
+def cap_reached(snapshot: dict[str, Any], cap_gb: float) -> bool:
+    """True when the exact archive size reaches cap_gb.
+
+    Compare the byte total, never the rounded archive_gb value. A rounded
+    value can sit at the cap while the exact total is below it. The delete
+    pass then finds nothing to remove, and the start stays blocked.
+    """
+    return int(snapshot["archive_bytes"]) >= int(cap_gb * 1024**3)
 
 
 def format_bytes(n: int) -> str:

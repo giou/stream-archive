@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from stream_archive import disk
 from stream_archive.config import AppConfig, bare_name, category_allowed, is_kick_channel
 from stream_archive.health import clear_degraded, set_degraded
 
@@ -344,11 +345,11 @@ class Monitor:
             cap = disk_cfg.max_total_gb
             if cap <= 0:
                 return None
-            if snapshot["archive_gb"] >= cap:
+            if disk.cap_reached(snapshot, cap):
                 if disk_cfg.delete_oldest:
                     await self.recorder.delete_oldest_to_cap()
                     snapshot = await self.recorder.disk_snapshot()
-                    if snapshot["archive_gb"] >= cap:
+                    if disk.cap_reached(snapshot, cap):
                         return f"recording archive at {cap:g} GB cap (nothing to delete)"
                 else:
                     return f"recording archive at {cap:g} GB cap"

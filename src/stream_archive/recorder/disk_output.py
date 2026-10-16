@@ -126,14 +126,14 @@ class DiskOutputMixin:
                 if cap <= 0:
                     continue  # cap disabled: no snapshot, no archive walk
                 snap = await disk.disk_snapshot(self._config)
-                if snap["archive_gb"] >= cap:
+                if disk.cap_reached(snap, cap):
                     if cfg.delete_oldest:
                         await self.delete_oldest_to_cap()
                     # The abort decision needs a live total, never the cached
                     # one: a stale value must not stop a healthy recording.
                     disk.invalidate_snapshot()
                     snap = await disk.disk_snapshot(self._config)
-                    if snap["archive_gb"] >= cap:
+                    if disk.cap_reached(snap, cap):
                         await self._abort(channel, f"recording archive at {cap:g} GB cap")
                         return
             except asyncio.CancelledError:

@@ -59,6 +59,7 @@ class FakeRecorder:
             "file_count": 0,
             "chat_gb": 0.0,
             "chat_count": 0,
+            "archive_bytes": 0,
             "archive_gb": 0.0,
             "dir": "recordings",
         }
@@ -98,6 +99,7 @@ class FakeRecorder:
         self.delete_oldest_calls.append(1)
         self.snapshot["dir_gb"] = 0.0
         self.snapshot["archive_gb"] = 0.0
+        self.snapshot["archive_bytes"] = 0
         return (0, 0.0)
 
     def youtube_active_count(self):
@@ -309,6 +311,7 @@ def test_delete_oldest_and_starts_when_over_cap():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
     rec.snapshot["archive_gb"] = 25.0
+    rec.snapshot["archive_bytes"] = 25 * 1024**3
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec)
     config = make_config(channels=["ch"], disk={"max_total_gb": 20, "delete_oldest": True})
@@ -323,6 +326,7 @@ def test_block_when_cap_reached_and_nothing_to_delete():
     rec = FakeRecorder()
     rec.snapshot["dir_gb"] = 25.0
     rec.snapshot["archive_gb"] = 25.0
+    rec.snapshot["archive_bytes"] = 25 * 1024**3
     notifier = FakeNotifier()
     api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
     mon = make_monitor(recorder=rec, notifier=notifier)
@@ -338,6 +342,36 @@ def test_block_when_cap_reached_and_nothing_to_delete():
 
     assert rec.started == []
     assert any("nothing to delete" in m for m in notifier.messages)
+
+
+def test_start_allowed_when_rounded_archive_gb_reaches_cap():
+    """The cap gate must read the exact byte total, not the rounded display value.
+
+    A rounded value can sit at the cap while the files stay below it. The
+    delete pass then finds nothing to remove, and every start stays blocked
+    with "nothing to delete".
+    """
+    rec = FakeRecorder()
+    # The rounded value sits at the cap; the exact total is one byte below.
+    rec.snapshot["dir_gb"] = 20.0
+    rec.snapshot["archive_gb"] = 20.0
+    rec.snapshot["archive_bytes"] = 20 * 1024**3 - 1
+    notifier = FakeNotifier()
+    api = FakeTwitchAPI(streams={"u1": {"title": "T", "game_name": "G"}}, user_ids={"ch": "u1"})
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    config = make_config(channels=["ch"], disk={"max_total_gb": 20, "delete_oldest": True})
+
+    async def keep_full():
+        rec.delete_oldest_calls.append(1)
+        return (0, 0.0)
+
+    rec.delete_oldest_to_cap = keep_full
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.delete_oldest_calls == []
+    assert rec.started == ["twitch:ch"]
+    assert not any("nothing to delete" in m for m in notifier.messages)
 
 
 def test_concurrency_limit_records_first_n():
