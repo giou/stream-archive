@@ -1,9 +1,9 @@
 # Pinned uv version used to build the image. A separate stage keeps the tag
 # visible to Dependabot. This tag is the only copy: ci.yml and publish.yml
 # read it at runtime, so a bump needs no other change.
-FROM ghcr.io/astral-sh/uv:0.12.20 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.4 AS uv
 
-FROM python:3.14.7-slim
+FROM python:3.15.0-slim
 
 # Runtime dependencies. Chromium is not needed. The recorder plays live
 # streams through the ttvlol playlist proxies (config proxy_list). These
