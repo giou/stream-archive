@@ -30,11 +30,11 @@ jobs:
             echo "cannot read the uv version from the Dockerfile" >&2; exit 1
           fi
           echo "version=$UV" >> "$GITHUB_OUTPUT"
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # Version comes from the Dockerfile step above: one copy only.
           version: ${{ steps.uv.outputs.version }}
-          # 3.14 means the newest 3.14.x, while the image pins 3.14.7. A patch
+          # 3.14 means the newest 3.14.x, while the image pins 3.14.9. A patch
           # pin would download that interpreter on every run, so the drift is
           # deliberate.
           python-version: "3.14"
