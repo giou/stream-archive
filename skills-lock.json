@@ -5,7 +5,7 @@
       "source": "alibaba/open-code-review",
       "sourceType": "github",
       "skillPath": "skills/open-code-review/SKILL.md",
-      "computedHash": "995cf0e228accf99ba227fae2332e1e21c6d78d9f7ce2fa0c1371d04abeff7a4"
+      "computedHash": "d3a3a06ec51a1b1d8c4ff4cb5fbc963269446b1627178c1106c606868f5a4d29"
     },
     "security-audit": {
       "source": "cloudflare/security-audit-skill",
