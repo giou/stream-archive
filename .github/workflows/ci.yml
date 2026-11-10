@@ -34,7 +34,7 @@ jobs:
         with:
           # Version comes from the Dockerfile step above: one copy only.
           version: ${{ steps.uv.outputs.version }}
-          # 3.14 means the newest 3.14.x, while the image pins 3.14.9. A patch
+          # 3.14 means the newest 3.14.x, while the image pins 3.14.10. A patch
           # pin would download that interpreter on every run, so the drift is
           # deliberate.
           python-version: "3.14"
