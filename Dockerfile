@@ -3,7 +3,10 @@
 # read it at runtime, so a bump needs no other change.
 FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
 
-FROM python:3.15.0-slim
+# The project caps requires-python below 3.15 until it validates that
+# interpreter, so the image stays on the 3.14 series. A newer base image would
+# make uv download and use its own 3.14 interpreter instead.
+FROM python:3.14.10-slim
 
 # Runtime dependencies. Chromium is not needed. The recorder plays live
 # streams through the ttvlol playlist proxies (config proxy_list). These
